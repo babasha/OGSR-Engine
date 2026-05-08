@@ -1,10 +1,14 @@
 ﻿# Папки
 /.vs
+/.claude
 /3rd_party/_LIB
 /3rd_party/_TEMP
 /ogsr_engine/_LIB
 /ogsr_engine/_TEMP
 /bin*
+
+# Build intermediaries (MSBuild ObjectFileName="obj\")
+**/obj/
 
 # Precompiled Headers
 *.ipch

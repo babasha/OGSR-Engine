@@ -1,0 +1,553 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+// Licensed under the same terms as X-Ray Engine (see root License.txt)
+
+#include "stdafx.h"
+#include "vk_descriptors.h"
+#include "HW_Vulkan.h"
+
+namespace VK
+{
+
+// Constructor
+CVulkanDescriptorManager::CVulkanDescriptorManager()
+{
+    Msg("[Vulkan] CVulkanDescriptorManager::CVulkanDescriptorManager()");
+}
+
+// Destructor
+CVulkanDescriptorManager::~CVulkanDescriptorManager()
+{
+    Msg("[Vulkan] CVulkanDescriptorManager::~CVulkanDescriptorManager()");
+    Destroy();
+}
+
+// Создание descriptor system
+void CVulkanDescriptorManager::Create()
+{
+    if (m_bCreated) {
+        Msg("![Vulkan] DescriptorManager already created");
+        return;
+    }
+
+    Msg("[Vulkan] Creating Descriptor Manager...");
+
+    CreateLayouts();
+    CreatePool();
+
+    m_bCreated = true;
+
+    Msg("[Vulkan] Descriptor Manager created successfully");
+}
+
+// Уничтожение
+void CVulkanDescriptorManager::Destroy()
+{
+    if (!m_bCreated) {
+        return;
+    }
+
+    Msg("[Vulkan] Destroying Descriptor Manager...");
+
+    // Destroy pools (автоматически освобождает все allocated sets)
+    for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        if (m_Pools[i] != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(VulkanHW.m_Device, m_Pools[i], nullptr);
+            m_Pools[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    // Destroy layouts
+    if (m_PerFrameLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(VulkanHW.m_Device, m_PerFrameLayout, nullptr);
+        m_PerFrameLayout = VK_NULL_HANDLE;
+    }
+
+    if (m_PerMaterialLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(VulkanHW.m_Device, m_PerMaterialLayout, nullptr);
+        m_PerMaterialLayout = VK_NULL_HANDLE;
+    }
+
+    if (m_PerObjectLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(VulkanHW.m_Device, m_PerObjectLayout, nullptr);
+        m_PerObjectLayout = VK_NULL_HANDLE;
+    }
+
+    if (m_LightingLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(VulkanHW.m_Device, m_LightingLayout, nullptr);
+        m_LightingLayout = VK_NULL_HANDLE;
+    }
+
+    for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i)
+        m_AllocatedSets[i] = 0;
+    m_CurrentFrame = 0;
+    m_bCreated = false;
+
+    Msg("[Vulkan] Descriptor Manager destroyed");
+}
+
+// Создание layouts
+void CVulkanDescriptorManager::CreateLayouts()
+{
+    Msg("[Vulkan] Creating descriptor set layouts...");
+
+    // ========================================================================
+    // Set 0: PerFrame (обновляется каждый кадр)
+    // ========================================================================
+    {
+        VkDescriptorSetLayoutBinding binding = {};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        m_PerFrameLayout = CreateLayout(&binding, 1);
+        Msg("[Vulkan]   Set 0 (PerFrame): 1 uniform buffer");
+    }
+
+    // ========================================================================
+    // Set 1: PerMaterial (текстуры материала)
+    // ========================================================================
+    {
+        // PBR материал может использовать до 8 текстур:
+        // 0: Albedo/Diffuse
+        // 1: Normal map
+        // 2: Roughness
+        // 3: Metallic
+        // 4: AO (Ambient Occlusion)
+        // 5: Emissive
+        // 6: Height (для parallax)
+        // 7: SSS (Subsurface Scattering)
+
+        VkDescriptorSetLayoutBinding bindings[8] = {};
+        for (u32 i = 0; i < 8; ++i) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+
+        m_PerMaterialLayout = CreateLayout(bindings, 8);
+        Msg("[Vulkan]   Set 1 (PerMaterial): 8 texture samplers");
+    }
+
+    // ========================================================================
+    // Set 2: PerObject (world matrix + bone matrices SSBO)
+    // ========================================================================
+    {
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+
+        // Binding 0: World matrix UBO
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        // Binding 1: Bone matrices SSBO (for GPU skinning)
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        m_PerObjectLayout = CreateLayout(bindings, 2);
+        Msg("[Vulkan]   Set 2 (PerObject): 1 uniform buffer + 1 storage buffer (bones)");
+    }
+
+    // ========================================================================
+    // Set 3: Lighting (light data)
+    // ========================================================================
+    {
+        // Lighting set содержит:
+        // - binding 0: Light data buffer (все lights в сцене)
+        // - binding 1: Shadow maps (array of textures)
+
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+
+        // Light data buffer
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        // Shadow maps (до 16 shadow maps)
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[1].descriptorCount = 16;
+        bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        m_LightingLayout = CreateLayout(bindings, 2);
+        Msg("[Vulkan]   Set 3 (Lighting): 1 uniform buffer + 16 shadow maps");
+    }
+
+    Msg("[Vulkan] Descriptor set layouts created");
+}
+
+// Создание pools (one per frame-in-flight)
+void CVulkanDescriptorManager::CreatePool()
+{
+    Msg("[Vulkan] Creating descriptor pools (%u frames-in-flight)...", FRAMES_IN_FLIGHT);
+
+    // Подсчитываем количество каждого типа descriptor
+    // Предполагаем максимум (pool is reset every frame):
+    // - 100 PerFrame sets
+    // - 2000 PerMaterial sets (with per-frame caching: 1 set per unique material)
+    // - 10000 PerObject sets (много объектов)
+    // - 100 Lighting sets
+
+    VkDescriptorPoolSize poolSizes[3] = {};
+
+    // Uniform buffers: 100 + 10000 + 100 = 10200 (PerFrame + PerObject + Lighting)
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[0].descriptorCount = 10200;
+
+    // Combined image samplers: 2000*8 + 100*16 = 17600 (PerMaterial + Lighting shadow maps)
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = 17600;
+
+    // Storage buffers: 10000 (PerObject bone SSBO - one per skinned object)
+    poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[2].descriptorCount = 10000;
+
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // Позволяет vkFreeDescriptorSets
+    poolInfo.maxSets = 13200;  // 100 + 2000 + 10000 + 100 + 1000 reserve
+    poolInfo.poolSizeCount = 3;
+    poolInfo.pPoolSizes = poolSizes;
+
+    for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        VK_CHECK(vkCreateDescriptorPool(VulkanHW.m_Device, &poolInfo, nullptr, &m_Pools[i]));
+    }
+
+    Msg("[Vulkan] Descriptor pools created (%u x max sets: %u)", FRAMES_IN_FLIGHT, poolInfo.maxSets);
+    Msg("[Vulkan]   - Uniform buffers: %u per pool", poolSizes[0].descriptorCount);
+    Msg("[Vulkan]   - Texture samplers: %u per pool (supports %u materials/frame)",
+        poolSizes[1].descriptorCount, poolSizes[1].descriptorCount / 8);
+}
+
+// Helper для создания layout
+VkDescriptorSetLayout CVulkanDescriptorManager::CreateLayout(
+    const VkDescriptorSetLayoutBinding* bindings, u32 count)
+{
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = count;
+    layoutInfo.pBindings = bindings;
+
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(VulkanHW.m_Device, &layoutInfo, nullptr, &layout));
+
+    return layout;
+}
+
+// Allocate PerFrame set
+VkDescriptorSet CVulkanDescriptorManager::AllocatePerFrame()
+{
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_PerFrameLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
+
+    if (result != VK_SUCCESS) {
+        Msg("![Vulkan] Failed to allocate PerFrame descriptor set: %d", result);
+        return VK_NULL_HANDLE;
+    }
+
+    m_AllocatedSets[m_CurrentFrame]++;
+    return set;
+}
+
+// Allocate PerMaterial set
+VkDescriptorSet CVulkanDescriptorManager::AllocatePerMaterial()
+{
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_PerMaterialLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
+
+    if (result != VK_SUCCESS) {
+        Msg("![Vulkan] Failed to allocate PerMaterial descriptor set: %d", result);
+        return VK_NULL_HANDLE;
+    }
+
+    m_AllocatedSets[m_CurrentFrame]++;
+    return set;
+}
+
+// Allocate PerObject set
+VkDescriptorSet CVulkanDescriptorManager::AllocatePerObject()
+{
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_PerObjectLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
+
+    if (result != VK_SUCCESS) {
+        Msg("![Vulkan] Failed to allocate PerObject descriptor set: %d", result);
+        return VK_NULL_HANDLE;
+    }
+
+    m_AllocatedSets[m_CurrentFrame]++;
+    return set;
+}
+
+// Allocate Lighting set
+VkDescriptorSet CVulkanDescriptorManager::AllocateLighting()
+{
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_LightingLayout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
+
+    if (result != VK_SUCCESS) {
+        Msg("![Vulkan] Failed to allocate Lighting descriptor set: %d", result);
+        return VK_NULL_HANDLE;
+    }
+
+    m_AllocatedSets[m_CurrentFrame]++;
+    return set;
+}
+
+// Allocate with arbitrary layout (for custom pipelines like spot light)
+VkDescriptorSet CVulkanDescriptorManager::AllocateWithLayout(VkDescriptorSetLayout layout)
+{
+    VkDescriptorSetAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &layout;
+
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
+
+    if (result != VK_SUCCESS) {
+        Msg("![Vulkan] Failed to allocate descriptor set with custom layout: %d", result);
+        return VK_NULL_HANDLE;
+    }
+
+    m_AllocatedSets[m_CurrentFrame]++;
+    return set;
+}
+
+// Update buffer binding
+void CVulkanDescriptorManager::UpdateBuffer(VkDescriptorSet set, u32 binding,
+                                             VkBuffer buffer, VkDeviceSize size, VkDeviceSize offset)
+{
+    VkDescriptorBufferInfo bufferInfo = {};
+    bufferInfo.buffer = buffer;
+    bufferInfo.offset = offset;
+    bufferInfo.range = size;
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &bufferInfo;
+
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &write, 0, nullptr);
+}
+
+// Update storage buffer (SSBO) binding
+void CVulkanDescriptorManager::UpdateStorageBuffer(VkDescriptorSet set, u32 binding,
+                                                    VkBuffer buffer, VkDeviceSize size, VkDeviceSize offset)
+{
+    VkDescriptorBufferInfo bufferInfo = {};
+    bufferInfo.buffer = buffer;
+    bufferInfo.offset = offset;
+    bufferInfo.range = size;
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &bufferInfo;
+
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &write, 0, nullptr);
+}
+
+// Update texture binding
+void CVulkanDescriptorManager::UpdateTexture(VkDescriptorSet set, u32 binding,
+                                              VkImageView view, VkSampler sampler)
+{
+    VkDescriptorImageInfo imageInfo = {};
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfo.imageView = view;
+    imageInfo.sampler = sampler;
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo = &imageInfo;
+
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &write, 0, nullptr);
+}
+
+// Update multiple textures
+void CVulkanDescriptorManager::UpdateTextures(VkDescriptorSet set, u32 firstBinding,
+                                               const VkImageView* views, const VkSampler* samplers, u32 count)
+{
+    if (count == 0 || count > 16) {
+        Msg("![Vulkan] Invalid texture count: %u (max 16)", count);
+        return;
+    }
+
+    VkDescriptorImageInfo imageInfos[16] = {};
+    VkWriteDescriptorSet writes[16] = {};
+
+    for (u32 i = 0; i < count; ++i) {
+        imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfos[i].imageView = views[i];
+        imageInfos[i].sampler = samplers[i];
+
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = firstBinding + i;
+        writes[i].dstArrayElement = 0;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].descriptorCount = 1;
+        writes[i].pImageInfo = &imageInfos[i];
+    }
+
+    vkUpdateDescriptorSets(VulkanHW.m_Device, count, writes, 0, nullptr);
+}
+
+// Reset pool for a specific frame-in-flight slot
+void CVulkanDescriptorManager::ResetPool(u32 frameIndex)
+{
+    if (frameIndex >= FRAMES_IN_FLIGHT) return;
+    if (m_Pools[frameIndex] == VK_NULL_HANDLE) return;
+    VK_CHECK(vkResetDescriptorPool(VulkanHW.m_Device, m_Pools[frameIndex], 0));
+    m_AllocatedSets[frameIndex] = 0;
+}
+
+// ============================================================================
+// DescriptorWriter implementation
+// ============================================================================
+
+DescriptorWriter::DescriptorWriter(VkDescriptorSet set) : m_Set(set)
+{
+    ZeroMemory(m_Writes, sizeof(m_Writes));
+    ZeroMemory(m_BufferInfos, sizeof(m_BufferInfos));
+    ZeroMemory(m_ImageInfos, sizeof(m_ImageInfos));
+}
+
+DescriptorWriter& DescriptorWriter::UniformBuffer(u32 binding, VkBuffer buf,
+    VkDeviceSize size, VkDeviceSize offset)
+{
+    VERIFY(m_Count < MAX_WRITES);
+    u32 i = m_Count++;
+
+    m_BufferInfos[i].buffer = buf;
+    m_BufferInfos[i].offset = offset;
+    m_BufferInfos[i].range  = size;
+
+    m_Writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    m_Writes[i].dstSet          = m_Set;
+    m_Writes[i].dstBinding      = binding;
+    m_Writes[i].dstArrayElement = 0;
+    m_Writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    m_Writes[i].descriptorCount = 1;
+    m_Writes[i].pBufferInfo     = &m_BufferInfos[i];
+
+    return *this;
+}
+
+DescriptorWriter& DescriptorWriter::StorageBuffer(u32 binding, VkBuffer buf,
+    VkDeviceSize size, VkDeviceSize offset)
+{
+    VERIFY(m_Count < MAX_WRITES);
+    u32 i = m_Count++;
+
+    m_BufferInfos[i].buffer = buf;
+    m_BufferInfos[i].offset = offset;
+    m_BufferInfos[i].range  = size;
+
+    m_Writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    m_Writes[i].dstSet          = m_Set;
+    m_Writes[i].dstBinding      = binding;
+    m_Writes[i].dstArrayElement = 0;
+    m_Writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    m_Writes[i].descriptorCount = 1;
+    m_Writes[i].pBufferInfo     = &m_BufferInfos[i];
+
+    return *this;
+}
+
+DescriptorWriter& DescriptorWriter::ImageSampler(u32 binding, VkImageView view,
+    VkSampler sampler, VkImageLayout layout)
+{
+    VERIFY(m_Count < MAX_WRITES);
+    u32 i = m_Count++;
+
+    m_ImageInfos[i].imageView   = view;
+    m_ImageInfos[i].sampler     = sampler;
+    m_ImageInfos[i].imageLayout = layout;
+
+    m_Writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    m_Writes[i].dstSet          = m_Set;
+    m_Writes[i].dstBinding      = binding;
+    m_Writes[i].dstArrayElement = 0;
+    m_Writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    m_Writes[i].descriptorCount = 1;
+    m_Writes[i].pImageInfo      = &m_ImageInfos[i];
+
+    return *this;
+}
+
+DescriptorWriter& DescriptorWriter::StorageImage(u32 binding, VkImageView view,
+    VkImageLayout layout)
+{
+    VERIFY(m_Count < MAX_WRITES);
+    u32 i = m_Count++;
+
+    m_ImageInfos[i].imageView   = view;
+    m_ImageInfos[i].sampler     = VK_NULL_HANDLE;
+    m_ImageInfos[i].imageLayout = layout;
+
+    m_Writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    m_Writes[i].dstSet          = m_Set;
+    m_Writes[i].dstBinding      = binding;
+    m_Writes[i].dstArrayElement = 0;
+    m_Writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    m_Writes[i].descriptorCount = 1;
+    m_Writes[i].pImageInfo      = &m_ImageInfos[i];
+
+    return *this;
+}
+
+void DescriptorWriter::Flush()
+{
+    if (m_Count > 0)
+        vkUpdateDescriptorSets(VulkanHW.m_Device, m_Count, m_Writes, 0, nullptr);
+}
+
+} // namespace VK
+
+// Глобальный экземпляр
+VK::CVulkanDescriptorManager* g_DescriptorManager = nullptr;

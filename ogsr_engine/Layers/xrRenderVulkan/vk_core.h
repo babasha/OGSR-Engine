@@ -1,0 +1,92 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+// Licensed under the same terms as X-Ray Engine (see root License.txt)
+
+#pragma once
+#include "stdafx.h"
+
+// Global device-lost flag — when set, all rendering is skipped
+// Defined in rvk.cpp, declared extern here so it's accessible from xrEngine too
+extern bool g_bDeviceLost;
+
+// Soft error checking macro — logs error, sets device-lost on fatal codes, but does NOT crash
+#define VK_CHECK(result) \
+    do { \
+        VkResult res = (result); \
+        if (res != VK_SUCCESS) { \
+            if (res == VK_ERROR_DEVICE_LOST) { \
+                if (!g_bDeviceLost) { \
+                    Msg("!Vulkan DEVICE LOST at %s:%d", __FILE__, __LINE__); \
+                    g_bDeviceLost = true; \
+                } \
+            } else { \
+                Msg("!Vulkan error: %d at %s:%d", res, __FILE__, __LINE__); \
+            } \
+        } \
+    } while(0)
+
+// Critical error checking — used for resource creation that MUST succeed
+#define VK_CHECK_CRITICAL(result) \
+    do { \
+        VkResult res = (result); \
+        if (res != VK_SUCCESS) { \
+            Msg("!Vulkan CRITICAL error: %d at %s:%d", res, __FILE__, __LINE__); \
+            VERIFY(false); \
+        } \
+    } while(0)
+
+// Required instance extensions (debug_utils always included for validation diagnostics)
+inline const char* g_InstanceExtensions[] = {
+    VK_KHR_SURFACE_EXTENSION_NAME,
+    VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
+    VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+};
+
+inline constexpr u32 g_InstanceExtensionCount = sizeof(g_InstanceExtensions) / sizeof(g_InstanceExtensions[0]);
+
+// Validation layers (always available — essential for Vulkan development)
+inline const char* g_ValidationLayers[] = {
+    "VK_LAYER_KHRONOS_validation"
+};
+inline constexpr u32 g_ValidationLayerCount = sizeof(g_ValidationLayers) / sizeof(g_ValidationLayers[0]);
+
+// Required device extensions
+inline const char* g_DeviceExtensions[] = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+};
+
+// Optional device extensions for NVIDIA NGX (DLSS)
+inline const char* g_NgxDeviceExtensions[] = {
+    VK_NVX_BINARY_IMPORT_EXTENSION_NAME,
+    VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,
+    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+};
+inline constexpr u32 g_NgxDeviceExtensionCount = sizeof(g_NgxDeviceExtensions) / sizeof(g_NgxDeviceExtensions[0]);
+
+// Set to true by CreateLogicalDevice() if all NGX extensions were enabled
+inline bool g_bNgxExtensionsEnabled = false;
+
+// Optional device extensions for hardware ray tracing (RTGI)
+inline const char* g_RtDeviceExtensions[] = {
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+    VK_KHR_RAY_QUERY_EXTENSION_NAME,
+    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+};
+inline constexpr u32 g_RtDeviceExtensionCount = sizeof(g_RtDeviceExtensions) / sizeof(g_RtDeviceExtensions[0]);
+
+inline constexpr u32 g_DeviceExtensionCount = sizeof(g_DeviceExtensions) / sizeof(g_DeviceExtensions[0]);
+
+// Forward declarations
+struct VulkanCaps;
+
+// Core functions
+bool VK_CreateInstance(VkInstance* outInstance);
+void VK_DestroyInstance(VkInstance instance);
+
+// Physical device selection
+VkPhysicalDevice VK_SelectPhysicalDevice(VkInstance instance, VulkanCaps* outCaps);
+bool VK_CheckDeviceExtensionSupport(VkPhysicalDevice device);
+
+// Debug messenger setup (always available for validation diagnostics)
+VkResult VK_SetupDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT* outMessenger);
+void VK_DestroyDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT messenger);

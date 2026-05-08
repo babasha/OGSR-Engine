@@ -28,4 +28,16 @@ git clone --branch v310.4.0 --depth 1 https://github.com/NVIDIA/DLSS.git 3rd_par
 RD /s /q 3rd_party\Src\cpputils\cpputils
 git clone --branch main --depth 1 https://github.com/tzcnt/cpputils.git 3rd_party\Src\cpputils\cpputils
 
+REM ===== Vulkan renderer dependencies =====
+REM VMA — header-only, used by xrRenderVulkan. Pinned to v3.4.x range (matches monolith).
+RD /s /q 3rd_party\Src\VulkanMemoryAllocator\VulkanMemoryAllocator
+git clone --branch master --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git 3rd_party\Src\VulkanMemoryAllocator\VulkanMemoryAllocator
+
+REM NGX (DLSS for Vulkan) — currently *deferred*, kept commented so structure is ready.
+REM Existing 3rd_party\Src\NVIDIA_DLSS\DLSS clone (above) is the same SDK used for Vulkan;
+REM Vulkan renderer just needs a different lib variant from the same tree.
+REM Reflex SDK — also deferred until requested by OGSR team.
+REM RD /s /q 3rd_party\Src\NVIDIA_Reflex\Reflex
+REM git clone --branch main --depth 1 https://github.com/NVIDIAGameWorks/Reflex.git 3rd_party\Src\NVIDIA_Reflex\Reflex
+
 pause

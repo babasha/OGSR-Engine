@@ -1,0 +1,622 @@
+// xrRenderVulkan - IRenderFactory implementation.
+//
+// CreateRenderDeviceRender hands back a working vkRenderDeviceRender (HW +
+// swapchain + sync). Create{UIShader, UISequenceVideoItem, FontRender}
+// return real implementations driving the UI render path — these are why
+// the menu draws. Stats, WallMarkArray, Environment, Rain, LensFlare,
+// Thunderbolt return inert stubs that satisfy the engine's invariant
+// "factory always returns a non-null object" until the matching Vulkan
+// subsystem ports over. The reference implementation we're grafting from
+// is in _parked/vk_RenderFactory.cpp.
+
+#include "stdafx.h"
+#include "vk_RenderFactory.h"
+#include "vk_RenderDeviceRender.h"
+#include "vk_ui_shader.h"
+#include "vk_UIPipeline.h"
+#include "vk_texture.h"
+#include "vk_buffer.h"
+#include "vk_command_buffer.h"
+#include "HW_Vulkan.h"
+
+#include "../../Include/xrRender/UIShader.h"
+#include "../../Include/xrRender/UISequenceVideoItem.h"
+#include "../../Include/xrRender/FontRender.h"
+#include "../../Include/xrRender/StatsRender.h"
+#include "../../Include/xrRender/WallMarkArray.h"
+#include "../../Include/xrRender/UIRender.h"
+#include "../../xr_3da/GameFont.h"
+#include "../../xr_3da/MbHelpers.h"
+#include "../../xr_3da/xrTheora_Surface.h"
+#include "../../Include/xrRender/EnvironmentRender.h"
+#include "../../Include/xrRender/RainRender.h"
+#include "../../Include/xrRender/LensFlareRender.h"
+#include "../../Include/xrRender/ThunderboltRender.h"
+#include "../../Include/xrRender/ThunderboltDescRender.h"
+
+#include <unordered_map>
+#include <string>
+
+vkRenderFactory RenderFactoryImpl_VK;
+
+// ---------------------------------------------------------------------------
+// vkUIShader_Real and vkFontRender_Real are at GLOBAL scope (not in the
+// anonymous namespace below) because CGameFont declares them as friends to
+// reach its protected members — friend lookup is by unqualified name and
+// won't match a class defined inside an unnamed namespace.
+// ---------------------------------------------------------------------------
+
+// Real vkUIShader — inherits IVkUIShader so vkUIRender's dynamic_cast picks it
+// up and feeds the bound texture's descriptor into vkCmdBindDescriptorSets.
+//
+// ----------------------------------------------------------------------------
+// UI texture cache — shared across all vkUIShader_Real instances. Settings
+// menu spawns hundreds of UIStatic widgets, each with its own IUIShader; without
+// a cache we re-loaded the same DDS/OGM 130+ times (600ms+ stall on menu open,
+// validation errors from leaking samplers, and the .ogm video item ended up
+// pointing at one Theora playback while a different one rendered).
+//
+// Slots own the GPU resources for the lifetime of the engine (cleared on
+// process exit). Shader instances hold non-owning pointers.
+// ----------------------------------------------------------------------------
+struct UITextureSlot
+{
+    VK::CVulkanTexture  texture;
+    VkDescriptorSet     descSet  = VK_NULL_HANDLE;
+    bool                hasTex   = false;
+
+    // Theora playback state — only populated for .ogm-backed slots.
+    CTheoraSurface*     pTheora  = nullptr;
+    VK::CVulkanBuffer   videoStaging;
+    xr_vector<u32>      yuvScratch;
+    u32                 videoRealW = 0, videoRealH = 0;
+    u32                 videoPadW  = 0, videoPadH  = 0;
+    u32                 videoSyncTime        = 0xFFFFFFFF;  // last VideoSync
+    u32                 videoLastUploadFrame = 0;           // dwFrame de-dup
+
+    bool hasVideo() const { return pTheora != nullptr; }
+};
+
+static std::unordered_map<std::string, UITextureSlot*> g_UITextureCache;
+
+struct vkUIShader_Real final : IVkUIShader
+{
+    xr_string      m_TexName;
+    bool           m_inited = false;
+    UITextureSlot* m_Slot   = nullptr;       // non-owning, lives in g_UITextureCache
+
+    void Copy(IUIShader& other) override
+    {
+        auto* o = static_cast<vkUIShader_Real*>(&other);
+        m_TexName = o->m_TexName;
+        m_inited  = o->m_inited;
+        if (!m_TexName.empty()) loadTexture();
+    }
+
+    void create(LPCSTR /*sh*/, LPCSTR tex, bool /*no_cache*/) override
+    {
+        m_TexName = tex ? tex : "";
+        m_inited  = true;
+        if (!m_TexName.empty()) loadTexture();
+    }
+
+    bool inited() override { return m_inited; }
+
+    VkDescriptorSet GetDescriptorSet() override
+    {
+        // Lazy per-bind decode for video-backed slots — render-pass-safe via
+        // immediate cmd buffer. De-duped by dwFrame so multiple shaders sharing
+        // the same Theora slot (because of texture caching) only tick once.
+        if (m_Slot && m_Slot->pTheora) tickVideoSlot(*m_Slot);
+        return m_Slot ? m_Slot->descSet : VK_NULL_HANDLE;
+    }
+    u32 GetTextureWidth()  const override { return (m_Slot && m_Slot->hasTex) ? m_Slot->texture.GetWidth()  : 1; }
+    u32 GetTextureHeight() const override { return (m_Slot && m_Slot->hasTex) ? m_Slot->texture.GetHeight() : 1; }
+
+    // ---- Video API forwarded by vkUISequenceVideoItem ------------------------
+    bool HasVideo() const override { return m_Slot && m_Slot->pTheora; }
+
+    void VideoPlay(BOOL looped, u32 _time) override
+    {
+        if (!m_Slot || !m_Slot->pTheora) return;
+        u32 t = (_time != 0xFFFFFFFF) ? _time : Device.dwTimeContinual;
+        m_Slot->videoSyncTime = _time;
+        m_Slot->pTheora->Play(looped, t);
+    }
+    void VideoSync(u32 _time) override { if (m_Slot) m_Slot->videoSyncTime = _time; }
+    void VideoStop()          override { if (m_Slot && m_Slot->pTheora) m_Slot->pTheora->Stop(); }
+    BOOL VideoIsPlaying()     override { return (m_Slot && m_Slot->pTheora) ? m_Slot->pTheora->IsPlaying() : FALSE; }
+
+private:
+    // Allocate descriptor set + bind it to slot.texture. Called once per slot
+    // (right after the texture is created/loaded).
+    static bool createSlotDescriptor(UITextureSlot& slot)
+    {
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool     = VulkanUI::s_DescriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts        = &VulkanUI::s_DescriptorSetLayout;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &slot.descSet) != VK_SUCCESS) {
+            slot.descSet = VK_NULL_HANDLE;
+            return false;
+        }
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfo.imageView   = slot.texture.GetView();
+        imageInfo.sampler     = slot.texture.GetSampler();
+        VkWriteDescriptorSet write{};
+        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet          = slot.descSet;
+        write.dstBinding      = 0;
+        write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.descriptorCount = 1;
+        write.pImageInfo      = &imageInfo;
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &write, 0, nullptr);
+        return true;
+    }
+
+    // Sequence-file fallback: parse FPS-prefixed list and load the first frame
+    // as a static DDS. Used only when .dds is missing for the requested name.
+    static bool loadFirstSeqFrame(const xr_string& texName, UITextureSlot& slot)
+    {
+        string_path seqPath;
+        if (!FS.exist(seqPath, "$game_textures$", texName.c_str(), ".seq")) return false;
+        IReader* r = FS.r_open(seqPath);
+        if (!r) return false;
+
+        string1024 line;
+        line[0] = 0;
+        while (!r->eof()) {
+            r->r_string(line, sizeof(line));
+            size_t n = strlen(line);
+            while (n && (line[n-1] == ' ' || line[n-1] == '\t' || line[n-1] == '\r')) line[--n] = 0;
+            if (!line[0])                          continue;
+            if (_stricmp(line, "cycled") == 0)     continue;
+            bool isnum = true;
+            for (char* c = line; *c; ++c) if (*c < '0' || *c > '9') { isnum = false; break; }
+            if (isnum)                             continue;
+            break;
+        }
+        FS.r_close(r);
+        if (!line[0]) return false;
+
+        string_path framePath;
+        if (!FS.exist(framePath, "$game_textures$", line, ".dds")) return false;
+        Msg("[VK-UIShader] %s missing .dds — using .seq frame %s", texName.c_str(), line);
+        return slot.texture.LoadDDS(framePath);
+    }
+
+    // .ogm initialiser — same flow as R4's SH_Texture.cpp:181 (Load Theora,
+    // size + Play(loop), allocate dynamic RGBA8 texture + persistent staging).
+    static bool tryLoadOgmSlot(const xr_string& texName, UITextureSlot& slot)
+    {
+        string_path fn;
+        if (!FS.exist(fn, "$game_textures$", texName.c_str(), ".ogm")) return false;
+
+        slot.pTheora = xr_new<CTheoraSurface>();
+        if (!slot.pTheora->Load(fn)) {
+            xr_delete(slot.pTheora);
+            Msg("![VK-UIShader] failed to open .ogm: %s", fn);
+            return false;
+        }
+        slot.videoRealW = slot.pTheora->Width(true);
+        slot.videoRealH = slot.pTheora->Height(true);
+        slot.videoPadW  = slot.pTheora->Width(false);
+        slot.videoPadH  = slot.pTheora->Height(false);
+
+        BOOL stop_at_end = (strstr(texName.c_str(), "intro\\") ||
+                            strstr(texName.c_str(), "outro\\")) ? TRUE : FALSE;
+        slot.pTheora->Play(!stop_at_end, Device.dwTimeContinual);
+
+        const VkDeviceSize stagingBytes = VkDeviceSize(slot.videoPadW) * slot.videoRealH * 4;
+        slot.videoStaging.Create(stagingBytes,
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                 VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+        slot.videoStaging.Map();
+        slot.yuvScratch.assign(VkDeviceSize(slot.videoPadW) * slot.videoRealH, 0);
+
+        slot.texture.Create(slot.videoPadW, slot.videoPadH, VK_FORMAT_R8G8B8A8_UNORM, 1,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        slot.texture.TransitionLayoutImmediate(VK_IMAGE_LAYOUT_UNDEFINED,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        slot.hasTex = true;
+        return createSlotDescriptor(slot);
+    }
+
+    // Decode latest Theora frame, convert YUV→RGB, push to slot.texture.
+    static void tickVideoSlot(UITextureSlot& slot)
+    {
+        // Bind heartbeat — counts how many GetDescriptorSet calls reached this
+        // function in the last second, regardless of whether a new frame
+        // decoded. If this stops, the OGM shader has stopped being bound for
+        // rendering.
+        static u32 binds = 0;
+        static u32 lastLogFrame = 0;
+        ++binds;
+        if (Device.dwFrame > lastLogFrame + 60) {
+            Msg("[VK-Theora] heartbeat: %u binds in last %u frames (sync=%u, playing=%d)",
+                binds, Device.dwFrame - lastLogFrame, slot.videoSyncTime,
+                slot.pTheora ? slot.pTheora->IsPlaying() : 0);
+            binds = 0;
+            lastLogFrame = Device.dwFrame;
+        }
+
+        if (slot.videoLastUploadFrame == Device.dwFrame) return;
+        slot.videoLastUploadFrame = Device.dwFrame;
+
+        const u32 t = (slot.videoSyncTime != 0xFFFFFFFF) ? slot.videoSyncTime
+                                                         : Device.dwTimeContinual;
+        if (!slot.pTheora->Update(t)) return;
+        // First few decodes — confirm we got a fresh YUV frame (not just bind).
+        static u32 decodes = 0;
+        if (++decodes <= 3 || (decodes % 100) == 0)
+            Msg("[VK-Theora] decoded frame #%u (t=%u)", decodes, t);
+
+        const u32 padding = slot.videoPadW - slot.videoRealW;
+        int pos = 0;
+        slot.pTheora->DecompressFrame(slot.yuvScratch.data(), padding, pos);
+
+        // YUV-packed-as-BGRA → BT.601 RGB → RGBA8 (Vulkan format-native).
+        u32* dst = static_cast<u32*>(slot.videoStaging.m_Mapped);
+        const u32 rowStride = slot.videoPadW;
+        for (u32 row = 0; row < slot.videoRealH; ++row) {
+            const u32* src = slot.yuvScratch.data() + row * rowStride;
+            u32* out       = dst                    + row * rowStride;
+            for (u32 col = 0; col < slot.videoRealW; ++col) {
+                const u32 yuv = src[col];
+                // color_rgba bits: [31:24]=255 [23:16]=Y [15:8]=U [7:0]=V.
+                const int V = int( yuv        & 0xFF);
+                const int U = int((yuv >> 8 ) & 0xFF);
+                const int Y = int((yuv >> 16) & 0xFF);
+                const int yC = Y - 16, uC = U - 128, vC = V - 128;
+                int R = (298 * yC           + 409 * vC + 128) >> 8;
+                int G = (298 * yC - 100 * uC - 208 * vC + 128) >> 8;
+                int B = (298 * yC + 516 * uC           + 128) >> 8;
+                R = R < 0 ? 0 : (R > 255 ? 255 : R);
+                G = G < 0 ? 0 : (G > 255 ? 255 : G);
+                B = B < 0 ? 0 : (B > 255 ? 255 : B);
+                out[col] = u32(0xFF000000u) | (u32(B) << 16) | (u32(G) << 8) | u32(R);
+            }
+        }
+        slot.videoStaging.Flush();
+
+        VkCommandBuffer cmd = CommandManager.BeginImmediate();
+        if (cmd == VK_NULL_HANDLE) return;
+
+        slot.texture.TransitionLayout(cmd,
+                                      VK_IMAGE_LAYOUT_UNDEFINED,
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkBufferImageCopy region{};
+        region.bufferOffset      = 0;
+        region.bufferRowLength   = slot.videoPadW;
+        region.bufferImageHeight = slot.videoRealH;
+        region.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel       = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount     = 1;
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {slot.videoRealW, slot.videoRealH, 1};
+        vkCmdCopyBufferToImage(cmd, slot.videoStaging.m_Buffer, slot.texture.GetImage(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        slot.texture.TransitionLayout(cmd,
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        CommandManager.EndAndSubmitImmediate(cmd);
+    }
+
+    void loadTexture()
+    {
+        if (!VulkanUI::s_DescriptorPool || !VulkanUI::s_DescriptorSetLayout) return;
+
+        // Cache hit: reuse the slot. No texture reload, no descriptor realloc.
+        const std::string key{m_TexName.c_str()};
+        auto it = g_UITextureCache.find(key);
+        if (it != g_UITextureCache.end()) {
+            m_Slot = it->second;
+            return;
+        }
+
+        // Cache miss — populate a new slot and insert it.
+        auto* slot = xr_new<UITextureSlot>();
+
+        // .ogm beats .dds (R4 ordering — SH_Texture.cpp:181).
+        if (!tryLoadOgmSlot(m_TexName, *slot)) {
+            string_path full;
+            FS.update_path(full, "$game_textures$", (m_TexName + ".dds").c_str());
+            bool loaded = slot->texture.LoadDDS(full);
+            if (!loaded) loaded = loadFirstSeqFrame(m_TexName, *slot);
+            if (loaded) {
+                slot->hasTex = true;
+                createSlotDescriptor(*slot);
+            }
+        }
+
+        g_UITextureCache.emplace(key, slot);
+        m_Slot = slot;
+        Msg("[VK-UIShader] tex=%-48s loaded=%d ogm=%d",
+            m_TexName.c_str(), slot->hasTex ? 1 : 0, slot->pTheora ? 1 : 0);
+    }
+};
+
+// Real video item — mirrors dxUISequenceVideoItem (just a thin wrapper). All
+// playback work lives in vkUIShader_Real (matches R4 where CTexture owns
+// pTheora and apply_theora). CaptureTexture grabs whichever IVkUIShader was
+// most recently bound by SetShader, identical in spirit to R4 reading
+// RCache.get_ActiveTexture(0) right after the SetShader call.
+struct vkUISequenceVideoItem_Real final : IUISequenceVideoItem
+{
+    IVkUIShader* m_pShader = nullptr;
+
+    void Copy(IUISequenceVideoItem& _in) override
+    {
+        m_pShader = static_cast<vkUISequenceVideoItem_Real*>(&_in)->m_pShader;
+    }
+    bool HasTexture()         override { return m_pShader != nullptr; }
+    void CaptureTexture()     override { m_pShader = g_pLastVkUIShader; }
+    void ResetTexture()       override { m_pShader = nullptr; }
+    BOOL video_IsPlaying()    override { return m_pShader ? m_pShader->VideoIsPlaying() : FALSE; }
+    void video_Sync(u32 t)    override { if (m_pShader) m_pShader->VideoSync(t); }
+    void video_Play(BOOL loop, u32 t) override { if (m_pShader) m_pShader->VideoPlay(loop, t); }
+    void video_Stop()         override { if (m_pShader) m_pShader->VideoStop(); }
+};
+
+// Real font renderer — owns a vkUIShader_Real for the font atlas texture, then
+// emits per-glyph quads through ::UIRender. Field names + scale helpers match
+// OGSR's CGameFont (different from monolith's PS.c / smart_strlen).
+extern ENGINE_API BOOL     g_bRendering;
+extern ENGINE_API Fvector2 g_current_font_scale;
+
+struct vkFontRender_Real final : IFontRender
+{
+    xr_string         m_ShaderName;
+    xr_string         m_TexName;
+    vkUIShader_Real   m_Shader;
+
+    void Initialize(LPCSTR cShader, LPCSTR cTexture) override
+    {
+        m_ShaderName = cShader  ? cShader  : "";
+        m_TexName    = cTexture ? cTexture : "";
+        Msg("[VK-Font] Initialize: shader=%s tex=%s",
+            m_ShaderName.c_str(), m_TexName.c_str());
+        m_Shader.create(m_ShaderName.c_str(), m_TexName.c_str(), false);
+    }
+
+    void OnRender(CGameFont& owner) override
+    {
+        VERIFY(g_bRendering);
+        if (owner.strings.empty()) return;
+
+        if (m_Shader.inited()) UIRender->SetShader(m_Shader);
+
+        if (!(owner.uFlags & CGameFont::fsValid))
+        {
+            Fvector2 texSize;
+            UIRender->GetActiveTextureResolution(texSize);
+            owner.vTS.set((int)texSize.x, (int)texSize.y);
+            owner.fTCHeight = owner.fHeight / float(owner.vTS.y);
+            owner.uFlags |= CGameFont::fsValid;
+        }
+
+        for (u32 i = 0; i < owner.strings.size(); )
+        {
+            int count  = 1;
+            int length = owner.SmartLength(owner.strings[i].string);
+            while (i + count < owner.strings.size())
+            {
+                int L = owner.SmartLength(owner.strings[i + count].string);
+                if (L + length < MAX_MB_CHARS) { ++count; length += L; }
+                else break;
+            }
+
+            UIRender->StartPrimitive(length * 4, IUIRender::ptTriList, IUIRender::pttTL);
+
+            const u32 last = i + count;
+            for (; i < last; ++i)
+            {
+                const CGameFont::String& PS = owner.strings[i];
+                wide_char wsStr[MAX_MB_CHARS];
+                u32 len = owner.IsMultibyte()
+                            ? mbhMulti2Wide(wsStr, nullptr, MAX_MB_CHARS, PS.string)
+                            : xr_strlen(PS.string);
+                if (!len) continue;
+
+                float X     = float(iFloor(PS.x));
+                float Y     = float(iFloor(PS.y));
+                float S     = PS.height * g_current_font_scale.y * owner.GetHeightScale();
+                float Y2    = Y + S;
+                float fSize = 0;
+
+                if (PS.align)
+                    fSize = owner.IsMultibyte() ? owner.SizeOf_(wsStr) : owner.SizeOf_(PS.string);
+                if (PS.align == CGameFont::alCenter)
+                    X -= iFloor(fSize * 0.5f) * g_current_font_scale.x;
+                else if (PS.align == CGameFont::alRight)
+                    X -= iFloor(fSize) * g_current_font_scale.x;
+
+                u32 clr  = PS.color;
+                u32 clr2 = clr;
+                if (owner.uFlags & CGameFont::fsGradient) {
+                    clr2 = color_rgba(color_get_R(clr) / 2,
+                                      color_get_G(clr) / 2,
+                                      color_get_B(clr) / 2,
+                                      color_get_A(clr));
+                }
+
+                for (u32 j = 0; j < len; ++j)
+                {
+                    Fvector l = owner.IsMultibyte()
+                                  ? owner.GetCharTC(wsStr[1 + j])
+                                  : owner.GetCharTC((u16)(u8)PS.string[j]);
+                    float scw      = l.z * g_current_font_scale.x * owner.GetWidthScale();
+                    float fTCWidth = l.z / owner.vTS.x;
+
+                    if (!fis_zero(l.z))
+                    {
+                        float tu = l.x / owner.vTS.x;
+                        float tv = l.y / owner.vTS.y;
+                        UIRender->PushPoint(X,       Y2, 0, clr2, tu,            tv + owner.fTCHeight);
+                        UIRender->PushPoint(X,       Y,  0, clr,  tu,            tv);
+                        UIRender->PushPoint(X + scw, Y2, 0, clr2, tu + fTCWidth, tv + owner.fTCHeight);
+
+                        UIRender->PushPoint(X,       Y,  0, clr,  tu,            tv);
+                        UIRender->PushPoint(X + scw, Y2, 0, clr2, tu + fTCWidth, tv + owner.fTCHeight);
+                        UIRender->PushPoint(X + scw, Y,  0, clr,  tu + fTCWidth, tv);
+                    }
+
+                    X += scw * owner.vInterval.x;
+                }
+            }
+
+            UIRender->FlushPrimitive();
+        }
+    }
+};
+
+// Below: pure stubs that don't need friend access — keep them in anon ns.
+namespace {
+
+struct vkStatsRender_Stub final : IStatsRender
+{
+    void Copy(IStatsRender&)                         override {}
+    void OutData(CGameFont&)                         override {}
+    void GuardVerts(CGameFont&)                      override {}
+    void GuardDrawCalls(CGameFont&)                  override {}
+    void SetDrawParams(IRenderDeviceRender*)         override {}
+};
+
+struct vkWallMarkArray_Stub final : IWallMarkArray
+{
+    void Copy(IWallMarkArray&)        override {}
+    void AppendMark(LPCSTR)            override {}
+    void clear()                       override {}
+    bool empty()                       override { return true; }
+    wm_shader GenerateWallmark()       override { return {}; }  // default factory ctor
+};
+
+// CEnvironment / CEnvDescriptor / WeatherFX subsystem ------------------------
+// CGamePersistent ctor → IGame_Persistent ctor → CEnvironment ctor →
+// m_pRender->OnDeviceCreate(). Without these stubs we crash *before* the menu
+// even starts loading.
+
+struct vkEnvironmentRender_Stub final : IEnvironmentRender
+{
+    void Copy(IEnvironmentRender&)               override {}
+    void OnFrame(CEnvironment&)                  override {}
+    void RenderSky(CBackend&, CEnvironment&)     override {}
+    void RenderClouds(CBackend&, CEnvironment&)  override {}
+    void OnDeviceCreate()                        override {}
+    void OnDeviceDestroy()                       override {}
+};
+
+struct vkEnvDescriptorRender_Stub final : IEnvDescriptorRender
+{
+    void Copy(IEnvDescriptorRender&)             override {}
+    void OnDeviceCreate(CEnvDescriptor&)         override {}
+    void OnDeviceDestroy()                       override {}
+    void OnPrepare(CEnvDescriptor&)              override {}
+    void OnUnload(CEnvDescriptor&)               override {}
+};
+
+struct vkEnvDescriptorMixerRender_Stub final : IEnvDescriptorMixerRender
+{
+    void Copy(IEnvDescriptorMixerRender&)                  override {}
+    void Destroy()                                          override {}
+    void Clear()                                            override {}
+    void lerp(IEnvDescriptorRender*, IEnvDescriptorRender*) override {}
+};
+
+struct vkRainRender_Stub final : IRainRender
+{
+    void Copy(IRainRender&)                      override {}
+    void Render(CBackend&, CEffect_Rain&)        override {}
+    void Calculate(CEffect_Rain&)                override {}
+    const Fsphere& GetDropBounds() const         override { static Fsphere s{ {0,0,0}, 0.f }; return s; }
+};
+
+struct vkLensFlareRender_Stub final : ILensFlareRender
+{
+    void Copy(ILensFlareRender&)                                  override {}
+    void Render(CBackend&, CLensFlare&, BOOL, BOOL, BOOL)         override {}
+    void OnDeviceCreate()                                          override {}
+    void OnDeviceDestroy()                                         override {}
+};
+
+struct vkFlareRender_Stub final : IFlareRender
+{
+    void Copy(IFlareRender&)                     override {}
+    void CreateShader(LPCSTR, LPCSTR)            override {}
+    void DestroyShader()                          override {}
+};
+
+struct vkThunderboltRender_Stub final : IThunderboltRender
+{
+    void Copy(IThunderboltRender&)               override {}
+    void Render(CBackend&, CEffect_Thunderbolt&) override {}
+};
+
+struct vkThunderboltDescRender_Stub final : IThunderboltDescRender
+{
+    void Copy(IThunderboltDescRender&)           override {}
+    void CreateModel(LPCSTR)                     override {}
+    void DestroyModel()                          override {}
+};
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// IRenderFactory implementations — only the menu-path ones return real stubs.
+// ---------------------------------------------------------------------------
+
+IUIShader* vkRenderFactory::CreateUIShader()                       { return xr_new<vkUIShader_Real>(); }
+void       vkRenderFactory::DestroyUIShader(IUIShader* p)          { xr_delete(p); }
+
+IUISequenceVideoItem* vkRenderFactory::CreateUISequenceVideoItem() { return xr_new<vkUISequenceVideoItem_Real>(); }
+void                  vkRenderFactory::DestroyUISequenceVideoItem(IUISequenceVideoItem* p) { xr_delete(p); }
+
+IFontRender* vkRenderFactory::CreateFontRender()                   { return xr_new<vkFontRender_Real>(); }
+void         vkRenderFactory::DestroyFontRender(IFontRender* p)    { xr_delete(p); }
+
+IStatsRender* vkRenderFactory::CreateStatsRender()                 { return xr_new<vkStatsRender_Stub>(); }
+void          vkRenderFactory::DestroyStatsRender(IStatsRender* p) { xr_delete(p); }
+
+IWallMarkArray* vkRenderFactory::CreateWallMarkArray()             { return xr_new<vkWallMarkArray_Stub>(); }
+void            vkRenderFactory::DestroyWallMarkArray(IWallMarkArray* p) { xr_delete(p); }
+
+// xr_new keeps engine-side ownership semantics consistent with dxRenderFactory.
+IRenderDeviceRender* vkRenderFactory::CreateRenderDeviceRender()
+{
+    return xr_new<vkRenderDeviceRender>();
+}
+
+void vkRenderFactory::DestroyRenderDeviceRender(IRenderDeviceRender* p)
+{
+    xr_delete(p);
+}
+
+// Environment / weather / effects ----------------------------------------------
+IEnvironmentRender* vkRenderFactory::CreateEnvironmentRender()                   { return xr_new<vkEnvironmentRender_Stub>(); }
+void                vkRenderFactory::DestroyEnvironmentRender(IEnvironmentRender* p) { xr_delete(p); }
+
+IEnvDescriptorRender* vkRenderFactory::CreateEnvDescriptorRender()               { return xr_new<vkEnvDescriptorRender_Stub>(); }
+void                  vkRenderFactory::DestroyEnvDescriptorRender(IEnvDescriptorRender* p) { xr_delete(p); }
+
+IEnvDescriptorMixerRender* vkRenderFactory::CreateEnvDescriptorMixerRender()     { return xr_new<vkEnvDescriptorMixerRender_Stub>(); }
+void                       vkRenderFactory::DestroyEnvDescriptorMixerRender(IEnvDescriptorMixerRender* p) { xr_delete(p); }
+
+IRainRender*  vkRenderFactory::CreateRainRender()                                { return xr_new<vkRainRender_Stub>(); }
+void          vkRenderFactory::DestroyRainRender(IRainRender* p)                 { xr_delete(p); }
+
+ILensFlareRender* vkRenderFactory::CreateLensFlareRender()                       { return xr_new<vkLensFlareRender_Stub>(); }
+void              vkRenderFactory::DestroyLensFlareRender(ILensFlareRender* p)   { xr_delete(p); }
+
+IFlareRender* vkRenderFactory::CreateFlareRender()                               { return xr_new<vkFlareRender_Stub>(); }
+void          vkRenderFactory::DestroyFlareRender(IFlareRender* p)               { xr_delete(p); }
+
+IThunderboltRender* vkRenderFactory::CreateThunderboltRender()                   { return xr_new<vkThunderboltRender_Stub>(); }
+void                vkRenderFactory::DestroyThunderboltRender(IThunderboltRender* p) { xr_delete(p); }
+
+IThunderboltDescRender* vkRenderFactory::CreateThunderboltDescRender()           { return xr_new<vkThunderboltDescRender_Stub>(); }
+void                    vkRenderFactory::DestroyThunderboltDescRender(IThunderboltDescRender* p) { xr_delete(p); }

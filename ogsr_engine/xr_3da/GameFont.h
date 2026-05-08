@@ -7,6 +7,7 @@
 class ENGINE_API CGameFont
 {
     friend class dxFontRender;
+    friend struct vkFontRender_Real;  // Vulkan renderer in Layers/xrRenderVulkan
 
 public:
     enum EAligment

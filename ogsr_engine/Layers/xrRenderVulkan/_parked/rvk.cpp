@@ -1,0 +1,3193 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+// Licensed under the same terms as X-Ray Engine (see root License.txt)
+
+#include "stdafx.h"
+#include "rvk.h"
+
+// Definition of g_bDeviceLost (declared extern in vk_core.h)
+bool g_bDeviceLost = false;
+
+// Reset UI state on crash (defined in xrRender_Vulkan.cpp)
+extern "C" void VulkanUI_ResetState();
+#include "vk_R_Backend.h"
+#include "vk_sector.h"
+#include "HW_Vulkan.h"
+#include "vk_swapchain.h"
+#include "vk_command_buffer.h"
+#include "vk_sync.h"
+#include "vk_rendertarget.h"
+#include "vk_shaders.h"
+#include "vk_lighting.h"
+#include "vk_descriptors.h"
+#include "vk_pipeline.h"
+#include "vk_buffer.h"
+#include "vk_buffer_pool.h"
+#include "vk_texture.h"
+#include "vk_material.h"
+#include "vk_shader.h"
+#include "vk_buffer_pool.h"
+#include "vk_ModelPool.h"
+#include "vk_Visual.h"
+#include "vk_ParticleCustom.h"
+#include "vk_ParticleEffect.h"
+#include "vk_ParticleGroup.h"
+#include "vk_WallmarksEngine.h"
+#include "vk_DetailManager.h"
+#include "../xrRender/dxWallMarkArray.h"
+#include "../xrRender/dxUIShader.h"
+#include "3DFluid/vk3DFluidManager.h"  // Phase 0: 3D Fluid system
+#include "vk_dlss.h"                   // DLSS integration
+#include "vk_reflex.h"                 // NVIDIA Reflex low-latency
+#include "vk_framegen.h"               // DLSS Frame Generation
+#include "vk_rtgi.h"                   // Ray-Traced Global Illumination
+#include "vk_barriers.h"               // VK::ImageBarrier
+#include "vk_ShadowManager.h"          // GPU-driven shadow rendering
+#include "../xrRender/FBasicVisual.h"  // dxRender_Visual full definition
+#include "../xrRender/PSLibrary.h"
+#include "../../Include/xrRender/Kinematics.h"
+#include "../../xrCDB/ISpatial.h"
+#include "../../xrCDB/xrXRC.h"  // CDB::Collider for detectSector
+#include "../../xr_3da/IGame_Level.h"  // g_pGameLevel for detectSector geometry query
+#include "../../xr_3da/customhud.h"   // g_hud for HUD rendering (Render_Last)
+
+// Direct diagnostic write disabled for performance (file I/O every frame)
+static void VkDiagFrame(const char* msg) {
+	// No-op: disabled to avoid file I/O overhead in release builds
+}
+
+// Light system
+#include "../xrRender/light.h"
+#include "../xrRender/light_db.h"
+
+// Engine includes for Device access
+#include "../../xr_3da/device.h"
+#include "../../xr_3da/GameFont.h"
+#include "../../xr_3da/IGame_Persistent.h"
+
+// VULKAN_DIAG: Static init diagnostics (using Win32 API to avoid CRT issues)
+#include <windows.h>
+static void VulkanDiagWriteRvk(const char* msg) {
+	HANDLE h = CreateFileA("D:\\anomaly\\appdata\\logs\\vulkan_diag.txt",
+		FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h != INVALID_HANDLE_VALUE) {
+		DWORD written;
+		WriteFile(h, msg, (DWORD)strlen(msg), &written, NULL);
+		WriteFile(h, "\r\n", 2, &written, NULL);
+		FlushFileBuffers(h);
+		CloseHandle(h);
+	}
+}
+struct VulkanDiagRvk {
+	VulkanDiagRvk() { VulkanDiagWriteRvk("[DIAG] Before CRender RImplementation construction"); }
+} g_VulkanDiagRvk;
+
+// Global render instance
+CRender RImplementation;
+
+struct VulkanDiagRvk2 {
+	VulkanDiagRvk2() { VulkanDiagWriteRvk("[DIAG] After CRender RImplementation construction"); }
+} g_VulkanDiagRvk2;
+
+// SSA (Screen-Space Area) culling thresholds
+// Recomputed each frame in Calculate() from screen resolution (matching DX11)
+float r_ssaDISCARD       = 4.f;    // Will be overwritten in Calculate()
+float r_ssaDONTSORT      = 32.f;
+float r_ssaLOD_A         = 64.f;
+float r_ssaLOD_B         = 48.f;
+extern float r_dtex_range;         // defined in vk_console.cpp
+
+// Console variables (defined in vk_console.cpp)
+extern float ps_r__LOD;
+extern float ps_r__ssaDISCARD;
+extern float ps_r__ssaDONTSORT;
+extern float ps_r2_ssaLOD_A;
+extern float ps_r2_ssaLOD_B;
+extern float ps_r2_df_parallax_range;
+
+// Halton sequence: quasi-random low-discrepancy sequence for TAA/DLSS jitter
+// base=2 for X, base=3 for Y
+static float Halton(int index, int base)
+{
+    float f = 1.0f, r = 0.0f;
+    while (index > 0) {
+        f /= (float)base;
+        r += f * (float)(index % base);
+        index /= base;
+    }
+    return r;
+}
+
+// ============================================================================
+// CRender - Constructor/Destructor
+// ============================================================================
+CRender::CRender()
+{
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 1 - basic fields");
+    phase = PHASE_NORMAL;
+    marker = 0;
+    pmask[0] = pmask[1] = true;
+    pmask_wmark = false;
+
+    val_pObject = nullptr;
+    val_pTransform = nullptr;
+    val_bHUD = FALSE;
+    val_bCamAttached = FALSE;
+    val_bInvisible = FALSE;
+    val_bRecordMP = FALSE;
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 2a - o_hemi");
+    o_hemi = 0.f;
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 2b - o_sun");
+    o_sun = 0.f;
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 2c - o_hemi_cube");
+    // NOTE: Using memset instead of ZeroMemory because ZeroMemory is redefined
+    // as Memory.mem_fill() which requires initialized Memory system.
+    // During static construction, Memory is not yet initialized.
+    memset(o_hemi_cube, 0, sizeof(o_hemi_cube));
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 2c2 - after o_hemi_cube");
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 2d - m_bFirstFrameAfterReset");
+    m_bFirstFrameAfterReset = false;
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 2e - counters");
+    counter_S = 0;
+    counter_D = 0;
+    b_loaded = FALSE;
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 3 - subsystems");
+    Models = nullptr;
+    HOM = nullptr;
+    Details = nullptr;
+    Wallmarks = nullptr;
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 4 - level data");
+    pLastSector = nullptr;
+    vLastCameraPos.set(0, 0, 0);
+    rmPortals = nullptr;
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 5 - options");
+    memset(&o, 0, sizeof(o));  // memset instead of ZeroMemory (static init safe)
+    o.smapsize = 2048;
+    o.mrt = 1;
+    o.HW_smap = 1;
+    o.distortion = 1;
+    o.distortion_enabled = 1;
+    o.advancedpp = 1;
+    o.ssfx_water = 1;
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 5b - jitter");
+    m_Jitter.current.set(0, 0);
+    m_Jitter.previous.set(0, 0);
+    m_Jitter.phase = 0;
+    m_Jitter.enabled = true;
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 6 - stats");
+    memset(&stats, 0, sizeof(stats));  // memset instead of ZeroMemory (static init safe)
+
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: step 7 - scene graph");
+    // Scene graph / visibility (Phase 1)
+    View = nullptr;  // Will be set to &ViewBase in Calculate()
+    VulkanDiagWriteRvk("[DIAG] CRender ctor: DONE");
+}
+
+CRender::~CRender()
+{
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+void CRender::create()
+{
+    Msg("[Vulkan] CRender::create()");
+
+    // Initialize backend
+    RCache.OnDeviceCreate();
+
+    // Create HOM (deferred from constructor due to xrCriticalSection needing Memory system)
+    if (!HOM) {
+        HOM = xr_new<vkCHOM>();
+        Msg("[Vulkan] HOM created");
+    }
+
+    // Create model pool
+    if (!Models) {
+        Models = xr_new<vkModelPool>();
+        Msg("[Vulkan] ModelPool created");
+    }
+
+    // Create detail manager (grass/debris)
+    if (!Details) {
+        Details = xr_new<VK::CDetailManager>();
+        Msg("[Vulkan] DetailManager created");
+    }
+
+    // Initialize particle system library
+    PSLibrary.OnCreate();
+    Msg("[Vulkan] PSLibrary initialized");
+
+    // Create managers if not already created
+    if (!g_ShaderManager) {
+        g_ShaderManager = xr_new<VK::CVulkanSPIRVLoader>();
+        Msg("[Vulkan] ShaderManager created");
+    }
+
+    // Now that g_ShaderManager exists, load deferred shaders for lighting
+    if (VK::g_VulkanLighting) {
+        VK::g_VulkanLighting->LoadShadersDeferred();
+    }
+
+    if (!g_DescriptorManager) {
+        g_DescriptorManager = xr_new<VK::CVulkanDescriptorManager>();
+        g_DescriptorManager->Create();
+        Msg("[Vulkan] DescriptorManager created");
+    }
+
+    if (!VK::g_PipelineManager) {
+        VK::g_PipelineManager = xr_new<VK::CVulkanPipelineManager>();
+        VK::g_PipelineManager->Create();
+        Msg("[Vulkan] PipelineManager created");
+    }
+
+    // Create Material Manager (Phase 2.22)
+    if (!g_MaterialManager) {
+        g_MaterialManager = xr_new<VK::CMaterialManager>();
+        g_MaterialManager->Create();
+        Msg("[Vulkan] MaterialManager created");
+    }
+
+    // Create Vulkan Shader Manager (Phase 2.32)
+    if (!g_VulkanShaderManager) {
+        g_VulkanShaderManager = xr_new<VK::CVulkanShaderManager>();
+        if (g_VulkanShaderManager) {
+            g_VulkanShaderManager->Create();
+            Msg("[Vulkan] VulkanShaderManager created");
+        } else {
+            Msg("![Vulkan] CRITICAL: Failed to allocate VulkanShaderManager!");
+            // This is a fatal error - without shader manager, rendering is impossible
+            // But we continue to avoid crashing during initialization
+        }
+    }
+
+    // Create Buffer Pool (Phase 2.23)
+    if (!VK::g_BufferPool) {
+        VK::g_BufferPool = xr_new<VK::CBufferPool>();
+        VK::g_BufferPool->Create();
+        Msg("[Vulkan] BufferPool created");
+    }
+
+    // Create Shadow Manager (GPU-driven shadow rendering)
+    if (!VK::g_ShadowManager) {
+        VK::g_ShadowManager = xr_new<VK::CShadowManager>();
+        VK::g_ShadowManager->Create();
+        Msg("[Vulkan] ShadowManager created");
+    }
+
+    // Create G-Buffer render target
+    if (!RTarget && Swapchain.m_Swapchain != VK_NULL_HANDLE) {
+        RTarget = xr_new<VK::CRenderTarget>();
+        RTarget->Create(Swapchain.m_Extent.width, Swapchain.m_Extent.height);
+        Msg("[Vulkan] RenderTarget (G-Buffer) created: %dx%d",
+            Swapchain.m_Extent.width, Swapchain.m_Extent.height);
+    }
+
+    // Initialize DLSS (graceful fallback if NGX not available)
+    g_DlssManager.Init();
+
+    // Initialize DLSS Frame Generation (requires NGX init from DLSS)
+    if (g_DlssManager.IsAvailable())
+    {
+        // Share NGX params from DLSS manager
+        extern NVSDK_NGX_Parameter* CDlssManager_GetParams();
+        NVSDK_NGX_Parameter* ngxParams = CDlssManager_GetParams();
+        g_FrameGenManager.Init(ngxParams);
+    }
+
+    // Initialize NVIDIA Reflex (graceful fallback on AMD/Intel)
+    g_ReflexManager.Init();
+
+    // Initialize viewport to normal full-screen rendering
+    rmNormal();
+    Msg("[Vulkan] Viewport initialized (rmNormal)");
+
+    // Initialize portal traverser for fade rendering
+    vkPortalTraverser.initialize();
+    Msg("[Vulkan] PortalTraverser initialized");
+
+    // Initialize sun cascade shadow maps (Phase 2.15)
+    init_sun_cascades();
+
+    // Create ring allocator for per-frame UBO/SSBO uploads (Step A2)
+    m_RingAllocator.Create();
+
+    // ========================================================================
+    // Register frame callback (CRITICAL - without this OnFrame won't work)
+    // ========================================================================
+    static_cast<IRenderDevice&>(Device).AddSeqFrame(this, false);  // Non-multithreaded
+    Msg("[Vulkan] Frame callback registered");
+
+    Msg("[Vulkan] CRender::create() complete");
+}
+
+// Forward declaration from vk_RenderFactory.cpp
+extern void UITextureCache_DestroyAll();
+
+void CRender::destroy()
+{
+    Msg("[Vulkan] CRender::destroy()");
+
+    // ========================================================================
+    // Unregister frame callback (prevent crashes after destroy)
+    // ========================================================================
+    static_cast<IRenderDevice&>(Device).RemoveSeqFrame(this);
+    Msg("[Vulkan] Frame callback unregistered");
+
+    // Wait for GPU to finish
+    if (VulkanHW.m_Device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(VulkanHW.m_Device);
+    }
+
+    // Destroy UI texture cache (must be done before descriptor pool is destroyed)
+    UITextureCache_DestroyAll();
+
+    // Destroy HOM
+    if (HOM) {
+        xr_delete(HOM);
+        HOM = nullptr;
+        Msg("[Vulkan] HOM destroyed");
+    }
+
+    // Clear level visuals
+    Visuals.clear();
+
+    // Destroy portal traverser
+    vkPortalTraverser.destroy();
+    Msg("[Vulkan] PortalTraverser destroyed");
+
+    // Destroy particle system library
+    PSLibrary.OnDestroy();
+    Msg("[Vulkan] PSLibrary destroyed");
+
+    // Destroy model pool
+    if (Models) {
+        xr_delete(Models);
+        Models = nullptr;
+        Msg("[Vulkan] ModelPool destroyed");
+    }
+
+    // Destroy detail manager
+    if (Details) {
+        xr_delete(Details);
+        Details = nullptr;
+        Msg("[Vulkan] DetailManager destroyed");
+    }
+
+    // Shutdown Frame Generation before Reflex and DLSS
+    g_FrameGenManager.Shutdown();
+
+    // Shutdown Reflex before DLSS
+    g_ReflexManager.Shutdown();
+
+    // Shutdown DLSS before destroying render targets
+    g_DlssManager.Shutdown();
+
+    // Destroy render target
+    if (RTarget) {
+        xr_delete(RTarget);
+        RTarget = nullptr;
+        Msg("[Vulkan] RenderTarget destroyed");
+    }
+
+    // Destroy managers
+    if (VK::g_BufferPool) {
+        xr_delete(VK::g_BufferPool);
+        VK::g_BufferPool = nullptr;
+        Msg("[Vulkan] BufferPool destroyed");
+    }
+
+    if (g_MaterialManager) {
+        xr_delete(g_MaterialManager);
+        g_MaterialManager = nullptr;
+        Msg("[Vulkan] MaterialManager destroyed");
+    }
+
+    if (g_VulkanShaderManager) {
+        xr_delete(g_VulkanShaderManager);
+        g_VulkanShaderManager = nullptr;
+        Msg("[Vulkan] VulkanShaderManager destroyed");
+    }
+
+    if (VK::g_PipelineManager) {
+        xr_delete(VK::g_PipelineManager);
+        VK::g_PipelineManager = nullptr;
+        Msg("[Vulkan] PipelineManager destroyed");
+    }
+
+    if (g_DescriptorManager) {
+        xr_delete(g_DescriptorManager);
+        g_DescriptorManager = nullptr;
+        Msg("[Vulkan] DescriptorManager destroyed");
+    }
+
+    if (g_ShaderManager) {
+        xr_delete(g_ShaderManager);
+        g_ShaderManager = nullptr;
+        Msg("[Vulkan] ShaderManager destroyed");
+    }
+
+    // Destroy ring allocator (must be before device destruction)
+    m_RingAllocator.Destroy();
+    m_Graph.FullReset();
+
+    // Cleanup backend
+    RCache.OnDeviceDestroy();
+
+    Msg("[Vulkan] CRender::destroy() complete");
+}
+
+void CRender::reset_begin()
+{
+    Msg("[Vulkan] CRender::reset_begin()");
+
+    // Called before device reset (window resize, etc.)
+    // Wait for GPU to finish before releasing resources
+    if (VulkanHW.m_Device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(VulkanHW.m_Device);
+    }
+
+    // Release G-Buffer (will be recreated with new size)
+    if (RTarget) {
+        RTarget->Destroy();
+        Msg("[Vulkan] G-Buffer released for resize");
+    }
+}
+
+void CRender::reset_end()
+{
+    Msg("[Vulkan] CRender::reset_end()");
+
+    // Called after device reset - recreate resources with new dimensions
+    if (RTarget && Swapchain.m_Swapchain != VK_NULL_HANDLE) {
+        RTarget->Create(Swapchain.m_Extent.width, Swapchain.m_Extent.height);
+        Msg("[Vulkan] G-Buffer recreated: %dx%d",
+            Swapchain.m_Extent.width, Swapchain.m_Extent.height);
+    }
+
+    m_bFirstFrameAfterReset = true;
+}
+
+// ============================================================================
+// Level management - see rvk_loader.cpp for implementation
+// ============================================================================
+
+// ============================================================================
+// Information
+// ============================================================================
+void CRender::Statistics(CGameFont* F)
+{
+    // Display render statistics
+    if (!F) return;
+
+    F->OutNext("*** VULKAN RENDER ***");
+    F->OutNext("Polys:     %d", RCache.stat.polys);
+    F->OutNext("Verts:     %d", RCache.stat.verts);
+    F->OutNext("DIP/DP:    %d", RCache.stat.calls);
+    F->OutNext("Xforms:    %d", RCache.stat.xforms);
+
+    // Swapchain info
+    if (Swapchain.m_Swapchain != VK_NULL_HANDLE) {
+        F->OutNext("Resolution: %dx%d", Swapchain.m_Extent.width, Swapchain.m_Extent.height);
+    }
+
+    // Vulkan HW info
+    if (VulkanHW.Caps.deviceName[0]) {
+        F->OutNext("GPU: %s", VulkanHW.Caps.deviceName);
+    }
+}
+
+// ============================================================================
+// Main rendering
+// ============================================================================
+void CRender::Calculate()
+{
+    // Skip if level not loaded
+    if (!b_loaded) return;
+
+    // Swap previous-frame matrices: curr becomes prev for this frame's MV computation
+    m_PrevFrameMatrices.swap(m_CurrFrameMatrices);
+    m_CurrFrameMatrices.clear();
+
+    // Clear per-frame maps at the start of Calculate() (before new items are added).
+    // This prevents mapHUD growing unbounded if Render() early-returns (menu, device lost).
+    mapHUD.clear();
+    mapCamAttached.clear();
+    mapHUDSorted.clear();
+    mapCamAttachedSorted.clear();
+    mapSorted.clear();
+
+    // ========================================================================
+    // Compute SSA thresholds from screen resolution (same as DX11 R4)
+    // ========================================================================
+    {
+        IRender_Target* T = getTarget();
+        float fov_factor = _sqr(90.f / Device.fFOV);
+        float g_fSCREEN  = float(T->get_width() * T->get_height()) * fov_factor * (EPS_S + ps_r__LOD);
+        r_ssaDISCARD     = _sqr(ps_r__ssaDISCARD)      / g_fSCREEN;
+        r_ssaDONTSORT    = _sqr(ps_r__ssaDONTSORT / 3)  / g_fSCREEN;
+        r_ssaLOD_A       = _sqr(ps_r2_ssaLOD_A   / 3)  / g_fSCREEN;
+        r_ssaLOD_B       = _sqr(ps_r2_ssaLOD_B   / 3)  / g_fSCREEN;
+        r_dtex_range     = ps_r2_df_parallax_range * g_fSCREEN / (1024.f * 768.f);
+    }
+
+    // ========================================================================
+    // Phase 2: Full scene graph with Portal Visibility and HOM Occlusion
+    // ========================================================================
+
+    // ========================================================================
+    // Detect camera sector every frame when camera moves (ported from DX11 R2)
+    // ========================================================================
+    if (!Sectors.empty())
+    {
+        if (!vLastCameraPos.similar(Device.vCameraPosition, EPS_S))
+        {
+            vkCSector* pSector = (vkCSector*)detectSector(Device.vCameraPosition);
+            if (pSector && (pSector != pLastSector))
+            {
+                // Notify game about sector change
+                int sectorIdx = -1;
+                for (u32 i = 0; i < Sectors.size(); ++i)
+                {
+                    if (Sectors[i] == pSector) { sectorIdx = (int)i; break; }
+                }
+                if (sectorIdx >= 0)
+                    g_pGamePersistent->OnSectorChanged(sectorIdx);
+            }
+            if (nullptr == pSector) pSector = pLastSector;
+            pLastSector = pSector;
+            vLastCameraPos.set(Device.vCameraPosition);
+        }
+
+        // If still no sector (first frame), detect it
+        if (!pLastSector)
+        {
+            pLastSector = (vkCSector*)detectSector(Device.vCameraPosition);
+            if (pLastSector)
+                Msg("[Vulkan] Detected initial sector for camera");
+            vLastCameraPos.set(Device.vCameraPosition);
+        }
+    }
+
+    // ========================================================================
+    // Check if camera is too near to some portal - force DualRender
+    // (ported from DX11 R2 - prevents flickering at portal boundaries)
+    // ========================================================================
+    if (rmPortals)
+    {
+        float eps = VIEWPORT_NEAR + EPS_L;
+        Fvector box_radius;
+        box_radius.set(eps, eps, eps);
+        Sectors_xrc.box_options(CDB::OPT_FULL_TEST);
+        Sectors_xrc.box_query(rmPortals, Device.vCameraPosition, box_radius);
+        for (int K = 0; K < Sectors_xrc.r_count(); K++)
+        {
+            CDB::TRI* pTri = rmPortals->get_tris() + Sectors_xrc.r_begin()[K].id;
+            if (pTri->dummy < Portals.size())
+            {
+                vkCPortal* pPortal = (vkCPortal*)Portals[pTri->dummy];
+                if (pPortal)
+                    pPortal->bDualRender = TRUE;
+            }
+        }
+    }
+
+    // Update lights (sun direction/color from environment)
+    Lights.Update();
+
+    // Clear render queues
+    lstNormal.clear();
+    lstMatrix.clear();
+    lstParticles.clear();
+
+    // Enable wallmark routing (level wallmarks flagged with bWmark go to mapWmark)
+    pmask_wmark = true;
+
+    // Increment marker for visibility tracking
+    marker++;
+
+    // Build frustum from camera transform
+    ViewBase.CreateFromMatrix(Device.mFullTransform, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+    View = &ViewBase;
+
+    // ========================================================================
+    // HOM (Hierarchical Occlusion Map) - Render occluders
+    // ========================================================================
+    // HOM renders occluder geometry to a low-res Z-buffer for fast culling
+    // TEMP DISABLED: investigating visibility culling bug (particles/grass disappear from certain angles)
+    if (false && HOM && pLastSector)
+    {
+        HOM->Enable();
+        HOM->Render(ViewBase);
+    }
+
+    // ========================================================================
+    // Portal Traversal - Determine visible sectors
+    // ========================================================================
+    if (pLastSector)
+    {
+        // Calculate view-projection matrix for portal traversal
+        Fmatrix m_ViewProjection;
+        m_ViewProjection.mul(Device.mProject, Device.mView);
+
+        // Traverse sector/portal structure with HOM + SSA + FADE
+        vkPortalTraverser.traverse(
+            pLastSector,
+            ViewBase,
+            Device.vCameraPosition,
+            m_ViewProjection,
+            vkCPortalTraverser::VQ_HOM | vkCPortalTraverser::VQ_SSA | vkCPortalTraverser::VQ_FADE
+        );
+
+        // ========================================================================
+        // Render static geometry from visible sectors
+        // ========================================================================
+        for (u32 s_it = 0; s_it < vkPortalTraverser.r_sectors.size(); s_it++)
+        {
+            vkCSector* sector = (vkCSector*)vkPortalTraverser.r_sectors[s_it];
+            vkRender_Visual* root = sector->root();
+
+            // Diagnostic: log root visual info once
+            static u32 diag_frame = 0;
+            if (Device.dwFrame - diag_frame > 600)
+            {
+                diag_frame = Device.dwFrame;
+                if (root)
+                {
+                    Msg("[VK-DIAG] Sector %u: root=%p type=%u frustums=%u",
+                        s_it, root, root->Type, sector->r_frustums.size());
+                    if (root->Type == MT_HIERRARHY)
+                    {
+                        vkFHierrarhyVisual* pH = (vkFHierrarhyVisual*)root;
+                        Msg("[VK-DIAG]   hierarchy children: %u", pH->children.size());
+                    }
+                }
+                else
+                {
+                    Msg("[VK-DIAG] Sector %u: root=NULL", s_it);
+                }
+            }
+
+            // Process each frustum for this sector
+            for (u32 v_it = 0; v_it < sector->r_frustums.size(); v_it++)
+            {
+                CFrustum& frustum = sector->r_frustums[v_it];
+                View = &frustum;
+
+                // Add sector geometry to render queue
+                if (root)
+                    add_Static(root, SF_RENDERING);
+            }
+        }
+
+        // Restore main frustum
+        View = &ViewBase;
+    }
+    else
+    {
+        // ========================================================================
+        // Fallback: No portal system - render all visuals
+        // ========================================================================
+        for (auto visual : Visuals)
+        {
+            if (!visual) continue;
+            vkRender_Visual* pV = static_cast<vkRender_Visual*>(visual);
+            add_Static(pV, SF_RENDERING);
+        }
+    }
+
+    // ========================================================================
+    // Dynamic objects from Spatial Database (ported from R4 render_main)
+    // ========================================================================
+    if (g_SpatialSpace && pLastSector)
+    {
+        set_Object(0);
+
+        // Query all renderables in frustum
+        lstSpatial.clear();
+        g_SpatialSpace->q_frustum(lstSpatial, ISpatial_DB::O_ORDERED, STYPE_RENDERABLE, ViewBase);
+
+        static u32 s_dynLog = 0;
+        if (s_dynLog < 5) {
+            Msg("[DYN-DIAG] Calculate: lstSpatial(RENDERABLE)=%u, pLastSector=%p, marker=%u",
+                lstSpatial.size(), pLastSector, vkPortalTraverser.i_marker);
+            s_dynLog++;
+        }
+
+        u32 dbg_skipped_sector = 0, dbg_skipped_marker = 0, dbg_skipped_frustum = 0, dbg_rendered = 0;
+        for (u32 o_it = 0; o_it < lstSpatial.size(); o_it++)
+        {
+            ISpatial* spatial = lstSpatial[o_it];
+            if (!spatial) continue;
+
+            spatial->spatial_updatesector();
+            vkCSector* sector = (vkCSector*)spatial->spatial.sector;
+            if (0 == sector) { dbg_skipped_sector++; continue; }
+
+            // Check if this is a particle object (bypass sector/frustum checks for diagnostics)
+            bool isParticle = false;
+            if (spatial->spatial.type & STYPE_RENDERABLE)
+            {
+                IRenderable* rr = spatial->dcast_Renderable();
+                if (rr && rr->renderable.visual)
+                {
+                    u32 vtype = ((vkRender_Visual*)rr->renderable.visual)->Type;
+                    isParticle = (vtype == MT_PARTICLE_EFFECT || vtype == MT_PARTICLE_GROUP);
+                }
+            }
+
+            // DIAG: log particle culling details
+            if (isParticle)
+            {
+                static u32 s_pdiag = 0;
+                if (s_pdiag < 20) {
+                    s_pdiag++;
+                    bool markerOk = (vkPortalTraverser.i_marker == sector->r_marker);
+                    bool frustumOk = false;
+                    for (u32 v = 0; v < sector->r_frustums.size(); v++) {
+                        if (sector->r_frustums[v].testSphere_dirty(spatial->spatial.sphere.P, spatial->spatial.sphere.R))
+                        { frustumOk = true; break; }
+                    }
+                    Msg("[PARTICLE-CULL] sphere=(%.1f,%.1f,%.1f) R=%.1f sector=%p marker=%s(%u/%u) frustums=%u frustumOk=%s cam=(%.1f,%.1f,%.1f)",
+                        spatial->spatial.sphere.P.x, spatial->spatial.sphere.P.y, spatial->spatial.sphere.P.z,
+                        spatial->spatial.sphere.R,
+                        sector, markerOk ? "PASS" : "FAIL",
+                        sector->r_marker, vkPortalTraverser.i_marker,
+                        sector->r_frustums.size(),
+                        frustumOk ? "PASS" : "FAIL",
+                        Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z);
+                }
+            }
+
+            // Skip objects in sectors not touched by portal traversal
+            if (vkPortalTraverser.i_marker != sector->r_marker) { dbg_skipped_marker++; continue; }
+
+            for (u32 v_it = 0; v_it < sector->r_frustums.size(); v_it++)
+            {
+                CFrustum& view = sector->r_frustums[v_it];
+                if (!view.testSphere_dirty(spatial->spatial.sphere.P, spatial->spatial.sphere.R)) { dbg_skipped_frustum++; continue; }
+
+                if (spatial->spatial.type & STYPE_RENDERABLE)
+                {
+                    IRenderable* renderable = spatial->dcast_Renderable();
+                    if (0 == renderable) break;
+
+                    // HOM occlusion test
+                    if (renderable->renderable.visual)
+                    {
+                        vis_data& v_orig = ((vkRender_Visual*)renderable->renderable.visual)->vis;
+                        vis_data v_copy = v_orig;
+                        v_copy.box.xform(renderable->renderable.xform);
+                        BOOL bVisible = (HOM && HOM->bEnabled) ? HOM->visible(v_copy) : TRUE;
+                        v_orig.marker = v_copy.marker;
+                        v_orig.accept_frame = v_copy.accept_frame;
+                        v_orig.hom_frame = v_copy.hom_frame;
+                        v_orig.hom_tested = v_copy.hom_tested;
+                        if (!bVisible) break;
+                    }
+
+                    // Render the object (populates lstMatrix, mapHUD, etc.)
+                    set_Object(renderable);
+                    renderable->renderable_Render();
+                    set_Object(0);
+                    dbg_rendered++;
+                }
+                break; // exit loop on frustums (same as R4)
+            }
+        }
+
+        if (s_dynLog <= 5) {
+            Msg("[DYN-DIAG] Results: rendered=%u skipped_nosector=%u skipped_marker=%u skipped_frustum=%u mapHUD=%u lstMatrix=%u",
+                dbg_rendered, dbg_skipped_sector, dbg_skipped_marker, dbg_skipped_frustum, mapHUD.size(), lstMatrix.size());
+        }
+
+        // HUD rendering - collect HUD visuals from game
+        if (g_pGameLevel && (phase == PHASE_NORMAL))
+        {
+            extern ENGINE_API CCustomHUD* g_hud;
+            u32 hudBefore = mapHUD.size();
+            if (g_hud)
+                g_hud->Render_Last();
+            u32 hudAfter = mapHUD.size();
+
+            static u32 s_hudFrameLog = 0;
+            if (hudAfter > 0 || (Device.dwFrame - s_hudFrameLog > 300)) {
+                Msg("[DYN-DIAG] Render_Last: g_hud=%p mapHUD before=%u after=%u frame=%u",
+                    g_hud, hudBefore, hudAfter, Device.dwFrame);
+                s_hudFrameLog = Device.dwFrame;
+            }
+        }
+    }
+
+    // ========================================================================
+    // Lights visibility with HOM culling
+    // ========================================================================
+    if (g_SpatialSpace && pLastSector)
+    {
+        // Get lights from spatial database
+        lstSpatial.clear();
+        g_SpatialSpace->q_frustum(lstSpatial, ISpatial_DB::O_ORDERED, STYPE_LIGHTSOURCE, ViewBase);
+
+        for (u32 o_it = 0; o_it < lstSpatial.size(); o_it++)
+        {
+            ISpatial* spatial = lstSpatial[o_it];
+            if (!spatial) continue;
+
+            light* L = (light*)spatial->dcast_Light();
+            if (!L) continue;
+            if (!L->flags.bActive) continue;
+
+            // HOM visibility test for lights
+            // TODO: HOM culling disabled for lights — Vulkan HOM not yet reliable
+            // Frustum culling from q_frustum() above is sufficient for now
+            Lights.add_light(L);
+        }
+    }
+
+    // ========================================================================
+    // Statistics (occasional logging)
+    // ========================================================================
+    static u32 lastLogFrame = 0;
+    if (Device.dwFrame - lastLogFrame > 300)
+    {
+        Msg("[Vulkan] Calculate: sectors=%u, visuals=%u",
+            pLastSector ? vkPortalTraverser.r_sectors.size() : 0,
+            lstNormal.size());
+        lastLogFrame = Device.dwFrame;
+    }
+}
+
+// ============================================================================
+// add_Static_Simple - Add static visual to render queue with frustum culling
+// ============================================================================
+// This is Phase 1 implementation - simplified for MVP
+// Phase 2+ will add:
+//   - SSA culling (r_ssaDISCARD threshold)
+//   - HOM occlusion culling
+//   - Portal/sector visibility
+//   - Pipeline sorting for state change minimization
+// ============================================================================
+// ============================================================================
+// Helper: Calculate SSA (Screen Space Area)
+// ============================================================================
+ICF float CalcSSA(float& distSQ, Fvector& C, vkRender_Visual* V)
+{
+    float R = V->vis.sphere.R;
+    distSQ = Device.vCameraPosition.distance_to_sqr(C) + EPS;
+    return R / distSQ;
+}
+
+ICF float CalcSSA(float& distSQ, Fvector& C, float R)
+{
+    distSQ = Device.vCameraPosition.distance_to_sqr(C) + EPS;
+    return R / distSQ;
+}
+
+// ============================================================================
+// rimp_select_sh_static - Select shader element for static geometry
+// ============================================================================
+// Chooses appropriate shader element from visual's shader array based on:
+// - Rendering phase (normal, shadow map, etc.)
+// - Distance to camera (HQ vs LQ)
+// Returns shader element with flags (bDistort, bEmissive, bStrictB2F, etc.)
+ShaderElement* CRender::rimp_select_sh_static(dxRender_Visual* pVisual, float cdist_sq)
+{
+    // Vulkan: visuals use vkRender_Visual (not dxRender_Visual), so they don't
+    // have the DX11 ref_shader member. We return a default ShaderElement to let
+    // visuals pass through the dsgraph pipeline. Actual Vulkan shader binding
+    // happens in vkFVisual::Render() using shader_id -> Shaders[] lookup.
+    static ShaderElement* s_default = nullptr;
+    if (!s_default) {
+        s_default = xr_new<ShaderElement>();
+        s_default->flags.iPriority   = 1;
+        s_default->flags.bStrictB2F  = 0;
+        s_default->flags.bEmissive   = 0;
+        s_default->flags.bDistort    = 0;
+        s_default->flags.bWmark      = 0;
+        s_default->flags.bLandscape  = 0;
+    }
+    return s_default;
+}
+
+// ============================================================================
+// rimp_select_sh_dynamic - Select shader element for dynamic geometry
+// ============================================================================
+// Similar to rimp_select_sh_static but for dynamic objects (characters, items)
+ShaderElement* CRender::rimp_select_sh_dynamic(dxRender_Visual* pVisual, float cdist_sq)
+{
+    // Vulkan: same as rimp_select_sh_static - return default ShaderElement.
+    // Actual shader binding happens in vkFVisual::Render() via shader_id.
+    return rimp_select_sh_static(pVisual, cdist_sq);
+}
+
+// ============================================================================
+// add_Static - Add static visual with full frustum culling
+// ============================================================================
+void CRender::add_Static(vkRender_Visual* pVisual, u32 planes)
+{
+    if (!pVisual) return;
+
+    // Validate pointer is readable (guard against corrupted child pointers)
+    __try {
+        volatile u32 test = pVisual->Type;
+        (void)test;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! add_Static: corrupted visual pointer %p at frame %u", pVisual, Device.dwFrame);
+        return;
+    }
+
+    // Skip if already processed this frame
+    if (pVisual->vis.marker == marker) return;
+    pVisual->vis.marker = marker;
+
+    // ========================================================================
+    // SSA (Screen Space Area) Culling - Skip tiny objects
+    // ========================================================================
+    // SSA = sphere_radius / distance_squared
+    // Objects with SSA < r_ssaDISCARD are too small to be visible
+    float distSQ;
+    float SSA = CalcSSA(distSQ, pVisual->vis.sphere.P, pVisual);
+    if (SSA <= r_ssaDISCARD) { return; }  // Skip tiny objects
+
+    // ========================================================================
+    // Frustum culling with plane mask
+    // ========================================================================
+    EFC_Visible VIS = View->testSphere(pVisual->vis.sphere.P, pVisual->vis.sphere.R, planes);
+    if (VIS == fcvNone) { return; }  // Completely outside frustum
+
+    // ========================================================================
+    // HOM visibility test (optional - already done at sector level)
+    // ========================================================================
+    // Per-object HOM test disabled here to avoid double-testing
+    // Sectors are already HOM-culled during portal traversal
+
+    // ========================================================================
+    // Handle by visual type
+    // ========================================================================
+    switch (pVisual->Type)
+    {
+    case MT_HIERRARHY:
+        {
+            // Hierarchical visual - recursively process children
+            vkFHierrarhyVisual* pV = (vkFHierrarhyVisual*)pVisual;
+            for (auto child : pV->children)
+            {
+                if (!child) continue;
+
+                if (VIS == fcvPartial)
+                    // Partially visible - need per-child culling
+                    add_Static((vkRender_Visual*)child, planes);
+                else
+                    // Fully visible - skip culling for children
+                    add_leafs_Static((vkRender_Visual*)child);
+            }
+        }
+        break;
+
+    case MT_LOD:
+        {
+            // LOD visual - render children directly (skip LOD imposter for now)
+            vkFLOD* pLOD = (vkFLOD*)pVisual;
+            for (auto child : pLOD->children)
+            {
+                if (child)
+                    add_leafs_Static((vkRender_Visual*)child);
+            }
+        }
+        break;
+
+    case MT_TREE_ST:
+    case MT_TREE_PM:
+        if (VK::g_ShadowManager && VK::g_ShadowManager->IsTreeGBufferReady()) return;
+        // fall through to default if GPU-driven trees are not ready
+        [[fallthrough]];
+    default:
+        {
+            // Check if this visual is a wallmark (decal) and route to mapWmark
+            if (pmask_wmark && pVisual->shader_id < (u16)Shaders.size())
+            {
+                VK::CVulkanShader* pVKShader = Shaders[pVisual->shader_id];
+                if (pVKShader && pVKShader->m_bWmark)
+                {
+                    R_dsgraph::mapSorted_Node* N = mapWmark.insertInAnyWay(distSQ);
+                    N->val.ssa     = SSA;
+                    N->val.pObject = nullptr;
+                    N->val.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+                    N->val.Matrix  = Fidentity;
+                    N->val.se      = nullptr;
+                    break;
+                }
+            }
+
+            // Leaf visual - add directly to lstNormal render queue.
+            // We bypass r_dsgraph_insert_static() because it expects dxRender_Visual*
+            // layout which is incompatible with vkRender_Visual* memory layout.
+            R_dsgraph::_NormalItem item;
+            item.ssa = SSA;
+            item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+            lstNormal.push_back(item);
+        }
+        break;
+    }
+}
+
+// ============================================================================
+// add_leafs_Static - Add visual without additional culling
+// ============================================================================
+// Used for children of fully visible parent nodes
+// Note: Still performs SSA culling to skip tiny objects
+void CRender::add_leafs_Static(vkRender_Visual* pVisual)
+{
+    if (!pVisual) return;
+
+    // Validate pointer is readable
+    __try {
+        volatile u32 test = pVisual->Type;
+        (void)test;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! add_leafs_Static: corrupted visual pointer %p at frame %u", pVisual, Device.dwFrame);
+        return;
+    }
+
+    // Skip if already processed
+    if (pVisual->vis.marker == marker) return;
+    pVisual->vis.marker = marker;
+
+    // ========================================================================
+    // SSA Culling - Still needed even for "fully visible" children
+    // ========================================================================
+    // Parent might be visible, but child could still be too small to render
+    float distSQ;
+    float SSA = CalcSSA(distSQ, pVisual->vis.sphere.P, pVisual);
+    if (SSA <= r_ssaDISCARD) return;  // Skip tiny objects
+
+    switch (pVisual->Type)
+    {
+    case MT_HIERRARHY:
+        {
+            // Recursively add all children
+            vkFHierrarhyVisual* pV = (vkFHierrarhyVisual*)pVisual;
+            for (auto child : pV->children)
+            {
+                if (child)
+                    add_leafs_Static((vkRender_Visual*)child);
+            }
+        }
+        break;
+
+    case MT_LOD:
+        {
+            // LOD visual - render children directly
+            vkFLOD* pLOD = (vkFLOD*)pVisual;
+            for (auto child : pLOD->children)
+            {
+                if (child)
+                    add_leafs_Static((vkRender_Visual*)child);
+            }
+        }
+        break;
+
+    case MT_TREE_ST:
+    case MT_TREE_PM:
+        if (VK::g_ShadowManager && VK::g_ShadowManager->IsTreeGBufferReady()) return;
+        [[fallthrough]];
+    default:
+        {
+            // Check if this visual is a wallmark (decal) and route to mapWmark
+            if (pmask_wmark && pVisual->shader_id < (u16)Shaders.size())
+            {
+                VK::CVulkanShader* pVKShader = Shaders[pVisual->shader_id];
+                if (pVKShader && pVKShader->m_bWmark)
+                {
+                    R_dsgraph::mapSorted_Node* N = mapWmark.insertInAnyWay(distSQ);
+                    N->val.ssa     = SSA;
+                    N->val.pObject = nullptr;
+                    N->val.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+                    N->val.Matrix  = Fidentity;
+                    N->val.se      = nullptr;
+                    break;
+                }
+            }
+
+            // Leaf visual - add directly to lstNormal
+            R_dsgraph::_NormalItem item;
+            item.ssa = SSA;
+            item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+            lstNormal.push_back(item);
+        }
+        break;
+    }
+}
+
+void CRender::add_Static_Simple(vkRender_Visual* pVisual)
+{
+    if (!pVisual) return;
+
+    // Skip if already processed this frame (marker check)
+    if (pVisual->vis.marker == marker) return;
+    pVisual->vis.marker = marker;
+
+    // ========================================================================
+    // Frustum culling - skip objects outside camera view
+    // ========================================================================
+    if (View && !View->testSphere_dirty(pVisual->vis.sphere.P, pVisual->vis.sphere.R))
+        return;
+
+    // ========================================================================
+    // Handle hierarchical visuals (recursively process children)
+    // ========================================================================
+    if (pVisual->Type == MT_HIERRARHY)
+    {
+        vkFHierrarhyVisual* pH = static_cast<vkFHierrarhyVisual*>(pVisual);
+        for (auto child : pH->children)
+        {
+            if (child)
+                add_Static_Simple(static_cast<vkRender_Visual*>(child));
+        }
+        return;  // Hierarchy node itself has no geometry
+    }
+
+    // ========================================================================
+    // Calculate Screen-Space Area (SSA) for LOD and culling
+    // ========================================================================
+    // SSA = sphere_radius / distance_squared
+    // Larger SSA = closer/bigger objects = higher priority
+    float distSQ = Device.vCameraPosition.distance_to_sqr(pVisual->vis.sphere.P);
+    if (distSQ < EPS) distSQ = EPS;  // Avoid division by zero
+    float SSA = pVisual->vis.sphere.R / distSQ;
+
+    // ========================================================================
+    // SSA Culling - Skip tiny objects
+    // ========================================================================
+    if (SSA <= r_ssaDISCARD) return;  // Skip objects too small to be visible
+
+    // ========================================================================
+    // Add to render queue
+    // ========================================================================
+    R_dsgraph::_NormalItem item;
+    item.ssa = SSA;
+    item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);  // Type alias for Vulkan
+    lstNormal.push_back(item);
+}
+
+// Crash recovery tracking — if we crash too many times in a short window,
+// stop trying and leave g_bDeviceLost permanently set.
+static u32 s_crashCount = 0;
+static u32 s_lastCrashFrame = 0;
+static constexpr u32 MAX_CRASHES_PER_WINDOW = 5;   // max crashes allowed
+static constexpr u32 CRASH_WINDOW_FRAMES   = 300;  // within this many frames
+
+void CRender::Render()
+{
+    // Skip all rendering if device is permanently lost
+    if (g_bDeviceLost) {
+        static u32 s_lastDeviceLostMsg = 0;
+        if (Device.dwFrame - s_lastDeviceLostMsg > 300) {
+            Msg("! [RENDER] g_bDeviceLost=true, skipping Render() at frame %u (crashCount=%u)", Device.dwFrame, s_crashCount);
+            FlushLog();
+            s_lastDeviceLostMsg = Device.dwFrame;
+        }
+        return;
+    }
+
+    // Check crash loop: if too many crashes in a short window, give up permanently
+    if (s_crashCount >= MAX_CRASHES_PER_WINDOW &&
+        (Device.dwFrame - s_lastCrashFrame) <= CRASH_WINDOW_FRAMES)
+    {
+        static bool s_crashLoopLogged = false;
+        if (!s_crashLoopLogged) {
+            Msg("! [RENDER] Crash loop detected: %u crashes in %u frames, disabling render permanently at frame %u",
+                s_crashCount, Device.dwFrame - s_lastCrashFrame, Device.dwFrame);
+            FlushLog();
+            s_crashLoopLogged = true;
+        }
+        g_bDeviceLost = true;
+        return;
+    }
+
+    VkDiagFrame("[RENDER] Render() enter");
+
+    // NVIDIA Reflex: mark render submission start
+    g_ReflexManager.SetMarker(VK_RENDERSUBMIT_START);
+
+    // Skip rendering if no command buffer is active (swapchain not ready, window minimized, etc.)
+    if (RCache.GetCommandBuffer() == VK_NULL_HANDLE) {
+        VkDiagFrame("[RENDER] no cmd buffer, return");
+        static u32 s_lastNoCmdMsg = 0;
+        if (Device.dwFrame - s_lastNoCmdMsg > 300) {
+            Msg("! [RENDER] No command buffer at frame %u, skipping", Device.dwFrame);
+            FlushLog();
+            s_lastNoCmdMsg = Device.dwFrame;
+        }
+        return;
+    }
+
+    // ========================================================================
+    // Check if main menu needs PP-UI rendering (same as DX R4 render_menu)
+    // When the main menu is active with post-process, CMainMenu::OnRender()
+    // expects the renderer to call OnRenderPPUI_main/PP. Without this,
+    // CMainMenu skips DoRenderDialogs() → 0 UI draw calls.
+    // ========================================================================
+    bool _menu_pp = g_pGamePersistent ? g_pGamePersistent->OnRenderPPUI_query() : false;
+    if (_menu_pp)
+    {
+        VkDiagFrame("[RENDER] render_menu (PP-UI)");
+
+        // Render main UI elements to swapchain
+        g_pGamePersistent->OnRenderPPUI_main();
+
+        // TODO Phase 2.20.2: Render PP-UI (magnifier) to rt_Distortion
+        // For now, just call OnRenderPPUI_PP() which renders to swapchain
+        // This means magnifier won't have distortion effect yet, but will display
+        g_pGamePersistent->OnRenderPPUI_PP();
+
+        return;
+    }
+
+    // ========================================================================
+    // NVIDIA Reflex: simulation start marker + mode change detection
+    // ========================================================================
+    g_ReflexManager.SetMarker(VK_SIMULATION_START);
+    g_ReflexManager.SetMarker(VK_INPUT_SAMPLE);
+
+    {
+        static u32 s_LastReflexMode = 0;
+        if (ps_r__reflex_mode != s_LastReflexMode) {
+            s_LastReflexMode = ps_r__reflex_mode;
+            g_ReflexManager.SetMode(ps_r__reflex_mode);
+        }
+    }
+
+    // ========================================================================
+    // DLSS Frame Generation: mode change detection + feature create/destroy
+    // ========================================================================
+    {
+        static u32 s_LastFrameGenMode = 0;
+        if (ps_r__frame_gen != s_LastFrameGenMode)
+        {
+            s_LastFrameGenMode = ps_r__frame_gen;
+            if (ps_r__frame_gen && g_FrameGenManager.IsAvailable())
+            {
+                // Create frame gen buffers if needed
+                if (RTarget && !RTarget->m_bFrameGenBuffersReady)
+                {
+                    RTarget->CreateFrameGenBuffers(
+                        Swapchain.m_Extent.width, Swapchain.m_Extent.height,
+                        Swapchain.GetFormat());
+                }
+                // Create DLSS-G feature
+                if (!g_FrameGenManager.IsFeatureCreated())
+                {
+                    VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
+                    if (cmd != VK_NULL_HANDLE)
+                    {
+                        u32 renderW = RTarget ? RTarget->m_Width  : Swapchain.m_Extent.width;
+                        u32 renderH = RTarget ? RTarget->m_Height : Swapchain.m_Extent.height;
+                        g_FrameGenManager.CreateFeature(cmd,
+                            Swapchain.m_Extent.width, Swapchain.m_Extent.height,
+                            renderW, renderH,
+                            Swapchain.GetFormat());
+                        VulkanHW.EndSingleTimeCommands(cmd);
+                    }
+                }
+                Msg("[FrameGen] Enabled");
+            }
+            else
+            {
+                // Destroy DLSS-G feature
+                g_FrameGenManager.DestroyFeature();
+                Msg("[FrameGen] Disabled");
+            }
+        }
+    }
+
+    // Begin frame
+    VkDiagFrame("[RENDER] OnFrameBegin");
+    RCache.OnFrameBegin();
+
+    // ========================================================================
+    // Set camera matrices from Device (engine integration)
+    // ========================================================================
+    // Current frame matrices
+    RCache.set_xform_view(Device.mView);
+    RCache.set_xform_project(Device.mProject);
+
+    // Previous frame matrices (for motion blur, TAA, etc.)
+    RCache.set_xform_view_prev(Device.mView_prev);
+    RCache.set_xform_project_prev(Device.mProject_prev);
+
+    // ========================================================================
+    // DLSS: handle quality/preset changes — DEFERRED to between frames
+    // ========================================================================
+    // Mid-frame resize (vkDeviceWaitIdle + Destroy/Create render targets while
+    // a command buffer is recording) causes VK_ERROR_DEVICE_LOST.  Instead we
+    // set a flag and skip this frame; the actual resize is applied in
+    // ApplyDeferredDlssResize() which is called from End() after present.
+    if (RTarget && g_DlssManager.IsAvailable())
+    {
+        static u32 s_LastDlssQuality = 0;
+        static u32 s_LastDlssPreset = 0;
+        u32 curQuality = ps_r__dlss_quality;
+        u32 curPreset  = ps_r__dlss_preset;
+
+        bool bQualityChanged = (curQuality != s_LastDlssQuality);
+        bool bPresetChanged  = (curPreset != s_LastDlssPreset) && (curQuality != DLSS_OFF);
+
+        if (bQualityChanged || bPresetChanged)
+        {
+            // Update tracking so we don't re-trigger next frame
+            s_LastDlssQuality = curQuality;
+            s_LastDlssPreset  = curPreset;
+
+            // Signal deferred resize — will be applied in Begin() of next frame
+            m_bDlssPendingResize = true;
+            Msg("[DLSS] Quality/preset change detected (cur=%d, last=%d) — deferring resize to next Begin()",
+                curQuality, s_LastDlssQuality);
+            FlushLog();
+            return;  // skip rendering this frame (End() will present black + apply resize)
+        }
+    }
+
+    // ========================================================================
+    // DLSS Jitter: compute sub-pixel offset for this frame
+    // ========================================================================
+    {
+        m_Jitter.previous = m_Jitter.current;
+
+        // Determine if jitter should be applied:
+        // 0 = off (no jitter)
+        // 1 = auto (jitter only when DLSS is active)
+        // 2 = force (always jitter, for TAA)
+        bool bDlssActive = (ps_r__dlss_quality != DLSS_OFF);
+        bool bApplyJitter = (ps_r__jitter_mode == 2) || (ps_r__jitter_mode == 1 && bDlssActive);
+
+        if (m_Jitter.enabled && bApplyJitter && RTarget)
+        {
+            m_Jitter.phase = (m_Jitter.phase + 1) % 64;
+            int idx = m_Jitter.phase + 1; // 1-based (0 gives 0,0)
+
+            // Jitter in pixel space [-0.5, 0.5]
+            float jx = Halton(idx, 2) - 0.5f;
+            float jy = Halton(idx, 3) - 0.5f;
+
+            // Convert to NDC: 1 pixel = 2/resolution in NDC
+            float w = (float)RTarget->m_Width;
+            float h = (float)RTarget->m_Height;
+            m_Jitter.current.x = jx * 2.0f / w;
+            m_Jitter.current.y = jy * 2.0f / h;
+        }
+        else
+        {
+            m_Jitter.current.set(0.0f, 0.0f);
+        }
+    }
+
+    // World matrix starts as identity (will be set per-object)
+    Fmatrix identity;
+    identity.identity();
+    RCache.set_xform_world(identity);
+
+    // Update hemi/sun values from engine
+    // TODO: Get actual values from lights DB
+    RCache.hemi.set_material(o_hemi, o_sun, 0.0f, 0.0f);
+
+    // ========================================================================
+    // Render scene - Deferred Shading Pipeline
+    // ========================================================================
+    bool bPassCrashed = false;  // Set by __except handlers to trigger recovery
+
+    // Reset descriptor pool for this frame-in-flight slot.
+    {
+        u32 frameIndex = CommandManager.GetCurrentFrame();
+        if (g_DescriptorManager) {
+            g_DescriptorManager->SetCurrentFrame(frameIndex);
+            g_DescriptorManager->ResetPool(frameIndex);
+        }
+        // Advance ring allocator to this frame's region (safe: GPU from 3 frames
+        // ago has retired by now, so its region is no longer in use).
+        if (m_RingAllocator.IsCreated())
+        {
+            m_RingAllocator.BeginFrame(frameIndex);
+            // Pre-allocate bone SSBO region for this frame (triple-buffered via ring)
+            VK::RingAlloc boneRegion = m_RingAllocator.Allocate(
+                (VkDeviceSize)CBackend::MAX_TOTAL_BONES * sizeof(Fmatrix), 256);
+            RCache.SetBoneRegion(boneRegion);
+        }
+    }
+
+    // Invalidate cached descriptor set handles — they were freed by ResetPool()
+    if (RTarget)
+        RTarget->InvalidateDescriptorSets();
+
+
+    // ========================================================================
+    // PASS 2: G-Buffer Pass (geometry to MRT)
+    // ========================================================================
+    VkDiagFrame("[RENDER] PASS 2: gbuffer");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    if (b_loaded && RTarget) {
+        // Update GlobalLighting UBO before gbuffer so m_View is available to vertex shaders
+        if (VK::g_VulkanLighting)
+        {
+            VK::RingAlloc glAlloc  = m_RingAllocator.Allocate(sizeof(VK::CVulkanLighting::GlobalLightingUBO), 256);
+            VK::RingAlloc matAlloc = m_RingAllocator.Allocate(sizeof(VK::CVulkanLighting::MaterialConstantsUBO), 256);
+            VK::g_VulkanLighting->UpdateGlobalLightingUBO(glAlloc);
+            VK::g_VulkanLighting->UpdateMaterialConstantsUBO(matAlloc);
+        }
+
+        // GPU-driven tree g-buffer: update frustum UBO (CPU-side data prep only).
+        // The compute cull dispatch is registered as a graph pass below so the
+        // graph can auto-insert the COMPUTE → DRAW_INDIRECT barrier before gbuffer.
+        if (VK::g_ShadowManager && VK::g_ShadowManager->IsTreeGBufferReady()) {
+            // Build VP matrix for view frustum plane extraction
+            Fmatrix proj = Device.mProject;
+            // Apply DLSS jitter to projection (same as detail manager)
+            if (m_Jitter.enabled) {
+                proj._31 += m_Jitter.current.x;
+                proj._32 += m_Jitter.current.y;
+            }
+            Fmatrix vp;
+            vp.mul(proj, Device.mView);
+
+            // Compute prevVP (matching UpdateGlobalLightingUBO logic)
+            Fmatrix prevProj = Device.mProject_prev;
+            prevProj._31 += m_Jitter.previous.x;
+            prevProj._32 += m_Jitter.previous.y;
+            Fmatrix prevVP;
+            prevVP.mul(prevProj, Device.mView_prev);
+
+            float currJX = m_Jitter.enabled ? m_Jitter.current.x  : 0.f;
+            float currJY = m_Jitter.enabled ? m_Jitter.current.y  : 0.f;
+            float prevJX = m_Jitter.enabled ? m_Jitter.previous.x : 0.f;
+            float prevJY = m_Jitter.enabled ? m_Jitter.previous.y : 0.f;
+            VK::g_ShadowManager->UpdateTreeGBufferFrustum(vp, proj, Device.mView, prevVP,
+                                                          currJX, currJY, prevJX, prevJY);
+        }
+
+        {
+            VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+            if (graphCmd != VK_NULL_HANDLE) {
+                m_Graph.Reset();
+                // Register tree g-buffer cull BEFORE the gbuffer pass so the graph
+                // inserts the COMPUTE → DRAW_INDIRECT barrier automatically.
+                if (VK::g_ShadowManager && VK::g_ShadowManager->IsTreeGBufferReady())
+                    VK::g_ShadowManager->RegisterCullTreesGBufferPass(m_Graph);
+                RTarget->RegisterGBufferPass(m_Graph);
+                m_Graph.Compile();
+                m_Graph.Execute(graphCmd);
+            } else {
+                bPassCrashed = true;
+            }
+        }
+    }
+
+    // ========================================================================
+    // PASS 3: Lighting Pass (deferred lighting)
+    // ========================================================================
+    VkDiagFrame("[RENDER] PASS 3: lighting");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    if (b_loaded && RTarget) {
+        __try {
+            // ====================================================================
+            // PASS 3a: Sun Cascade Shadow Maps
+            // ====================================================================
+            // Shadow rendering must happen AFTER gbuffer (when scene graph is valid)
+            // but BEFORE phase_accumulator() (before accumulator rendering begins)
+            // DISABLED: Shadow rendering crashes because Visuals[] contains hierarchy
+            // containers with invalid vtables that can't be rendered directly.
+            // TODO: Implement proper shadow scene graph traversal (separate from GBuffer)
+            // instead of raw Visuals[] iteration.
+            if (ps_r__sun_shadows) {
+                VkDiagFrame("[RENDER] PASS 3a: sun cascades");
+                __try {
+                    render_sun_cascades();
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    Msg("! CRASH in render_sun_cascades() at frame %u, exception 0x%08X",
+                        Device.dwFrame, GetExceptionCode());
+                    VkCommandBuffer cmdSafe = RCache.GetCommandBuffer();
+                    if (cmdSafe != VK_NULL_HANDLE)
+                        vkCmdEndRendering(cmdSafe);
+                    FlushLog();
+                }
+            }
+
+            // ====================================================================
+            // PASS 3b: Accumulator Setup (lighting deferred)
+            // ====================================================================
+            // Graph auto-inserts:
+            //   rt_smap_depth DEPTH_ATTACHMENT → DEPTH_READ_ONLY  (sun shadow atlas)
+            //   rt_Depth      DEPTH_ATTACHMENT → DEPTH_READ_ONLY  (scene depth/stencil)
+            //   rt_Accumulator UNDEFINED       → COLOR_ATTACHMENT
+            // Callback (phase_accumulator_inner) clears accumulator, begins rendering.
+            {
+                VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+                if (graphCmd != VK_NULL_HANDLE) {
+                    m_Graph.Reset();
+                    RTarget->RegisterAccumulatorPass(m_Graph);
+                    m_Graph.Compile();
+                    m_Graph.Execute(graphCmd);
+                }
+            }
+
+            // ====================================================================
+            // PASS 3c: Sun Direct Lighting (with cascaded shadows)
+            // ====================================================================
+            // DIAG: skip sun to isolate point/spot light contribution
+            // RTarget->accum_direct(0);
+
+            // End accumulator pass BEFORE point lights (they manage their own passes)
+            // accum_point calls vkCmdBeginRendering which requires no active rendering
+            {
+                VkCommandBuffer cmdEndAccumSun = RCache.GetCommandBuffer();
+                if (cmdEndAccumSun != VK_NULL_HANDLE) {
+                    vkCmdEndRendering(cmdEndAccumSun);
+                }
+            }
+
+            // Diagnostic: light counts per category (every 60 frames)
+            if (Device.dwFrame % 60 == 0) {
+                u32 nOmni = 0;
+                for (u32 k = 0; k < Lights.package.v_shadowed.size(); k++) {
+                    light* Lk = Lights.package.v_shadowed[k];
+                    if (Lk && Lk->flags.type == IRender_Light::OMNIPART) nOmni++;
+                }
+                Msg("[LIGHT-DIAG] v_point=%u, v_spot=%u, v_shadowed=%u (OMNIPART=%u), noshadows=%u",
+                    (u32)Lights.package.v_point.size(),
+                    (u32)Lights.package.v_spot.size(),
+                    (u32)Lights.package.v_shadowed.size(),
+                    nOmni,
+                    RImplementation.o.noshadows);
+                // Dump first 10 shadowed lights' parameters
+                u32 nDumped = 0;
+                for (u32 k = 0; k < Lights.package.v_shadowed.size() && nDumped < 10; k++) {
+                    light* Lk = Lights.package.v_shadowed[k];
+                    if (!Lk) continue;
+                    Msg("[SHADOW-DIAG] [%u] type=%d omni_num=%d active=%d pos=(%.1f,%.1f,%.1f) range=%.2f color=(%.3f,%.3f,%.3f) shadow=%d",
+                        k, Lk->flags.type, Lk->omnipart_num, Lk->flags.bActive ? 1 : 0,
+                        Lk->position.x, Lk->position.y, Lk->position.z, Lk->range,
+                        Lk->color.r, Lk->color.g, Lk->color.b, Lk->flags.bShadow ? 1 : 0);
+                    nDumped++;
+                }
+            }
+
+            // Point lights (Phase 2.16.5)
+            VkDiagFrame("[RENDER] PASS 3b: point lights");
+            if (Lights.package.v_point.size() > 4096) {
+                Msg("! Suspicious point light count: %u — skipping", (u32)Lights.package.v_point.size());
+            } else
+            for (u32 i = 0; i < Lights.package.v_point.size(); i++) {
+                light* L = Lights.package.v_point[i];
+                if (L && L->flags.bActive) {
+                    __try {
+                        RTarget->accum_point(L);
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        Msg("! CRASH in accum_point[%u] at frame %u, light=%p, exception 0x%08X",
+                            i, Device.dwFrame, L, GetExceptionCode());
+                    }
+                }
+            }
+
+            // Accumulator pass was already ended before point lights (above)
+            // accum_point and accum_spot each manage their own render passes
+
+            // Spot lights (Phase 2.17.5)
+            // Each spot light manages its own render passes:
+            //   phase_smap_spot: depth-only pass → shadow map
+            //   accum_spot: accumulator pass with additive blending (LOAD_OP_LOAD)
+            VkDiagFrame("[RENDER] PASS 3c: spot lights");
+            if (Lights.package.v_spot.size() > 4096) {
+                Msg("! Suspicious spot light count: %u — skipping", (u32)Lights.package.v_spot.size());
+            } else
+            for (u32 i = 0; i < Lights.package.v_spot.size(); i++) {
+                light* L = Lights.package.v_spot[i];
+                if (L && L->flags.bActive) {
+                    __try {
+                        // First render shadow map (if light casts shadows)
+                        if (L->flags.bShadow) {
+                            RTarget->phase_smap_spot(L);
+                        }
+                        // Then accumulate lighting
+                        RTarget->accum_spot(L);
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        Msg("! CRASH in accum_spot[%u] at frame %u, light=%p, exception 0x%08X",
+                            i, Device.dwFrame, L, GetExceptionCode());
+                    }
+                }
+            }
+
+            // Shadowed lights (v_shadowed)
+            // OMNIPART = shadowed point light split into 6 faces → render cubemap + shadow accumulation
+            // SPOT = shadowed spot → render shadow map + spot accumulation
+            VkDiagFrame("[RENDER] PASS 3d: shadowed lights");
+            for (u32 i = 0; i < Lights.package.v_shadowed.size(); i++) {
+                light* L = Lights.package.v_shadowed[i];
+                if (!L || !L->flags.bActive) continue;
+                __try {
+                    if (L->flags.type == IRender_Light::OMNIPART) {
+                        // Only render face 0 to avoid 6x duplication
+                        if (L->omnipart_num == 0) {
+                            RTarget->phase_smap_point(L);
+                            RTarget->accum_point_shadowed(L);
+                        }
+                    } else if (L->flags.type == IRender_Light::SPOT) {
+                        RTarget->accum_spot(L);
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    Msg("! CRASH in accum_shadowed[%u] at frame %u, light=%p type=%d, exception 0x%08X",
+                        i, Device.dwFrame, L, L->flags.type, GetExceptionCode());
+                }
+            }
+
+            // [D3e] RTGI: Ray-traced global illumination from point/spot lights
+            {
+                // Edge-detect ps_r__rtgi changes — fires the moment user toggles in console
+                static u32 s_rtgi_last = 0xFFFFFFFFu;
+                if (ps_r__rtgi != s_rtgi_last) {
+                    Msg("[RTGI/gate] ps_r__rtgi CHANGED %u -> %u  g_RTGI=%p ready=%d",
+                        s_rtgi_last, ps_r__rtgi, VK::g_RTGI,
+                        VK::g_RTGI ? (int)VK::g_RTGI->IsReady() : -1);
+                    s_rtgi_last = ps_r__rtgi;
+                }
+                // Periodic gate state (every 120 frames) — confirms code path is reached
+                if ((Device.dwFrame % 120u) == 0u) {
+                    Msg("[RTGI/gate] frame=%u ps_r__rtgi=%u g_RTGI=%p ready=%d",
+                        Device.dwFrame, ps_r__rtgi, VK::g_RTGI,
+                        VK::g_RTGI ? (int)VK::g_RTGI->IsReady() : -1);
+                }
+            }
+            if (ps_r__rtgi && VK::g_RTGI && VK::g_RTGI->IsReady()) {
+                VK::g_RTGI->CollectLights(Lights.package);
+                VkCommandBuffer rtgiCmd = RCache.GetCommandBuffer();
+                if (rtgiCmd != VK_NULL_HANDLE)
+                    VK::g_RTGI->Dispatch(rtgiCmd);
+            }
+
+            // [D3] rt_Accumulator stays in COLOR_ATTACHMENT_OPTIMAL after all lighting passes.
+            // RegisterCombinePass declares Use(hAccum, SHADER_READ) → graph auto-inserts
+            // COLOR_ATTACHMENT → SHADER_READ_ONLY barrier before the combine callback.
+
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Msg("! CRASH in lighting pass (outer) at frame %u, exception 0x%08X",
+                Device.dwFrame, GetExceptionCode());
+            FlushLog();
+            bPassCrashed = true;
+        }
+    }
+
+    // If any pass crashed, skip remaining passes and go to recovery
+    if (bPassCrashed) goto render_crash_recovery;
+
+    // ========================================================================
+    // PASS 4: Distortion Pass (PP-UI elements like magnifier)
+    // ========================================================================
+    // Phase 2.20.1: Render distortion elements to rt_Distortion
+    // This must happen BEFORE combine so the combine shader can sample it
+    VkDiagFrame("[RENDER] PASS 4: distortion");
+    if (RTarget) {
+        RTarget->phase_distortion();
+    }
+
+    // ========================================================================
+    // PASS 4.5: Water SSR + Final Water Rendering
+    // ========================================================================
+    VkDiagFrame("[RENDER] PASS 4.5: water");
+    if (b_loaded && RTarget && o.ssfx_water && mapWater.size()) {
+        RTarget->phase_water_ssr();
+        RTarget->phase_water_blur();
+        RTarget->phase_water_waves();
+        RTarget->phase_water();
+    }
+
+    // ========================================================================
+    // PASS 5: Combine Pass (accumulator → swapchain)
+    // ========================================================================
+    // Phase 2.18: Combine accumulated lighting with albedo and output to swapchain
+    // Also applies distortion from rt_Distortion (magnifier glass effect)
+    VkDiagFrame("[RENDER] PASS 5: combine");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    if (RTarget) {
+        // Explicit barrier: flush all manual lighting writes to rt_Accumulator
+        // before the combine graph reads it. The graph should also insert one,
+        // but this guarantees correctness for the manual passes in between.
+        {
+            VkCommandBuffer barrierCmd = RCache.GetCommandBuffer();
+            if (barrierCmd != VK_NULL_HANDLE && RTarget->rt_Accumulator.m_Image != VK_NULL_HANDLE) {
+                VK::ImageBarrier(barrierCmd, RTarget->rt_Accumulator.m_Image,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);  // same layout — just flush writes
+            }
+        }
+        {
+            VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+            if (graphCmd != VK_NULL_HANDLE) {
+                m_Graph.Reset();
+                RTarget->RegisterCombinePass(m_Graph);
+                m_Graph.Compile();
+                m_Graph.Execute(graphCmd);
+            }
+        }
+        VkDiagFrame("[RENDER] PASS 5: combine done");
+        // Sky and clouds are now registered in the PASS 5.8 forward mini-graph.
+    } else {
+        // Fallback: no RTarget — clear swapchain to a solid color so it's not garbage
+        VkCommandBuffer cmd = RCache.GetCommandBuffer();
+        if (cmd != VK_NULL_HANDLE && Swapchain.m_Swapchain != VK_NULL_HANDLE) {
+            VkImage swapImg = Swapchain.GetCurrentImage();
+            if (swapImg != VK_NULL_HANDLE) {
+                // Transition swapchain: UNDEFINED → TRANSFER_DST
+                VkImageMemoryBarrier barrier = {};
+                barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier.srcAccessMask = 0;
+                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = swapImg;
+                barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barrier.subresourceRange.baseMipLevel = 0;
+                barrier.subresourceRange.levelCount = 1;
+                barrier.subresourceRange.baseArrayLayer = 0;
+                barrier.subresourceRange.layerCount = 1;
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+                // Clear to dark blue
+                VkClearColorValue clearColor = {{0.0f, 0.05f, 0.1f, 1.0f}};
+                VkImageSubresourceRange clearRange = {};
+                clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                clearRange.baseMipLevel = 0;
+                clearRange.levelCount = 1;
+                clearRange.baseArrayLayer = 0;
+                clearRange.layerCount = 1;
+                vkCmdClearColorImage(cmd, swapImg,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &clearRange);
+
+                // Transition swapchain: TRANSFER_DST → PRESENT_SRC
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = 0;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &barrier);
+            }
+        }
+    }
+
+    // ========================================================================
+    // PASS 5.7: Grass compute (clear + trail + generate SSBOs)
+    // ========================================================================
+    VkDiagFrame("[RENDER] PASS 5.7: details compute");
+    if (Details && b_loaded) {
+        // CPU-side prep (wind, VP constants, interactors, UBO, trail dirty bounds).
+        Details->PrepareFrame();
+        VkCommandBuffer detailCmd = RCache.GetCommandBuffer();
+        if (detailCmd != VK_NULL_HANDLE) {
+            // Register grass_clear + grass_trail + grass_gen compute passes.
+            // Graph auto-inserts COMPUTE → VERTEX/DRAW_INDIRECT barriers.
+            m_Graph.Reset();
+            Details->RegisterComputePasses(m_Graph);
+            m_Graph.Compile();
+            m_Graph.Execute(detailCmd);
+            // Graphics draw is now registered in PASS 5.8 forward mini-graph.
+        }
+    }
+
+    // ========================================================================
+    // PASS 5.8: Forward passes (sky, clouds, grass draw, wallmarks)
+    // ========================================================================
+    // All write rt_HDR (COLOR_ATTACHMENT, LOAD_OP_LOAD).
+    //
+    // E3: sky + clouds share ONE vkCmdBeginRendering scope (RegisterSkyGroupPass).
+    // Sequential writes to the same attachment inside a single rendering scope
+    // need no inter-draw barrier — the barrier rule "same layout = no transition"
+    // is naturally satisfied by the shared scope.
+    //
+    //   depth transitions: ATTACH→READ_ONLY (once, in BeginForwardSkyGroup)
+    //                      READ_ONLY→ATTACH (once, in EndForwardSkyGroup)
+    //
+    // grass and wallmarks keep their own begin/end (different depth usage).
+    VkDiagFrame("[RENDER] PASS 5.8: forward");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    __try {
+    if (RTarget) {
+        VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+        if (graphCmd != VK_NULL_HANDLE) {
+            m_Graph.Reset();
+
+            // E3: sky+clouds in ONE shared rendering scope — no barrier between them
+            RTarget->RegisterSkyGroupPass(m_Graph);
+
+            // grass draw: counter copy + indirect draw into rt_HDR + depth (WRITE)
+            // (depends on PASS 5.7 compute having filled SSBOs)
+            if (Details && b_loaded)
+                Details->RegisterGraphicsPass(m_Graph);
+
+            // wallmarks: writes rt_HDR, reads depth as DEPTH_READ_ONLY
+            if (Wallmarks) {
+                vkCWallmarksEngine* pWM = Wallmarks;
+                RTarget->RegisterWallmarksPass(m_Graph, [pWM]() { pWM->Render(); });
+            }
+
+            m_Graph.Compile();
+            m_Graph.Execute(graphCmd);
+        }
+    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! CRASH in forward passes (PASS 5.8) at frame %u, exception 0x%08X",
+            Device.dwFrame, GetExceptionCode());
+        FlushLog();
+        bPassCrashed = true;
+    }
+
+    // ========================================================================
+    // PASS 6: Sorted transparent geometry + portal fading
+    // ========================================================================
+    // phase_forward() clears sorted/particle lists (currently disabled draw path).
+    // r_dsgraph_render_sorted() and fade_render() are effectively no-ops until
+    // the forward draw pipeline is re-enabled.
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    VkDiagFrame("[RENDER] PASS 6: forward sorted");
+    __try {
+        if (RTarget) {
+            RTarget->phase_forward();  // clears sorted/particle/distort lists
+        }
+
+        VkDiagFrame("[RENDER] PASS 6a: render_sorted");
+        r_dsgraph_render_sorted();
+
+        VkDiagFrame("[RENDER] PASS 6b: fade_render");
+        vkPortalTraverser.fade_render();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! CRASH in sorted forward (PASS 6) at frame %u, exception 0x%08X",
+            Device.dwFrame, GetExceptionCode());
+        FlushLog();
+        bPassCrashed = true;
+    }
+
+    // ========================================================================
+    // PASS 6.52: Auto-Exposure compute (rt_HDR → 1x1 R32F)
+    // ========================================================================
+    VkDiagFrame("[RENDER] PASS 6.52: auto-exposure");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    __try {
+    if (RTarget && RTarget->m_bExposureReady) {
+        VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+        if (graphCmd != VK_NULL_HANDLE) {
+            m_Graph.Reset();
+            RTarget->RegisterExposurePass(m_Graph);
+            m_Graph.Compile();
+            m_Graph.Execute(graphCmd);
+        }
+    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! CRASH in auto-exposure (PASS 6.52) at frame %u, exception 0x%08X",
+            Device.dwFrame, GetExceptionCode());
+        FlushLog();
+        bPassCrashed = true;
+    }
+
+    // ========================================================================
+    // PASS 6.54: DLSS Upscaling (rt_HDR → rt_DlssOutput)
+    // ========================================================================
+    // Registered as EXTERNAL graph pass: phase_dlss() manages its own barriers
+    // (NGX Evaluate is a blackbox).  AddPassConditional skips the callback when
+    // DLSS is not active, so the graph records nothing and tonemap falls back to
+    // reading rt_HDR directly.
+    VkDiagFrame("[RENDER] PASS 6.54: DLSS");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    __try {
+    if (RTarget) {
+        VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+        if (graphCmd != VK_NULL_HANDLE) {
+            m_Graph.Reset();
+            RTarget->RegisterDlssPass(m_Graph);
+            m_Graph.Compile();
+            m_Graph.Execute(graphCmd);
+        }
+    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! CRASH in DLSS (PASS 6.54) at frame %u, exception 0x%08X",
+            Device.dwFrame, GetExceptionCode());
+        FlushLog();
+        bPassCrashed = true;
+    }
+
+    // ========================================================================
+    // PASS 6.55: Tonemap (rt_HDR/rt_DlssOutput → Swapchain) + present barrier
+    // ========================================================================
+    // Converts HDR scene to LDR with ACES tonemapping + vignette.
+    // Graph manages: HDR→SHADER_READ, swapchain UNDEFINED→COLOR_ATTACHMENT,
+    //                and the final COLOR_ATTACHMENT→PRESENT_SRC transition.
+    VkDiagFrame("[RENDER] PASS 6.55: tonemap");
+    if (g_bDeviceLost || bPassCrashed) { if (bPassCrashed) goto render_crash_recovery; return; }
+    __try {
+    if (RTarget) {
+        VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+        if (graphCmd != VK_NULL_HANDLE) {
+            m_Graph.Reset();
+            RTarget->RegisterTonemapPass(m_Graph);
+            m_Graph.Compile();
+            m_Graph.Execute(graphCmd);
+        }
+    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        Msg("! CRASH in tonemap (PASS 6.55) at frame %u, exception 0x%08X",
+            Device.dwFrame, GetExceptionCode());
+        FlushLog();
+        bPassCrashed = true;
+    }
+
+    // ========================================================================
+    // PASS 6.6: 3D Fluid Volumes (volumetric smoke, fog, fire)
+    // ========================================================================
+    VkDiagFrame("[RENDER] PASS 6.6: 3D fluid");
+    if (b_loaded && o.volumetricfog) {
+        VkCommandBuffer cmd = RCache.GetCommandBuffer();
+        if (cmd != VK_NULL_HANDLE) {
+            VK::g_FluidManager.RenderFluid(cmd);
+        }
+    }
+
+    // ========================================================================
+    // PASS 7: HUD 3D Rendering (weapons, hands, HUD particles)
+    // ========================================================================
+    // NOTE: HUD is now rendered inside phase_gbuffer (Step 9c) so it goes
+    // through the deferred pipeline. This pass just clears any leftover mapHUD.
+    VkDiagFrame("[RENDER] PASS 7: HUD 3D");
+    if (mapHUD.size() > 0) {
+        Msg("! [HUD] WARNING: mapHUD=%u still has items at PASS 7 (should be 0 after gbuffer)", mapHUD.size());
+        mapHUD.clear();
+    }
+    if (mapCamAttached.size() > 0) {
+        Msg("! [HUD] WARNING: mapCamAttached=%u still has items at PASS 7", mapCamAttached.size());
+        mapCamAttached.clear();
+    }
+
+    // ========================================================================
+    // PASS E4: Frame Gen capture + HUD UI overlay
+    // ========================================================================
+    // E4a (conditional): copy swapchain → rt_HudlessColor before 2D UI, for
+    //                    DLSS Frame Generation artifact-free interpolation.
+    // E4b: render 3D HUD overlays (weapon sights, scopes) onto swapchain.
+    // E4c: final COLOR_ATTACHMENT → PRESENT_SRC_KHR barrier.
+    //
+    // All barriers managed by CFrameGraph (declared via RegisterE4Pass).
+    VkDiagFrame("[RENDER] PASS E4: frame gen capture + HUD UI");
+    if (!g_bDeviceLost && !bPassCrashed && RTarget)
+    {
+        // Save camera state for frame gen evaluate (called later in End()).
+        // Must happen before the graph runs so the state reflects this frame.
+        if (ps_r__frame_gen && g_FrameGenManager.IsFeatureCreated())
+        {
+            float farPlane = g_pGamePersistent
+                ? g_pGamePersistent->Environment().CurrentEnv->far_plane : 500.f;
+            g_FrameGenManager.SaveFrameState(
+                m_Jitter.current.x, m_Jitter.current.y,
+                Device.mProject, Device.mView,
+                Device.vCameraPosition,
+                VIEWPORT_NEAR, farPlane,
+                Device.fFOV, Device.fASPECT);
+        }
+
+        VkCommandBuffer graphCmd = RCache.GetCommandBuffer();
+        if (graphCmd != VK_NULL_HANDLE)
+        {
+            m_Graph.Reset();
+            RTarget->RegisterE4Pass(m_Graph,
+                [this]()
+                {
+                    extern ENGINE_API CCustomHUD* g_hud;
+                    if (!g_hud) return;
+                    if (g_hud->RenderActiveItemUIQuery())
+                        r_dsgraph_render_hud_ui();
+                    if (g_hud->RenderCamAttachedUIQuery())
+                        r_dsgraph_render_cam_ui();
+                });
+            m_Graph.Compile();
+            m_Graph.Execute(graphCmd);
+        }
+    }
+
+    // ========================================================================
+    // PASS 8: Post-Process Pass
+    // ========================================================================
+    // TODO: Bloom, color grading, etc.
+
+    // ========================================================================
+    // PASS 9: UI Pass (in-game UI when level is loaded)
+    // ========================================================================
+    // In-game UI (HUD, inventory, etc.) is rendered via seqRender callbacks
+    // from CMainMenu::OnRender() / IGame_Level::OnRender() after Render() returns.
+    // Main menu PP-UI is handled by the render_menu check at the top of Render().
+
+    VkDiagFrame("[RENDER] OnFrameEnd");
+    // End frame - flush statistics
+    RCache.OnFrameEnd();
+
+    // Update stats
+    stats.l_total = 0;
+    stats.l_visible = 0;
+    return;
+
+    // ========================================================================
+    // Crash recovery: a pass crashed with access violation.
+    // Set g_bDeviceLost so End() knows to do recovery (reset cmd buffer,
+    // submit minimal frame, present).  End() will clear g_bDeviceLost
+    // after recovery, so the next frame can try rendering again.
+    //
+    // If we crash too often (MAX_CRASHES_PER_WINDOW within CRASH_WINDOW_FRAMES),
+    // leave g_bDeviceLost permanently set to avoid an infinite crash loop.
+    // ========================================================================
+render_crash_recovery:
+    {
+        u32 currentFrame = Device.dwFrame;
+        // Reset crash counter if we haven't crashed recently
+        if (currentFrame - s_lastCrashFrame > CRASH_WINDOW_FRAMES) {
+            s_crashCount = 0;
+        }
+        s_crashCount++;
+        s_lastCrashFrame = currentFrame;
+
+        Msg("! Render crash recovery: crash %u/%u at frame %u, signaling End() for cmd buffer recovery",
+            s_crashCount, MAX_CRASHES_PER_WINDOW, currentFrame);
+
+        // Signal End() to do recovery (reset cmd pool, submit minimal frame, present).
+        // End() will clear g_bDeviceLost after recovery so the next frame can try again.
+        // If s_crashCount reaches MAX_CRASHES_PER_WINDOW, the check at the top of
+        // Render() will permanently set g_bDeviceLost and stop trying.
+        g_bDeviceLost = true;
+        VulkanUI_ResetState();  // prevent EndUIPass from crashing on stale state
+        FlushLog();
+
+        // End frame stats
+        RCache.OnFrameEnd();
+        stats.l_total = 0;
+        stats.l_visible = 0;
+    }
+}
+
+// ============================================================================
+// ApplyDeferredDlssResize — called from End() AFTER present, BETWEEN frames
+// ============================================================================
+// At this point no command buffer is recording and all GPU work is done,
+// so vkDeviceWaitIdle + Destroy/Create of render targets is safe.
+void CRender::ApplyDeferredDlssResize()
+{
+    if (!m_bDlssPendingResize || !RTarget)
+        return;
+
+    m_bDlssPendingResize = false;
+
+    u32 curQuality = ps_r__dlss_quality;
+    Msg("[DLSS] Applying deferred resize (quality=%d)...", curQuality);
+    FlushLog();
+
+    VkResult waitRes = vkDeviceWaitIdle(VulkanHW.m_Device);
+    if (waitRes != VK_SUCCESS) {
+        Msg("![DLSS] vkDeviceWaitIdle failed: 0x%08X", (u32)waitRes);
+        FlushLog();
+        if (waitRes == VK_ERROR_DEVICE_LOST) {
+            g_bDeviceLost = true;
+            return;
+        }
+    }
+    Msg("[DLSS] GPU idle, proceeding with resize");
+    FlushLog();
+
+    if (curQuality == DLSS_OFF)
+    {
+        g_DlssManager.DestroyFeature();
+        RTarget->DestroyDlssOutput();
+        u32 dispW = Swapchain.m_Extent.width;
+        u32 dispH = Swapchain.m_Extent.height;
+        RTarget->OnResize(dispW, dispH);
+        Msg("[DLSS] Disabled — render targets restored to %dx%d", dispW, dispH);
+    }
+    else
+    {
+        u32 dispW = Swapchain.m_Extent.width;
+        u32 dispH = Swapchain.m_Extent.height;
+        u32 renW = 0, renH = 0;
+        g_DlssManager.GetOptimalResolution(dispW, dispH, curQuality, renW, renH);
+
+        Msg("[DLSS] Destroying old feature...");
+        g_DlssManager.DestroyFeature();
+
+        Msg("[DLSS] OnResize(%d, %d)...", renW, renH);
+        FlushLog();
+        RTarget->OnResize(renW, renH);
+
+        Msg("[DLSS] CreateDlssOutput(%d, %d)...", dispW, dispH);
+        RTarget->CreateDlssOutput(dispW, dispH);
+
+        if (RTarget->m_bExposureReady)
+        {
+            RTarget->DestroyExposureResources();
+            RTarget->CreateExposureResources();
+        }
+
+        Msg("[DLSS] CreateFeature(%d, %d -> %d, %d, quality=%d)...", renW, renH, dispW, dispH, curQuality);
+        FlushLog();
+        bool ok = g_DlssManager.CreateFeature(renW, renH, dispW, dispH, curQuality);
+        Msg("[DLSS] CreateFeature result: %s", ok ? "OK" : "FAILED");
+        FlushLog();
+
+        Msg("[DLSS] Quality=%d: render %dx%d -> display %dx%d", curQuality, renW, renH, dispW, dispH);
+    }
+
+    Msg("[DLSS] Deferred resize complete");
+    FlushLog();
+}
+
+void CRender::OnFrame()
+{
+    // Per-frame update - called before Render()
+    // This is called by Device.seqFrame.Process(rp_Frame) every frame
+
+    // ========================================================================
+    // Save previous frame matrices for temporal effects
+    // ========================================================================
+    // These are used for:
+    // - Motion blur (velocity vectors)
+    // - Temporal Anti-Aliasing (TAA)
+    // - Motion vectors for reflections
+    // - Reprojection for post-processing
+    RCache.xforms.set_W_prev(RCache.xforms.get_W());
+    RCache.xforms.set_V_prev(RCache.xforms.get_V());
+    RCache.xforms.set_P_prev(RCache.xforms.get_P());
+
+    // ========================================================================
+    // Reset visibility markers for new frame
+    // ========================================================================
+    // Each visual has vis.marker field compared against RImplementation.marker
+    // to prevent re-processing the same object multiple times per frame
+    marker++;
+
+    // ========================================================================
+    // Update subsystems (if needed)
+    // ========================================================================
+
+    // Update model pool (LOD, animation caching)
+    // Models->OnFrame() might update LOD distances, animation states, etc.
+    // Currently Models is vkModelPool which doesn't have OnFrame() - may add later
+
+    // Update particle systems
+    // PSLibrary should update emitters, lifetime, spawning
+    // Currently PSLibrary doesn't have OnFrame() - particles update in Render()
+
+    // Update environment/weather
+    // g_pGamePersistent->Environment() updates time-of-day, fog, rain, etc.
+    // This is usually called by game logic, not renderer
+
+    // ========================================================================
+    // Statistics reset (optional)
+    // ========================================================================
+    // Some renderers reset per-frame stats here
+    // We do it in OnFrameBegin()/OnFrameEnd() instead
+
+    // TODO: If adding temporal effects (motion blur, TAA), implement here:
+    // - Update velocity buffer history
+    // - Update jitter pattern for TAA
+    // - Update temporal accumulation buffers
+}
+
+// ============================================================================
+// Object management
+// ============================================================================
+void CRender::set_Object(IRenderable* O)
+{
+    val_pObject = O;
+
+    if (O)
+    {
+        // TODO: Update object-specific rendering state
+        // Similar to apply_object in R4
+    }
+}
+
+// ============================================================================
+// add_leafs_to_lstMatrix - Decompose hierarchy/skeleton into leaf visuals
+// for lstMatrix. Each leaf gets its own _MatrixItem with the parent's world
+// matrix. This mirrors what add_leafs_HUD_VK does for mapHUD.
+// ============================================================================
+static const u32 MAX_HIERARCHY_DEPTH = 32;
+
+void CRender::add_leafs_to_lstMatrix(vkRender_Visual* pVisual, const Fmatrix& worldMatrix, u32 depth)
+{
+    if (!pVisual) return;
+    if (depth > MAX_HIERARCHY_DEPTH) {
+        static u32 s_depthWarn = 0;
+        if (s_depthWarn < 5) {
+            Msg("! [HIER] add_leafs_to_lstMatrix: depth %u exceeded limit, visual=%p type=%u",
+                depth, pVisual, pVisual->Type);
+            s_depthWarn++;
+        }
+        return;
+    }
+
+    switch (pVisual->Type)
+    {
+    case MT_SKELETON_ANIM:
+    case MT_SKELETON_RIGID:
+    case MT_HIERRARHY:
+    {
+        xr_vector<IRenderVisual*>* children = pVisual->get_children();
+        if (children) {
+            for (auto child : *children) {
+                if (child)
+                    add_leafs_to_lstMatrix(static_cast<vkRender_Visual*>(child), worldMatrix, depth + 1);
+            }
+        }
+        return;
+    }
+
+    default:
+    {
+        // One-shot diagnostic: log skeleton children being added to lstMatrix
+        {
+            static u32 s_leafAddCount = 0;
+            if (s_leafAddCount < 20) {
+                s_leafAddCount++;
+                const char* nm = (pVisual->dbg_name.size() > 0) ? pVisual->dbg_name.c_str() : "<empty>";
+                Msg("[MATRIX-ADD] leaf Type=%u name='%s' depth=%u pos=(%.1f,%.1f,%.1f) ptr=%p",
+                    pVisual->Type, nm, depth,
+                    worldMatrix._41, worldMatrix._42, worldMatrix._43, pVisual);
+            }
+        }
+        R_dsgraph::_MatrixItem item;
+        item.ssa = 1.0f;
+        item.pObject = val_pObject;
+        item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+        item.Matrix = worldMatrix;
+        if (val_pObject) {
+            auto it = m_PrevFrameMatrices.find(val_pObject);
+            item.PrevMatrix = (it != m_PrevFrameMatrices.end()) ? it->second : worldMatrix;
+            m_CurrFrameMatrices[val_pObject] = worldMatrix;
+        } else {
+            item.PrevMatrix = worldMatrix;
+        }
+        lstMatrix.push_back(item);
+        return;
+    }
+    }
+}
+
+void CRender::add_Visual(IRenderVisual* V)
+{
+    if (!V) return;
+
+    vkRender_Visual* pVisual = static_cast<vkRender_Visual*>(V);
+
+    // Route HUD visuals to mapHUD — decompose hierarchy into leaf visuals
+    if (val_bHUD)
+    {
+        add_leafs_HUD_VK(pVisual);
+        return;
+    }
+
+    // Particle effects/groups → separate queue, rendered in forward phase
+    // World transform is propagated via UpdateParent() called by game code
+    if (pVisual->Type == MT_PARTICLE_EFFECT || pVisual->Type == MT_PARTICLE_GROUP)
+    {
+        R_dsgraph::_NormalItem item;
+        item.ssa = 1.0f;
+        item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+        lstParticles.push_back(item);
+        return;
+    }
+
+    // For skeleton and hierarchy types: decompose into leaf visuals.
+    // Bones are calculated at add-time, leaf visuals go into lstMatrix.
+    if (pVisual->Type == MT_SKELETON_ANIM || pVisual->Type == MT_SKELETON_RIGID ||
+        pVisual->Type == MT_HIERRARHY)
+    {
+        Fmatrix worldMatrix = (val_pTransform) ? *val_pTransform : Fidentity;
+
+        // Calculate bones for skeleton types
+        if (pVisual->Type == MT_SKELETON_ANIM || pVisual->Type == MT_SKELETON_RIGID)
+        {
+            IKinematics* pK = pVisual->dcast_PKinematics();
+            if (pK) pK->CalculateBones(TRUE);
+        }
+
+        add_leafs_to_lstMatrix(pVisual, worldMatrix);
+        return;
+    }
+
+    // Leaf visual — add directly to lstMatrix
+    R_dsgraph::_MatrixItem item;
+    item.ssa = 1.0f;
+    item.pObject = val_pObject;
+    item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+    item.Matrix = (val_pTransform) ? *val_pTransform : Fidentity;
+    if (val_pObject) {
+        auto it = m_PrevFrameMatrices.find(val_pObject);
+        item.PrevMatrix = (it != m_PrevFrameMatrices.end()) ? it->second : item.Matrix;
+        m_CurrFrameMatrices[val_pObject] = item.Matrix;
+    } else {
+        item.PrevMatrix = item.Matrix;
+    }
+    lstMatrix.push_back(item);
+}
+
+// ============================================================================
+// add_leafs_Dynamic_VK - Recursively expand dynamic visuals into render queue
+// ============================================================================
+void CRender::add_leafs_Dynamic_VK(vkRender_Visual* pVisual)
+{
+    if (!pVisual) return;
+
+    switch (pVisual->Type)
+    {
+    case MT_PARTICLE_GROUP:
+    {
+        // Expand particle group: iterate all child items
+        vkCParticleGroup* pG = static_cast<vkCParticleGroup*>(pVisual);
+        for (auto& item : pG->items)
+        {
+            if (item.pVisual)
+                add_leafs_Dynamic_VK(static_cast<vkRender_Visual*>(item.pVisual));
+        }
+        return;
+    }
+
+    case MT_PARTICLE_EFFECT:
+    {
+        // Particle effects go to separate queue, rendered in forward phase
+        R_dsgraph::_NormalItem item;
+        item.ssa = 1.0f;
+        item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+        lstParticles.push_back(item);
+        return;
+    }
+
+    case MT_HIERRARHY:
+    {
+        // Expand hierarchy via IRenderVisual::get_children()
+        xr_vector<IRenderVisual*>* children = pVisual->get_children();
+        if (children) {
+            for (auto child : *children) {
+                if (child)
+                    add_leafs_Dynamic_VK(static_cast<vkRender_Visual*>(child));
+            }
+        }
+        return;
+    }
+
+    case MT_SKELETON_ANIM:
+    case MT_SKELETON_RIGID:
+    {
+        // Skeleton: calculate bones, then expand children
+        IKinematics* pK = pVisual->dcast_PKinematics();
+        if (pK) {
+            pK->CalculateBones(TRUE);
+        }
+
+        // Expand skeleton children via IRenderVisual interface
+        xr_vector<IRenderVisual*>* children = pVisual->get_children();
+        if (children) {
+            for (auto child : *children) {
+                if (child)
+                    add_leafs_Dynamic_VK(static_cast<vkRender_Visual*>(child));
+            }
+        }
+        return;
+    }
+
+    default:
+    {
+        // Diagnostic: detect skeleton children entering lstNormal (no world matrix!)
+        if (pVisual->Type == 5) { // MT_SKELETON_GEOMDEF_ST
+            static u32 s_sklNormalWarn = 0;
+            if (s_sklNormalWarn < 10) {
+                s_sklNormalWarn++;
+                const char* nm = (pVisual->dbg_name.size() > 0) ? pVisual->dbg_name.c_str() : "<empty>";
+                Msg("[SKL-IN-NORMAL!] Skeleton child added to lstNormal (no matrix)! Type=%u name='%s' ptr=%p",
+                    pVisual->Type, nm, pVisual);
+            }
+        }
+        // Leaf visual (geometry, particle effect, etc.) - add to render queue
+        R_dsgraph::_NormalItem item;
+        item.ssa = 1.0f;  // Dynamic objects: max priority
+        item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+        lstNormal.push_back(item);
+        return;
+    }
+    }
+}
+
+// ============================================================================
+// add_leafs_HUD_VK - Recursively expand HUD visuals into mapHUD/mapCamAttached
+// ============================================================================
+// Same as add_leafs_Dynamic_VK but routes leaf visuals to HUD render queues
+// instead of lstNormal. This ensures skeleton hierarchies are properly decomposed
+// so that each leaf (vkSkeletonX_PM, vkSkeletonX_ST, vkFVisual) can be rendered
+// directly with its own pipeline/material binding.
+// ============================================================================
+void CRender::add_leafs_HUD_VK(vkRender_Visual* pVisual)
+{
+    if (!pVisual) return;
+
+    // Frame-limited diagnostics (first 5 frames)
+    static u32 s_diagHudFrame = 0;
+    static u32 s_diagHudCount = 0;
+    bool bDiag = (Device.dwFrame != s_diagHudFrame) && (s_diagHudCount < 5);
+    if (bDiag) {
+        s_diagHudFrame = Device.dwFrame;
+        s_diagHudCount++;
+    }
+
+    switch (pVisual->Type)
+    {
+    case MT_PARTICLE_GROUP:
+    {
+        if (bDiag) Msg("[HUD-LEAF] ParticleGroup visual=%p", pVisual);
+        vkCParticleGroup* pG = static_cast<vkCParticleGroup*>(pVisual);
+        for (auto& item : pG->items)
+        {
+            if (item.pVisual)
+                add_leafs_HUD_VK(static_cast<vkRender_Visual*>(item.pVisual));
+        }
+        return;
+    }
+
+    case MT_HIERRARHY:
+    {
+        xr_vector<IRenderVisual*>* children = pVisual->get_children();
+        if (bDiag) Msg("[HUD-LEAF] Hierarchy visual=%p children=%u", pVisual, children ? (u32)children->size() : 0);
+        if (children) {
+            for (auto child : *children) {
+                if (child)
+                    add_leafs_HUD_VK(static_cast<vkRender_Visual*>(child));
+            }
+        }
+        return;
+    }
+
+    case MT_SKELETON_ANIM:
+    case MT_SKELETON_RIGID:
+    {
+        // Calculate bones first, then expand children
+        IKinematics* pK = pVisual->dcast_PKinematics();
+
+        if (bDiag) {
+            Msg("[HUD-LEAF] Skeleton visual=%p type=%u dcast_PKinematics=%p", pVisual, pVisual->Type, pK);
+            if (pK) {
+                Msg("[HUD-LEAF]   IKinematics=%p LL_BoneCount=%u", pK, pK->LL_BoneCount());
+            }
+        }
+
+        if (pK) {
+            pK->CalculateBones(TRUE);
+        } else {
+            Msg("! [HUD-LEAF] WARNING: dcast_PKinematics returned NULL for skeleton visual=%p type=%u!", pVisual, pVisual->Type);
+        }
+
+        xr_vector<IRenderVisual*>* children = pVisual->get_children();
+        if (bDiag && children) {
+            Msg("[HUD-LEAF]   Skeleton children count=%u", (u32)children->size());
+        }
+        if (children) {
+            for (u32 ci = 0; ci < children->size(); ci++) {
+                IRenderVisual* child = (*children)[ci];
+                if (!child) continue;
+                if (bDiag) {
+                    Msg("[HUD-LEAF]   child[%u]=%p type=%u", ci, child, child->getType());
+                }
+                add_leafs_HUD_VK(static_cast<vkRender_Visual*>(child));
+            }
+        }
+        return;
+    }
+
+    default:
+    {
+        if (bDiag) {
+            Msg("[HUD-LEAF] Leaf visual=%p type=%u -> mapHUD (val_bCamAttached=%d)", pVisual, pVisual->Type, val_bCamAttached?1:0);
+        }
+        // Leaf visual — insert into HUD render queue based on shader flags
+        // (mirrors DX11 r_dsgraph_insert_dynamic HUD routing logic)
+        R_dsgraph::_MatrixItemS item;
+        item.ssa = 1.0f;
+        item.pObject = val_pObject;
+        item.pVisual = reinterpret_cast<dxRender_Visual*>(pVisual);
+        item.Matrix = (val_pTransform) ? *val_pTransform : Fidentity;
+        if (val_pObject) {
+            auto it = m_PrevFrameMatrices.find(val_pObject);
+            item.PrevMatrix = (it != m_PrevFrameMatrices.end()) ? it->second : item.Matrix;
+            m_CurrFrameMatrices[val_pObject] = item.Matrix;
+        } else {
+            item.PrevMatrix = item.Matrix;
+        }
+        item.se = nullptr;
+
+        // Lookup Vulkan shader flags for this visual
+        VK::CVulkanShader* pVKShader = nullptr;
+        if (pVisual->shader_id < (u16)Shaders.size())
+            pVKShader = Shaders[pVisual->shader_id];
+
+        bool bDistort  = pVKShader && pVKShader->m_bDistort;
+        bool bEmissive = pVKShader && pVKShader->m_bEmissive;
+        bool bSorted   = pVKShader && pVKShader->m_PipelineConfig.blendEnable;
+
+        // 1) Distortion pass (scope heat, barrel shimmer)
+        if (bDistort)
+            mapHUDDistort.insertInAnyWay(0.f, item);
+
+        // 2) Sorted transparent (scope glass, transparent parts) — back-to-front
+        if (bSorted)
+        {
+            // Emissive transparent also goes to emissive pass (collimator dots, LEDs)
+            if (bEmissive)
+            {
+                if (val_bCamAttached)
+                    mapCamAttachedEmissive.insertInAnyWay(0.f, item);
+                else
+                    mapHUDEmissive.insertInAnyWay(0.f, item);
+            }
+
+            if (val_bCamAttached)
+                mapCamAttachedSorted.insertInAnyWay(0.f, item);
+            else
+                mapHUDSorted.insertInAnyWay(0.f, item);
+            return;
+        }
+
+        // 3) Opaque HUD (weapon body, hands) — may also have emissive
+        if (bEmissive)
+        {
+            if (val_bCamAttached)
+                mapCamAttachedEmissive.insertInAnyWay(0.f, item);
+            else
+                mapHUDEmissive.insertInAnyWay(0.f, item);
+        }
+
+        if (val_bCamAttached)
+            mapCamAttached.insertInAnyWay(0.f, item);
+        else
+            mapHUD.insertInAnyWay(0.f, item);
+        return;
+    }
+    }
+}
+
+void CRender::add_Geometry(IRenderVisual* V)
+{
+    // Same as add_Visual for Vulkan renderer
+    add_Visual(V);
+}
+
+void CRender::add_Occluder(Fbox2& bb_screenspace)
+{
+    // TODO: Implement HOM integration
+}
+
+void CRender::flush()
+{
+    // TODO: Flush queued render objects
+}
+
+// ============================================================================
+// Model management
+// ============================================================================
+IRenderVisual* CRender::model_Create(LPCSTR name, IReader* data)
+{
+    if (!Models) {
+        Msg("![Vulkan] model_Create: Models is NULL!");
+        return nullptr;
+    }
+
+    IRenderVisual* result = Models->Create(name, data, true);
+
+    if (!result)
+    {
+        Msg("![Vulkan] model_Create('%s'): FAILED (nullptr)", name ? name : "NULL");
+    }
+
+    return result;
+}
+
+IRenderVisual* CRender::model_CreateChild(LPCSTR name, IReader* data)
+{
+    if (!Models) return nullptr;
+    return Models->CreateChild(name, data);
+}
+
+IRenderVisual* CRender::model_CreateParticles(LPCSTR name)
+{
+    if (!Models) {
+        Msg("![Vulkan] ModelPool not initialized");
+        return nullptr;
+    }
+
+    // Try to find particle effect definition
+    PS::CPEDef* pe_def = PSLibrary.FindPED(name);
+    if (pe_def) {
+        return Models->CreatePE(pe_def);
+    }
+
+    // Try to find particle group definition
+    PS::CPGDef* pg_def = PSLibrary.FindPGD(name);
+    if (pg_def) {
+        return Models->CreatePG(pg_def);
+    }
+
+    Msg("![Vulkan] Particle not found: %s", name);
+    return nullptr;
+}
+
+IRenderVisual* CRender::model_Duplicate(IRenderVisual* V)
+{
+    if (!Models || !V) return nullptr;
+    vkRender_Visual* vkV = static_cast<vkRender_Visual*>(V);
+    return Models->Instance_Duplicate(vkV);
+}
+
+void CRender::model_Delete(IRenderVisual*& V, BOOL bDiscard)
+{
+    if (!Models || !V) return;
+    vkRender_Visual* vkV = static_cast<vkRender_Visual*>(V);
+    Models->Delete(vkV, bDiscard);
+    V = nullptr;
+}
+
+void CRender::model_Logging(BOOL bEnable)
+{
+    if (Models)
+        Models->Logging(bEnable);
+}
+
+void CRender::models_Prefetch()
+{
+    if (Models)
+        Models->Prefetch();
+}
+
+void CRender::models_PrefetchOne(LPCSTR name, bool assert_on_fail)
+{
+    if (Models)
+        Models->Prefetch_One(name, assert_on_fail);
+}
+
+void CRender::models_Clear(BOOL b_complete)
+{
+    if (Models)
+        Models->ClearPool(b_complete);
+}
+
+bool CRender::models_Exists(LPCSTR name)
+{
+    if (!Models) return false;
+    return Models->Exists(name);
+}
+
+// ============================================================================
+// Light management
+// ============================================================================
+IRender_Light* CRender::light_create()
+{
+    return Lights.Create();
+}
+
+// ============================================================================
+// Glow - minimal implementation (stub rendering, proper interface)
+// ============================================================================
+class CGlow : public IRender_Glow
+{
+public:
+    bool     bActive;
+    Fvector  position;
+    Fvector  direction;
+    float    radius;
+    Fcolor   color;
+
+    CGlow() : bActive(false), radius(0.5f)
+    {
+        position.set(0, 0, 0);
+        direction.set(0, 0, 1);
+        color.set(1, 1, 1, 1);
+    }
+
+    virtual void set_active(bool b) override    { bActive = b; }
+    virtual bool get_active() override          { return bActive; }
+    virtual void set_position(const Fvector& P) override { position.set(P); }
+    virtual void set_direction(const Fvector& D) override { direction.set(D); }
+    virtual void set_radius(float R) override   { radius = R; }
+    virtual void set_texture(LPCSTR name) override { /* Vulkan: glow textures not yet implemented */ }
+    virtual void set_color(const Fcolor& C) override { color.set(C); }
+    virtual void set_color(float r, float g, float b) override { color.set(r, g, b, 1); }
+};
+
+IRender_Glow* CRender::glow_create()
+{
+    return xr_new<CGlow>();
+}
+
+// ============================================================================
+// Wallmarks
+// ============================================================================
+
+// Helper: ref_shader overload with random rotation
+void CRender::add_StaticWallmark(ref_shader& S, const Fvector& P, float s, CDB::TRI* T, Fvector* V, float ttl, bool ignore_opt, bool random_rotation)
+{
+    add_StaticWallmark(S, P, s, T, V, ttl, ignore_opt, random_rotation ? ::Random.randF(-20.f, 20.f) : 0.f);
+}
+
+// Helper: ref_shader overload with explicit rotation
+void CRender::add_StaticWallmark(ref_shader& S, const Fvector& P, float s, CDB::TRI* T, Fvector* V, float ttl, bool ignore_opt, float rotation)
+{
+    if (T->suppress_wm) return;
+    VERIFY2(_valid(P) && _valid(s) && T && V && (s > EPS_L), "Invalid static wallmark params");
+    if (Wallmarks)
+        Wallmarks->AddStaticWallmark(T, V, P, S, s, ttl, ignore_opt, rotation);
+}
+
+// IWallMarkArray overload with random rotation (called by game code)
+void CRender::add_StaticWallmark(IWallMarkArray* pArray, const Fvector& P, float s, CDB::TRI* T, Fvector* V, float ttl, bool ignore_opt, bool random_rotation)
+{
+    add_StaticWallmark(pArray, P, s, T, V, ttl, ignore_opt, random_rotation ? ::Random.randF(-20.f, 20.f) : 0.f);
+}
+
+// IWallMarkArray overload with explicit rotation (called by game code)
+void CRender::add_StaticWallmark(IWallMarkArray* pArray, const Fvector& P, float s, CDB::TRI* T, Fvector* V, float ttl, bool ignore_opt, float rotation)
+{
+    dxWallMarkArray* pWMA = (dxWallMarkArray*)pArray;
+    ref_shader* pShader = pWMA->dxGenerateWallmark();
+    if (pShader) add_StaticWallmark(*pShader, P, s, T, V, ttl, ignore_opt, rotation);
+}
+
+// wm_shader overload (used by older/UI code paths)
+void CRender::add_StaticWallmark(const wm_shader& S, const Fvector& P, float s, CDB::TRI* T, Fvector* V)
+{
+    dxUIShader* pShader = (dxUIShader*)&*S;
+    add_StaticWallmark(pShader->hShader, P, s, T, V, 0.0f, false, true);
+}
+
+void CRender::clear_static_wallmarks()
+{
+    if (Wallmarks)
+        Wallmarks->clear();
+}
+
+// Include CSkeletonWallmark + CKinematics for proper downcast from IKinematics*
+// MUST be before add_SkeletonWallmark so the (CKinematics*)obj cast performs
+// correct pointer adjustment for multiple inheritance (FHierrarhyVisual + IKinematics).
+#define FBasicVisualH
+#define dxRender_Visual vkRender_Visual
+#include "../xrRender/SkeletonCustom.h"
+#undef dxRender_Visual
+#undef FBasicVisualH
+
+// IKinematics + IWallMarkArray overload (called by game code for blood on animated models)
+void CRender::add_SkeletonWallmark(const Fmatrix* xf, IKinematics* obj, IWallMarkArray* pArray, const Fvector& start,
+                                   const Fvector& dir, float size, float ttl, bool ignore_opt)
+{
+    if (!obj || !pArray || !xf) return;
+    dxWallMarkArray* pWMA = (dxWallMarkArray*)pArray;
+    ref_shader* pShader = pWMA->dxGenerateWallmark();
+    if (pShader) add_SkeletonWallmark(xf, static_cast<CKinematics*>(obj), *pShader, start, dir, size, ttl, ignore_opt);
+}
+
+void CRender::add_SkeletonWallmark_impl(const CSkeletonWallmark* wm)
+{
+    // Not used directly - see intrusive_ptr overload below
+}
+
+// intrusive_ptr overload (called by CKinematics when wallmark is ready)
+void CRender::add_SkeletonWallmark(intrusive_ptr<CSkeletonWallmark> wm)
+{
+    if (Wallmarks)
+        Wallmarks->AddSkeletonWallmark(wm);
+}
+
+// CKinematics + ref_shader overload (direct skeleton wallmark creation)
+void CRender::add_SkeletonWallmark(const Fmatrix* xf, CKinematics* obj, ref_shader& sh, const Fvector& start,
+                                   const Fvector& dir, float size, float ttl, bool ignore_opt)
+{
+    if (Wallmarks)
+        Wallmarks->AddSkeletonWallmark(xf, obj, sh, start, dir, size, ttl, ignore_opt);
+}
+
+// ============================================================================
+// ROS (Render Object Specific) - Stub for Vulkan
+// ============================================================================
+// Minimal implementation returning safe dummy luminosity values.
+// Full light tracking (CROS_impl) not yet ported to Vulkan.
+// ============================================================================
+class vkROS : public IRender_ObjectSpecific
+{
+    u32   m_mode;
+    float m_hemi_cube[6];
+public:
+    vkROS() : m_mode(TRACE_ALL)
+    {
+        for (int i = 0; i < 6; i++)
+            m_hemi_cube[i] = 0.5f;   // neutral hemisphere
+    }
+    virtual void   force_mode(u32 mode)            { m_mode = mode; }
+    virtual float  get_luminocity()                 { return 0.5f; }
+    virtual float  get_luminocity_hemi()            { return 0.5f; }
+    virtual float* get_luminocity_hemi_cube()       { return m_hemi_cube; }
+    virtual ~vkROS() {}
+};
+
+IRender_ObjectSpecific* CRender::ros_create(IRenderable* parent)
+{
+    return xr_new<vkROS>();
+}
+
+void CRender::ros_destroy(IRender_ObjectSpecific*& ROS)
+{
+    xr_delete(ROS);
+    ROS = nullptr;
+}
+
+// ============================================================================
+// Sector/Portal (stubs for now)
+// ============================================================================
+IRender_Sector* CRender::getSector(int id)
+{
+    if (id >= 0 && id < (int)Sectors.size()) {
+        IRender_Sector* sector = Sectors[id];
+        // Extra safety: verify sector is valid
+        if (!sector) {
+            Msg("![Vulkan] getSector(%d): Sectors array contains nullptr at valid index!", id);
+        }
+        return sector;
+    }
+    return nullptr;
+}
+
+IRenderVisual* CRender::getVisual(int id)
+{
+    if (id >= 0 && id < (int)Visuals.size())
+        return Visuals[id];
+    return nullptr;
+}
+
+IRender_Sector* CRender::detectSector(const Fvector& P)
+{
+    // Ported from DX11 R2: detectSector with two-direction ray cast
+    if (Sectors.empty())
+        return nullptr;
+
+    Sectors_xrc.ray_options(CDB::OPT_ONLYNEAREST);
+
+    // Try downward ray first
+    Fvector dir;
+    dir.set(0, -1, 0);
+    IRender_Sector* S = detectSector(P, dir);
+
+    // If downward fails, try upward
+    if (nullptr == S)
+    {
+        dir.set(0, 1, 0);
+        S = detectSector(P, dir);
+    }
+
+    return S;
+}
+
+IRender_Sector* CRender::detectSector(const Fvector& P, Fvector& dir)
+{
+    // Ported from DX11 R2: ray-cast through portal and geometry models
+    // to determine which sector contains point P
+
+    // Portal model query
+    int id1 = -1;
+    float range1 = 500.f;
+    if (rmPortals)
+    {
+        Sectors_xrc.ray_query(rmPortals, P, dir, range1);
+        if (Sectors_xrc.r_count())
+        {
+            CDB::RESULT* RP1 = Sectors_xrc.r_begin();
+            id1 = RP1->id;
+            range1 = RP1->range;
+        }
+    }
+
+    // Geometry model query
+    int id2 = -1;
+    float range2 = range1;
+    if (g_pGameLevel && g_pGameLevel->ObjectSpace.GetStaticModel())
+    {
+        Sectors_xrc.ray_query(g_pGameLevel->ObjectSpace.GetStaticModel(), P, dir, range2);
+        if (Sectors_xrc.r_count())
+        {
+            CDB::RESULT* RP2 = Sectors_xrc.r_begin();
+            id2 = RP2->id;
+            range2 = RP2->range;
+        }
+    }
+
+    // Select best hit
+    int ID;
+    if (id1 >= 0)
+    {
+        if (id2 >= 0) ID = (range1 <= range2 + EPS) ? id1 : id2;
+        else ID = id1;
+    }
+    else if (id2 >= 0) ID = id2;
+    else return nullptr;
+
+    if (ID == id1)
+    {
+        // Hit portal - get sector facing the point
+        CDB::TRI* pTri = rmPortals->get_tris() + ID;
+        if (pTri->dummy < Portals.size())
+        {
+            vkCPortal* pPortal = (vkCPortal*)Portals[pTri->dummy];
+            if (pPortal)
+                return pPortal->getSectorFacing(P);
+        }
+        return nullptr;
+    }
+    else
+    {
+        // Hit geometry - get sector from triangle
+        CDB::TRI* pTri = g_pGameLevel->ObjectSpace.GetStaticTris() + ID;
+        return getSector(pTri->sector);
+    }
+}
+
+IRender_Target* CRender::getTarget()
+{
+    return RTarget;
+}
+
+// ============================================================================
+// Occlusion (stubs for now)
+// ============================================================================
+BOOL CRender::occ_visible(vis_data& V)
+{
+    // TODO: Implement occlusion query
+    return TRUE;
+}
+
+BOOL CRender::occ_visible(Fbox& B)
+{
+    // TODO: Implement
+    return TRUE;
+}
+
+BOOL CRender::occ_visible(sPoly& P)
+{
+    // TODO: Implement
+    return TRUE;
+}
+
+// ============================================================================
+// Screenshots (stubs for now)
+// ============================================================================
+void CRender::Screenshot(ScreenshotMode mode, LPCSTR name)
+{
+    // TODO: Implement Vulkan screenshot
+    Msg("[Vulkan] Screenshot requested: %s", name ? name : "unnamed");
+}
+
+void CRender::Screenshot(ScreenshotMode mode, CMemoryWriter& memory_writer)
+{
+    // TODO: Implement
+}
+
+void CRender::ScreenshotAsyncBegin()
+{
+    // TODO: Implement async screenshot
+}
+
+void CRender::ScreenshotAsyncEnd(CMemoryWriter& memory_writer)
+{
+    // TODO: Implement
+}
+
+// ============================================================================
+// Render mode
+// ============================================================================
+void CRender::rmNear()
+{
+    // Set viewport depth range for HUD weapon rendering (front of depth buffer)
+    IRender_Target* T = getTarget();
+    if (!T) return;
+
+    u32 width = T->get_width();
+    u32 height = T->get_height();
+
+    RCache.m_Viewport.x = 0;
+    RCache.m_Viewport.y = (float)height;
+    RCache.m_Viewport.width  = (float)width;
+    RCache.m_Viewport.height = -(float)height;
+    RCache.m_Viewport.minDepth = 0.f;
+    RCache.m_Viewport.maxDepth = 0.02f;
+
+    RCache.m_Scissor.offset.x = 0;
+    RCache.m_Scissor.offset.y = 0;
+    RCache.m_Scissor.extent.width = width;
+    RCache.m_Scissor.extent.height = height;
+
+    RCache.ApplyViewportScissor();
+}
+
+void CRender::rmFar()
+{
+    // Set viewport depth range for sky rendering (back of depth buffer)
+    IRender_Target* T = getTarget();
+    if (!T) return;
+
+    u32 width = T->get_width();
+    u32 height = T->get_height();
+
+    RCache.m_Viewport.x = 0;
+    RCache.m_Viewport.y = (float)height;
+    RCache.m_Viewport.width  = (float)width;
+    RCache.m_Viewport.height = -(float)height;
+    RCache.m_Viewport.minDepth = 0.99999f;
+    RCache.m_Viewport.maxDepth = 1.f;
+
+    RCache.m_Scissor.offset.x = 0;
+    RCache.m_Scissor.offset.y = 0;
+    RCache.m_Scissor.extent.width = width;
+    RCache.m_Scissor.extent.height = height;
+
+    RCache.ApplyViewportScissor();
+}
+
+void CRender::rmNormal()
+{
+    // Use display (swapchain) resolution for viewport — UI and present must
+    // always target the full window, not the DLSS internal render resolution.
+    u32 width  = Swapchain.m_Extent.width;
+    u32 height = Swapchain.m_Extent.height;
+
+    RCache.m_Viewport.x = 0;
+    RCache.m_Viewport.y = (float)height;
+    RCache.m_Viewport.width  = (float)width;
+    RCache.m_Viewport.height = -(float)height;
+    RCache.m_Viewport.minDepth = 0.f;
+    RCache.m_Viewport.maxDepth = 1.f;
+
+    RCache.m_Scissor.offset.x = 0;
+    RCache.m_Scissor.offset.y = 0;
+    RCache.m_Scissor.extent.width = width;
+    RCache.m_Scissor.extent.height = height;
+
+    RCache.ApplyViewportScissor();
+}
+
+// ============================================================================
+// Shader compilation
+// ============================================================================
+HRESULT CRender::shader_compile(
+    LPCSTR name,
+    DWORD const* pSrcData,
+    UINT SrcDataLen,
+    LPCSTR pFunctionName,
+    LPCSTR pTarget,
+    DWORD Flags,
+    void*& result)
+{
+    // TODO: Implement Vulkan shader compilation
+    // This will need to use glslang or similar to compile HLSL/GLSL to SPIR-V
+    result = nullptr;
+    return E_NOTIMPL;
+}
+
+// ============================================================================
+// Particles
+// ============================================================================
+void CRender::ExportParticles()
+{
+    // TODO: Implement particle export
+}
+
+void CRender::ImportParticles()
+{
+    // TODO: Implement particle import
+}
+
+// ============================================================================
+// RenderToTarget
+// ============================================================================
+void CRender::RenderToTarget(RRT target)
+{
+    // TODO: Implement render to target
+}
+
+// ============================================================================
+// Sun values (anglobes)
+// ============================================================================
+Fvector CRender::GetSunPosition()
+{
+    static Fvector default_pos = {0, 0, 0};
+    // TODO: Return actual sun position from lights DB
+    return default_pos;
+}
+
+Fcolor CRender::GetSunColor()
+{
+    static Fcolor default_color = {0.0f, 0.0f, 0.0f, 0.0f};
+    // TODO: Return actual sun color from lights DB
+    return default_color;
+}
+
+float CRender::GetSunIntensity()
+{
+    // TODO: Return actual sun intensity
+    return 0.0f;
+}
+
+bool CRender::IsSun()
+{
+    // TODO: Check if sun light is active
+    return false;
+}
+
+// ============================================================================
+// Selective Screenshot (antglobes)
+// ============================================================================
+void CRender::TakeScreenshot(LPCSTR path, Fvector2 dimensions, DxEncoding encoding)
+{
+    // TODO: Implement selective screenshot
+    Msg("[Vulkan] TakeScreenshot: %s (%.0fx%.0f)", path, dimensions.x, dimensions.y);
+}
+
+// ============================================================================
+// Screenshot implementation
+// ============================================================================
+void CRender::ScreenshotImpl(ScreenshotMode mode, LPCSTR name, CMemoryWriter* memory_writer)
+{
+    // TODO: Implement actual Vulkan screenshot capture
+    Msg("[Vulkan] ScreenshotImpl mode:%d name:%s", mode, name ? name : "null");
+}
+
+// ============================================================================
+// HUD Particle Rendering
+// ============================================================================
+void CRender::RenderHUDParticles()
+{
+    // HUD-mode particles (muzzle flashes, impact effects, etc.) are rendered
+    // through two mechanisms:
+    //
+    // 1. Primary path: Particles with HUD mode go through add_leafs_HUD_VK()
+    //    into mapHUD and are rendered in the gbuffer phase with HUD projection.
+    //
+    // 2. Self-handling: vkCParticleEffect::Render() checks GetHudMode() and
+    //    switches to HUD projection internally (matching DX11 behavior).
+    //
+    // This function is called as a safety net after mapHUD rendering.
+    // Currently no additional work needed — particles handle themselves.
+}
