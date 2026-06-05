@@ -81,9 +81,12 @@ BOOL CWeaponStatMgun::net_Spawn(CSE_Abstract* DC)
         return FALSE;
 
     IKinematics* K = smart_cast<IKinematics*>(Visual());
-    CInifile* pUserData = K->LL_UserData();
-
-    R_ASSERT2(pUserData, "Empty WeaponStatMgun user data!");
+    CInifile* pUserData = K ? K->LL_UserData() : nullptr;
+    if (!pUserData)
+    {
+        Msg("![CWeaponStatMgun::net_Spawn] no UserData (renderer stub) — stationary MG inert");
+        return TRUE;
+    }
 
     m_rotate_x_bone = K->LL_BoneID(pUserData->r_string("mounted_weapon_definition", "rotate_x_bone"));
     m_rotate_y_bone = K->LL_BoneID(pUserData->r_string("mounted_weapon_definition", "rotate_y_bone"));

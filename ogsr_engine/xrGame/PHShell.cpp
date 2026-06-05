@@ -100,6 +100,7 @@ void CPHShell::ReanableObject()
 void CPHShell::vis_update_activate()
 {
     ++m_active_count;
+    if (elements.empty()) return;  // skinned-mesh stub gave 0 bones → empty shell
     CPhysicsShellHolder* ref_object = (*elements.begin())->PhysicsRefObject();
     if (ref_object && m_active_count > 0)
     {
@@ -193,7 +194,10 @@ void CPHShell::PhDataUpdate(dReal step)
     else
         ReanableObject();
 
-    if (PhOutOfBoundaries(cast_fv(dBodyGetPosition((*elements.begin())->get_body()))))
+    if (elements.empty()) return;
+    dBodyID first_body = (*elements.begin())->get_body();
+    if (!first_body) return;  // [VK stub] shell partially initialised — out-of-bounds check needs a real ODE body
+    if (PhOutOfBoundaries(cast_fv(dBodyGetPosition(first_body))))
         Disable();
 }
 
@@ -1096,6 +1100,7 @@ void CPHShell::set_DisableParams(const SAllDDOParams& params)
 
 void CPHShell::UpdateRoot()
 {
+    if (elements.empty()) return;
     ELEMENT_I i = elements.begin();
     if (!(*i)->isFullActive())
         return;
@@ -1106,6 +1111,7 @@ void CPHShell::UpdateRoot()
 void CPHShell::InterpolateGlobalTransform(Fmatrix* m)
 {
     // if(!CPHObject::is_active()&&!CPHObject::NetInterpolation()) return;
+    if (elements.empty()) { m->identity(); return; }  // bone-less stub shell
 
     ELEMENT_I i, e;
     i = elements.begin();
@@ -1126,6 +1132,8 @@ void CPHShell::InterpolateGlobalTransform(Fmatrix* m)
 
 void CPHShell::GetGlobalTransformDynamic(Fmatrix* m)
 {
+    if (elements.empty()) { m->identity(); return; }  // bone-less stub shell — no transform
+
     ELEMENT_I i, e;
     i = elements.begin();
     e = elements.end();
@@ -1142,6 +1150,7 @@ void CPHShell::GetGlobalTransformDynamic(Fmatrix* m)
 }
 void CPHShell::InterpolateGlobalPosition(Fvector* v)
 {
+    if (elements.empty()) { v->set(0,0,0); return; }
     (*elements.begin())->InterpolateGlobalPosition(v);
     v->add(m_object_in_root.c);
     VERIFY2(_valid(*v), "not valide result position");

@@ -31,4 +31,14 @@ void MemoryBarrier(VkCommandBuffer cmd,
     VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
     VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess);
 
+// Inter-pass ordering for the shared color+depth swapchain attachments WITHOUT a
+// layout change. With the single-layout convention (image stays COLOR_ATTACHMENT
+// the whole frame) two consecutive dynamic-rendering passes that LOAD the same
+// color/depth target have no implicit dependency, so this orders pass N's
+// attachment writes before pass N+1's attachment access. Replaces the old
+// COLOR<->TRANSFER_DST round-trip each pass used to do (the layout thrash).
+// A real framegraph will later swap this conservative global barrier for precise
+// per-resource ones.
+void SceneAttachmentBarrier(VkCommandBuffer cmd);
+
 } // namespace VK

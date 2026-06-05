@@ -38,6 +38,11 @@ void CPHShell::Activate(const Fmatrix& m0, float dt01, const Fmatrix& m2, bool d
 {
     if (isActive())
         return;
+    // Empty shell happens when build_FromKinematics ran against the renderer's
+    // bone-less stub — there are no physics elements to drive. Bail before
+    // GetGlobalTransformDynamic dereferences elements.begin() on empty list.
+    if (elements.empty())
+        return;
     activate(disable);
     //	ELEMENT_I i;
     mXFORM.set(m0);

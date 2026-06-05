@@ -5,6 +5,14 @@
 #include "vk_sync.h"
 #include "vk_command_buffer.h"
 #include "vk_UIPipeline.h"
+#include "vk_pipeline_cache.h"
+#include "vk_world_material.h"
+#include "vk_pass_sky.h"
+#include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
+#include "vk_shader.h"   // g_VulkanShaderManager (level-shader table)
+#include "vk_shaders.h"  // g_ShaderManager (SPIRV module loader/cache)
+#include "vk_ModelPool.h"
+#include "CRender_Vulkan.h"
 #include "vk_stub.h"
 
 bool g_bDeviceLost = false;
@@ -63,6 +71,27 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     // UI pipeline + vertex buffer + white-texture descriptor.
     VulkanUI::Create();
 
+    // World forward pipeline cache (needs swapchain format) + model pool.
+    // OGSR engine doesn't call CRender::create() through this build path, so
+    // we own the CRender-side subsystems here, where Create is actually
+    // invoked. WorldMaterialCache must come first — PipelineCache builds
+    // pipelines whose layout includes the material descriptor set layout.
+    VK::WorldMaterialCache::Init();
+    VK::PipelineCache::Init();
+    VK::SkyPass::Init();
+
+    // Shader manager owns the level-shader table that maps shader_id →
+    // (shader name, diffuse texture name). Without it the loader leaves all
+    // Shaders[i] nullptr and every visual ends up with the default white
+    // material. Cheap to spin up — no GPU work, just the hashmap + a default
+    // entry.
+    if (!g_VulkanShaderManager) {
+        g_VulkanShaderManager = xr_new<VK::CVulkanShaderManager>();
+        g_VulkanShaderManager->Create();
+    }
+    if (!RImplementation.Models)
+        RImplementation.Models = xr_new<vkModelPool>();
+
     m_bInitialized = true;
     Msg("[VK] DevRender::Create OK — swapchain %ux%u, %u images",
         Swapchain.GetWidth(), Swapchain.GetHeight(), Swapchain.m_ImageCount);
@@ -73,15 +102,45 @@ void vkRenderDeviceRender::Destroy()
     Msg("[VK] DevRender::Destroy");
     if (!m_bInitialized) return;
 
+    // Teardown is logged step-by-step: log.cpp flushes every line, so if a future
+    // change ever hangs/crashes here the last line pinpoints the failing step.
+    // Low-noise (one block per exit); kept as a permanent guard.
     if (VulkanHW.m_Device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(VulkanHW.m_Device);
+        Msg("[VK] DevRender::Destroy: vkDeviceWaitIdle ...");
+        VkResult wi = vkDeviceWaitIdle(VulkanHW.m_Device);
+        Msg("[VK] DevRender::Destroy: vkDeviceWaitIdle done (res=%d)", wi);
     }
 
-    VulkanUI::Destroy();
-    Swapchain.Destroy();
-    CommandManager.Destroy();
-    Sync.Destroy();
-    VulkanHW.DestroyDevice();
+    if (RImplementation.Models) { xr_delete(RImplementation.Models); RImplementation.Models = nullptr; }
+    Msg("[VK] DevRender::Destroy: Models freed");
+    if (g_VulkanShaderManager) {
+        g_VulkanShaderManager->Destroy();
+        xr_delete(g_VulkanShaderManager);
+        g_VulkanShaderManager = nullptr;
+    }
+    Msg("[VK] DevRender::Destroy: ShaderManager freed");
+    VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
+    VK::Skinned_Destroy();              Msg("[VK] DevRender::Destroy: SkinnedPass done");
+    VK::PipelineCache::Destroy();       Msg("[VK] DevRender::Destroy: PipelineCache done");
+    VK::WorldMaterialCache::Destroy();  Msg("[VK] DevRender::Destroy: WorldMaterial done");
+    VulkanUI::Destroy();                Msg("[VK] DevRender::Destroy: VulkanUI done");
+
+    // Free the SPIRV module cache LAST among shader consumers: SkyPass / Skinned /
+    // PipelineCache / VulkanUI / DetailManager only null their own handles (the
+    // modules are owned here), so their VkShaderModules outlive them until now.
+    // Must run before VulkanHW.DestroyDevice() — otherwise vkDestroyDevice trips
+    // VUID-vkDestroyDevice-device-05137 (undestroyed child shader modules).
+    if (g_ShaderManager) {
+        g_ShaderManager->DestroyAll();
+        xr_delete(g_ShaderManager);
+        g_ShaderManager = nullptr;
+    }
+    Msg("[VK] DevRender::Destroy: SPIRV shader modules freed");
+
+    Swapchain.Destroy();                Msg("[VK] DevRender::Destroy: Swapchain done");
+    CommandManager.Destroy();           Msg("[VK] DevRender::Destroy: CommandManager done");
+    Sync.Destroy();                     Msg("[VK] DevRender::Destroy: Sync done");
+    VulkanHW.DestroyDevice();           Msg("[VK] DevRender::Destroy: device destroyed");
 
     m_bInitialized = false;
     m_hWnd         = nullptr;

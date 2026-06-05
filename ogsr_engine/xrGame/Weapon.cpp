@@ -2220,6 +2220,12 @@ void CWeapon::update_visual_bullet_textures(const bool forced)
     if (!GetHUDmode())
         return;
 
+    // Vulkan: the texture resource manager isn't ported (GetResourceManager()
+    // returns null), so the per-shell bullet-texture swap below would deref null.
+    // Skip the cosmetic swap on this renderer.
+    if (!Device.m_pRender || !Device.m_pRender->GetResourceManager())
+        return;
+
     const u32 id = m_set_next_ammoType_on_reload != u32(-1) ? m_set_next_ammoType_on_reload : m_ammoType;
     const auto& current_ammo_sect = m_ammoTypes[id];
     const auto bullet_texrure_find_it = bullet_textures_for_ammos.find(current_ammo_sect);

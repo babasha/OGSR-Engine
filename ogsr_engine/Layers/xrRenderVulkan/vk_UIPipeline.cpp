@@ -7,10 +7,16 @@
 #include "vk_texture.h"
 #include "vk_shaders.h"
 #include "vk_swapchain.h"
+#include "vk_pipeline_cache.h"     // VK::PipelineCache::GetCacheObject() — shared disk-backed cache
+#include "vk_barriers.h"           // VK::SceneAttachmentBarrier — inter-pass ordering
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"   // Device.dwWidth / dwHeight
 
 VkCommandBuffer g_VkUI_FrameCmd = VK_NULL_HANDLE;
+
+// Defined in vk_RenderFactory.cpp (global scope) — frees the engine-lifetime UI
+// texture cache. Declared here so VulkanUI::Destroy can call it at teardown.
+void VK_ClearUITextureCache();
 
 namespace VulkanUI
 {
@@ -20,7 +26,9 @@ namespace VulkanUI
     VkDescriptorSetLayout    s_DescriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool         s_DescriptorPool      = VK_NULL_HANDLE;
     VkPipelineLayout         s_PipelineLayout      = VK_NULL_HANDLE;
-    VkPipeline               s_Pipeline            = VK_NULL_HANDLE;
+    VkPipeline               s_Pipeline            = VK_NULL_HANDLE;   // TRIANGLE_LIST (default UI quads)
+    VkPipeline               s_PipelineLineList    = VK_NULL_HANDLE;   // LINE_LIST  (crosshair)
+    VkPipeline               s_PipelineLineStrip   = VK_NULL_HANDLE;   // LINE_STRIP (UIWindow borders)
     VkDescriptorSet          s_WhiteTextureSet     = VK_NULL_HANDLE;
 
     // Frame state ------------------------------------------------------------
@@ -38,30 +46,9 @@ namespace VulkanUI
     VkBuffer GetVertexBufferHandle() { return s_VertexBuffer.GetHandle(); }
     void     FlushVertexBuffer()     { s_VertexBuffer.Flush(); }
 
-    static void TransitionSwapchain(VkCommandBuffer cmd, VkImage image,
-        VkImageLayout oldLayout, VkImageLayout newLayout,
-        VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-        VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess)
-    {
-        VkImageMemoryBarrier2 barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        barrier.srcStageMask  = srcStage;
-        barrier.srcAccessMask = srcAccess;
-        barrier.dstStageMask  = dstStage;
-        barrier.dstAccessMask = dstAccess;
-        barrier.oldLayout = oldLayout;
-        barrier.newLayout = newLayout;
-        barrier.image     = image;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.layerCount = 1;
-
-        VkDependencyInfo depInfo{};
-        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        depInfo.imageMemoryBarrierCount = 1;
-        depInfo.pImageMemoryBarriers    = &barrier;
-        vkCmdPipelineBarrier2(cmd, &depInfo);
-    }
+    // Swapchain layout is managed centrally now (single-layout convention): the
+    // image is in COLOR_ATTACHMENT for the whole frame, so the UI pass does no
+    // layout transition — only an inter-pass ordering barrier on entry.
 
     // ----- Create / Destroy -------------------------------------------------
 
@@ -250,11 +237,23 @@ namespace VulkanUI
         pipelineInfo.pDynamicState       = &dynamicState;
         pipelineInfo.layout              = s_PipelineLayout;
 
-        VkResult result = vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &s_Pipeline);
+        VkPipelineCache pcache = VK::PipelineCache::GetCacheObject();
+        VkResult result = vkCreateGraphicsPipelines(VulkanHW.m_Device, pcache, 1, &pipelineInfo, nullptr, &s_Pipeline);
         if (result != VK_SUCCESS) {
             Msg("![Vulkan UI] Failed to create UI pipeline! Error: %d", result);
             return;
         }
+
+        // Line-topology variants — identical state, only inputAssembly.topology differs.
+        // UIRender drives ptLineList (HUD crosshair) / ptLineStrip (UIWindow borders);
+        // without these they'd render through the triangle-list pipeline and the line
+        // endpoints would assemble into stray stretched triangles (the "sky spike").
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, pcache, 1, &pipelineInfo, nullptr, &s_PipelineLineList) != VK_SUCCESS)
+            Msg("![Vulkan UI] Failed to create UI line-list pipeline");
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, pcache, 1, &pipelineInfo, nullptr, &s_PipelineLineStrip) != VK_SUCCESS)
+            Msg("![Vulkan UI] Failed to create UI line-strip pipeline");
 
         Msg("[Vulkan UI] UI infrastructure created successfully");
     }
@@ -265,7 +264,14 @@ namespace VulkanUI
         Msg("[Vulkan UI] Destroying UI infrastructure...");
         vkDeviceWaitIdle(VulkanHW.m_Device);
 
+        // Free the engine-lifetime UI texture cache (UI/map/font/HUD textures +
+        // any video staging buffer) before we tear down the descriptor pool and
+        // (later) the VMA allocator. Defined at global scope in vk_RenderFactory.cpp.
+        ::VK_ClearUITextureCache();
+
         if (s_Pipeline)            { vkDestroyPipeline(VulkanHW.m_Device, s_Pipeline, nullptr);                   s_Pipeline            = VK_NULL_HANDLE; }
+        if (s_PipelineLineList)    { vkDestroyPipeline(VulkanHW.m_Device, s_PipelineLineList, nullptr);           s_PipelineLineList    = VK_NULL_HANDLE; }
+        if (s_PipelineLineStrip)   { vkDestroyPipeline(VulkanHW.m_Device, s_PipelineLineStrip, nullptr);          s_PipelineLineStrip   = VK_NULL_HANDLE; }
         if (s_PipelineLayout)      { vkDestroyPipelineLayout(VulkanHW.m_Device, s_PipelineLayout, nullptr);       s_PipelineLayout      = VK_NULL_HANDLE; }
         s_WhiteTexture.Destroy();
         if (s_DescriptorPool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_DescriptorPool, nullptr);       s_DescriptorPool      = VK_NULL_HANDLE; }
@@ -289,12 +295,11 @@ namespace VulkanUI
         VkImageView view = Swapchain.m_ImageViews[imageIndex];
         if (!img || !view) return;
 
-        // CRender::Begin already left the image in TRANSFER_DST_OPTIMAL after
-        // the cornflower clear. Move it to COLOR_ATTACHMENT_OPTIMAL for UI draws.
-        TransitionSwapchain(cmd, img,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_TRANSFER_BIT,           VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        // Image is already COLOR_ATTACHMENT (Begin set it; scene passes left it
+        // there). Just order any prior scene color writes before the UI draws —
+        // no layout change. Covers both the immediate path (opened mid-frame) and
+        // the deferred replay in CRender::End.
+        VK::SceneAttachmentBarrier(cmd);
 
         VkRenderingAttachmentInfo colorAttachment{};
         colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -332,14 +337,9 @@ namespace VulkanUI
 
         vkCmdEndRendering(cmd);
 
-        // CRender::End expects PRESENT_SRC layout. Transition from COLOR_ATT→PRESENT.
-        u32 imageIndex = Swapchain.m_CurrentImageIndex;
-        TransitionSwapchain(cmd, Swapchain.m_Images[imageIndex],
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE);
-
-        Swapchain.m_bRenderedThisFrame = true;
+        // No layout transition here: the image stays COLOR_ATTACHMENT. CRender::End
+        // owns the single COLOR→PRESENT transition for the whole frame.
+        Swapchain.m_bRenderedThisFrame = true;   // vestigial; End no longer branches on it
         s_bUIPassActive  = false;
         s_UIVertexOffset = 0;
     }
@@ -360,7 +360,8 @@ namespace VulkanUI
             switch (dcmd.type)
             {
             case DeferredUICmd::Draw: {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Pipeline);
+                VkPipeline pipe = dcmd.pipeline ? dcmd.pipeline : s_Pipeline;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
                 float screenSize[2] = { (float)Device.dwWidth, (float)Device.dwHeight };
                 vkCmdPushConstants(cmd, s_PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, screenSize);
                 VkBuffer     vbs[]     = { s_VertexBuffer.GetHandle() };

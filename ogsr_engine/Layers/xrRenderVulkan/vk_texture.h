@@ -61,16 +61,20 @@ public:
     /**
      * Загрузить текстуру из DDS файла
      * @param filename Путь к файлу
+     * @param applyBCSwizzle  Apply R↔B swap on BC formats (true for UI atlases
+     *                        whose tooling shipped BGR-ordered endpoints; false
+     *                        for level statics which are stock BC1/3 RGB).
      * @return true если успешно
      */
-    bool LoadDDS(const char* filename);
+    bool LoadDDS(const char* filename, bool applyBCSwizzle = true);
 
     /**
      * Загрузить cubemap текстуру из DDS файла (6 faces)
      * @param filename Путь к файлу
+     * @param applyBCSwizzle  R↔B swap on BC formats — see LoadDDS notes.
      * @return true если успешно
      */
-    bool LoadDDSCubemap(const char* filename);
+    bool LoadDDSCubemap(const char* filename, bool applyBCSwizzle = true);
 
     /**
      * Уничтожить текстуру
@@ -104,6 +108,13 @@ public:
     bool            m_bCubemap = false;      // True if this is a cubemap texture (6 faces)
     u32             m_ArrayLayers = 1;       // Number of array layers (6 for cubemap)
 
+    /**
+     * Upload данных через staging buffer. Low-level — most callers go via
+     * CreateFromData / LoadDDS / LoadDDSCubemap. Public so cubemap fallbacks
+     * (sky pass) can fill 1×1×6 faces without rolling their own DDS.
+     */
+    void UploadData(const void* data, VkDeviceSize size);
+
 private:
     /**
      * Создать VkImageView
@@ -114,11 +125,6 @@ private:
      * Создать VkSampler
      */
     void CreateSampler();
-
-    /**
-     * Upload данных через staging buffer
-     */
-    void UploadData(const void* data, VkDeviceSize size);
 
     /**
      * Рассчитать количество mip levels

@@ -190,10 +190,21 @@ void CPhysicsShellHolder::activate_physic_shell()
 void CPhysicsShellHolder::setup_physic_shell()
 {
     VERIFY(!m_pPhysicsShell);
+    // Bone-less stub visual produces an empty physics shell. Activating /
+    // syncing such a shell crashes downstream (get_ElementSync indexes
+    // elements[0] without bounds check). Skip the whole setup — leaving
+    // m_pPhysicsShell == nullptr makes PHGetSyncItem / PHUnFreeze / etc.
+    // return early via their existing nullptr guards.
+    auto* kin = smart_cast<IKinematics*>(Visual());
+    if (!kin || kin->LL_BoneCount() == 0)
+    {
+        Msg("![CPhysicsShellHolder::setup_physic_shell] visual has no bones — physics disabled");
+        return;
+    }
     create_physic_shell();
     m_pPhysicsShell->Activate(XFORM(), 0, XFORM());
-    smart_cast<IKinematics*>(Visual())->CalculateBones_Invalidate();
-    smart_cast<IKinematics*>(Visual())->CalculateBones();
+    kin->CalculateBones_Invalidate();
+    kin->CalculateBones();
     m_pPhysicsShell->GetGlobalTransformDynamic(&XFORM());
 }
 

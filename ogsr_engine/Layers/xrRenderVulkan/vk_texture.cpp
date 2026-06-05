@@ -101,6 +101,21 @@ void CVulkanTexture::Create(u32 width, u32 height, VkFormat format, u32 mipLevel
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.flags = m_bCubemap ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
 
+    // Upload-target images are filled on the dedicated TRANSFER queue and sampled
+    // on GRAPHICS. With distinct families that's cross-family access — CONCURRENT
+    // sharing lets the contents (and the transfer-side layout transition) survive
+    // without queue-ownership-transfer barriers, which the transfer queue can't
+    // express for the final SHADER_READ transition anyway (no FRAGMENT_SHADER
+    // stage). Sampled textures aren't DCC-compressed, so the cost is negligible.
+    // Only for TRANSFER_DST images when the families actually differ.
+    const u32 imgFamilies[2] = { VulkanHW.m_GraphicsFamily, VulkanHW.m_TransferFamily };
+    if ((usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+        VulkanHW.m_TransferFamily != VulkanHW.m_GraphicsFamily) {
+        imageInfo.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+        imageInfo.queueFamilyIndexCount = 2;
+        imageInfo.pQueueFamilyIndices   = imgFamilies;
+    }
+
     // VMA allocation info - prefer device local memory
     VmaAllocationCreateInfo allocInfo = {};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -142,6 +157,10 @@ void CVulkanTexture::CreateFromData(const void* data, u32 width, u32 height, VkF
     if (m_Image == VK_NULL_HANDLE) {
         return;
     }
+    if (m_Allocation) {  // leak-dump name: procedural textures have no file name
+        char nm[32]; xr_sprintf(nm, "proc:%ux%u", width, height);
+        vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, nm);
+    }
 
     // Upload данных
     UploadData(data, dataSize);
@@ -150,55 +169,9 @@ void CVulkanTexture::CreateFromData(const void* data, u32 width, u32 height, VkF
 // Upload данных через staging buffer
 void CVulkanTexture::UploadData(const void* data, VkDeviceSize size)
 {
-    // Создаём staging buffer
-    CVulkanBuffer stagingBuffer;
-    stagingBuffer.Create(
-        size,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_HOST
-    );
-
-    // Копируем данные в staging
-    void* mapped = stagingBuffer.Map();
-    if (!mapped) {
-        Msg("![Vulkan] Failed to map staging buffer for texture");
-        stagingBuffer.Destroy();
-        return;
-    }
-
-    memcpy(mapped, data, size);
-    stagingBuffer.Flush();
-    stagingBuffer.Unmap();
-
-    // Создаём локальный command pool и buffer для upload
-    VkCommandPoolCreateInfo poolInfo = {};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = VulkanHW.m_GraphicsFamily;
-
-    VkCommandPool cmdPool;
-    VK_CHECK(vkCreateCommandPool(VulkanHW.m_Device, &poolInfo, nullptr, &cmdPool));
-
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = cmdPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd;
-    VK_CHECK(vkAllocateCommandBuffers(VulkanHW.m_Device, &allocInfo, &cmd));
-
-    // Begin command buffer
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
-
-    // Transition: UNDEFINED -> TRANSFER_DST
-    TransitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
-    // Prepare copy regions for mipmaps (and array layers for cubemaps)
-    // DDS cubemap layout: for each face, all mipmaps sequentially
+    // Prepare copy regions for mipmaps (and array layers for cubemaps).
+    // DDS cubemap layout: for each face, all mipmaps sequentially. bufferOffsets are
+    // relative to `data`; the async uploader rebases them into its staging ring.
     xr_vector<VkBufferImageCopy> regions;
     VkDeviceSize offset = 0;
 
@@ -245,28 +218,14 @@ void CVulkanTexture::UploadData(const void* data, VkDeviceSize size)
         }
     }
 
-    vkCmdCopyBufferToImage(cmd, stagingBuffer.m_Buffer, m_Image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (u32)regions.size(), regions.data());
-
-    // Transition: TRANSFER_DST -> SHADER_READ_ONLY
-    TransitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-    VK_CHECK(vkEndCommandBuffer(cmd));
-
-    // Submit и wait
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-
-    vkQueueSubmit(VulkanHW.m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(VulkanHW.m_GraphicsQueue);
-
-    // Cleanup command pool
-    vkDestroyCommandPool(VulkanHW.m_Device, cmdPool, nullptr);
-
-    // Cleanup staging buffer
-    stagingBuffer.Destroy();
+    // Async upload on the dedicated transfer queue — no per-texture command pool, no
+    // vkQueueWaitIdle, no per-upload staging buffer. Leaves the image in
+    // SHADER_READ_ONLY_OPTIMAL; the graphics frame's upload-timeline wait
+    // (FRAGMENT_SHADER) makes the copy+transition visible to samplers. The image is
+    // created CONCURRENT{graphics,transfer} so no queue-ownership transfer is needed.
+    CommandManager.UploadImage(m_Image, data, size, regions.data(), (u32)regions.size(),
+                               m_MipLevels, m_ArrayLayers);
+    m_CurrentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 // Transition image layout
@@ -427,7 +386,7 @@ void CVulkanTexture::Destroy()
 }
 
 // Загрузка DDS
-bool CVulkanTexture::LoadDDS(const char* filename)
+bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
 {
     IReader* F = FS.r_open(filename);
     if (!F) {
@@ -470,12 +429,10 @@ bool CVulkanTexture::LoadDDS(const char* filename)
                 FS.r_close(F);
                 return false;
         }
-        // X-Ray DDS BC blocks store BGR-ordered colour endpoints — Vulkan BC
-        // formats decode as RGB so we end up with R↔B swapped at sample time
-        // (yellow indicators come out blue without this). Confirmed via shader-
-        // side R/B swap test: swap fixes UI atlases, breaks RGBA8 video texture.
-        m_bBCSwizzle = true;
-        Msg("[VK-Tex] BC %s — bcSwizzle=1", filename);
+        // X-Ray UI atlases ship with BGR-ordered BC endpoints (yellow indicators
+        // come out blue without R↔B swap). Level statics are stock BC1/3 with
+        // RGB endpoints — `applyBCSwizzle=false` keeps them correct.
+        m_bBCSwizzle = applyBCSwizzle;
     } else if (header.ddspf.dwFlags & DDPF_RGB) {
         if (header.ddspf.dwRGBBitCount == 32) {
             // Choose format based on channel masks. D3DFMT_A8R8G8B8 (BGRA-in-
@@ -487,10 +444,6 @@ bool CVulkanTexture::LoadDDS(const char* filename)
             } else {
                 format = VK_FORMAT_B8G8R8A8_UNORM;
             }
-            Msg("[VK-Tex] RGBA8 %s — fmt=%s (Rmask=0x%X)",
-                filename,
-                format == VK_FORMAT_R8G8B8A8_UNORM ? "R8G8B8A8" : "B8G8R8A8",
-                header.ddspf.dwRBitMask);
         } else {
             Msg("![Vulkan] Unsupported RGB bit count: %d in %s", header.ddspf.dwRGBBitCount, filename);
             FS.r_close(F);
@@ -548,6 +501,9 @@ bool CVulkanTexture::LoadDDS(const char* filename)
 
     // Create texture
     Create(width, height, format, mipLevels);
+    // Tag the VMA allocation with the source file so any leaked image is
+    // identifiable by name in the vmaDestroyAllocator leak dump (see vma_impl.cpp).
+    if (m_Allocation) vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, filename);
 
     // Read remaining data
     VkDeviceSize dataSize = F->length() - F->tell();
@@ -567,7 +523,7 @@ bool CVulkanTexture::LoadDDS(const char* filename)
 }
 
 // Загрузка DDS cubemap (6 faces)
-bool CVulkanTexture::LoadDDSCubemap(const char* filename)
+bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle)
 {
     IReader* F = FS.r_open(filename);
     if (!F) {
@@ -617,8 +573,8 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename)
                 FS.r_close(F);
                 return false;
         }
-        // Same R↔B swizzle as 2D BC textures.
-        m_bBCSwizzle = true;
+        // Same R↔B swizzle policy as 2D BC: caller decides.
+        m_bBCSwizzle = applyBCSwizzle;
     } else if (header.ddspf.dwFlags & DDPF_RGB) {
         if (header.ddspf.dwRGBBitCount == 32) {
             format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -647,6 +603,7 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename)
         FS.r_close(F);
         return false;
     }
+    if (m_Allocation) vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, filename);  // leak-dump name
 
     // Read remaining data (all 6 faces with mipmaps)
     VkDeviceSize dataSize = F->length() - F->tell();

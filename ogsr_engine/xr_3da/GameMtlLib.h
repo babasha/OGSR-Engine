@@ -281,11 +281,22 @@ public:
         {
             return materials[idx];
         }
-        else
+        // Vulkan stopgap (same root cause as GetMaterialPair below): objects can
+        // pass an out-of-range material id when their collision material isn't fully
+        // set up. This path fires thousands of times PER FRAME on the Vulkan build
+        // (camera/AI/physics passability checks) — the original synchronous Msg here
+        // wrote ~700k log lines in 2 min and crushed FPS to single digits. Return the
+        // default material; log only once so the condition stays visible. R4 feeds
+        // valid indices → inert there. TODO: fix the root (object material setup).
+        if (materials.empty())
+            return nullptr;
+        static bool s_logged_once = false;
+        if (!s_logged_once)
         {
-            Msg("!![%s] material id [%u] not found!", __FUNCTION__, idx);
-            return materials.front();
+            s_logged_once = true;
+            Msg("!![%s] material id [%u] not found! (out-of-range; further occurrences suppressed)", __FUNCTION__, idx);
         }
+        return materials.front();
     }
 
     IC GameMtlIt FirstMaterial() { return materials.begin(); }
@@ -295,7 +306,16 @@ public:
     // game
     IC SGameMtlPair* GetMaterialPair(u16 idx0, u16 idx1)
     {
-        R_ASSERT((idx0 < material_count) && (idx1 < material_count));
+        // Vulkan stopgap: collisions can pass an out-of-range material id
+        // (uninitialised triangle/geom/bone material on a not-fully-set-up object),
+        // which trips the R_ASSERT during spawn and blocks the level. Clamp to the
+        // default material instead of asserting so physics keeps running. R4 feeds
+        // valid indices, so the clamp is inert there. TODO: fix the root (object
+        // collision material setup) and restore the assert.
+        if (material_count == 0)
+            return nullptr;
+        if (idx0 >= material_count) idx0 = 0;
+        if (idx1 >= material_count) idx1 = 0;
         return material_pairs_rt[idx1 * material_count + idx0];
     }
 

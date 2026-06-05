@@ -16,6 +16,12 @@
 
 void CAI_Crow::SAnim::Load(IKinematicsAnimated* visual, LPCSTR prefix)
 {
+    // Bone-less stub visual returns invalid MotionID for every name → list
+    // stays empty and the assert at the bottom fires. Skip when there's no
+    // skeleton; the crow stays inert at the spawn spot but doesn't crash.
+    auto* k = visual ? visual->dcast_PKinematics() : nullptr;
+    if (!k || k->LL_BoneCount() == 0) return;
+
     const MotionID& M = visual->ID_Cycle_Safe(prefix);
     if (M)
         m_Animations.push_back(M);
@@ -312,6 +318,10 @@ void CAI_Crow::shedule_Update(u32 DT)
     spatial.type &= ~STYPE_VISIBLEFORAI;
 
     inherited::shedule_Update(DT);
+
+    // [VK stub] crow with bone-less visual has no animations loaded → skip the state machine, the crow stays inert.
+    if (m_Anims.m_fly.m_Animations.empty())
+        return;
 
     if (st_target != st_current)
     {

@@ -11,7 +11,9 @@
 #include "../xrRender/r__dsgraph_structure.h"  // R_dsgraph_structure base class
 #include "../xrRender/Light_DB.h"  // CLight_DB
 #include "../xrRender/PSLibrary.h" // CPSLibrary for particle system
-#include "vk_HOM.h"               // vkCHOM (Vulkan HOM stub)
+// vk_HOM.h doesn't exist — vkCHOM only used as `vkCHOM*` pointer below,
+// forward decl is enough.
+class vkCHOM;
 #include "vk_sun_cascades.h"      // Sun cascade structures
 #include "../../xrCDB/Frustum.h"  // CFrustum for visibility culling
 #include "vk_rendergraph.h"       // CFrameGraph — render-graph barrier automation

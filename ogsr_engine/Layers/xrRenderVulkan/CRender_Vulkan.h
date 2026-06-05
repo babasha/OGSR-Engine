@@ -12,6 +12,14 @@
 #include "vk_core.h"
 #include "../../xr_3da/Render.h"
 #include "../../xr_3da/pure.h"
+#include "../../xr_3da/fmesh.h"  // FSlideWindowItem
+
+namespace VK { class CVulkanShader; class CVulkanBuffer; class CDetailManager; class CTreeManager; class CLODManager; }
+class vkModelPool;
+class vkCWallmarksEngine;
+class vkCHOM;
+class CStreamReader;
+class CSkeletonWallmark;  // shared SkeletonCustom.cpp -> append_SkeletonWallmark
 
 // Naming follows OGSR R4 convention: class CRender + global RImplementation.
 // The filename keeps the _Vulkan suffix so VK sources are obviously distinct
@@ -20,8 +28,57 @@
 class CRender : public IRender_interface, public pureFrame
 {
 public:
+    // ----- Level data ------------------------------------------------------
+    // Level-loaded shader table — index matches OGF visual `shader_id`.
+    // Populated by level_Load() from the fsL_SHADERS chunk; visuals look up
+    // their material via `Shaders[shader_id]->GetMaterial()`.
+    xr_vector<VK::CVulkanShader*>  Shaders;
+
+    // Level visuals (one per OGF entry in fsL_VISUALS chunk).
+    xr_vector<IRenderVisual*>      Visuals;
+
+    // Level vertex/index buffers — normal (`level.geom`) and extended/fast
+    // (`level.geomx`, used for shadow/HOM passes once those land).
+    xr_vector<VK::CVulkanBuffer*>  nVB, xVB;
+    xr_vector<VK::CVulkanBuffer*>  nIB, xIB;
+    xr_vector<u32>                 nVB_Strides, xVB_Strides;
+
+    // Sliding-window items (LOD index ranges per progressive mesh).
+    xr_vector<FSlideWindowItem>    SWIs;
+
+    BOOL                           b_loaded = FALSE;
+
+    // ----- Subsystems ------------------------------------------------------
+    // Real impl: vkModelPool. Created in CRender::create() once the device is
+    // up so model_Create can resolve names against `$level$` / `$game_meshes$`.
+    vkModelPool*                   Models   = nullptr;
+
+    // Stubs until those subsystems port over. nullptr is the working contract:
+    // rvk_loader.cpp and level_Unload guard with `if (X)` before touching them.
+    vkCWallmarksEngine*            Wallmarks = nullptr;
+    vkCHOM*                        HOM       = nullptr;
+    VK::CDetailManager*            Details   = nullptr;
+    VK::CTreeManager*              Trees     = nullptr;
+    VK::CLODManager*               LODs      = nullptr;
+
+    // ----- Render options (only the flags rvk_loader actually reads) -------
+    struct _options
+    {
+        u32 volumetricfog : 1;  // gates Load3DFluid (currently always 0)
+    } o{};
+
+public:
     CRender();
     ~CRender() override;
+
+    // ----- Level loading helpers (bodies in rvk_loader.cpp) ----------------
+    void LoadBuffers (CStreamReader* base_fs, BOOL alternative);
+    void LoadSWIs    (CStreamReader* base_fs);
+    FSlideWindowItem* getSWI(int id);   // resolve OGF_SWICONTAINER id → pooled SWI
+    void LoadVisuals (IReader* fs);
+    void LoadSectors (IReader* fs);
+    void LoadLights  (IReader* fs);
+    void Load3DFluid ();
 
     // ----- IRender_interface : Loading / Unloading --------------------------
     void create() override;
@@ -70,12 +127,18 @@ public:
     IRenderVisual* model_Create(LPCSTR name, IReader* data) override;
     IRenderVisual* model_CreateChild(LPCSTR name, IReader* data) override;
     IRenderVisual* model_Duplicate(IRenderVisual* V) override;
-    void model_Delete(IRenderVisual*& V, BOOL bDiscard) override;
+    void model_Delete(IRenderVisual*& V, BOOL bDiscard = FALSE) override;
     void model_Logging(BOOL bEnable) override;
     void models_Prefetch() override;
     void models_Clear(BOOL b_complete) override;
     void models_savePrefetch() override;
     void models_begin_prefetch1(bool val) override;
+
+    // Skeleton wallmarks (decals on skinned meshes). No-op for now — the Vulkan
+    // path doesn't render skeleton wallmarks yet. Shared SkeletonCustom.cpp calls
+    // this from CKinematics::AddWallmark. Param by const-ref so the definition
+    // needs only a forward decl of CSkeletonWallmark.
+    void append_SkeletonWallmark(const intrusive_ptr<CSkeletonWallmark>& wm);
 
     // ----- IRender_interface : Frame ----------------------------------------
     void Calculate() override;

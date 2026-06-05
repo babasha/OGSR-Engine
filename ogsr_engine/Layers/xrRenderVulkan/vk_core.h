@@ -9,6 +9,13 @@
 // Defined in rvk.cpp, declared extern here so it's accessible from xrEngine too
 extern bool g_bDeviceLost;
 
+// Triple-buffering depth — single source of truth for the renderer.
+// Per-frame GPU resources (command buffers, sync, descriptor pools, ring
+// allocators) all size their slot arrays from this. Classes alias it as
+// their own static FRAMES_IN_FLIGHT so existing Class::FRAMES_IN_FLIGHT
+// references keep working; change the value only here.
+inline constexpr u32 VK_FRAMES_IN_FLIGHT = 3;
+
 // Soft error checking macro — logs error, sets device-lost on fatal codes, but does NOT crash
 #define VK_CHECK(result) \
     do { \

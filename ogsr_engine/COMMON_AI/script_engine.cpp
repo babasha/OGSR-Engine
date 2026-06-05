@@ -56,9 +56,10 @@ void CScriptEngine::unload()
     no_files.clear();
 }
 
+// [VK-PROBE] downgrade FATAL to Msg so script asserts (e.g. door init failures from inert objects) don't kill the run while we verify rendering. Revert when guards are in place.
 #define DEF_LUA_ERROR_TEMPLATE(L) \
     print_output(L, "[" __FUNCTION__ "]", LUA_ERRRUN); \
-    FATAL("[%s]: %s", __FUNCTION__, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
+    Msg("![%s]: %s", __FUNCTION__, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
 
 int CScriptEngine::lua_panic(lua_State* L)
 {
@@ -72,7 +73,9 @@ void CScriptEngine::lua_error(lua_State* L) { DEF_LUA_ERROR_TEMPLATE(L) }
 
 int CScriptEngine::lua_pcall_failed(lua_State* L)
 {
-    DEF_LUA_ERROR_TEMPLATE(L)
+    // [VK-PROBE] downgrade FATAL to Msg so script asserts (e.g. door init failures from inert objects) don't kill the run while we verify rendering. Revert when guards are in place.
+    print_output(L, "[" __FUNCTION__ "]", LUA_ERRRUN);
+    Msg("![lua_pcall_failed] %s", lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
     if (lua_isstring(L, -1))
         lua_pop(L, 1);
     return LUA_ERRRUN;

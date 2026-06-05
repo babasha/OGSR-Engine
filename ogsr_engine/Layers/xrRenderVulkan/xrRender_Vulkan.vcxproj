@@ -97,6 +97,16 @@
     <ClInclude Include="vk_stub.h" />
     <ClInclude Include="vk_UIPipeline.h" />
     <ClInclude Include="vk_ui_shader.h" />
+    <ClInclude Include="vk_Visual.h" />
+    <ClInclude Include="vk_ModelPool.h" />
+    <ClInclude Include="vk_FBasicVisual.h" />
+    <ClInclude Include="vk_pass_context.h" />
+    <ClInclude Include="vk_pass_world.h" />
+    <ClInclude Include="vk_pass_sky.h" />
+    <ClInclude Include="vk_pipeline_cache.h" />
+    <ClInclude Include="vk_render_queue.h" />
+    <ClInclude Include="vk_world_material.h" />
+    <ClInclude Include="vk_KinematicsStub.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CRender_Vulkan.cpp" />
@@ -130,6 +140,32 @@
     <ClCompile Include="vk_swapchain.cpp" />
     <ClCompile Include="vk_sync.cpp" />
     <ClCompile Include="vk_UIRender.cpp" />
+    <ClCompile Include="vk_Visual.cpp" />
+    <ClCompile Include="vk_ModelPool.cpp" />
+    <ClCompile Include="rvk_loader.cpp" />
+    <ClCompile Include="vk_pass_world.cpp" />
+    <ClCompile Include="vk_pass_sky.cpp" />
+    <ClCompile Include="vk_pass_skinned.cpp" />
+    <ClCompile Include="vk_pipeline_cache.cpp" />
+    <ClCompile Include="vk_render_queue.cpp" />
+    <ClCompile Include="vk_world_material.cpp" />
+    <ClCompile Include="vk_KinematicsStub.cpp" />
+    <ClCompile Include="vk_R_Backend_min.cpp" />
+    <ClCompile Include="vk_FHierrarhyVisual.cpp" />
+    <ClCompile Include="vk_SkeletonX.cpp" />
+    <ClCompile Include="vk_SkeletonStubs.cpp" />
+    <ClCompile Include="vk_SkeletonRigid.cpp" />
+    <ClCompile Include="vk_SkeletonCustom.cpp" />
+    <ClCompile Include="vk_SkeletonAnimated.cpp" />
+
+    <ClCompile Include="vk_Detail.cpp" />
+    <ClCompile Include="vk_DetailManager.cpp" />
+    <ClCompile Include="vk_DetailManager_Render.cpp" />
+    <ClCompile Include="vk_TreeManager.cpp" />
+    <ClCompile Include="vk_TreeManager_Render.cpp" />
+    <ClCompile Include="vk_LODManager.cpp" />
+    <ClCompile Include="..\xrRender\ETextureParams.cpp" />
+    <ClCompile Include="..\xrRender\Animation.cpp" />  <!-- animation::channels for CKinematicsAnimated -->
     <ClCompile Include="vma_impl.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

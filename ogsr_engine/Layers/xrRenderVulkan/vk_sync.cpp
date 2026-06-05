@@ -23,7 +23,7 @@ void CVulkanSync::Create()
 
     for (u32 i = 0; i < FRAMES_IN_FLIGHT; i++) {
         VK_CHECK_CRITICAL(vkCreateSemaphore(VulkanHW.m_Device, &semaphoreInfo, nullptr, &m_FrameSync[i].imageAvailable));
-        VK_CHECK_CRITICAL(vkCreateSemaphore(VulkanHW.m_Device, &semaphoreInfo, nullptr, &m_FrameSync[i].renderFinished));
+        // renderFinished is per swapchain image now (CVulkanSwapchain::m_RenderFinished).
         VK_CHECK_CRITICAL(vkCreateFence(VulkanHW.m_Device, &fenceInfo, nullptr, &m_FrameSync[i].inFlightFence));
     }
 
@@ -39,11 +39,6 @@ void CVulkanSync::Destroy()
         if (m_FrameSync[i].imageAvailable != VK_NULL_HANDLE) {
             vkDestroySemaphore(VulkanHW.m_Device, m_FrameSync[i].imageAvailable, nullptr);
             m_FrameSync[i].imageAvailable = VK_NULL_HANDLE;
-        }
-
-        if (m_FrameSync[i].renderFinished != VK_NULL_HANDLE) {
-            vkDestroySemaphore(VulkanHW.m_Device, m_FrameSync[i].renderFinished, nullptr);
-            m_FrameSync[i].renderFinished = VK_NULL_HANDLE;
         }
 
         if (m_FrameSync[i].inFlightFence != VK_NULL_HANDLE) {

@@ -28,7 +28,9 @@ namespace VulkanUI
     extern u32             s_UIVertexOffset;
     extern VkDescriptorSet s_WhiteTextureSet;
     extern bool            s_bUIPassActive;
-    extern VkPipeline      s_Pipeline;
+    extern VkPipeline      s_Pipeline;          // TRIANGLE_LIST
+    extern VkPipeline      s_PipelineLineList;   // LINE_LIST  (crosshair)
+    extern VkPipeline      s_PipelineLineStrip;  // LINE_STRIP (UIWindow borders)
     extern VkPipelineLayout s_PipelineLayout;
     extern VkDescriptorSetLayout s_DescriptorSetLayout;
     extern VkDescriptorPool s_DescriptorPool;
@@ -49,6 +51,8 @@ namespace VulkanUI
         u32 vertexCount;
         VkDescriptorSet textureSet;
         VkRect2D scissorRect;
+        VkPipeline pipeline;   // topology-specific pipeline (line vs triangle); null = default triangle list
+
     };
     static const u32 MAX_DEFERRED_CMDS = 4096;
     extern DeferredUICmd s_DeferredCmds[MAX_DEFERRED_CMDS];

@@ -2,8 +2,11 @@
 
 #include "../../xrCore/xr_resource.h"
 #include "tss_def.h"
+#include "xrD3DDefs.h" // brings in D3D type stubs / typedefs per backend
 
+#if defined(USE_DX10) || defined(USE_DX11)
 #include "../xrRenderDX10/StateManager/dx10State.h"
+#endif
 
 #pragma pack(push, 4)
 

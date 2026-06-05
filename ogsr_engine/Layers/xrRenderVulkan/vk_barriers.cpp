@@ -198,4 +198,19 @@ void MemoryBarrier(VkCommandBuffer cmd,
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
+// ---------------------------------------------------------------------------
+// SceneAttachmentBarrier — inter-pass color+depth ordering, no layout change.
+// ---------------------------------------------------------------------------
+void SceneAttachmentBarrier(VkCommandBuffer cmd)
+{
+    MemoryBarrier(cmd,
+        // src: prior pass finished writing color (and late depth)
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        // dst: next pass loads/tests color + depth (early depth test, blend reads color)
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT
+        | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+}
+
 } // namespace VK

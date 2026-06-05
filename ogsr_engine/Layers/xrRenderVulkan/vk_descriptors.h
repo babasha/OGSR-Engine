@@ -127,7 +127,7 @@ private:
     VkDescriptorSetLayout m_LightingLayout    = VK_NULL_HANDLE;  // Set 3
 
     // Descriptor Pools (one per frame-in-flight to avoid vkDeviceWaitIdle)
-    static constexpr u32 FRAMES_IN_FLIGHT = 3;
+    static constexpr u32 FRAMES_IN_FLIGHT = VK_FRAMES_IN_FLIGHT;
     VkDescriptorPool m_Pools[FRAMES_IN_FLIGHT] = {};
     u32 m_CurrentFrame = 0;
 

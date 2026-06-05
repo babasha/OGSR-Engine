@@ -423,11 +423,12 @@ void CInventoryItem::load(IReader& packet)
     if (!object().PPhysicsShell())
     {
         object().setup_physic_shell();
+        if (!object().PPhysicsShell()) return;  // bone-less stub → setup bailed
         object().PPhysicsShell()->Disable();
     }
 
     object().PHLoadState(packet);
-    object().PPhysicsShell()->Disable();
+    if (object().PPhysicsShell()) object().PPhysicsShell()->Disable();
 }
 
 void CInventoryItem::reload(LPCSTR section)

@@ -79,6 +79,27 @@ struct UITextureSlot
 
 static std::unordered_map<std::string, UITextureSlot*> g_UITextureCache;
 
+// Teardown: free every cached UI-texture slot's GPU resources before the VMA
+// allocator + device are destroyed. Each slot's VkImage / video staging buffer
+// is released by ~UITextureSlot (its CVulkanTexture / CVulkanBuffer members'
+// dtors call Destroy()); descSet objects are freed implicitly when VulkanUI's
+// descriptor pool is destroyed. Without this the whole UI/map/font/HUD texture
+// set (and a video staging buffer) leaked all the way to vmaDestroyAllocator →
+// VMA "Some allocations were not freed" assert on exit. Called from
+// VulkanUI::Destroy() (runs before CVulkanHW::DestroyDevice). Must run while the
+// device + allocator are still valid.
+void VK_ClearUITextureCache()
+{
+    for (auto& kv : g_UITextureCache)
+    {
+        UITextureSlot* slot = kv.second;
+        if (!slot) continue;
+        if (slot->pTheora) xr_delete(slot->pTheora);
+        xr_delete(slot);  // ~UITextureSlot → texture.Destroy() + videoStaging.Destroy()
+    }
+    g_UITextureCache.clear();
+}
+
 struct vkUIShader_Real final : IVkUIShader
 {
     xr_string      m_TexName;
@@ -227,21 +248,6 @@ private:
     // Decode latest Theora frame, convert YUV→RGB, push to slot.texture.
     static void tickVideoSlot(UITextureSlot& slot)
     {
-        // Bind heartbeat — counts how many GetDescriptorSet calls reached this
-        // function in the last second, regardless of whether a new frame
-        // decoded. If this stops, the OGM shader has stopped being bound for
-        // rendering.
-        static u32 binds = 0;
-        static u32 lastLogFrame = 0;
-        ++binds;
-        if (Device.dwFrame > lastLogFrame + 60) {
-            Msg("[VK-Theora] heartbeat: %u binds in last %u frames (sync=%u, playing=%d)",
-                binds, Device.dwFrame - lastLogFrame, slot.videoSyncTime,
-                slot.pTheora ? slot.pTheora->IsPlaying() : 0);
-            binds = 0;
-            lastLogFrame = Device.dwFrame;
-        }
-
         if (slot.videoLastUploadFrame == Device.dwFrame) return;
         slot.videoLastUploadFrame = Device.dwFrame;
 

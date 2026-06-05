@@ -41,6 +41,7 @@ void CStepManager::reload(LPCSTR section)
     m_steps_map.clear();
 
     IKinematicsAnimated* skeleton_animated = smart_cast<IKinematicsAnimated*>(m_object->Visual());
+    if (!skeleton_animated) return;  // dummy visual — no animations to map
 
     for (u32 i = 0; pSettings->r_line(anim_section, i, &anim_name, &val); ++i)
     {
@@ -247,7 +248,11 @@ void CStepManager::load_foot_bones(CInifile::Sect& data)
 
 void CStepManager::reload_foot_bones()
 {
-    CInifile* ini = smart_cast<IKinematics*>(m_object->Visual())->LL_UserData();
+    // [VK stub] no skinned visual → no UserData and no section in pSettings — bail.
+    auto* K = smart_cast<IKinematics*>(m_object->Visual());
+    if (!K || K->LL_BoneCount() == 0) return;
+
+    CInifile* ini = K->LL_UserData();
     if (ini && ini->section_exist("foot_bones"))
     {
         load_foot_bones(ini->r_section("foot_bones"));
@@ -255,7 +260,10 @@ void CStepManager::reload_foot_bones()
     else
     {
         if (!pSettings->line_exist(*m_object->cNameSect(), "foot_bones"))
-            R_ASSERT2(false, "section [foot_bones] not found in monster user_data");
+        {
+            Msg("![CStepManager::reload_foot_bones] section [foot_bones] missing for [%s] — skipped", m_object->cNameSect().c_str());
+            return;
+        }
         load_foot_bones(pSettings->r_section(pSettings->r_string(*m_object->cNameSect(), "foot_bones")));
     }
 

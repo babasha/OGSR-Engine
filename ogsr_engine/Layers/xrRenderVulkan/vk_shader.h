@@ -55,6 +55,11 @@ public:
     shared_str m_TexDiffuse;   // Base texture (T_Base from .thm)
     shared_str m_TexNormal;    // Normal map (T_Bump from .thm)
     shared_str m_TexSpecular;  // Specular map (optional)
+    // Lightmap (3rd entry of the level shader's texture list, e.g.
+    // "lmap#####"). Present on lmap-style materials (tcOffset==24); empty
+    // on vert-lit materials. WorldMaterialCache uses it to bind a real
+    // lightmap at descriptor binding 2 instead of the 1×1 white fallback.
+    shared_str m_TexLmap;
 
     // Pipeline configuration
     VK::PipelineConfig m_PipelineConfig;

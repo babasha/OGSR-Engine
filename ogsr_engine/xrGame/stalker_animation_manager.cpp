@@ -71,6 +71,11 @@ void CStalkerAnimationManager::reload(CAI_Stalker* _object)
     m_skeleton_animated = smart_cast<IKinematicsAnimated*>(m_visual);
     VERIFY(m_skeleton_animated);
 
+    // Bone-less stub visual → no motions, no skeleton, no animation manager.
+    // Bail before LL_GetMotionDef returns nullptr and we deref ->bone_or_part.
+    auto* k_check = m_skeleton_animated ? m_skeleton_animated->dcast_PKinematics() : nullptr;
+    if (!k_check || k_check->LL_BoneCount() == 0) return;
+
     m_data_storage = stalker_animation_data_storage().object(m_skeleton_animated);
     VERIFY(m_data_storage);
 

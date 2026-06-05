@@ -162,6 +162,13 @@ public:
         VkCommandBuffer cmd = g_VkUI_FrameCmd;
         const u32 vertexSize = (m_PointType == pttTL) ? sizeof(FVF::TL) : sizeof(FVF::LIT);
 
+        // Select the pipeline matching the requested primitive topology. R4 maps
+        // ptLineList/ptLineStrip to D3D line topology; without this the crosshair's
+        // line vertices assemble into stray stretched triangles (the "sky spike").
+        VkPipeline pipe = VulkanUI::s_Pipeline;
+        if (m_PrimitiveType == IUIRender::ptLineList  && VulkanUI::s_PipelineLineList)  pipe = VulkanUI::s_PipelineLineList;
+        else if (m_PrimitiveType == IUIRender::ptLineStrip && VulkanUI::s_PipelineLineStrip) pipe = VulkanUI::s_PipelineLineStrip;
+
         if (!cmd) {
             // Deferred path: vertex data already in mapped buffer; queue draw.
             if (VulkanUI::s_DeferredCmdCount < VulkanUI::MAX_DEFERRED_CMDS) {
@@ -170,6 +177,7 @@ public:
                 dcmd.vertexBufferOffset = VulkanUI::s_UIVertexOffset;
                 dcmd.vertexCount        = vertCount;
                 dcmd.textureSet         = m_CurrentTextureSet;
+                dcmd.pipeline           = pipe;
             } else { ++VulkanUI::s_FrameStats.droppedCmds; }
             VulkanUI::s_FrameStats.totalVerts += vertCount;
             VulkanUI::s_UIVertexOffset += vertCount * vertexSize;
@@ -182,7 +190,7 @@ public:
         if (!VulkanUI::s_bUIPassActive) VulkanUI::BeginUIPassInternal();
         if (VulkanUI::s_Pipeline == VK_NULL_HANDLE) return;
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, VulkanUI::s_Pipeline);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         float screenSize[2] = { (float)Device.dwWidth, (float)Device.dwHeight };
         vkCmdPushConstants(cmd, VulkanUI::s_PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, screenSize);
 

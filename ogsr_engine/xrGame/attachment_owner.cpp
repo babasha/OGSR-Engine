@@ -92,7 +92,11 @@ void CAttachmentOwner::attach(CInventoryItem* inventory_item)
         VERIFY(game_object && game_object->Visual());
         if (m_attached_objects.empty())
             game_object->add_visual_callback(AttachmentCallback);
-        const u16 bone_id = smart_cast<IKinematics*>(game_object->Visual())->LL_BoneID(attachable_item->bone_name());
+        // Bone-less stub visual → LL_BoneID returns BI_NONE for every name.
+        // Skip silently; the attachment just doesn't get parented to a bone.
+        auto* k_check = smart_cast<IKinematics*>(game_object->Visual());
+        if (!k_check || k_check->LL_BoneCount() == 0) return;
+        const u16 bone_id = k_check->LL_BoneID(attachable_item->bone_name());
         ASSERT_FMT(bone_id != BI_NONE, "!![%s] attach_bone_name [%s] in section [%s] not found in game object [%s] with visual [%s]", __FUNCTION__,
                    attachable_item->bone_name().c_str(), smart_cast<CGameObject*>(inventory_item)->cNameSect().c_str(), game_object->cNameSect().c_str(),
                    game_object->Visual()->getDebugName().c_str());

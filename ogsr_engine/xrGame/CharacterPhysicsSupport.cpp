@@ -564,12 +564,16 @@ void CCharacterPhysicsSupport::CreateSkeleton(CPhysicsShell*& pShell)
     R_ASSERT2(!pShell, "pShell already initialized!!");
     if (!m_EntityAlife.Visual())
         return;
+    // Bone-less stub visual → preBuild_FromKinematics derefs nullptr bone data.
+    // Skip skeleton physics build; NPC will exist visually-only.
+    auto* k = smart_cast<IKinematics*>(m_EntityAlife.Visual());
+    if (!k || k->LL_BoneCount() == 0) return;
 #ifdef DEBUG
     CTimer t;
     t.Start();
 #endif
     pShell = P_create_Shell();
-    pShell->preBuild_FromKinematics(smart_cast<IKinematics*>(m_EntityAlife.Visual()));
+    pShell->preBuild_FromKinematics(k);
     pShell->mXFORM.set(mXFORM);
     pShell->SetAirResistance(skel_airr_lin_factor, skel_airr_ang_factor);
     pShell->SmoothElementsInertia(0.3f);
@@ -664,6 +668,10 @@ void CCharacterPhysicsSupport::ActivateShell(CObject* who)
     destroy_animation_collision();
 
     IKinematics* K = smart_cast<IKinematics*>(m_EntityAlife.Visual());
+    // Bone-less stub visual → CreateSkeleton above bailed and m_physics_skeleton
+    // stays null; the entire ActivateShell expects a populated skeleton (root
+    // bone, bone callbacks, physics shell). Skip silently.
+    if (!K || K->LL_BoneCount() == 0) return;
 
     // animation movement controller issues
     bool anim_mov_ctrl = m_EntityAlife.animation_movement_controlled();
@@ -855,6 +863,17 @@ void CCharacterPhysicsSupport::PHGetLinearVell(Fvector& velocity)
 void CCharacterPhysicsSupport::CreateIKController()
 {
     VERIFY(!m_ik_controller);
+    // IK system reads bone IDs from the visual's skeleton (bip01_l_thigh,
+    // bip01_l_foot, ...). On the renderer's bone-less stub all lookups
+    // return BI_NONE and CIKFoot::set_toe ends up indexing an empty
+    // bind-transform vector. Skip IK setup until skinned-mesh support
+    // brings real skeletons.
+    auto* k = smart_cast<IKinematics*>(m_EntityAlife.Visual());
+    if (!k || k->LL_BoneCount() == 0)
+    {
+        Msg("![CCharacterPhysicsSupport::CreateIKController] visual has no bones — IK disabled");
+        return;
+    }
     m_ik_controller = xr_new<CIKLimbsController>();
     m_ik_controller->Create(&m_EntityAlife);
 }

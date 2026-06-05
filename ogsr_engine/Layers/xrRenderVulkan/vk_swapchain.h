@@ -17,6 +17,16 @@ public:
     VkExtent2D               m_Extent     = {};
     u32                      m_ImageCount = 0;
 
+    // Per-swapchain-image "render finished" semaphores (signaled by the frame's
+    // queue submit, waited by vkQueuePresentKHR). MUST be indexed by the acquired
+    // imageIndex, NOT by frame-in-flight: a binary semaphore signaled by submit is
+    // only freed once its present has executed, and an image isn't re-acquired
+    // until its present completed — so a per-image semaphore is guaranteed
+    // unsignaled before the next submit re-signals it. Indexing by frame-in-flight
+    // (acquire can return images in any order) lets a submit re-signal a semaphore
+    // a pending present still owns → VUID-vkQueueSubmit-pSignalSemaphores-00067.
+    std::vector<VkSemaphore> m_RenderFinished;
+
     // Depth buffer
     VkImage       m_DepthImage      = VK_NULL_HANDLE;
     VkImageView   m_DepthView       = VK_NULL_HANDLE;

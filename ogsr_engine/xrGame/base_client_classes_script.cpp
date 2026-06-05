@@ -202,9 +202,13 @@ void CPatrolPathScript::script_register(lua_State* L)
 
 luabind::object script_texture_find(const char* name)
 {
-    auto textures = Device.m_pRender->GetResourceManager()->FindTexture(name);
-
     auto table = luabind::newtable(ai().script_engine().lua());
+
+    // Vulkan: texture resource manager not ported (GetResourceManager() == null).
+    if (!Device.m_pRender || !Device.m_pRender->GetResourceManager())
+        return table;
+
+    auto textures = Device.m_pRender->GetResourceManager()->FindTexture(name);
 
     for (const auto& tex : textures)
         table[tex->GetName()] = tex; // key - texture name, value - texture object

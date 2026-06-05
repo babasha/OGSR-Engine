@@ -3,6 +3,7 @@
 #include "xr_fixed_map.h"
 
 class dxRender_Visual;
+struct FloraVertData; // R_Backend.h has the full def — forward decl is enough for `T*` in vector
 
 namespace R_dsgraph
 {

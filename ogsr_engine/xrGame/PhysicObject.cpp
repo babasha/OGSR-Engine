@@ -45,6 +45,14 @@ BOOL CPhysicObject::net_Spawn(CSE_Abstract* DC)
     setVisible(TRUE);
     setEnabled(TRUE);
 
+    // Bone-less stub visual → shell built with zero elements. Every PPhysicsShell
+    // deref below (isBreakable, applyImpulse, getMass, Animated, position update)
+    // crashes on `*elements.begin()`. Bail post-Spawn and let the object exist
+    // visually-only without physics.
+    auto* k_check = smart_cast<IKinematics*>(Visual());
+    if (!k_check || k_check->LL_BoneCount() == 0)
+        return TRUE;
+
     if (!PPhysicsShell()->isBreakable() && !CScriptBinder::object() && !CPHSkeleton::IsRemoving())
         SheduleUnregister();
 
@@ -90,7 +98,7 @@ void CPhysicObject::RunStartupAnim(CSE_Abstract* D)
 void CPhysicObject::net_Destroy()
 {
 #ifdef ANIMATED_PHYSICS_OBJECT_SUPPORT
-    if (PPhysicsShell()->Animated())
+    if (PPhysicsShell() && PPhysicsShell()->Animated())  // [VK stub] shell may be null when stub-kinematics bailed during net_Spawn
     {
         processing_deactivate();
     }
@@ -117,10 +125,16 @@ void CPhysicObject::CreateSkeleton(CSE_ALifeObjectPhysic* po)
         return;
     if (!Visual())
         return;
+    // P_build_Shell resolves fixed_bones via LL_BoneID — bone-less stub returns
+    // BI_NONE and the function R_ASSERTs ("wrong fixed bone"). Skip the entire
+    // shell build until skinned-mesh support lands.
+    auto* k = smart_cast<IKinematics*>(Visual());
+    if (!k || k->LL_BoneCount() == 0) return;
+
     LPCSTR fixed_bones = *po->fixed_bones;
     m_pPhysicsShell = P_build_Shell(this, !po->_flags.test(CSE_PHSkeleton::flActive), fixed_bones);
     ApplySpawnIniToPhysicShell(&po->spawn_ini(), m_pPhysicsShell, fixed_bones[0] != '\0');
-    ApplySpawnIniToPhysicShell(smart_cast<IKinematics*>(Visual())->LL_UserData(), m_pPhysicsShell, fixed_bones[0] != '\0');
+    ApplySpawnIniToPhysicShell(k->LL_UserData(), m_pPhysicsShell, fixed_bones[0] != '\0');
 }
 
 void CPhysicObject::Load(LPCSTR section)
@@ -141,7 +155,7 @@ void CPhysicObject::UpdateCL()
 #ifdef ANIMATED_PHYSICS_OBJECT_SUPPORT
     //Если наш физический объект анимированный, то
     //двигаем объект за анимацией
-    if (m_pPhysicsShell->PPhysicsShellAnimator())
+    if (m_pPhysicsShell && m_pPhysicsShell->PPhysicsShellAnimator())  // [VK stub] shell may be null when stub-kinematics bailed during net_Spawn
     {
         m_pPhysicsShell->PPhysicsShellAnimator()->OnFrame();
     }
@@ -252,6 +266,11 @@ void CPhysicObject::CreateBody(CSE_ALifeObjectPhysic* po)
     }
     break;
     }
+
+    // CreateSkeleton may have bailed early (bone-less stub) leaving the shell
+    // un-built. Skip XFORM/AirResistance setup — net_Spawn's bone-count guard
+    // handles the rest of the lifecycle.
+    if (!m_pPhysicsShell) return;
 
     m_pPhysicsShell->mXFORM.set(XFORM());
     m_pPhysicsShell->SetAirResistance(0.001f, 0.02f);

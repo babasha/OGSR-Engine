@@ -171,6 +171,16 @@ void CVulkanSwapchain::Create(u32 width, u32 height)
         VK_CHECK(vkCreateImageView(VulkanHW.m_Device, &viewInfo, nullptr, &m_ImageViews[i]));
     }
 
+    // Per-image "render finished" semaphores — one per swapchain image, waited by
+    // vkQueuePresentKHR (see m_RenderFinished doc in the header). Created here and
+    // destroyed in Destroy() so they track the image set across resizes.
+    m_RenderFinished.resize(imageCount);
+    for (u32 i = 0; i < imageCount; i++) {
+        VkSemaphoreCreateInfo semInfo = {};
+        semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        VK_CHECK(vkCreateSemaphore(VulkanHW.m_Device, &semInfo, nullptr, &m_RenderFinished[i]));
+    }
+
     // Создаём depth buffer
     CreateDepthResources();
 
@@ -184,6 +194,13 @@ void CVulkanSwapchain::Destroy()
 
     // Уничтожаем depth buffer
     DestroyDepthResources();
+
+    // Per-image render-finished semaphores. Recreate() calls vkDeviceWaitIdle
+    // first, so no submit/present still references them here.
+    for (auto sem : m_RenderFinished) {
+        if (sem != VK_NULL_HANDLE) vkDestroySemaphore(VulkanHW.m_Device, sem, nullptr);
+    }
+    m_RenderFinished.clear();
 
     // Уничтожаем image views
     for (auto imageView : m_ImageViews) {
@@ -297,11 +314,18 @@ VkFormat CVulkanSwapchain::FindSupportedFormat(const std::vector<VkFormat>& cand
 // Поиск depth формата
 VkFormat CVulkanSwapchain::FindDepthFormat()
 {
-    // Prefer depth+stencil formats (accumulator uses stencil test for deferred light volumes)
+    // Prefer the depth-only D32_SFLOAT. The forward Vulkan renderer never uses
+    // stencil (every pipeline leaves stencilAttachmentFormat = UNDEFINED and
+    // stencilTestEnable = FALSE). Picking a depth+stencil format would force the
+    // depth barrier/view to carry a stencil aspect while the attachment layout is
+    // DEPTH_ATTACHMENT_OPTIMAL (depth-only) — that mismatch trips
+    // VUID-VkImageMemoryBarrier2-aspectMask-08703. Depth+stencil formats stay as
+    // fallbacks (D32_SFLOAT is a mandatory format, so they should never be reached).
+    // When the deferred path is un-parked and needs stencil, revisit this.
     std::vector<VkFormat> candidates = {
-        VK_FORMAT_D32_SFLOAT_S8_UINT,   // 32-bit float depth + 8-bit stencil (preferred)
-        VK_FORMAT_D24_UNORM_S8_UINT,    // 24-bit depth + 8-bit stencil
-        VK_FORMAT_D32_SFLOAT,           // 32-bit float depth only (fallback, no stencil)
+        VK_FORMAT_D32_SFLOAT,           // 32-bit float depth only (preferred, no stencil)
+        VK_FORMAT_D32_SFLOAT_S8_UINT,   // 32-bit float depth + 8-bit stencil (fallback)
+        VK_FORMAT_D24_UNORM_S8_UINT,    // 24-bit depth + 8-bit stencil (fallback)
     };
 
     VkFormat format = FindSupportedFormat(
@@ -337,7 +361,9 @@ void CVulkanSwapchain::CreateDepthResources()
     imageInfo.format = m_DepthFormat;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // SAMPLED_BIT lets the grass HZB-build compute pass sample this depth buffer
+    // (max-reduce into the Hi-Z pyramid). Harmless for attachment usage.
+    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 

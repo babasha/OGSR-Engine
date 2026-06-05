@@ -181,6 +181,12 @@ u32 CControlAnimationBase::get_animation_variants_count(EMotionAnim anim) const
 
 void CControlAnimationBase::select_animation(bool anim_end)
 {
+    // [VK stub] no skeleton → no animations loaded; ID_Cycle_Safe will return
+    // invalid for any name and the FATAL below would fire.
+    if (auto* skel = smart_cast<IKinematicsAnimated*>(m_object->Visual());
+        !skel || !skel->dcast_PKinematics() || skel->dcast_PKinematics()->LL_BoneCount() == 0)
+        return;
+
     // start new animation
     SControlAnimationData* ctrl_data = (SControlAnimationData*)m_man->data(this, ControlCom::eControlAnimation);
     if (!ctrl_data)
@@ -498,6 +504,11 @@ void CControlAnimationBase::ValidateAnimation()
 void CControlAnimationBase::UpdateAnimCount()
 {
     IKinematicsAnimated* skel = smart_cast<IKinematicsAnimated*>(m_object->Visual());
+
+    // [VK stub] no skeleton → ID_Cycle_Safe returns invalid for every name and
+    // the count==0 R_ASSERT below would fire. Bail; monster stays inert.
+    if (!skel || !skel->dcast_PKinematics() || skel->dcast_PKinematics()->LL_BoneCount() == 0)
+        return;
 
     for (auto it = m_anim_storage.begin(); it != m_anim_storage.end(); it++)
     {

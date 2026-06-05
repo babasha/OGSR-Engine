@@ -5,11 +5,14 @@
 #pragma once
 #include "vk_core.h"
 
-// Synchronization для одного frame
+// Synchronization для одного frame-in-flight.
+// NOTE: the "render finished" semaphore is NOT here — it must be per swapchain
+// IMAGE (CVulkanSwapchain::m_RenderFinished), not per frame-in-flight, to satisfy
+// VUID-vkQueueSubmit-pSignalSemaphores-00067. imageAvailable + inFlightFence stay
+// per-frame: the fence gates their reuse.
 struct FrameSync
 {
     VkSemaphore imageAvailable;  // Signaled когда swapchain image acquired
-    VkSemaphore renderFinished;  // Signaled когда rendering complete
     VkFence     inFlightFence;   // CPU-GPU sync
 };
 
@@ -17,7 +20,7 @@ struct FrameSync
 class CVulkanSync
 {
 public:
-    static constexpr u32 FRAMES_IN_FLIGHT = 3;
+    static constexpr u32 FRAMES_IN_FLIGHT = VK_FRAMES_IN_FLIGHT;
 
 private:
     FrameSync m_FrameSync[FRAMES_IN_FLIGHT];

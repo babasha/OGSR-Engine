@@ -184,7 +184,10 @@ BOOL CCar::net_Spawn(CSE_Abstract* DC)
 
     CDamagableItem::RestoreEffect();
 
-    CInifile* pUserData = PKinematics(Visual())->LL_UserData();
+    auto* k_check = PKinematics(Visual());
+    CInifile* pUserData = k_check ? k_check->LL_UserData() : nullptr;
+    if (!pUserData)
+        return TRUE;  // bone-less stub — skip car-specific setup
     if (pUserData->section_exist("destroyed"))
         CPHDestroyable::Load(pUserData, "destroyed");
     if (pUserData->section_exist("mounted_weapon_definition"))
@@ -319,6 +322,13 @@ void CCar::RestoreNetState(CSE_PHSkeleton* /*po*/)
 {
     auto obj = PPhysicsShellHolder();
     if (!obj)
+        return;
+    // Bone-less stub visual → physics shell is null OR empty (no elements
+    // built from skeleton bones). Either case makes GetGlobalTransformDynamic
+    // identity-fallback and CPHActivationShape::Create fail dBodyStateValide.
+    // Bail when the visual has no skeleton.
+    auto* k_check = smart_cast<IKinematics*>(Visual());
+    if (!k_check || k_check->LL_BoneCount() == 0 || !PPhysicsShell())
         return;
     auto se_obj = obj->alife_object();
     if (!se_obj)
@@ -466,6 +476,11 @@ BOOL CCar::AlwaysTheCrow() { return (m_car_weapon && m_car_weapon->IsActive()); 
 
 void CCar::UpdateCL()
 {
+    // [VK stub] inert car (skinned-mesh stub) skipped ParseDefinitions/Init —
+    // PhysicsShell etc. are uninitialised. VisualUpdate would deref null.
+    if (auto* K = smart_cast<IKinematics*>(Visual()); !K || K->LL_BoneCount() == 0)
+        return;
+
     inherited::UpdateCL();
     CExplosive::UpdateCL();
     if (m_car_weapon)
@@ -742,7 +757,13 @@ void CCar::ParseDefinitions()
     IKinematics* pKinematics = smart_cast<IKinematics*>(Visual());
     bone_map.insert(mk_pair(pKinematics->LL_GetBoneRoot(), physicsBone()));
     CInifile* ini = pKinematics->LL_UserData();
-    R_ASSERT2(ini, "Car has no description !!! See ActorEditor Object - UserData");
+    if (!ini)
+    {
+        // Bone-less stub visual → no UserData. Car remains inert (no wheels,
+        // engine, doors mapping); spawn proceeds.
+        Msg("![CCar::ParseDefinitions] no UserData (renderer stub) — car inert");
+        return;
+    }
     CExplosive::Load(ini, "explosion");
     // CExplosive::SetInitiator(ID());
     m_camera_position = ini->r_fvector3("car_definition", "camera_pos");
@@ -869,8 +890,12 @@ void CCar::Init()
 
     // get reference wheel radius
     IKinematics* pKinematics = smart_cast<IKinematics*>(Visual());
-    CInifile* ini = pKinematics->LL_UserData();
-    R_ASSERT2(ini, "Car has no description !!! See ActorEditor Object - UserData");
+    CInifile* ini = pKinematics ? pKinematics->LL_UserData() : nullptr;
+    if (!ini)
+    {
+        Msg("![CCar::Init] no UserData (renderer stub) — car remains inert");
+        return;
+    }
     /// SWheel& ref_wheel=m_wheels_map.find(pKinematics->LL_BoneID(ini->r_string("car_definition","reference_wheel")))->second;
 
     if (ini->section_exist("air_resistance"))
@@ -1721,6 +1746,11 @@ void CCar::ResetScriptData(void* P) { CScriptEntity::ResetScriptData(P); }
 
 void CCar::PhDataUpdate(dReal step)
 {
+    // [VK stub] inert car — Init/ParseDefinitions skipped, m_pPhysicsShell null,
+    // wheels/engine state uninitialised. UpdatePower etc. would AV.
+    if (auto* K = smart_cast<IKinematics*>(Visual()); !K || K->LL_BoneCount() == 0)
+        return;
+
     if (m_repairing)
         Revert();
     LimitWheels();

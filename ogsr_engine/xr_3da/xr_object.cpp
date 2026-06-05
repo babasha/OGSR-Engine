@@ -35,8 +35,8 @@ void CObject::cNameVisual_set(shared_str N)
         NameVisual = N;
         renderable.visual = Render->model_Create(*N);
 
-        IKinematics* old_k = old_v ? old_v->dcast_PKinematics() : nullptr;
-        IKinematics* new_k = renderable.visual->dcast_PKinematics();
+        IKinematics* old_k = old_v             ? old_v->dcast_PKinematics()             : nullptr;
+        IKinematics* new_k = renderable.visual ? renderable.visual->dcast_PKinematics() : nullptr;
 
         if (old_k && new_k)
         {
@@ -101,17 +101,22 @@ void CObject::setVisible(BOOL _visible)
 
 void CObject::Center(Fvector& C) const
 {
-    ASSERT_FMT(renderable.visual, "[%s]: %s[%u] has no renderable.visual", __FUNCTION__, cName().c_str(), ID());
+    if (!renderable.visual) { renderable.xform.transform_tiny(C, Fvector().set(0,0,0)); return; }
     renderable.xform.transform_tiny(C, renderable.visual->getVisData().sphere.P);
 }
 float CObject::Radius() const
 {
-    ASSERT_FMT(renderable.visual, "[%s]: %s[%u] has no renderable.visual", __FUNCTION__, cName().c_str(), ID());
+    if (!renderable.visual) return 0.0f;
     return renderable.visual->getVisData().sphere.R;
 }
 const Fbox& CObject::BoundingBox() const
 {
-    ASSERT_FMT(renderable.visual, "[%s]: %s[%u] has no renderable.visual", __FUNCTION__, cName().c_str(), ID());
+    if (!renderable.visual)
+    {
+        static Fbox s_empty;
+        s_empty.set(Fvector().set(0,0,0), Fvector().set(0,0,0));
+        return s_empty;
+    }
     return renderable.visual->getVisData().box;
 }
 

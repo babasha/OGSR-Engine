@@ -1,3 +1,5 @@
+#ifndef FBasicVisualH
+#define FBasicVisualH
 #pragma once
 
 #include "../../xr_3da/vis_common.h"
@@ -103,3 +105,5 @@ public:
 
     const ShaderElement::Sflags& GetShaderFlags(const size_t idx) const;
 };
+
+#endif // !FBasicVisualH

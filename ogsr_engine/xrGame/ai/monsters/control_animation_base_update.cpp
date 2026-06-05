@@ -1,5 +1,7 @@
 #include "stdafx.h"
 #include "control_animation_base.h"
+#include "../../../Include/xrRender/Kinematics.h"
+#include "../../../Include/xrRender/KinematicsAnimated.h"
 #include "control_direction_base.h"
 #include "control_movement_base.h"
 #include "BaseMonster/base_monster.h"
@@ -15,6 +17,12 @@
 
 void CControlAnimationBase::update_frame()
 {
+    // [VK stub] no skeleton → animation chain (SelectVelocities → GetAnimSpeed
+    // → CMotionDef::Speed) AVs on null motion data.
+    if (auto* skel = smart_cast<IKinematicsAnimated*>(m_object->Visual());
+        !skel || !skel->dcast_PKinematics() || skel->dcast_PKinematics()->LL_BoneCount() == 0)
+        return;
+
     update();
 
     // raise event on velocity bounce

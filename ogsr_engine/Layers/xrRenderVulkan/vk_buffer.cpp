@@ -70,8 +70,33 @@ void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemor
         bufferInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     }
 
+    // Upload targets are filled by the async uploader on the dedicated TRANSFER
+    // queue and read on the GRAPHICS queue. With distinct families that's a
+    // cross-family access — use CONCURRENT sharing so the contents survive without
+    // explicit queue-ownership-transfer barriers (negligible cost for buffers).
+    // Only when a TRANSFER_DST target AND the families actually differ.
+    const u32 families[2] = { VulkanHW.m_GraphicsFamily, VulkanHW.m_TransferFamily };
+    if ((bufferInfo.usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+        VulkanHW.m_TransferFamily != VulkanHW.m_GraphicsFamily) {
+        bufferInfo.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+        bufferInfo.queueFamilyIndexCount = 2;
+        bufferInfo.pQueueFamilyIndices   = families;
+    }
+
     VK_CHECK(vmaCreateBuffer(VulkanHW.m_Allocator, &bufferInfo, &allocInfo,
                              &m_Buffer, &m_Allocation, nullptr));
+
+    // Tag the VMA allocation by usage so any leaked buffer is identifiable in the
+    // vmaDestroyAllocator leak dump (see vma_impl.cpp). Negligible cost.
+    if (m_Allocation) {
+        const char* tag =
+            (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ? "buf:storage" :
+            (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ? "buf:uniform" :
+            (usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)  ? "buf:vertex"  :
+            (usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)   ? "buf:index"   :
+            (usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT)   ? "buf:staging" : "buf:other";
+        vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, tag);
+    }
 
     // Если буфер создан с MAPPED_BIT, получаем mapped pointer
     if (allocInfo.flags & VMA_ALLOCATION_CREATE_MAPPED_BIT) {
@@ -159,60 +184,18 @@ void CVulkanBuffer::Upload(const void* data, VkDeviceSize size, VkDeviceSize off
     }
 }
 
-// Upload через staging buffer
+// Upload через staging — теперь асинхронно на выделенной transfer-очереди.
+// Раньше тут на КАЖДЫЙ upload создавался+уничтожался staging-буфер и делался
+// immediate submit+wait (полный стол). Теперь — общий async-аплоадер
+// (персистентный staging-ring + timeline), без per-upload аллокаций и без стола:
+// следующий graphics-сабмит ждёт копию через upload-timeline (см. CommandManager).
 void CVulkanBuffer::UploadViaStaging(const void* data, VkDeviceSize size, VkDeviceSize offset)
 {
     if (!IsValid()) {
         Msg("![Vulkan] UploadViaStaging: destination buffer is not valid");
         return;
     }
-
-    // Создаём staging buffer
-    CVulkanBuffer stagingBuffer;
-    stagingBuffer.Create(
-        size,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_HOST
-    );
-
-    if (!stagingBuffer.IsValid()) {
-        Msg("![Vulkan] UploadViaStaging: failed to create staging buffer");
-        return;
-    }
-
-    // Копируем данные в staging
-    void* mapped = stagingBuffer.Map();
-    if (!mapped) {
-        Msg("![Vulkan] Failed to map staging buffer");
-        stagingBuffer.Destroy();
-        return;
-    }
-
-    memcpy(mapped, data, size);
-    stagingBuffer.Flush();
-    stagingBuffer.Unmap();
-
-    // Копируем staging → destination buffer через GPU
-    // Use dedicated immediate command buffer to avoid corrupting the render frame's cmd buffer
-    VkCommandBuffer cmd = CommandManager.BeginImmediate();
-    if (cmd == VK_NULL_HANDLE) {
-        Msg("![Vulkan] UploadViaStaging: failed to begin immediate cmd");
-        stagingBuffer.Destroy();
-        return;
-    }
-
-    VkBufferCopy copyRegion = {};
-    copyRegion.srcOffset = 0;
-    copyRegion.dstOffset = offset;
-    copyRegion.size = size;
-
-    vkCmdCopyBuffer(cmd, stagingBuffer.m_Buffer, m_Buffer, 1, &copyRegion);
-
-    // Submit and wait using dedicated fence
-    CommandManager.EndAndSubmitImmediate(cmd);
-
-    // Cleanup staging buffer
-    stagingBuffer.Destroy();
+    CommandManager.UploadBuffer(m_Buffer, offset, data, size);
 }
 
 // Map memory

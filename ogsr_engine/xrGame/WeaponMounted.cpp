@@ -79,9 +79,12 @@ BOOL CWeaponMounted::net_Spawn(CSE_Abstract* DC)
     R_ASSERT(Visual() && smart_cast<IKinematics*>(Visual()));
 
     IKinematics* K = smart_cast<IKinematics*>(Visual());
-    CInifile* pUserData = K->LL_UserData();
-
-    R_ASSERT3(pUserData, "Empty MountedWeapon user data!", mw->get_visual());
+    CInifile* pUserData = K ? K->LL_UserData() : nullptr;
+    if (!pUserData)
+    {
+        Msg("![CWeaponMounted::net_Spawn] '%s' no UserData (renderer stub) — mounted weapon inert", mw->get_visual());
+        return TRUE;
+    }
 
     fire_bone = K->LL_BoneID(pUserData->r_string("mounted_weapon_definition", "fire_bone"));
     actor_bone = K->LL_BoneID(pUserData->r_string("mounted_weapon_definition", "actor_bone"));

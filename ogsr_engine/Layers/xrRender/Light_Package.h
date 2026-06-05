@@ -1,6 +1,11 @@
 #pragma once
 
-#include "light.h"
+// Forward decl is enough — `xr_vector<light*>` only needs `light` to be a
+// type. Consumers that actually deref a `light*` must include "light.h"
+// themselves (and its R4-specific transitives like `light_smapvis.h`,
+// `xr_area.h::RayPickAsync`).
+class light;
+class CBackend;
 
 class light_Package
 {

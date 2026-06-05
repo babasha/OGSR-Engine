@@ -26,7 +26,7 @@ struct RingAlloc
 
 class CFrameRingAllocator
 {
-    static constexpr u32          FRAMES_IN_FLIGHT = 3;
+    static constexpr u32          FRAMES_IN_FLIGHT = VK_FRAMES_IN_FLIGHT;
     static constexpr VkDeviceSize TOTAL_SIZE        = 6u * 1024u * 1024u;  // 6 MB (evenly divisible by 3)
 
     VkBuffer      m_Buffer     = VK_NULL_HANDLE;

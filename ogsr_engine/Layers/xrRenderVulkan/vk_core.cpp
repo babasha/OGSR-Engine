@@ -67,6 +67,13 @@ bool VK_CreateInstance(VkInstance* outInstance)
         }
     }
 
+    // Validation is OFF by default — the KHRONOS layer realistically costs 2-10x
+    // (NOT the "~5%" the old message claimed), and every error also runs through
+    // the debug callback → Msg → synchronous log write. Opt in with the
+    // `-vk_validation` command-line flag when debugging barriers/descriptors/layouts.
+    const bool wantValidation = Core.Params && strstr(Core.Params, "-vk_validation");
+    validationAvailable = validationAvailable && wantValidation;
+
     // Debug messenger for instance creation/destruction messages
     VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = {};
     debugCreateInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
@@ -83,12 +90,12 @@ bool VK_CreateInstance(VkInstance* outInstance)
         createInfo.enabledLayerCount = g_ValidationLayerCount;
         createInfo.ppEnabledLayerNames = g_ValidationLayers;
         createInfo.pNext = &debugCreateInfo;
-        Msg("[Vulkan] Validation layers ENABLED (basic — ~5%% overhead)");
+        Msg("[Vulkan] Validation layers ENABLED (-vk_validation) — expect a large FPS hit");
         Msg("[Vulkan] Barrier/descriptor/layout errors will appear as [VK-VAL] in log");
     } else {
         createInfo.enabledLayerCount = 0;
         createInfo.pNext = nullptr;
-        Msg("[Vulkan] Validation layers NOT AVAILABLE (install Vulkan SDK for diagnostics)");
+        Msg("[Vulkan] Validation layers OFF (pass -vk_validation to enable diagnostics)");
     }
 
     // Создаём instance

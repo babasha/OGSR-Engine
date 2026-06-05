@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../xrcdb/ispatial.h"
+#include "../../xr_3da/xr_area.h"  // RayPickAsync (used as member below)
 
 #include "light_package.h"
 #include "light_smapvis.h"

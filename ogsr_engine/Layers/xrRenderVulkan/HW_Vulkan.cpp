@@ -13,24 +13,8 @@
 using VK::g_VulkanGeometry;
 using VK::g_VulkanLighting;
 
-// VULKAN_DIAG: Static init diagnostics
-static void VulkanDiagWriteHW(const char* msg) {
-	HANDLE h = CreateFileA("D:\\anomaly\\appdata\\logs\\vulkan_diag.txt",
-		FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
-		FILE_ATTRIBUTE_NORMAL, NULL);
-	if (h != INVALID_HANDLE_VALUE) {
-		DWORD written;
-		WriteFile(h, msg, (DWORD)strlen(msg), &written, NULL);
-		WriteFile(h, "\r\n", 2, &written, NULL);
-		FlushFileBuffers(h);
-		CloseHandle(h);
-	}
-}
-
 // Глобальный экземпляр Vulkan HW (переименован чтобы избежать конфликта с R4)
-static struct DiagHW1 { DiagHW1() { VulkanDiagWriteHW("[DIAG] HW_Vulkan.cpp: before VulkanHW"); } } g_diagHW1;
 CVulkanHW VulkanHW;
-static struct DiagHW2 { DiagHW2() { VulkanDiagWriteHW("[DIAG] HW_Vulkan.cpp: after VulkanHW"); } } g_diagHW2;
 
 CVulkanHW::CVulkanHW()
 {
@@ -92,6 +76,37 @@ bool CVulkanHW::FindQueueFamilies()
         Msg("[Vulkan] Present queue family: %u", m_PresentFamily);
     }
 
+    // --- Dedicated compute family (Layer 1: discovery only, not yet submitted to) ---
+    // Prefer a COMPUTE family WITHOUT graphics → a genuinely async-capable queue.
+    // Fall back to any compute-capable family (usually == graphics) so the handle
+    // is always valid; callers gate real overlap on (m_ComputeFamily != m_GraphicsFamily).
+    m_ComputeFamily = UINT32_MAX;
+    for (u32 i = 0; i < queueFamilyCount; i++) {
+        const VkQueueFlags f = queueFamilies[i].queueFlags;
+        if ((f & VK_QUEUE_COMPUTE_BIT) && !(f & VK_QUEUE_GRAPHICS_BIT)) { m_ComputeFamily = i; break; }
+    }
+    if (m_ComputeFamily == UINT32_MAX) {
+        for (u32 i = 0; i < queueFamilyCount; i++)
+            if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { m_ComputeFamily = i; break; }
+    }
+    if (m_ComputeFamily == UINT32_MAX) m_ComputeFamily = m_GraphicsFamily;  // last resort
+
+    // --- Dedicated transfer family ---
+    // Prefer a pure DMA family (TRANSFER without graphics/compute) for off-timeline
+    // uploads. Note: per spec GRAPHICS/COMPUTE families support transfer implicitly,
+    // so the fallback to the graphics family is always valid.
+    m_TransferFamily = UINT32_MAX;
+    for (u32 i = 0; i < queueFamilyCount; i++) {
+        const VkQueueFlags f = queueFamilies[i].queueFlags;
+        if ((f & VK_QUEUE_TRANSFER_BIT) && !(f & VK_QUEUE_GRAPHICS_BIT) && !(f & VK_QUEUE_COMPUTE_BIT)) { m_TransferFamily = i; break; }
+    }
+    if (m_TransferFamily == UINT32_MAX) m_TransferFamily = m_GraphicsFamily;  // graphics implies transfer
+
+    Msg("[Vulkan] Compute queue family: %u%s", m_ComputeFamily,
+        (m_ComputeFamily == m_GraphicsFamily) ? " (shared with graphics — no async compute)" : " (dedicated, async-capable)");
+    Msg("[Vulkan] Transfer queue family: %u%s", m_TransferFamily,
+        (m_TransferFamily == m_GraphicsFamily) ? " (shared with graphics)" : " (dedicated DMA)");
+
     return true;
 }
 
@@ -100,7 +115,9 @@ bool CVulkanHW::CreateLogicalDevice()
 {
     // Queue create infos
     std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-    std::set<u32> uniqueQueueFamilies = { m_GraphicsFamily, m_PresentFamily };
+    // std::set dedups, so families that coincide (e.g. compute == graphics on a
+    // single-family GPU) request just one queue; their handles will then alias below.
+    std::set<u32> uniqueQueueFamilies = { m_GraphicsFamily, m_PresentFamily, m_ComputeFamily, m_TransferFamily };
 
     float queuePriority = 1.0f;
     for (u32 queueFamily : uniqueQueueFamilies) {
@@ -161,6 +178,7 @@ bool CVulkanHW::CreateLogicalDevice()
     deviceFeatures.features.fillModeNonSolid = VK_TRUE;
     deviceFeatures.features.wideLines = VK_TRUE;
     deviceFeatures.features.multiDrawIndirect = VK_TRUE;
+    deviceFeatures.features.drawIndirectFirstInstance = VK_TRUE;  // trees: firstInstance encodes global tree index
     deviceFeatures.pNext = &features12;
 
     // Build final extension list: required + optional NGX extensions if available
@@ -258,9 +276,12 @@ bool CVulkanHW::CreateLogicalDevice()
     createInfo.enabledExtensionCount = static_cast<u32>(enabledExtensions.size());
     createInfo.ppEnabledExtensionNames = enabledExtensions.data();
 
-    // Validation layers on logical device (mirrors instance layers)
-    createInfo.enabledLayerCount = g_ValidationLayerCount;
-    createInfo.ppEnabledLayerNames = g_ValidationLayers;
+    // Device-level layers are deprecated and ignored by modern loaders — validation
+    // is controlled entirely at the instance (see VK_CreateInstance, gated on the
+    // -vk_validation flag). Leave these zero so device creation never pulls the
+    // (expensive) validation layer regardless of the instance choice.
+    createInfo.enabledLayerCount = 0;
+    createInfo.ppEnabledLayerNames = nullptr;
 
     // Создаём device
     VkResult result = vkCreateDevice(m_PhysicalDevice, &createInfo, nullptr, &m_Device);
@@ -271,11 +292,14 @@ bool CVulkanHW::CreateLogicalDevice()
 
     Msg("[Vulkan] Logical device created");
 
-    // Получаем queue handles
+    // Получаем queue handles. When families coincide, vkGetDeviceQueue(fam, 0)
+    // legally returns the SAME VkQueue handle, so compute/transfer alias graphics.
     vkGetDeviceQueue(m_Device, m_GraphicsFamily, 0, &m_GraphicsQueue);
-    vkGetDeviceQueue(m_Device, m_PresentFamily, 0, &m_PresentQueue);
+    vkGetDeviceQueue(m_Device, m_PresentFamily,  0, &m_PresentQueue);
+    vkGetDeviceQueue(m_Device, m_ComputeFamily,  0, &m_ComputeQueue);
+    vkGetDeviceQueue(m_Device, m_TransferFamily, 0, &m_TransferQueue);
 
-    Msg("[Vulkan] Queue handles obtained");
+    Msg("[Vulkan] Queue handles obtained (graphics/present/compute/transfer)");
 
     return true;
 }

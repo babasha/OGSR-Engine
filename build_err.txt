@@ -1,0 +1,41 @@
+﻿
+  libtheora_static.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\libtheora_static.lib
+  default.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\ode.lib
+          1 file(s) copied.
+  liblz4.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\liblz4.lib
+  mimalloc-lib.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\mimalloc.lib
+  lzo.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\lzo.lib
+  libzstd.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\libzstd.lib
+  libsquashfs.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\libsquashfs.lib
+  xrCore.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\xrCore.lib
+  xrCDB.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\xrCDB.lib
+  luabind.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\Luabind.lib
+  vk_Visual.cpp
+  xrParticles.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\xrParticles.lib
+  libogg_static.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\libogg_static.lib
+  libvorbisfile_static.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\libvorbisfile_static.lib
+  libvorbis_static.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\libvorbis_static.lib
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\algorithm(3800,24): warning C4244: '=': conversion from 'int' to 'char', possible loss of data [C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\Layers\xrRenderVulkan\xrRender_Vulkan.vcxproj]
+  (compiling source file '/vk_Visual.cpp')
+      C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\algorithm(3800,24):
+      the template instantiation context (the oldest one first) is
+          C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\Layers\xrRenderVulkan\vk_Visual.cpp(151,18):
+          see reference to function template instantiation '_OutIt std::transform<std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,int(__cdecl *)(int)>(const _InIt,const _InIt,_OutIt,_Fn)' being compiled
+          with
+          [
+              _OutIt=std::_String_iterator<std::_String_val<std::_Simple_types<char>>>,
+              _Elem=char,
+              _InIt=std::_String_iterator<std::_String_val<std::_Simple_types<char>>>,
+              _Fn=int (__cdecl *)(int)
+          ]
+  
+  xrSound.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\xrSound.lib
+  imgui.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\3rd_party\_LIB\Debug\x64\imgui.lib
+  xrRender_Vulkan.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\xrRender_Vulkan.lib
+  xrGame.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\ogsr_engine\_LIB\Engine\Debug\x64\xrGame.lib
+  LINK : C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\\bin_x64\xrEngine_VK.exe not found or not built by the last incremental link; performing full link
+     Creating library C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\\ogsr_engine\_LIB\Engine\Debug\x64\xrEngine_VK.lib and object C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\\ogsr_engine\_LIB\Engine\Debug\x64\xrEngine_VK.exp
+  XR_3DA_Vulkan.vcxproj -> C:\Users\egorb\OneDrive\Documentos\GitHub\OGSR-Engine\bin_x64\xrEngine_VK.exe
+          1 file(s) copied.
+          1 file(s) copied.
+          1 file(s) copied.

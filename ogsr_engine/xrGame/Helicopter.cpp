@@ -150,6 +150,11 @@ BOOL CHelicopter::net_Spawn(CSE_Abstract* DC)
     R_ASSERT(Visual() && smart_cast<IKinematics*>(Visual()));
     IKinematics* K = smart_cast<IKinematics*>(Visual());
     CInifile* pUserData = K->LL_UserData();
+    if (!pUserData)
+    {
+        Msg("![CHelicopter::net_Spawn] visual has no UserData (renderer stub) — helicopter inert");
+        return TRUE;  // continue spawn-success without bone bindings
+    }
 
     m_rotate_x_bone = K->LL_BoneID(pUserData->r_string("helicopter_definition", "wpn_rotate_x_bone"));
     m_rotate_y_bone = K->LL_BoneID(pUserData->r_string("helicopter_definition", "wpn_rotate_y_bone"));
@@ -370,6 +375,12 @@ void CHelicopter::MoveStep()
 
 void CHelicopter::UpdateCL()
 {
+    // [VK stub] inert helicopter (skinned-mesh stub) skipped net_Spawn init for
+    // m_light_render etc.; UpdateHeliParticles would deref null. Bail before
+    // the inherited UpdateCL touches anything that needs that init.
+    if (auto* K = smart_cast<IKinematics*>(Visual()); !K || K->LL_BoneCount() == 0)
+        return;
+
     inherited::UpdateCL();
     CExplosive::UpdateCL();
     if (PPhysicsShell() && (state() == CHelicopter::eDead))

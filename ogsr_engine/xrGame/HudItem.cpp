@@ -191,7 +191,15 @@ void CHudItem::renderable_Render(u32 context_id, IRenderable* root)
     UpdateXForm();
 
     const bool _hud_render = root && root->renderable_HUD() && GetHUDmode();
-    if (_hud_render && !IsHidden())
+
+    // In first person the active item is shown as the HUD model (player hands +
+    // weapon); its WORLD model must not be drawn in ANY scene phase, or it clips
+    // into the camera as a stray stretched chunk. Previously only the HUD phase
+    // (_hud_render) skipped it, so the world-phase scene traversal still submitted
+    // the world model. (Bug surfaced on the Vulkan renderer, where the world model
+    // and the near-depth HUD model render with different projections; in R4 the
+    // world model was harmlessly occluded behind the HUD weapon.)
+    if (GetHUDmode() && !IsHidden())
         return;
 
     if (!object().H_Parent() || (!_hud_render && !IsHidden()))

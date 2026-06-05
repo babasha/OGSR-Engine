@@ -24,6 +24,7 @@ void CParticlesObject::Init(LPCSTR p_name, IRender_Sector::sector_id_t sector_id
     VERIFY(renderable.visual);
     IParticleCustom* V = smart_cast<IParticleCustom*>(renderable.visual);
     VERIFY(V);
+
     const float time_limit = V->GetTimeLimit();
 
     if (time_limit > 0.f)

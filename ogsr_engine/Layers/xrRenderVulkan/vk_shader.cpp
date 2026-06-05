@@ -53,15 +53,31 @@ void CVulkanShader::Create(LPCSTR name, LPCSTR tex_diffuse)
 {
     m_Name = name;
 
-    // Texture list from level shaders has format: "diffuse,lmap1,lmap2"
-    // Extract only the first texture name (diffuse) before the comma
+    // Texture list from level shaders is comma-separated, format varies:
+    //   "diffuse"                     — solid material, no lightmap (vert-lit)
+    //   "diffuse,bump"                — bumped material
+    //   "diffuse,bump,lmap#####"      — lightmapped (lmap path)
+    //   "diffuse,lmap1,lmap2"         — legacy 2-texture lightmap (R1/R2)
+    // Slot 2 (third comma-separated entry) is what `uber_deffer.cpp` resolves
+    // as the lightmap when its name starts with "lmap". We keep it verbatim
+    // here; WorldMaterialCache decides whether to bind it.
     if (tex_diffuse && tex_diffuse[0])
     {
-        string256 diffuse_only;
-        xr_strcpy(diffuse_only, tex_diffuse);
-        LPSTR comma = strchr(diffuse_only, ',');
-        if (comma) *comma = 0;
-        m_TexDiffuse = diffuse_only;
+        string256 buf;
+        xr_strcpy(buf, tex_diffuse);
+
+        // Tokenize by comma in-place. `slots[i]` points into `buf` after
+        // each comma is replaced by NUL; safe because m_TexDiffuse / m_TexLmap
+        // copy into shared_str on assignment.
+        LPCSTR slots[3] = { nullptr, nullptr, nullptr };
+        u32    slot_idx = 0;
+        slots[0] = buf;
+        for (LPSTR p = buf; *p && slot_idx < 2; ++p) {
+            if (*p == ',') { *p = 0; ++slot_idx; slots[slot_idx] = p + 1; }
+        }
+
+        if (slots[0] && slots[0][0]) m_TexDiffuse = slots[0];
+        if (slots[2] && slots[2][0]) m_TexLmap    = slots[2];
     }
     else
     {

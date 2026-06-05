@@ -36,6 +36,9 @@ public:
 
     // Previous frame matrices (for motion vectors, TAA)
     Fmatrix m_w_prev;
+    // R4 name used by shared SkeletonX.cpp (read directly as xforms.m_w_old).
+    // Kept in sync by CBackend::set_xform_world_old.
+    Fmatrix m_w_old{};
     Fmatrix m_v_prev;
     Fmatrix m_p_prev;
     Fmatrix m_wv_prev;
@@ -109,6 +112,14 @@ public:
 // Implements a ring buffer for dynamic vertex data (particles, UI, debug geometry).
 // Uses persistent mapping with NOOVERWRITE/DISCARD pattern like D3D11.
 //
+// Per-frame-in-flight safety: the buffer is sized FRAMES_IN_FLIGHT * region. Each
+// in-flight frame owns one region [slot*region, (slot+1)*region) selected from
+// CommandManager.GetCurrentFrame() inside Lock(). A frame only writes its own region
+// after WaitForFence(slot) in CRender::Begin proved the GPU finished the previous
+// submission that read it, so regions still in flight are never clobbered. Buffer()
+// returns the single VkBuffer (cached handles stay valid) and vOffset is an ABSOLUTE
+// whole-buffer vertex index so draws land in the active region. Mirrors the bone SSBO.
+//
 // Usage:
 //   u32 offset;
 //   void* data = Vertex.Lock(100, 32, offset);  // Lock 100 vertices
@@ -123,8 +134,10 @@ private:
     VmaAllocation   m_Allocation = VK_NULL_HANDLE;
     void*           m_MappedData = nullptr;
 
-    u32             m_Size = 0;         // Total buffer size in bytes
-    u32             m_Position = 0;     // Current write position in bytes
+    u32             m_Size = 0;         // Total buffer size in bytes (m_RegionSize * FRAMES_IN_FLIGHT)
+    u32             m_RegionSize = 0;   // Per-frame-in-flight region size in bytes (the usable ring)
+    u32             m_Position = 0;     // Current write position in bytes (absolute, inside the active region)
+    u32             m_CurrentSlot = ~0u;// In-flight slot whose region is currently active (frame-change detector)
     u32             m_DiscardID = 0;    // Increments on each discard (for tracking)
 
 #ifdef DEBUG
@@ -222,6 +235,37 @@ public:
     u32                     m_AlphaRef;
 
     // === Statistics ===
+    // R4-compatible nested stats — shared SkeletonX.cpp accesses
+    // `stat.r.s_dynamic.add(vCount)` etc. Mirror R_statistics_element /
+    // R_statistics from `xrRender/R_Backend.h:31-65`.
+    struct R_statistics_element_vk
+    {
+        u32 verts{}, draw_calls{};
+        ICF void add(const u32 _verts) { verts += _verts; ++draw_calls; }
+    };
+    struct R_statistics_element_instanced_vk
+    {
+        u32 instances_count{}, draw_calls_count{}, total_verts{};
+        ICF void add(u32 inst_cnt, const u32 _verts)
+        {
+            instances_count += inst_cnt;
+            total_verts += inst_cnt * _verts;
+            ++draw_calls_count;
+        }
+    };
+    struct R_statistics_vk
+    {
+        R_statistics_element_vk             s_static;
+        R_statistics_element_instanced_vk   s_flora;
+        R_statistics_element_vk             s_flora_lods;
+        R_statistics_element_instanced_vk   s_details;
+        R_statistics_element_vk             s_dynamic;
+        R_statistics_element_vk             s_dynamic_inst;
+        R_statistics_element_vk             s_dynamic_1B;
+        R_statistics_element_vk             s_dynamic_2B;
+        R_statistics_element_vk             s_dynamic_3B;
+        R_statistics_element_vk             s_dynamic_4B;
+    };
     struct _stats
     {
         u32 polys;
@@ -232,7 +276,7 @@ public:
         u32 xforms;
         u32 target_rt;
         u32 target_zb;
-        u32 r;  // General rendering stats counter (skeleton compatibility)
+        R_statistics_vk r;  // shared SkeletonX.cpp expects nested struct
     } stat;
 
 public:
@@ -250,6 +294,12 @@ public:
     IC void set_xform_world_prev(const Fmatrix& M);
     IC void set_xform_view_prev(const Fmatrix& M);
     IC void set_xform_project_prev(const Fmatrix& M);
+
+    // R4 names — shared xrRender code (DetailManager, dxEnvironmentRender,
+    // SkeletonX) calls `_old` variants. Alias to vk's `_prev` impl.
+    IC void set_xform_world_old(const Fmatrix& M)        { set_xform_world_prev(M); xforms.m_w_old = M; }
+    IC void set_xform_view_old(const Fmatrix& M)         { set_xform_view_prev(M); }
+    IC void set_xform_project_old(const Fmatrix& M)      { set_xform_project_prev(M); }
 
     IC const Fmatrix& get_xform_world();
     IC const Fmatrix& get_xform_view();
@@ -269,6 +319,12 @@ public:
     void set_Indices(VkBuffer ib, VkIndexType indexType = VK_INDEX_TYPE_UINT16);
     void set_Geometry(SGeometry* geom);
     void set_Geometry(void* ref_geom);  // ref_geom compatibility wrapper
+    // Shared SkeletonX.cpp passes a ref_geom (resptr_core<SGeometry>). A member
+    // template forwards via its _get() accessor, so we don't need Shader.h here
+    // (avoids pulling r_constants.h into this early-included header). Only
+    // instantiated in the skeleton TUs where ref_geom is a complete type.
+    template <class TRefGeom>
+    void set_Geometry(const TRefGeom& g) { set_Geometry(g._get()); }
 
     // ========================================================================
     // Pipeline/Shader binding (P2 - Important)
@@ -288,6 +344,11 @@ public:
 
     // Shader constant retrieval (skeleton compatibility)
     void* get_c(LPCSTR name);
+
+    // Bone-array fetch used by shared SkeletonX.cpp GPU-skinning path.
+    // Returns a writable pointer (pVData) the skeleton fills with bone matrices.
+    // gData/pData are the geometry/pixel-stage variants (unused on Vulkan -> set null).
+    void get_ConstantDirect(const shared_str& n, u32 DataSize, void** pVData, void** pGData, void** pPData);
 
     // Constant arrays (skeleton compatibility)
     void set_ca(void* c, u32 startReg, u32 count, const void* data);

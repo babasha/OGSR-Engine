@@ -9,7 +9,7 @@
 class CVulkanCommandManager
 {
 public:
-    static constexpr u32 FRAMES_IN_FLIGHT = 3;
+    static constexpr u32 FRAMES_IN_FLIGHT = VK_FRAMES_IN_FLIGHT;
 
 private:
     VkCommandPool   m_CommandPools[FRAMES_IN_FLIGHT];
@@ -21,6 +21,29 @@ private:
     VkCommandPool   m_ImmediatePool = VK_NULL_HANDLE;
     VkCommandBuffer m_ImmediateCmd  = VK_NULL_HANDLE;
     VkFence         m_ImmediateFence = VK_NULL_HANDLE;
+
+    // --- Async buffer uploader (dedicated transfer queue + staging ring + timeline) ---
+    // Copies are recorded into m_UploadCmd against a persistent host-mapped staging
+    // ring, submitted on VulkanHW.m_TransferQueue signaling m_UploadTimeline. The
+    // per-frame graphics submit waits on that timeline (added inside Submit), so the
+    // GPU orders uploads before the draws that read them — no CPU stall per upload.
+    // Ownership across families is handled by CONCURRENT sharing on upload targets
+    // (see CVulkanBuffer::Create), so no explicit queue-ownership-transfer barriers.
+    VkCommandPool   m_UploadPool     = VK_NULL_HANDLE;   // on transfer family
+    VkCommandBuffer m_UploadCmd      = VK_NULL_HANDLE;
+    bool            m_UploadOpen     = false;            // m_UploadCmd has pending copies
+    VkSemaphore     m_UploadTimeline = VK_NULL_HANDLE;   // monotonic, signaled per flush
+    u64             m_UploadValue    = 0;                // last value submitted / to wait on
+    VkBuffer        m_StagingBuf     = VK_NULL_HANDLE;
+    VmaAllocation   m_StagingAlloc   = VK_NULL_HANDLE;
+    u8*             m_StagingPtr     = nullptr;          // persistently mapped
+    VkDeviceSize    m_StagingSize    = 0;
+    VkDeviceSize    m_StagingHead    = 0;
+
+    void EnsureUploadCmdOpen();
+    // Copy `size` bytes into the staging ring (opening the upload cmd); returns the
+    // ring byte-offset, or UINT64_MAX if `size` exceeds the whole ring.
+    VkDeviceSize StageBytes(const void* data, VkDeviceSize size);
 
 public:
     void Create();
@@ -34,6 +57,24 @@ public:
     // One-shot immediate command buffer (safe to call during rendering)
     VkCommandBuffer BeginImmediate();
     void            EndAndSubmitImmediate(VkCommandBuffer cmd);
+
+    // Async buffer upload: stage `size` bytes from `data` and record a transfer-queue
+    // copy into `dst` at `dstOffset`. Non-blocking (stalls only if the staging ring
+    // wraps mid-batch). The next graphics submit waits on the upload timeline.
+    void UploadBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size);
+
+    // Async image upload: stage `size` bytes (all mips/layers, tightly packed) and
+    // record on the transfer queue: UNDEFINED→TRANSFER_DST, copy `regions`, then
+    // →SHADER_READ_ONLY_OPTIMAL. `regions[].bufferOffset` are relative to `data`
+    // (the uploader rebases them into the staging ring). Leaves the image in
+    // SHADER_READ_ONLY_OPTIMAL; the graphics frame's timeline wait (FRAGMENT_SHADER)
+    // makes the copy+transition visible to samplers. Image MUST be CONCURRENT.
+    void UploadImage(VkImage dst, const void* data, VkDeviceSize size,
+                     const VkBufferImageCopy* regions, u32 regionCount,
+                     u32 mipLevels, u32 arrayLayers);
+
+    void FlushUploads();         // submit pending copies (async); call once per frame before Submit
+    void FlushUploadsAndWait();  // submit + block until complete; use at end of level load
 
     void NextFrame() { m_CurrentFrame = (m_CurrentFrame + 1) % FRAMES_IN_FLIGHT; }
     u32 GetCurrentFrame() const { return m_CurrentFrame; }

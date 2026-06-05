@@ -19,6 +19,17 @@
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #define VMA_VULKAN_VERSION 1003000 // Vulkan 1.3
 
+// VMA leak diagnostics (permanent regression guard). On a clean shutdown these
+// emit NOTHING; if any VkBuffer/VkImage outlives vmaDestroyAllocator() they are
+// each enumerated into the xray log by name, and the leak is logged rather than
+// popping a blocking Debug assert dialog (leak-on-exit is harmless — the OS
+// reclaims it — but we want it visible, not fatal). `Msg` lives in xrCore
+// (statically linked into the exe); forward-declare it so this otherwise-isolated
+// TU can call it without pulling xrCore headers.
+void __cdecl Msg(const char* format, ...);
+#define VMA_LEAK_LOG_FORMAT(format, ...)  do { Msg("![VK-VMA-LEAK] " format, __VA_ARGS__); } while (0)
+#define VMA_ASSERT_LEAK(expr)             do { if (!(expr)) Msg("![VK-VMA] leak-assert: %s", #expr); } while (0)
+
 // Определяем VMA implementation только здесь
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>

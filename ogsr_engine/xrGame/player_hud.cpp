@@ -36,6 +36,14 @@ player_hud_motion* player_hud_motion_container::find_motion(const shared_str& na
 
 void player_hud_motion_container::load(bool has_separated_hands, IKinematicsAnimated* model, IKinematicsAnimated* animatedHudItem, const shared_str& sect)
 {
+    auto stub_or_null = [](IKinematicsAnimated* m) {
+        return !m || !m->dcast_PKinematics() || m->dcast_PKinematics()->LL_BoneCount() == 0;
+    };
+    if (stub_or_null(model) && stub_or_null(animatedHudItem)) {
+        Msg("![player_hud_motion_container::load] '%s' kinematics is stub (no bones) — animations skipped", sect.c_str());
+        return;
+    }
+
     string512 buff;
     MotionID motion_ID;
 
@@ -323,6 +331,10 @@ void attachable_hud_item::render_item_ui() { m_parent_hud_item->render_item_3d_u
 
 void hud_item_measures::load(const shared_str& sect_name, IKinematics* K)
 {
+    if (!K || K->LL_BoneCount() == 0) {
+        Msg("![hud_item_measures::load] '%s' has no bones (renderer stub) — measurements skipped", sect_name.c_str());
+        return;
+    }
     bool is_16x9 = UI()->is_widescreen();
     string64 _prefix;
     xr_sprintf(_prefix, "%s", is_16x9 ? "_16x9" : "");
@@ -782,6 +794,20 @@ void player_hud::load(const shared_str& player_hud_sect, bool force)
     const char* model_name_2 = READ_IF_EXISTS(pSettings, r_string, player_hud_sect, "visual_2", model_name);
     m_model_2 = smart_cast<IKinematicsAnimated*>(::Render->model_Create(model_name_2));
     ::Render->hud_loading = false;
+
+    // Skinned-model support is renderer-dependent. Vulkan layer either:
+    //   (a) returns null from model_Create (older path) → m_model is null
+    //   (b) returns the IKinematicsAnimated stub → non-null but reports 0 bones
+    // In either case the HUD has no skeleton to drive, so bail before touching
+    // bone IDs. The asserts below assume real bones (l_clavicle, fingers, …).
+    const auto* k1 = m_model   ? m_model->dcast_PKinematics()   : nullptr;
+    const auto* k2 = m_model_2 ? m_model_2->dcast_PKinematics() : nullptr;
+    if (!k1 || !k2 || k1->LL_BoneCount() == 0 || k2->LL_BoneCount() == 0)
+    {
+        Msg("![player_hud::load] '%s' / '%s' — skinned model unavailable on this renderer, HUD disabled",
+            model_name, model_name_2);
+        return;
+    }
 
     u16 l_arm = m_model->dcast_PKinematics()->LL_BoneID("l_clavicle");
     ASSERT_FMT(l_arm != BI_NONE, "[%s]: bone [%s] not found in sect [%s] visual [%s]", __FUNCTION__, "l_clavicle", m_sect_name.c_str(), model_name);
@@ -1376,7 +1402,9 @@ void player_hud::calc_transform(u16 attach_slot_idx, const Fmatrix& offset, Fmat
 {
     bool hasHands = m_attached_items[attach_slot_idx] && m_attached_items[attach_slot_idx]->m_has_separated_hands;
 
-    if (hasHands || script_anim_item_model)
+    // [VK stub] m_ancors stays empty when player_hud::load bails on a stub kinematics — fall through to the no-hands path.
+    const bool ancors_ready = attach_slot_idx < m_ancors.size();
+    if ((hasHands || script_anim_item_model) && ancors_ready)
     {
         IKinematics* kin = (attach_slot_idx == 0) ? m_model->dcast_PKinematics() : m_model_2->dcast_PKinematics();
         Fmatrix ancor_m = kin->LL_GetTransform(m_ancors.at(attach_slot_idx));

@@ -88,3 +88,22 @@ void LogD3D11DebugMessages() {}
 struct ImDrawData;
 void ImGui_ImplDX11_NewFrame() {}
 void ImGui_ImplDX11_RenderDrawData(ImDrawData* /*draw_data*/) {}
+
+// ---------------------------------------------------------------------------
+// Material / lighting subsystems — stubs until vk_material.cpp / vk_lighting.cpp
+// graduate from _parked/. Active code that links against vk_material.h and
+// vk_lighting.h (vk_Visual.cpp's LoadTexture path, vk_shader.cpp, vk_pipeline.cpp)
+// references these symbols; without minimal definitions linking fails.
+// CreateMaterial returns nullptr → vkRender_Visual falls back to the
+// shader-id resolution path that uses RImplementation.Shaders.
+// ---------------------------------------------------------------------------
+#include "vk_material.h"
+#include "vk_lighting.h"
+
+VK::CMaterialManager* g_MaterialManager = nullptr;
+
+namespace VK
+{
+    CMaterial* CMaterialManager::CreateMaterial(LPCSTR /*name*/) { return nullptr; }
+    CVulkanLighting* g_VulkanLighting = nullptr;
+}

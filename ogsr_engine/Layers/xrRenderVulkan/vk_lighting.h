@@ -242,7 +242,7 @@ private:
 
     // Descriptor set for GlobalLighting (Set 0) — one per frame-in-flight
     VkDescriptorSetLayout m_GlobalLightingLayout = VK_NULL_HANDLE;
-    static constexpr u32 LIGHTING_FRAMES = 3;  // Must match CVulkanSync::FRAMES_IN_FLIGHT
+    static constexpr u32 LIGHTING_FRAMES = VK_FRAMES_IN_FLIGHT;  // Must match CVulkanSync::FRAMES_IN_FLIGHT
     VkDescriptorSet m_GlobalLightingDescriptorSet[LIGHTING_FRAMES] = {};
 
     // Methods
@@ -351,7 +351,7 @@ private:
 
     // Descriptor set for sun shadow (Set 3) — one per FRAMES_IN_FLIGHT
     VkDescriptorSetLayout m_SunShadowLayout = VK_NULL_HANDLE;
-    static constexpr u32 SUN_SHADOW_FRAMES = 3;  // Must match CVulkanSync::FRAMES_IN_FLIGHT
+    static constexpr u32 SUN_SHADOW_FRAMES = VK_FRAMES_IN_FLIGHT;  // Must match CVulkanSync::FRAMES_IN_FLIGHT
     VkDescriptorSet m_SunShadowDescSet[SUN_SHADOW_FRAMES] = {};
 
     // Cascade accumulation pipeline

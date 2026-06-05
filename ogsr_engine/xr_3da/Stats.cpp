@@ -34,6 +34,9 @@ CStats::CStats()
     fRFPS = 30.f;
     fTPS = 0;
     pFont = nullptr;
+    pFontHW = nullptr;  // was uninitialized: OnDeviceDestroy xr_delete's it, and the
+                        // Vulkan renderer stubs OnDeviceCreate (never creates the fonts),
+                        // so without this the exit teardown AV's in ~CGameFont on garbage.
     RenderDUMP_DT_Count = 0;
     Device.seqRender.Add(this, 4);
 }

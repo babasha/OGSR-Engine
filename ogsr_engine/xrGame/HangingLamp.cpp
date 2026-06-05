@@ -341,6 +341,12 @@ void CHangingLamp::CreateBody(CSE_ALifeObjectHangingLamp* lamp)
 
     IKinematics* pKinematics = smart_cast<IKinematics*>(Visual());
 
+    // Bone-less stub visual — fixed-bone resolution returns BI_NONE and the
+    // R_ASSERT below fires. Skip body creation until skinned-mesh support
+    // lands; the lamp visual still spawns, just without physics.
+    if (!pKinematics || pKinematics->LL_BoneCount() == 0)
+        return;
+
     m_pPhysicsShell = P_create_Shell();
 
     bone_map.clear();

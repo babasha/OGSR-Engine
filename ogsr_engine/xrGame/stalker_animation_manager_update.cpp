@@ -171,6 +171,14 @@ void CStalkerAnimationManager::update_impl()
     if (!object().g_Alive())
         return;
 
+    // [VK stub] no skeleton on the renderer stub → m_data_storage's
+    // animation vectors stay empty, play_head/torso/legs would do
+    // assign_head_animation()[0..1] on a 0-sized vector and AV.
+    if (!m_skeleton_animated)
+        return;
+    if (auto* k = m_skeleton_animated->dcast_PKinematics(); !k || k->LL_BoneCount() == 0)
+        return;
+
     play_delayed_callbacks();
     update_tracks();
 

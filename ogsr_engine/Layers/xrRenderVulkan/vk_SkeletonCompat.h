@@ -9,10 +9,8 @@
 // Compatibility layer for Skeleton classes in Vulkan renderer
 // This file provides all necessary type mappings and stubs
 
-// STEP 1: Prevent DirectX headers from being included
-#define xrD3DDefs_included
-
-// STEP 2: Include Vulkan equivalents BEFORE xrRender headers
+// STEP 1: Pull in xrD3DDefs.h Vulkan branch (void* typedefs for D3D types)
+//         + Vulkan equivalents BEFORE xrRender headers.
 #include "vk_d3d_skeleton_compat.h"
 #include "vk_Visual.h"
 #include "vk_R_Backend.h"
@@ -27,8 +25,33 @@
 // IMPORTANT: ALL files that include SkeletonCustom.h must use this mapping!
 #define dxRender_Visual vkRender_Visual
 
-// STEP 5-6: IRender_Mesh and ref_constant are defined in FBasicVisual.h (xrRender)
-// Don't redefine them here - let the wrapper files include the originals
+// monolith convention: RDEVICE = Device. Used in shared SkeletonAnimated /
+// SkeletonRigid for fTimeGlobal / dwFrame access.
+#ifndef RDEVICE
+#define RDEVICE Device
+#endif
+
+// STEP 5-6: IRender_Mesh — provided here when FBasicVisual.h is suppressed by
+// the `#define FBasicVisualH` trick. SkeletonX.h → FVisual.h needs IRender_Mesh
+// as a base class, so we provide a minimal compatible version.
+struct IRender_Mesh
+{
+    ref_geom            rm_geom;
+    ID3DVertexBuffer*   p_rm_Vertices = nullptr;
+    u32                 vBase = 0;
+    u32                 vCount = 0;
+    ID3DIndexBuffer*    p_rm_Indices = nullptr;
+    u32                 iBase = 0;
+    u32                 iCount = 0;
+    u32                 dwPrimitives = 0;
+
+    IRender_Mesh()                                         = default;
+    virtual ~IRender_Mesh()                                = default;
+
+private:
+    IRender_Mesh(const IRender_Mesh&)                      = delete;
+    void operator=(const IRender_Mesh&)                    = delete;
+};
 
 // STEP 7: Forward declare CRender - defined in rvk.h
 class CRender;

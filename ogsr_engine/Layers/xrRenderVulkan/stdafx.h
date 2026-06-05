@@ -20,6 +20,9 @@
 // shared Layers/xrRender/FVF.h and our vk_d3d_compat.h reference them as
 // integer values to identify vertex layouts. No D3D9 DLL is loaded.
 #include <d3d9types.h>
+// dxgiformat.h — DXGI_FORMAT enum used by shared CRT / sh_rt.h header for
+// render-target format identification. Tiny header, no DLL dependency.
+#include <dxgiformat.h>
 
 // Vulkan API + VMA — pulled into the PCH so vk_core.h (copied from monolith,
 // it assumes stdafx provides them) and downstream files just `#include "vk_core.h"`.

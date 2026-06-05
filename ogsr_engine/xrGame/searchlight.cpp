@@ -64,8 +64,12 @@ BOOL CProjector::net_Spawn(CSE_Abstract* DC)
     R_ASSERT(Visual() && smart_cast<IKinematics*>(Visual()));
 
     IKinematics* K = smart_cast<IKinematics*>(Visual());
-    CInifile* pUserData = K->LL_UserData();
-    R_ASSERT3(pUserData, "Empty Projector user data!", slight->get_visual());
+    CInifile* pUserData = K ? K->LL_UserData() : nullptr;
+    if (!pUserData)
+    {
+        Msg("![CProjector::net_Spawn] '%s' no UserData (renderer stub) — searchlight inert", slight->get_visual());
+        return TRUE;
+    }
     lanim = LALib.FindItem(pUserData->r_string("projector_definition", "color_animator"));
     guid_bone = K->LL_BoneID(pUserData->r_string("projector_definition", "guide_bone"));
     VERIFY(guid_bone != BI_NONE);

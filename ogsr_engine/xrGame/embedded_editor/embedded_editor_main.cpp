@@ -233,6 +233,7 @@ bool Editor_KeyPress(int key)
 
 bool Editor_KeyRelease(int key)
 {
+    if (!ImGui::GetCurrentContext()) return false;  // [VK stub] embedded editor not initialised on Vulkan renderer
     bool active = IsEditorActive();
     ImGuiIO& io = ImGui::GetIO();
 

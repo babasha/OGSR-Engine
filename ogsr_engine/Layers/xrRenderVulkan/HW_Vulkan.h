@@ -16,11 +16,21 @@ public:
     VkDevice                m_Device         = VK_NULL_HANDLE;
     VkSurfaceKHR            m_Surface        = VK_NULL_HANDLE;
 
-    // Queues
+    // Queues.
+    // Compute/Transfer prefer DEDICATED families (async-capable) and fall back to
+    // the graphics family when the GPU exposes none — in that case the handle
+    // aliases m_GraphicsQueue and the *Family index equals m_GraphicsFamily, so
+    // any future async submit must check `m_ComputeFamily != m_GraphicsFamily`
+    // before assuming real overlap. Layer 1 only discovers + creates them; no
+    // async submission is wired yet (see HW_Vulkan.cpp FindQueueFamilies).
     VkQueue     m_GraphicsQueue  = VK_NULL_HANDLE;
     VkQueue     m_PresentQueue   = VK_NULL_HANDLE;
+    VkQueue     m_ComputeQueue   = VK_NULL_HANDLE;
+    VkQueue     m_TransferQueue  = VK_NULL_HANDLE;
     u32         m_GraphicsFamily = UINT32_MAX;
     u32         m_PresentFamily  = UINT32_MAX;
+    u32         m_ComputeFamily  = UINT32_MAX;
+    u32         m_TransferFamily = UINT32_MAX;
 
     // Memory allocator
     VmaAllocator m_Allocator = VK_NULL_HANDLE;

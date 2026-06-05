@@ -23,18 +23,6 @@ extern float ps_r__WallmarkTTL;
 VertexSoftwareStub* _VertexStream = nullptr;
 void* _VS = nullptr;
 
-// CSkeletonX::has_visible_bones - checks if any bone used by this mesh is visible
-BOOL CSkeletonX::has_visible_bones()
-{
-	if (RM_SINGLE == RenderMode)
-	{
-		return Parent->LL_GetBoneVisible((u16)RMS_boneid);
-	}
-
-	for (u32 it = 0; it < BonesUsed.size(); it++)
-		if (Parent->LL_GetBoneVisible(BonesUsed[it]))
-		{
-			return TRUE;
-		}
-	return FALSE;
-}
+// NOTE: CSkeletonX::has_visible_bones is now provided by OGSR's own
+// xrRender/SkeletonX.cpp (compiled via vk_SkeletonX.cpp). Defining it here too
+// caused LNK4006 (duplicate symbol). Removed — the real implementation wins.

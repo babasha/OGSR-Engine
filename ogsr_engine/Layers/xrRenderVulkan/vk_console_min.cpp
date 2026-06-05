@@ -353,7 +353,8 @@ extern float ps_r_sunshafts_intensity;
 // xrRender_console.cpp expects these as engine-side externs. In OGSR's R4
 // build they're defined in xrRender lib, which we don't link. Provide local
 // definitions so console registration resolves.
-int   psSkeletonUpdate = 32;
+// psSkeletonUpdate is now owned by OGSR's xrRender/SkeletonCustom.cpp (compiled
+// via vk_SkeletonCustom.cpp); defining it here too caused LNK4006. Use the extern.
 float r__dtex_range    = 50.f;
 
 

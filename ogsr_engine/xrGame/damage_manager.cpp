@@ -64,6 +64,7 @@ void CDamageManager::init_bones(LPCSTR section, CInifile* ini)
 {
     IKinematics* kinematics = smart_cast<IKinematics*>(m_object->Visual());
     VERIFY(kinematics);
+    if (!kinematics) return;  // dummy visual (skinned support not yet ported on this renderer)
     for (u16 i = 0; i < kinematics->LL_BoneCount(); i++)
     {
         CBoneInstance& bone_instance = kinematics->LL_GetBoneInstance(i);
@@ -76,6 +77,9 @@ void CDamageManager::load_section(LPCSTR section, CInifile* ini)
 {
     string32 buffer;
     IKinematics* kinematics = smart_cast<IKinematics*>(m_object->Visual());
+    // Two skip cases: visual not skinned at all, or it's the renderer's
+    // bone-less stub (real visual once skinned-mesh support lands → bones>0).
+    if (!kinematics || kinematics->LL_BoneCount() == 0) return;
     CInifile::Sect& damages = ini->r_section(section);
     for (const auto& i : damages.Data)
     {
