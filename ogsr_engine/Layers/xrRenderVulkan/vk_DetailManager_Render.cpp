@@ -300,6 +300,27 @@ void CDetailManager::Render(VK::FrameContext& ctx)
 
     const VkCommandBuffer cmd = ctx.cmd;
 
+    // Frames in flight (VK_FRAMES_IN_FLIGHT = 3) share ONE set of grass GPU
+    // buffers (VisibleSSBO / AtomicCounters / IndirectCmdBuf / HZB mips). The
+    // previous frame's GPU work may still be reading them (instance vertex
+    // fetch, indirect fetch, gen-compute HZB reads) when this frame starts
+    // overwriting — a write-after-read hazard that shows up as flickering
+    // grass patches while the camera moves (the slot window shifts, so the
+    // overwritten data no longer matches what frame N-1 meant to draw).
+    // WAR needs only an execution dependency: order all prior-frame reads
+    // before this frame's transfer/compute writes.
+    {
+        VkMemoryBarrier b{};
+        b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &b, 0, nullptr, 0, nullptr);
+    }
+
     // Build the Hi-Z occlusion pyramid from this frame's depth before the gen
     // compute samples it (binding 6). Restores depth to DEPTH_ATTACHMENT_OPTIMAL.
     BuildHZB(ctx);

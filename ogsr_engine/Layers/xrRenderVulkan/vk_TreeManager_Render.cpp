@@ -307,6 +307,20 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     }
 
     // ----- 2) Clear per-group draw counts; barrier transfer→compute. ----------
+    // Same cross-frame WAR hazard as grass: m_TreeIndirectBuffer and
+    // m_TreeDrawCountBuffer are single-buffered while 3 frames are in flight.
+    // Order the previous frame's indirect fetches before this frame's
+    // fill/compute rewrites (execution dependency is enough for WAR).
+    {
+        VkMemoryBarrier b{};
+        b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &b, 0, nullptr, 0, nullptr);
+    }
     vkCmdFillBuffer(cmd, m_TreeDrawCountBuffer->GetHandle(), 0, VK_WHOLE_SIZE, 0u);
     {
         VkMemoryBarrier b{};
@@ -371,7 +385,9 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     // Push constants + transforms (set 0) once — shared across both variants.
     TreeGfxPush pc{};
     pc.mViewProj = vp;
-    pc.uvScale   = 1.0f / 1024.0f;
+    // Tree UVs are quantized with FTreeVisual_quant = 32768/16 = 2048
+    // (FTreeVisual.cpp tree_data consts.xy), NOT the static-geometry 1/1024.
+    pc.uvScale   = 1.0f / 2048.0f;
     pc.alphaRef  = 200.0f / 255.0f;
     vkCmdPushConstants(cmd, m_GfxPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,

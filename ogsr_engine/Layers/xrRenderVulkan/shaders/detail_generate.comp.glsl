@@ -416,7 +416,17 @@ void main()
                 float screenTexels = projDiameter * 0.5 * float(hzbSize.x);
                 float mipLevel = ceil(log2(max(1.0, screenTexels)));
 
-                float hzbDepth = textureLod(u_HZB, uv, mipLevel).r;
+                // A single centre sample (NEAREST) misses up to 3 of the 2x2
+                // texels the footprint straddles at this mip — the max gets
+                // underestimated and visible grass is culled for a frame as
+                // the camera moves (patch flicker). Take the max of the 4
+                // footprint corners instead; conservative by construction.
+                float uvRadius = projDiameter * 0.25;   // NDC→UV halving
+                float d0 = textureLod(u_HZB, uv + vec2(-uvRadius, -uvRadius), mipLevel).r;
+                float d1 = textureLod(u_HZB, uv + vec2( uvRadius, -uvRadius), mipLevel).r;
+                float d2 = textureLod(u_HZB, uv + vec2(-uvRadius,  uvRadius), mipLevel).r;
+                float d3 = textureLod(u_HZB, uv + vec2( uvRadius,  uvRadius), mipLevel).r;
+                float hzbDepth = max(max(d0, d1), max(d2, d3));
                 float instanceDepth = clipPos.z / clipPos.w;
 
                 if (instanceDepth > hzbDepth && hzbDepth > 0.0)

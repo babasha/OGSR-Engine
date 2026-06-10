@@ -29,7 +29,7 @@ struct FrameContext;
 struct TreeGfxPush
 {
     Fmatrix mViewProj;   // 64 B  world → clip
-    float   uvScale;     //  4 B  1/1024 for SHORT2 SSCALED
+    float   uvScale;     //  4 B  1/2048 (FTreeVisual_quant = 32768/16)
     float   alphaRef;    //  4 B  fragment alpha cutoff
 };
 static_assert(sizeof(TreeGfxPush) == 72, "TreeGfxPush must be 72 B");

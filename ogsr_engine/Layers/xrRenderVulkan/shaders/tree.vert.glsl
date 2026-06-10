@@ -29,7 +29,7 @@ layout(set = 0, binding = 0, std430) readonly buffer XformBuf {
 
 layout(push_constant) uniform PC {
     mat4  mViewProj;    // world → clip
-    float uvScale;      // 1/1024 for SHORT2 SSCALED
+    float uvScale;      // 1/2048 — tree UV quant (FTreeVisual_quant = 32768/16)
     float alphaRef;     // fragment alpha cutoff
 } pc;
 
