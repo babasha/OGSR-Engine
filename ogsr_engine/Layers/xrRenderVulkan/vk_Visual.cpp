@@ -1008,8 +1008,11 @@ static void vkUploadConvertedVertices(VK_Render_Mesh& mesh, void* dst, u32 vStri
 }
 
 // Convert vertBoned* -> vertHW_* and upload. renderMode uses the vkSkeletonX_ST enum
-// (identical in vkSkeletonX_PM). Bone index is stored * 3 (3-row matrix stride) for
-// the skinned shader (sub-step 2).
+// (identical in vkSkeletonX_PM). Bone index is stored RAW (0..BoneCount-1) — the
+// skinned shader indexes the bones[] SSBO directly. (Earlier it used the legacy DX
+// "*3" matrix-row stride, but that overflowed the u8 index channels in vertHW_* for
+// bones >85 (idx*3>255), garbling whole regions — e.g. a sail-like spike at the
+// shoulder. Direct indexing supports up to 255 bones, covering all real skeletons.)
 static void vkLoadSkinnedVertices(VK_Render_Mesh& mesh, u16 renderMode, void* _verts_, u32 dwVertCount, const char* diagTag)
 {
     using RM = vkSkeletonX_ST;
@@ -1023,7 +1026,7 @@ static void vkLoadSkinnedVertices(VK_Render_Mesh& mesh, u16 renderMode, void* _v
         vertBoned1W* src = (vertBoned1W*)_verts_;
         for (u32 i = 0; i < dwVertCount; i++) {
             Fvector2 uv; uv.set(src->u, src->v);
-            dst[i].set(src->P, src->N, src->T, src->B, uv, src->matrix * 3);
+            dst[i].set(src->P, src->N, src->T, src->B, uv, src->matrix);
             src++;
         }
         vkUploadConvertedVertices(mesh, dst, vStride, dwVertCount);
@@ -1036,7 +1039,7 @@ static void vkLoadSkinnedVertices(VK_Render_Mesh& mesh, u16 renderMode, void* _v
         vertBoned2W* src = (vertBoned2W*)_verts_;
         for (u32 i = 0; i < dwVertCount; i++) {
             Fvector2 uv; uv.set(src->u, src->v);
-            dst[i].set(src->P, src->N, src->T, src->B, uv, src->matrix0 * 3, src->matrix1 * 3, src->w);
+            dst[i].set(src->P, src->N, src->T, src->B, uv, src->matrix0, src->matrix1, src->w);
             src++;
         }
         vkUploadConvertedVertices(mesh, dst, vStride, dwVertCount);
@@ -1049,7 +1052,7 @@ static void vkLoadSkinnedVertices(VK_Render_Mesh& mesh, u16 renderMode, void* _v
         vertBoned3W* src = (vertBoned3W*)_verts_;
         for (u32 i = 0; i < dwVertCount; i++) {
             Fvector2 uv; uv.set(src->u, src->v);
-            dst[i].set(src->P, src->N, src->T, src->B, uv, src->m[0] * 3, src->m[1] * 3, src->m[2] * 3, src->w[0], src->w[1]);
+            dst[i].set(src->P, src->N, src->T, src->B, uv, src->m[0], src->m[1], src->m[2], src->w[0], src->w[1]);
             src++;
         }
         vkUploadConvertedVertices(mesh, dst, vStride, dwVertCount);
@@ -1062,7 +1065,7 @@ static void vkLoadSkinnedVertices(VK_Render_Mesh& mesh, u16 renderMode, void* _v
         vertBoned4W* src = (vertBoned4W*)_verts_;
         for (u32 i = 0; i < dwVertCount; i++) {
             Fvector2 uv; uv.set(src->u, src->v);
-            dst[i].set(src->P, src->N, src->T, src->B, uv, src->m[0] * 3, src->m[1] * 3, src->m[2] * 3, src->m[3] * 3, src->w[0], src->w[1], src->w[2]);
+            dst[i].set(src->P, src->N, src->T, src->B, uv, src->m[0], src->m[1], src->m[2], src->m[3], src->w[0], src->w[1], src->w[2]);
             src++;
         }
         vkUploadConvertedVertices(mesh, dst, vStride, dwVertCount);
@@ -1128,6 +1131,15 @@ static void vk_skinned_analyse(TLeaf* leaf, u32 dwVertType, void* _verts_, u32 d
         Msg("![Vulkan] vk_skinned_analyse: unknown vertex type 0x%X", dwVertType);
         leaf->RenderMode = TLeaf::RM_SINGLE; leaf->RMS_boneid = 0;
         break;
+    }
+
+    // DIAG (logs only on a new high-water mark): the largest bone index used by any
+    // skinned leaf. A value > 85 confirms the legacy idx*3 u8 packing would have
+    // overflowed (255/3) → the shoulder-spike artifact. Now stored RAW, safe to 255.
+    static u16 s_maxBoneIdx = 0;
+    if (sw_bones_cnt > s_maxBoneIdx) {
+        s_maxBoneIdx = sw_bones_cnt;
+        Msg("[VK Skinned] DIAG max bone index = %u (old idx*3 u8 overflow threshold = 85)", (u32)s_maxBoneIdx);
     }
 }
 

@@ -26,6 +26,17 @@ namespace {
     std::unordered_map<std::string, CVulkanTexture*>   s_LmapTexCache;
     CVulkanTexture*                                    s_WhiteLmap    = nullptr;
 
+    // --- Terrain splatting resources (R4 CBlender_BmmD) ---
+    // Separate 7-binding set {base, mask, dt_r, dt_g, dt_b, dt_a, lmap} +
+    // its own pool, plus a shared white 1×1 mask fallback (normalized → even
+    // blend) and the 4 default channel-detail textures (grass/asphalt/earth/
+    // gravel). Detail/mask textures are shared by reference across materials.
+    VkDescriptorSetLayout                              s_TerrainSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool                                   s_TerrainPool      = VK_NULL_HANDLE;
+    CVulkanTexture*                                    s_WhiteMask        = nullptr;  // 1×1 white
+    CVulkanTexture*                                    s_TerrainDetail[4] = {};       // R/G/B/A defaults
+    std::unordered_map<std::string, CVulkanTexture*>   s_TerrainDetCache;             // by name
+
     // Resolved file path: $game_textures$\\<name>.dds
     bool ResolveTexturePath(const char* name, string_path& out)
     {
@@ -177,6 +188,52 @@ namespace {
         return tex;
     }
 
+    // Generic cached loader for a named .dds in $game_textures$ (then $level$).
+    // Returns `fallback` (never null) on miss so descriptors stay valid.
+    CVulkanTexture* GetOrLoadGameTex(std::unordered_map<std::string, CVulkanTexture*>& cache,
+                                     const char* name, CVulkanTexture* fallback)
+    {
+        if (!name || !name[0]) return fallback;
+        std::string key(name);
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+
+        string_path leaf, full;
+        xr_sprintf(leaf, "%s.dds", name);
+        FS.update_path(full, "$game_textures$", leaf);
+        if (!FS.exist(full)) {
+            FS.update_path(full, "$level$", leaf);
+            if (!FS.exist(full)) { cache.emplace(std::move(key), fallback); return fallback; }
+        }
+        auto* tex = xr_new<CVulkanTexture>();
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+            xr_delete(tex);
+            cache.emplace(std::move(key), fallback);
+            return fallback;
+        }
+        cache.emplace(std::move(key), tex);
+        return tex;
+    }
+
+    // Write the 7-binding terrain set: base, mask, dt_r..dt_a, lmap.
+    void WriteTerrainSet(VkDescriptorSet set, const VkImageView v[7])
+    {
+        VkDescriptorImageInfo ii[7]{};
+        VkWriteDescriptorSet  w[7]{};
+        for (int i = 0; i < 7; ++i) {
+            ii[i].sampler     = s_Sampler;
+            ii[i].imageView   = v[i];
+            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet          = set;
+            w[i].dstBinding      = (u32)i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[i].pImageInfo      = &ii[i];
+        }
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 7, w, 0, nullptr);
+    }
+
     WorldMaterial* CreateDefaultWhite()
     {
         // 1×1 white as the universal fallback for missing textures.
@@ -198,9 +255,10 @@ namespace {
     }
 }
 
-VkDescriptorSetLayout GetSetLayout() { return s_SetLayout; }
-VkSampler             GetSampler()   { return s_Sampler;   }
-WorldMaterial*        GetDefault()   { return s_Default;   }
+VkDescriptorSetLayout GetSetLayout()        { return s_SetLayout;        }
+VkDescriptorSetLayout GetTerrainSetLayout() { return s_TerrainSetLayout; }
+VkSampler             GetSampler()          { return s_Sampler;          }
+WorldMaterial*        GetDefault()          { return s_Default;          }
 
 bool Init()
 {
@@ -283,7 +341,54 @@ bool Init()
     }
 
     s_Default = CreateDefaultWhite();
-    Msg("[VK WorldMaterial] Init OK (pool=%u sets, 3 bindings: base+detail+lmap, anisotropic 16x)", kMaxSets);
+
+    // ----- Terrain splatting set layout + pool + default channel details -----
+    {
+        // 7 combined image samplers, fragment-only: base, mask, dt_r..dt_a, lmap.
+        VkDescriptorSetLayoutBinding tb[7]{};
+        for (int i = 0; i < 7; ++i) {
+            tb[i].binding         = (u32)i;
+            tb[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            tb[i].descriptorCount = 1;
+            tb[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo tlci{};
+        tlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        tlci.bindingCount = 7;
+        tlci.pBindings    = tb;
+        vkCreateDescriptorSetLayout(VulkanHW.m_Device, &tlci, nullptr, &s_TerrainSetLayout);
+
+        // Terrain materials are few (a handful of ground textures per level);
+        // 256 sets is generous.
+        constexpr u32 kMaxTerrain = 256;
+        VkDescriptorPoolSize tps{};
+        tps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        tps.descriptorCount = kMaxTerrain * 7;
+        VkDescriptorPoolCreateInfo tpci{};
+        tpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        tpci.maxSets       = kMaxTerrain;
+        tpci.poolSizeCount = 1;
+        tpci.pPoolSizes    = &tps;
+        vkCreateDescriptorPool(VulkanHW.m_Device, &tpci, nullptr, &s_TerrainPool);
+
+        // 1×1 white mask fallback (normalized → even blend; never black).
+        const u8 white[4] = { 255, 255, 255, 255 };
+        s_WhiteMask = xr_new<CVulkanTexture>();
+        s_WhiteMask->CreateFromData(white, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
+
+        // Default channel-detail textures (CBlender_BmmD defaults). Per-shader
+        // overrides live in shaders.xr; these cover the common case.
+        static const char* kDet[4] = {
+            "detail\\detail_grnd_grass",   // R
+            "detail\\detail_grnd_asphalt", // G
+            "detail\\detail_grnd_earth",   // B
+            "detail\\detail_grnd_yantar",  // A
+        };
+        for (int i = 0; i < 4; ++i)
+            s_TerrainDetail[i] = GetOrLoadGameTex(s_TerrainDetCache, kDet[i], s_GreyDetail);
+    }
+
+    Msg("[VK WorldMaterial] Init OK (pool=%u sets base+detail+lmap; terrain pool=256 x7; anisotropic 16x)", kMaxSets);
     return true;
 }
 
@@ -326,6 +431,32 @@ void Destroy()
         s_WhiteLmap->Destroy();
         xr_delete(s_WhiteLmap);
         s_WhiteLmap = nullptr;
+    }
+
+    // Terrain splat resources. s_TerrainDetail[] alias entries in
+    // s_TerrainDetCache (or the grey/white fallbacks) — free the cache once,
+    // skipping shared fallbacks.
+    for (auto& kv : s_TerrainDetCache) {
+        if (kv.second && kv.second != s_GreyDetail && kv.second != s_WhiteMask) {
+            kv.second->Destroy();
+            xr_delete(kv.second);
+        }
+    }
+    s_TerrainDetCache.clear();
+    for (int i = 0; i < 4; ++i) s_TerrainDetail[i] = nullptr;
+
+    if (s_WhiteMask) {
+        s_WhiteMask->Destroy();
+        xr_delete(s_WhiteMask);
+        s_WhiteMask = nullptr;
+    }
+    if (s_TerrainPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(VulkanHW.m_Device, s_TerrainPool, nullptr);
+        s_TerrainPool = VK_NULL_HANDLE;
+    }
+    if (s_TerrainSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_TerrainSetLayout, nullptr);
+        s_TerrainSetLayout = VK_NULL_HANDLE;
     }
 
     if (s_Default) {
@@ -407,6 +538,43 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
         return s_Default;
     }
     WriteSet(m->set, m->view, m->view_detail, m->view_lmap);
+
+    // ----- Terrain splatting: diffuse under "terrain\" gets the 7-binding set.
+    // Mask = "<diffuse>_mask"; details = the 4 channel defaults; detail UV
+    // scale reuses the base .thm detail_scale (e.g. terrain_escape = 144).
+    // Falls back gracefully: missing mask → white (even blend), so terrain is
+    // never worse than the single-detail path.
+    const bool is_terrain = (strstr(diffuse_name, "terrain\\") == diffuse_name ||
+                             strstr(diffuse_name, "terrain/")  == diffuse_name);
+    if (is_terrain && s_TerrainSetLayout != VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = s_TerrainPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &s_TerrainSetLayout;
+        VkDescriptorSet tset = VK_NULL_HANDLE;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &ai, &tset) == VK_SUCCESS) {
+            string_path mask_name;
+            xr_sprintf(mask_name, "%s_mask", diffuse_name);
+            CVulkanTexture* mask = GetOrLoadGameTex(s_TerrainDetCache, mask_name, s_WhiteMask);
+
+            const VkImageView v[7] = {
+                m->view,
+                mask ? mask->GetView() : s_WhiteMask->GetView(),
+                s_TerrainDetail[0]->GetView(), s_TerrainDetail[1]->GetView(),
+                s_TerrainDetail[2]->GetView(), s_TerrainDetail[3]->GetView(),
+                m->view_lmap,
+            };
+            WriteTerrainSet(tset, v);
+            m->isTerrain  = true;
+            m->terrainSet = tset;
+            // Terrain still needs a sane detail UV scale even when the base .thm
+            // had none (single-detail path left it 0 → detailUV collapses).
+            if (m->detailScale <= 0.0f) m->detailScale = detail_scale > 0.0f ? detail_scale : 64.0f;
+            Msg("[VK Terrain] '%s' splat set: mask=%s scale=%.0f", diffuse_name,
+                (mask && mask != s_WhiteMask) ? "REAL" : "white", m->detailScale);
+        }
+    }
 
     s_Cache.emplace(std::move(key), m);
     return m;

@@ -6,11 +6,11 @@
 // no motion vectors, single MVP push, flat output for skinned.frag).
 //
 // vertHW formats (vk_Visual.h), per skinMode:
-//   1W (stride 36): P FLOAT4 | N_I u8x4 (a=boneIdx*3) | T u8x4 | B u8x4 | tc FLOAT2
-//   2W (stride 44): P | N(a=w0) | T | B | tc_i FLOAT4 (zw = idx0*3,idx1*3 as float)
-//   3W (stride 44): P | N(a=w0) | T(a=w1) | B(a=idx2*3) | tc_i FLOAT4 (zw = idx0,idx1)
-//   4W (stride 40): P | N(a=w0) | T(a=w1) | B(a=w2) | tc FLOAT2 | indices u8x4 (rgba=idx*3)
-// Bone index stored *3 (legacy DX encoding), decoded /3 -> index into bones[].
+//   1W (stride 36): P FLOAT4 | N_I u8x4 (a=boneIdx) | T u8x4 | B u8x4 | tc FLOAT2
+//   2W (stride 44): P | N(a=w0) | T | B | tc_i FLOAT4 (zw = idx0,idx1 as float)
+//   3W (stride 44): P | N(a=w0) | T(a=w1) | B(a=idx2) | tc_i FLOAT4 (zw = idx0,idx1)
+//   4W (stride 40): P | N(a=w0) | T(a=w1) | B(a=w2) | tc FLOAT2 | indices u8x4 (rgba=idx)
+// Bone index stored RAW (0..BoneCount-1) -> direct index into bones[].
 // bones[] holds the Fmatrix render transforms written row-major; GLSL reads them
 // column-major, which transposes, so `bones[i] * v` == X-Ray's `v * Mbone`.
 // ============================================================================
@@ -35,8 +35,11 @@ layout(push_constant) uniform PC {
 // All skeletons' bone matrices concatenated; this skeleton's start = pc.baseBone.
 layout(std430, set = 0, binding = 0) readonly buffer Bones { mat4 bones[]; };
 
-uint dN(float a) { return uint(round(a * 255.0)) / 3u; }  // from u8-normalized alpha
-uint dF(float v) { return uint(round(abs(v)))     / 3u; }  // from float field
+// Bone index decode. Indices are now stored RAW (0..BoneCount-1) — direct SSBO
+// index, no legacy "*3" matrix-row stride (which overflowed the u8 channels for
+// bones >85). dN: from u8-normalized alpha; dF: from a float field.
+uint dN(float a) { return uint(round(a * 255.0)); }
+uint dF(float v) { return uint(round(abs(v)));    }
 
 // Clamp a decoded local bone index to [0, boneCount). An out-of-range index would
 // read an unwritten (zero) SSBO slot -> S becomes a zero matrix -> w=0 -> the vertex
@@ -53,8 +56,11 @@ void main()
     if (pc.skinMode == 1u) {
         S = bones[bb + clampB(dN(a_Normal.a))];
     } else if (pc.skinMode == 2u) {
+        // R4 (FSkinned vertHW_2W::get_pos_bones): lerp(boneA, boneB, w) =
+        // boneA*(1-w) + boneB*w, with w stored in N.a and A=matrix0, B=matrix1.
+        // So matrix0 gets (1-w), matrix1 gets w — NOT the other way round.
         float w0 = a_Normal.a;
-        S = bones[bb + clampB(dF(a_TexCoordExt.z))] * w0 + bones[bb + clampB(dF(a_TexCoordExt.w))] * (1.0 - w0);
+        S = bones[bb + clampB(dF(a_TexCoordExt.z))] * (1.0 - w0) + bones[bb + clampB(dF(a_TexCoordExt.w))] * w0;
     } else if (pc.skinMode == 3u) {
         float w0 = a_Normal.a, w1 = a_Tangent.a;
         S = bones[bb + clampB(dF(a_TexCoordExt.z))] * w0

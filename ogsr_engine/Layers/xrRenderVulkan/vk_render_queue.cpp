@@ -50,15 +50,19 @@ void RenderQueue::Flush(FrameContext& ctx)
     // State tracking: each bind only fires when the next item differs from
     // what's already bound. After a sort by sortKey, runs of identical
     // (pipeline, material, VB, IB) collapse to one bind apiece.
-    VkPipeline      lastPipe   = VK_NULL_HANDLE;
-    VkDescriptorSet lastMatSet = VK_NULL_HANDLE;
-    float           lastAref   = 999.0f;          // sentinel — first push always fires
-    float           lastDetailScale = -999.0f;    // sentinel
-    VkBuffer        lastVB     = VK_NULL_HANDLE;
-    VkBuffer        lastIB     = VK_NULL_HANDLE;
-    VkIndexType     lastIType  = VK_INDEX_TYPE_MAX_ENUM;
-    Fmatrix         lastXform;                 // per-item MVP tracker (dynamic objects)
-    bool            haveXform  = false;
+    VkPipeline       lastPipe   = VK_NULL_HANDLE;
+    VkDescriptorSet  lastMatSet = VK_NULL_HANDLE;
+    float            lastAref   = 999.0f;          // sentinel — first push always fires
+    float            lastDetailScale = -999.0f;    // sentinel
+    VkBuffer         lastVB     = VK_NULL_HANDLE;
+    VkBuffer         lastIB     = VK_NULL_HANDLE;
+    VkIndexType      lastIType  = VK_INDEX_TYPE_MAX_ENUM;
+    Fmatrix          lastXform;                 // per-item MVP tracker (dynamic objects)
+    bool             haveXform  = false;
+    // Terrain splatting uses a separate pipeline layout (7-binding set). Push
+    // constants are range-compatible, but binds/pushes must target the active
+    // layout — track it and force re-emits when it flips.
+    VkPipelineLayout lastLayout = VK_NULL_HANDLE;
 
     u32 nDraw = 0, nPipeBind = 0, nMatBind = 0, nTailPush = 0, nVBBind = 0, nIBBind = 0;
 
@@ -68,69 +72,90 @@ void RenderQueue::Flush(FrameContext& ctx)
         if (!fv || !fv->m_mesh.IsValid()) continue;
         if (!fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) continue;
 
+        // Resolve material + pick the render path. Terrain (diffuse under
+        // "terrain\") uses a separate pipeline + 7-binding splat set + layout;
+        // everything else takes the standard lmap/vlit path. Decide first so
+        // all pushes/binds below target the correct (active) layout.
+        WorldMaterial* mat = fv->m_pWorldMaterial
+                              ? fv->m_pWorldMaterial
+                              : WorldMaterialCache::GetDefault();
+
+        VkPipeline       pipe   = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSet  set    = VK_NULL_HANDLE;
+
+        const bool terrain = mat && mat->isTerrain
+                          && mat->terrainSet != VK_NULL_HANDLE
+                          && PipelineCache::GetTerrainPipeline() != VK_NULL_HANDLE;
+        if (terrain) {
+            pipe   = PipelineCache::GetTerrainPipeline();
+            layout = PipelineCache::GetTerrainLayout();
+            set    = mat->terrainSet;
+        } else {
+            PipelineCache::Key k{};
+            k.stride   = fv->m_mesh.vStride;
+            k.tcOffset = fv->m_mesh.tcOffset;
+            // Sub-layout drives shader variant: tcOffset==24 → lmap (TC1+lightmap),
+            // tcOffset==28 → vert-lit (D3DCOLOR + sun mask).
+            const bool lmap = (k.tcOffset == 24);
+            k.vs        = lmap ? PipelineCache::WorldLmapVS() : PipelineCache::WorldVlitVS();
+            k.fs        = lmap ? PipelineCache::WorldLmapFS() : PipelineCache::WorldVlitFS();
+            k.depthTest = true;
+            pipe   = PipelineCache::Get(k);
+            layout = PipelineCache::GetLayout();
+            set    = mat ? mat->set : VK_NULL_HANDLE;
+        }
+        if (pipe == VK_NULL_HANDLE || layout == VK_NULL_HANDLE) continue;
+
+        // Layout flip (terrain ↔ standard): a new layout invalidates bound
+        // descriptors and may disturb push constants — force MVP + tail re-push
+        // and reset pipeline/set/buffer trackers.
+        if (layout != lastLayout) {
+            lastLayout      = layout;
+            haveXform       = false;
+            lastAref        = 999.0f;
+            lastDetailScale = -999.0f;
+            lastPipe        = VK_NULL_HANDLE;
+            lastMatSet      = VK_NULL_HANDLE;
+            lastVB          = VK_NULL_HANDLE;
+            lastIB          = VK_NULL_HANDLE;
+        }
+
         // Per-item MVP (push-constant offset 0). Dynamic visuals carry their own
         // world matrix in it.xform; level statics submit identity, giving
-        // mvp == *viewProj (same as Pass_World's pre-loop push). Push only when
-        // the xform changes — identical runs (e.g. all statics) collapse to one.
+        // mvp == *viewProj. Push only when the xform changes.
         if (ctx.viewProj && (!haveXform || 0 != memcmp(&it.xform, &lastXform, sizeof(Fmatrix)))) {
             Fmatrix mvp;
-            // Fmatrix::mul(A,B) == B·A; need uploaded = world·viewProj, so A=viewProj, B=xform.
-            // (Identity xform — statics — gives viewProj either way, which is why they rendered.)
             mvp.mul(*ctx.viewProj, it.xform);   // = it.xform · viewProj (model->clip)
-            vkCmdPushConstants(cmd, PipelineCache::GetLayout(),
+            vkCmdPushConstants(cmd, layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(Fmatrix), &mvp);
             lastXform = it.xform;
             haveXform = true;
         }
 
-        PipelineCache::Key k{};
-        k.stride    = fv->m_mesh.vStride;
-        k.tcOffset  = fv->m_mesh.tcOffset;
-        // Sub-layout drives shader variant: tcOffset==24 → lmap (TC1+lightmap),
-        // tcOffset==28 → vert-lit (D3DCOLOR + sun mask). Both share the same
-        // pipeline layout and push range.
-        const bool lmap = (k.tcOffset == 24);
-        k.vs        = lmap ? PipelineCache::WorldLmapVS() : PipelineCache::WorldVlitVS();
-        k.fs        = lmap ? PipelineCache::WorldLmapFS() : PipelineCache::WorldVlitFS();
-        k.depthTest = true;
-
-        VkPipeline pipe = PipelineCache::Get(k);
-        if (pipe == VK_NULL_HANDLE) continue;
-
         if (pipe != lastPipe) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             lastPipe = pipe;
             ++nPipeBind;
-            // Pipeline change forces VB/IB/material rebind even if the
-            // handles haven't changed — the spec treats them as dirty after
-            // a new pipeline. Reset the trackers so we re-emit.
             lastVB     = VK_NULL_HANDLE;
             lastIB     = VK_NULL_HANDLE;
             lastMatSet = VK_NULL_HANDLE;
         }
 
-        // Bind material (descriptor set 0) and patch alphaRef when either
-        // the visual's material or its aref changes.
-        WorldMaterial* mat = fv->m_pWorldMaterial
-                              ? fv->m_pWorldMaterial
-                              : WorldMaterialCache::GetDefault();
-        if (mat && mat->set != VK_NULL_HANDLE && mat->set != lastMatSet) {
+        if (set != VK_NULL_HANDLE && set != lastMatSet) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    PipelineCache::GetLayout(), 0, 1, &mat->set, 0, nullptr);
-            lastMatSet = mat->set;
+                                    layout, 0, 1, &set, 0, nullptr);
+            lastMatSet = set;
             ++nMatBind;
         }
         // Per-material tail at offset 72: { float alphaRef; float detailScale }.
-        // Push 8 bytes whenever either changes. stageFlags must include both
-        // VS and FS — detailScale is read by the vertex shader for v_DetailUV,
-        // alphaRef by the fragment shader for the discard.
         const float aref        = mat ? mat->alphaRef    : -1.0f;
         const float detailScale = mat ? mat->detailScale :  0.0f;
         if (aref != lastAref || detailScale != lastDetailScale) {
             constexpr u32 kTailOffset = sizeof(Fmatrix) + 2 * sizeof(float);
             float tail[2] = { aref, detailScale };
-            vkCmdPushConstants(cmd, PipelineCache::GetLayout(),
+            vkCmdPushConstants(cmd, layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                kTailOffset, sizeof(tail), tail);
             lastAref        = aref;

@@ -237,7 +237,13 @@ namespace {
             CKinematics* K = dynamic_cast<CKinematics*>(d.vis);  // CKinematics : FHierrarhyVisual : vkRender_Visual
             if (!K || K->children.empty()) continue;
 
-            K->CalculateBones(FALSE);     // ensure current (early-outs if already done this frame)
+            // bForceExact=TRUE: recompute bones every frame (matches R4's render
+            // path, r__dsgraph_build.cpp pV->CalculateBones(TRUE)). With FALSE the
+            // shared CKinematics::CalculateBones takes its "slow update" early-out
+            // (Device.dwTimeGlobal < UCalc_Time + UCalc_Interval) and leaves bones
+            // STALE for UCalc_Interval ms → visibly jerky animation. The
+            // dwTimeGlobal==UCalc_Time guard inside still prevents double-advance.
+            K->CalculateBones(TRUE);
             const u16 bc = K->LL_BoneCount();
             if (bc == 0) continue;
             if (cursor + bc > boneLimit) break;   // this frame's SSBO region full

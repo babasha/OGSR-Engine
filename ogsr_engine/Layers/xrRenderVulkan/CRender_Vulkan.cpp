@@ -16,11 +16,14 @@
 #include "vk_ModelPool.h"
 #include "vk_Visual.h"  // vkRender_Visual base for the particle stub
 #include "../../Include/xrRender/ParticleCustom.h"
+#include "vk_Particles.h"        // vkCreateParticle (real particle visuals)
+#include "vk_pass_particles.h"   // VK::Pass_Particles registration
 #include "../../xrCDB/ISpatial.h"      // g_SpatialSpace, ISpatial, STYPE_RENDERABLE (dynamic collection)
 #include "../../xrCDB/Frustum.h"       // CFrustum
 #include "../../xr_3da/IRenderable.h"  // IRenderable::renderable_Render
 #include "../../xr_3da/IGame_Level.h"  // g_pGameLevel (skip dynamic collection in the menu)
 #include "../../xr_3da/CustomHUD.h"    // g_hud->Render_MAIN (collect first-person HUD visuals)
+#include "../../xr_3da/PS_instance.h"  // CPS_Instance::PerformFrame (tick particle simulation)
 
 CRender RImplementation;
 
@@ -333,9 +336,14 @@ struct vkLight_Stub final : public IRender_Light
 IRender_Light* CRender::light_create() { return xr_new<vkLight_Stub>(); }
 
 // ----- Particles ------------------------------------------------------------
-void CRender::ParticleEffectFillName(xr_vector<shared_str>&) {}
-void CRender::ParticleGroupFillName(xr_vector<shared_str>&) {}
-float CRender::GetParticlesTimeLimit(LPCSTR) { return 0.0f; }
+// Backed by the Vulkan PS library (vk_PSLibrary.cpp).
+extern void  VK_ParticleEffectFillName(xr_vector<shared_str>&);
+extern void  VK_ParticleGroupFillName(xr_vector<shared_str>&);
+extern float VK_GetParticlesTimeLimit(const char* name);
+
+void CRender::ParticleEffectFillName(xr_vector<shared_str>& s) { VK_ParticleEffectFillName(s); }
+void CRender::ParticleGroupFillName(xr_vector<shared_str>& s)  { VK_ParticleGroupFillName(s); }
+float CRender::GetParticlesTimeLimit(LPCSTR name)             { return VK_GetParticlesTimeLimit(name); }
 
 // Inert particle visual: satisfies both IRenderVisual (via vkRender_Visual)
 // and IParticleCustom so xrGame's `smart_cast<IParticleCustom*>(visual)` lands
@@ -343,14 +351,14 @@ float CRender::GetParticlesTimeLimit(LPCSTR) { return 0.0f; }
 // the engine ticks it once, sees no work, and moves on. Real particle classes
 // (vk_ParticleEffect / vk_ParticleGroup) replace this when they port over.
 namespace {
-struct vkParticleVisual_Stub final : public vkRender_Visual, public IParticleCustom
+struct vkParticleVisual_Stub final : public vkParticleVisual
 {
     shared_str  m_name;
 
     vkParticleVisual_Stub() { Type = MT_PARTICLE_EFFECT; }
 
-    // IRenderVisual: route particle queries through ourselves.
-    IParticleCustom* dcast_ParticleCustom() override { return this; }
+    // vkParticleVisual — nothing to draw (dcast_ParticleCustom comes from the base).
+    void  CollectEffects(xr_vector<vkCParticleEffect*>&) override {}
 
     // IParticleCustom — all no-op / safe defaults.
     void  OnDeviceCreate()                 override {}
@@ -376,9 +384,15 @@ struct vkParticleVisual_Stub final : public vkRender_Visual, public IParticleCus
 // ----- Models — delegates to vkModelPool (created in CRender::create) -------
 IRenderVisual* CRender::model_CreateParticles(LPCSTR name, BOOL /*bNoPool*/)
 {
-    auto* p  = xr_new<vkParticleVisual_Stub>();
-    p->m_name = name ? name : "";
-    return p;
+    // Resolve against the loaded PS library → dedicated vk particle visual
+    // (effect or group), simulated via PAPI and drawn by Pass_Particles.
+    if (vkParticleVisual* p = vkCreateParticle(name))
+        return p;
+
+    // Unknown name → inert stub so spawn paths never null-deref.
+    auto* s   = xr_new<vkParticleVisual_Stub>();
+    s->m_name = name ? name : "";
+    return s;
 }
 
 IRenderVisual* CRender::model_Create(LPCSTR name, IReader* data)
@@ -447,6 +461,21 @@ void CRender::Calculate()
             r->renderable_Render(0u, r);
     }
 
+    // Tick particle simulation for visible particle instances. R4 does this in
+    // CRender::calculate_particles_async (PerformFrame → CParticlesObject::DoWork
+    // → the visual's OnFrame, which steps PAPI). Without it on-screen particles
+    // never advance: CParticlesObject::shedule_Update only updates particles that
+    // were NOT rendered last frame. DoWork is idempotent per Device.dwFrame, so
+    // this never double-ticks against shedule_Update.
+    {
+        static xr_vector<ISpatial*> lstParticles;
+        lstParticles.clear();
+        g_SpatialSpace->q_frustum(lstParticles, 0, STYPE_RENDERABLE | STYPE_PARTICLE, frustum);
+        for (ISpatial* sp : lstParticles)
+            if (CPS_Instance* ps = smart_cast<CPS_Instance*>(sp))
+                ps->PerformFrame();
+    }
+
     // First-person HUD (player hands + active item). R4 does this at the tail of
     // its dsgraph collection (r4_R_render.cpp); Render_MAIN sets renderable_HUD()
     // on the root and calls add_Visual → routed into g_HudVisuals (drawn by the
@@ -481,6 +510,9 @@ void CRender::Render()
                 RImplementation.LODs->Render(c);
         });
         VK::RegisterPass("Sky",   [](VK::FrameContext& c) { VK::Pass_Sky(c); });
+        // Particles last: camera-facing billboards composited over the scene
+        // (depth-tested vs world, additive/alpha blend, no depth write).
+        VK::RegisterPass("Particles", [](VK::FrameContext& c) { VK::Pass_Particles(c); });
         s_registered = true;
     }
 

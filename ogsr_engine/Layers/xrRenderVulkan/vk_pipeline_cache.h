@@ -59,6 +59,13 @@ VkShaderModule WorldLmapFS();
 VkShaderModule WorldVlitVS();
 VkShaderModule WorldVlitFS();
 
+// Terrain splatting (R4 CBlender_BmmD). Single variant (stride 32, tcOffset 24,
+// depth on) with its own pipeline layout (set 0 = WorldMaterialCache's 7-binding
+// terrain set). Lazily built on first GetTerrainPipeline() — needs swapchain
+// formats like the world pipelines. Both return VK_NULL_HANDLE before Init().
+VkPipelineLayout GetTerrainLayout();
+VkPipeline       GetTerrainPipeline();
+
 }}  // namespace VK::PipelineCache
 
 namespace std {

@@ -35,6 +35,14 @@ struct WorldMaterial
 
     VkDescriptorSet set      = VK_NULL_HANDLE;
     float           alphaRef = -1.0f;
+
+    // --- Terrain splatting (R4 CBlender_BmmD) ---
+    // When the diffuse name starts with "terrain\", this material also gets a
+    // 7-binding terrain set {base, mask, dt_r, dt_g, dt_b, dt_a, lmap} and is
+    // rendered with the terrain pipeline. `terrainSet` is VK_NULL_HANDLE for
+    // non-terrain materials, which keep the plain 3-binding `set` above.
+    bool            isTerrain  = false;
+    VkDescriptorSet terrainSet = VK_NULL_HANDLE;
 };
 
 namespace WorldMaterialCache {
@@ -51,6 +59,7 @@ void Destroy();
 WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef);
 
 VkDescriptorSetLayout GetSetLayout();
+VkDescriptorSetLayout GetTerrainSetLayout();   // 7-binding terrain splat set
 VkSampler             GetSampler();
 WorldMaterial*        GetDefault();
 

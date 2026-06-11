@@ -9,6 +9,7 @@
 #include "vk_world_material.h"
 #include "vk_pass_sky.h"
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
+#include "vk_pass_particles.h" // VK::ParticlePass_Init/Destroy — billboard particle pass
 #include "vk_shader.h"   // g_VulkanShaderManager (level-shader table)
 #include "vk_shaders.h"  // g_ShaderManager (SPIRV module loader/cache)
 #include "vk_ModelPool.h"
@@ -79,6 +80,12 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     VK::WorldMaterialCache::Init();
     VK::PipelineCache::Init();
     VK::SkyPass::Init();
+    VK::ParticlePass_Init();
+
+    // Load the particle-definition library (particles.xr / .pe-.pg) so
+    // model_CreateParticles can resolve effect/group names. Mirrors R4's
+    // CRender::create() → PSLibrary.OnCreate() (which this build path skips).
+    { extern void vkParticles_OnCreate(); vkParticles_OnCreate(); }
 
     // Shader manager owns the level-shader table that maps shader_id →
     // (shader name, diffuse texture name). Without it the loader leaves all
@@ -119,6 +126,8 @@ void vkRenderDeviceRender::Destroy()
         g_VulkanShaderManager = nullptr;
     }
     Msg("[VK] DevRender::Destroy: ShaderManager freed");
+    { extern void vkParticles_OnDestroy(); vkParticles_OnDestroy(); }
+    VK::ParticlePass_Destroy();         Msg("[VK] DevRender::Destroy: ParticlePass done");
     VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
     VK::Skinned_Destroy();              Msg("[VK] DevRender::Destroy: SkinnedPass done");
     VK::PipelineCache::Destroy();       Msg("[VK] DevRender::Destroy: PipelineCache done");

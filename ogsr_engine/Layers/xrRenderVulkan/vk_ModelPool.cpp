@@ -432,12 +432,14 @@ void vkModelPool::DeleteQueue()
 }
 
 // ============================================================================
-// Particle System — stubs until vk_ParticleEffect/Group port over.
-// MVP level loading doesn't traverse particle definitions, so a nullptr return
-// keeps the engine surviving any code path that asks for one.
+// Particle System — creation goes through vkCreateParticlesByName (vk_PSLibrary.cpp,
+// a compat TU) so the PS visual headers stay out of this non-compat TU. These
+// pool hooks are unused by the active path; kept as nullptr for the interface.
 // ============================================================================
 vkRender_Visual* vkModelPool::CreatePE(PS::CPEDef* /*source*/) { return nullptr; }
 vkRender_Visual* vkModelPool::CreatePG(PS::CPGDef* /*source*/) { return nullptr; }
+
+vkRender_Visual* vkModelPool::CreateParticleEffect(LPCSTR /*name*/) { return nullptr; }
 
 // ============================================================================
 // Utility

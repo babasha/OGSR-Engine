@@ -116,6 +116,9 @@ public:
     // ========================================================================
     vkRender_Visual* CreatePE(PS::CPEDef* source);
     vkRender_Visual* CreatePG(PS::CPGDef* source);
+    // Create a particle EFFECT by name — used by the shared ParticleGroup.cpp
+    // to instantiate its child effects. Delegates to vkCreateParticlesByName.
+    vkRender_Visual* CreateParticleEffect(LPCSTR name);
 
     // ========================================================================
     // Utility

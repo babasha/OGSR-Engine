@@ -158,6 +158,18 @@
     <ClCompile Include="vk_SkeletonCustom.cpp" />
     <ClCompile Include="vk_SkeletonAnimated.cpp" />
 
+    <!-- Particle system (dedicated vk classes on PAPI; see vk_Particles.h).
+         vk_ParticleEffectDef.cpp  : standalone PS::CPEDef/CPGDef impls (no R4 shader res)
+         vk_ParticleEffectActions.cpp / vk_PSLibrary.cpp : compat-compiled shared sources
+         vk_ParticleEffect/Group.cpp : the simulated billboard visuals
+         vk_pass_particles.cpp       : the billboard render pass -->
+    <ClCompile Include="vk_ParticleEffectDef.cpp" />
+    <ClCompile Include="vk_ParticleEffectActions.cpp" />
+    <ClCompile Include="vk_PSLibrary.cpp" />
+    <ClCompile Include="vk_ParticleGroup.cpp" />
+    <ClCompile Include="vk_ParticleEffect.cpp" />
+    <ClCompile Include="vk_pass_particles.cpp" />
+
     <ClCompile Include="vk_Detail.cpp" />
     <ClCompile Include="vk_DetailManager.cpp" />
     <ClCompile Include="vk_DetailManager_Render.cpp" />
