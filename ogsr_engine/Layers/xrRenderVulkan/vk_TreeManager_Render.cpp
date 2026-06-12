@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan — CTreeManager Session B: GPU-driven tree render.
 //
 // Per-frame flow (mirrors the monolith CShadowManager g-buffer tree path,
@@ -21,10 +28,15 @@
 #include "vk_TreeManager.h"
 #include "vk_pass_context.h"
 #include "vk_swapchain.h"
+#include "vk_scene_color.h"       // HDR scene target format
 #include "vk_texture.h"
 #include "vk_shaders.h"          // g_ShaderManager
 #include "vk_pipeline_cache.h"   // PipelineCache::GetCacheObject
+#include "vk_env_light.h"        // VK::EnvLight — set 2 (sun_vp + sun shadow map)
+#include "vk_shadow.h"           // ShadowMap::SphereVisible — caster culling (RenderDepth)
 #include "HW_Vulkan.h"
+#include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
+#include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_color/hemi_color)
 
 namespace VK
 {
@@ -175,14 +187,17 @@ void CTreeManager::CreateGfxPipelines()
     if (!g_ShaderManager) { Msg("![VK Trees] g_ShaderManager null — gfx pipeline disabled"); return; }
     if (m_XformDescLayout == VK_NULL_HANDLE || m_TexDescLayout == VK_NULL_HANDLE) return;
 
-    VkDescriptorSetLayout setLayouts[2] = { m_XformDescLayout, m_TexDescLayout };
+    // set0 = per-tree transforms (SSBO), set1 = per-group diffuse,
+    // set2 = shared env lighting (sun_vp + sun shadow map — vk_env_light).
+    VkDescriptorSetLayout setLayouts[3] = { m_XformDescLayout, m_TexDescLayout, VK::EnvLight::GetSetLayout() };
+    if (setLayouts[2] == VK_NULL_HANDLE) { Msg("![VK Trees] EnvLight layout not ready"); return; }
 
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.offset = 0; pcr.size = sizeof(TreeGfxPush);
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 2; plci.pSetLayouts = setLayouts;
+    plci.setLayoutCount = 3; plci.pSetLayouts = setLayouts;
     plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &m_GfxPipelineLayout);
 
@@ -248,7 +263,7 @@ void CTreeManager::CreateGfxPipelines()
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
 
-        VkFormat colorFmt = Swapchain.m_Format;
+        VkFormat colorFmt = VK::SceneColor::Format();
         VkPipelineRenderingCreateInfo prci{};
         prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
@@ -274,6 +289,152 @@ void CTreeManager::CreateGfxPipelines()
     bool ok28 = createVariant(28, m_GfxPipeline28);
     Msg("[VK Trees] Gfx pipeline (stride=32, tcOff 24=%s 28=%s)",
         ok24 ? "ok" : "FAIL", ok28 ? "ok" : "FAIL");
+
+    // Shadow caster variants: tree_depth.{vert,frag} (alpha-tested, depth-only
+    // into the sun map's D32), same pipeline layout (push offset 0..72 used).
+    VkShaderModule dvs = g_ShaderManager->Load("tree_depth.vert.spv");
+    VkShaderModule dfs = g_ShaderManager->Load("tree_depth.frag.spv");
+    if (dvs == VK_NULL_HANDLE || dfs == VK_NULL_HANDLE) {
+        Msg("![VK Trees] tree_depth.{vert,frag}.spv missing — tree shadow casting disabled");
+        return;
+    }
+    auto createDepthVariant = [&](u32 tcOffset, VkPipeline& out)
+    {
+        VkPipelineShaderStageCreateInfo ss[2]{};
+        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = dvs; ss[0].pName = "main";
+        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = dfs; ss[1].pName = "main";
+
+        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
+        VkVertexInputAttributeDescription via[2]{};
+        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
+        VkPipelineVertexInputStateCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
+        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
+
+        VkPipelineInputAssemblyStateCreateInfo ia{};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo vp{};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1; vp.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode    = VK_CULL_MODE_NONE;   // double-sided leaves
+        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth   = 1.0f;
+        rs.depthBiasEnable = VK_TRUE;         // dynamic — caller sets the sun bias
+
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE;
+        ds.depthCompareOp  = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendStateCreateInfo cb{};   // no color attachments
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+        VkPipelineDynamicStateCreateInfo dynState{};
+        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+
+        VkPipelineRenderingCreateInfo prci{};
+        prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;   // sun shadow map
+
+        VkGraphicsPipelineCreateInfo pi{};
+        pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
+        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
+        pi.pViewportState = &vp; pi.pRasterizationState = &rs;
+        pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
+        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState;
+        pi.layout = m_GfxPipelineLayout;
+        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
+                                      1, &pi, nullptr, &out) != VK_SUCCESS) {
+            Msg("![VK Trees] depth pipeline (tcOff=%u) create failed", tcOffset);
+            out = VK_NULL_HANDLE;
+        }
+    };
+    createDepthVariant(24, m_DepthPipeline24);
+    createDepthVariant(28, m_DepthPipeline28);
+}
+
+// ============================================================================
+// Shadow caster path — depth-only alpha-tested draws of trees inside the sun
+// ortho box. CPU-culled per tree (runs only on sun static-map redraws, so the
+// metadata walk + per-tree draws are off the per-frame path).
+// ============================================================================
+void CTreeManager::RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade,
+                               const CFrustum* frustum)
+{
+    if (!m_bBuilt || m_MetaCPU.empty()) return;
+    if (m_XformDescSet == VK_NULL_HANDLE || m_GfxPipelineLayout == VK_NULL_HANDLE) return;
+    if (m_DepthPipeline24 == VK_NULL_HANDLE && m_DepthPipeline28 == VK_NULL_HANDLE) return;
+
+    // Push: light view·proj + tree UV quant + leaf alpha cutoff (first 72 B of
+    // the TreeGfxPush range; sun/hemi tail unused by the depth shaders).
+    TreeGfxPush pc{};
+    pc.mViewProj = lightVP;
+    pc.uvScale   = 1.0f / 2048.0f;
+    pc.alphaRef  = 200.0f / 255.0f;
+    vkCmdPushConstants(cmd, m_GfxPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_GfxPipelineLayout,
+                            0, 1, &m_XformDescSet, 0, nullptr);
+
+    VkPipeline      lastPipe = VK_NULL_HANDLE;
+    VkDescriptorSet lastTex  = VK_NULL_HANDLE;
+    u32 nDraw = 0;
+
+    for (const TreeIndirectGroup& grp : m_Groups)
+    {
+        VkPipeline pipe = (grp.tcOffset == 24) ? m_DepthPipeline24 : m_DepthPipeline28;
+        if (pipe == VK_NULL_HANDLE) continue;
+
+        bool boundGroup = false;
+        for (u32 i = 0; i < grp.meshCount; ++i)
+        {
+            const GpuTreeMeta& m = m_MetaCPU[grp.meshOffset + i];
+            if (frustum) {
+                if (!frustum->testSphere_dirty(m.sphere_P, m.sphere_R)) continue;
+            } else if (cascade >= 0 ? !ShadowMap::CascadeSphereVisible((u32)cascade, m.sphere_P, m.sphere_R)
+                                    : !ShadowMap::SphereVisible(m.sphere_P, m.sphere_R)) continue;
+
+            if (!boundGroup) {
+                if (pipe != lastPipe) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+                    lastPipe = pipe;
+                }
+                if (grp.descSetIdx < m_TexDescSets.size() && m_TexDescSets[grp.descSetIdx] != lastTex) {
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_GfxPipelineLayout,
+                                            1, 1, &m_TexDescSets[grp.descSetIdx], 0, nullptr);
+                    lastTex = m_TexDescSets[grp.descSetIdx];
+                }
+                VkDeviceSize vbOff = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &grp.vb, &vbOff);
+                vkCmdBindIndexBuffer(cmd, grp.ib, 0, VK_INDEX_TYPE_UINT16);
+                boundGroup = true;
+            }
+            // firstInstance = global tree index → gl_InstanceIndex picks the xform.
+            vkCmdDrawIndexed(cmd, m.index_count, 1, m.ib_first, (s32)m.first_vertex, grp.meshOffset + i);
+            ++nDraw;
+        }
+    }
+
+    static bool s_diag = false;
+    if (!s_diag && nDraw) { s_diag = true; Msg("[VK Trees] first shadow render: %u trees in the sun box", nDraw); }
 }
 
 // ============================================================================
@@ -389,11 +550,25 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     // (FTreeVisual.cpp tree_data consts.xy), NOT the static-geometry 1/1024.
     pc.uvScale   = 1.0f / 2048.0f;
     pc.alphaRef  = 200.0f / 255.0f;
+    // Env lighting (colorize the baked per-tree hemi factor + open-sky sun term so
+    // foliage tracks time-of-day like the world). Neutral fallback if env not up.
+    pc.vSunColor.set(0.6f, 0.6f, 0.6f, 0.0f);
+    pc.vHemiColor.set(0.45f, 0.45f, 0.45f, 0.0f);
+    if (g_pGamePersistent) {
+        if (auto* E = g_pGamePersistent->Environment().CurrentEnv) {
+            pc.vSunColor.set(E->sun_color.x, E->sun_color.y, E->sun_color.z, 0.0f);
+            pc.vHemiColor.set(E->hemi_color.x, E->hemi_color.y, E->hemi_color.z, 0.0f);
+        }
+    }
     vkCmdPushConstants(cmd, m_GfxPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_GfxPipelineLayout,
                             0, 1, &m_XformDescSet, 0, nullptr);
+    // set 2 = shared env lighting (sun_vp + sun shadow map) — updated by Pass_World.
+    if (VkDescriptorSet envSet = VK::EnvLight::GetCurrentSet())
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_GfxPipelineLayout,
+                                2, 1, &envSet, 0, nullptr);
 
     // ----- 6) Per-group indirect draw. ----------------------------------------
     VkPipeline      lastPipe = VK_NULL_HANDLE;
@@ -449,6 +624,9 @@ void CTreeManager::DestroySessionB()
 
     if (m_GfxPipeline24)     { vkDestroyPipeline(dev, m_GfxPipeline24, nullptr); m_GfxPipeline24 = VK_NULL_HANDLE; }
     if (m_GfxPipeline28)     { vkDestroyPipeline(dev, m_GfxPipeline28, nullptr); m_GfxPipeline28 = VK_NULL_HANDLE; }
+    if (m_DepthPipeline24)   { vkDestroyPipeline(dev, m_DepthPipeline24, nullptr); m_DepthPipeline24 = VK_NULL_HANDLE; }
+    if (m_DepthPipeline28)   { vkDestroyPipeline(dev, m_DepthPipeline28, nullptr); m_DepthPipeline28 = VK_NULL_HANDLE; }
+    m_MetaCPU.clear();
     if (m_GfxPipelineLayout) { vkDestroyPipelineLayout(dev, m_GfxPipelineLayout, nullptr); m_GfxPipelineLayout = VK_NULL_HANDLE; }
 
     if (m_XformDescPool)   { vkDestroyDescriptorPool(dev, m_XformDescPool, nullptr); m_XformDescPool = VK_NULL_HANDLE; m_XformDescSet = VK_NULL_HANDLE; }

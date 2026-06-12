@@ -1,7 +1,10 @@
 // xrRenderVulkan - Vulkan renderer for X-Ray Engine
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
-// Licensed under the same terms as X-Ray Engine (see root License.txt)
 //
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // CFrameGraph — lightweight render-graph for automatic barrier insertion.
 // Step A1: infrastructure only, not yet wired into the render loop.
 // Step A2 will import all RTs and replace scattered manual barriers.

@@ -1,7 +1,15 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 #include "stdafx.h"
 #include "vk_render_queue.h"
 #include "vk_pipeline_cache.h"
 #include "vk_world_material.h"  // WorldMaterial set bind
+#include "vk_env_light.h"       // EnvLight::GetCurrentSet — set 1 (per-frame lighting)
 #include "vk_Visual.h"
 #include "vk_UIPipeline.h"   // g_VkUI_FrameCmd
 
@@ -26,7 +34,9 @@ u64 makeSortKey(u32 stride, u32 tcOffset, bool depthTest, const void* mat, const
 
 void RenderQueue::Push(const DrawItem& item)
 {
-    m_Items.push_back(item);
+    DrawItem it = item;
+    it.hemi = m_SubmitHemi;   // stamp the current submit-hemi (1.0 for statics)
+    m_Items.push_back(it);
 }
 
 void RenderQueue::Clear()
@@ -54,6 +64,7 @@ void RenderQueue::Flush(FrameContext& ctx)
     VkDescriptorSet  lastMatSet = VK_NULL_HANDLE;
     float            lastAref   = 999.0f;          // sentinel — first push always fires
     float            lastDetailScale = -999.0f;    // sentinel
+    float            lastHemi        = -999.0f;    // sentinel (per-object sky-ambient gate)
     VkBuffer         lastVB     = VK_NULL_HANDLE;
     VkBuffer         lastIB     = VK_NULL_HANDLE;
     VkIndexType      lastIType  = VK_INDEX_TYPE_MAX_ENUM;
@@ -119,6 +130,12 @@ void RenderQueue::Flush(FrameContext& ctx)
             lastMatSet      = VK_NULL_HANDLE;
             lastVB          = VK_NULL_HANDLE;
             lastIB          = VK_NULL_HANDLE;
+
+            // set 1 = per-frame env lighting. The world and terrain layouts differ at
+            // set 0, so a layout flip disturbs set 1 too — (re)bind it on every flip.
+            VkDescriptorSet envSet = EnvLight::GetCurrentSet();
+            if (envSet != VK_NULL_HANDLE)
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &envSet, 0, nullptr);
         }
 
         // Per-item MVP (push-constant offset 0). Dynamic visuals carry their own
@@ -149,17 +166,19 @@ void RenderQueue::Flush(FrameContext& ctx)
             lastMatSet = set;
             ++nMatBind;
         }
-        // Per-material tail at offset 72: { float alphaRef; float detailScale }.
+        // Per-material/-item tail at offset 72: { alphaRef, detailScale, dynHemi }.
+        // dynHemi gates the sky ambient per object (1.0 = statics/open sky).
         const float aref        = mat ? mat->alphaRef    : -1.0f;
         const float detailScale = mat ? mat->detailScale :  0.0f;
-        if (aref != lastAref || detailScale != lastDetailScale) {
+        if (aref != lastAref || detailScale != lastDetailScale || it.hemi != lastHemi) {
             constexpr u32 kTailOffset = sizeof(Fmatrix) + 2 * sizeof(float);
-            float tail[2] = { aref, detailScale };
+            float tail[3] = { aref, detailScale, it.hemi };
             vkCmdPushConstants(cmd, layout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                kTailOffset, sizeof(tail), tail);
             lastAref        = aref;
             lastDetailScale = detailScale;
+            lastHemi        = it.hemi;
             ++nTailPush;
         }
 
@@ -193,6 +212,94 @@ void RenderQueue::Flush(FrameContext& ctx)
             m_Items.size(), nDraw, nPipeBind, nMatBind, nTailPush, nVBBind, nIBBind);
         s_diag_done = true;
     }
+}
+
+void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool skipAlphaTested)
+{
+    if (m_Items.empty() || cmd == VK_NULL_HANDLE) return;
+    VkPipelineLayout layoutSolid = PipelineCache::GetDepthLayout();
+    VkPipelineLayout layoutAT    = PipelineCache::GetDepthATLayout();
+    if (layoutSolid == VK_NULL_HANDLE) return;
+
+    // Push block of the AT variant (must match shadow_depth_at.{vert,frag}).
+    struct ATPush { Fmatrix mvp; float uvScale[2]; float aref; float _pad; };
+
+    VkPipeline      lastPipe   = VK_NULL_HANDLE;
+    VkPipelineLayout lastLayout = VK_NULL_HANDLE;
+    VkDescriptorSet lastMatSet = VK_NULL_HANDLE;
+    float           lastAref   = -999.f;
+    VkBuffer    lastVB   = VK_NULL_HANDLE;
+    VkBuffer    lastIB   = VK_NULL_HANDLE;
+    VkIndexType lastIType = VK_INDEX_TYPE_MAX_ENUM;
+    Fmatrix     lastXform; bool haveXform = false;
+    u32 nDraw = 0;
+
+    for (const DrawItem& it : m_Items)
+    {
+        auto* fv = static_cast<vkFVisual*>(it.vis);
+        if (!fv || !fv->m_mesh.IsValid()) continue;
+        if (!fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) continue;
+
+        // Alpha-tested items go through the AT variant (punch-out silhouette in
+        // the depth); without it (shader missing / caller opted out) skip them.
+        WorldMaterial* mat = fv->m_pWorldMaterial ? fv->m_pWorldMaterial : WorldMaterialCache::GetDefault();
+        const float aref = mat ? mat->alphaRef : -1.f;
+        const bool  at   = aref >= 0.f;
+        if (at && (skipAlphaTested || layoutAT == VK_NULL_HANDLE
+                   || mat->set == VK_NULL_HANDLE)) continue;
+
+        VkPipeline pipe = at ? PipelineCache::GetDepthATPipeline(fv->m_mesh.vStride, fv->m_mesh.tcOffset)
+                             : PipelineCache::GetDepthPipeline(fv->m_mesh.vStride);
+        if (pipe == VK_NULL_HANDLE) continue;
+        VkPipelineLayout layout = at ? layoutAT : layoutSolid;
+
+        if (layout != lastLayout) {   // layout flip disturbs pushes + sets
+            lastLayout = layout;
+            haveXform  = false;
+            lastMatSet = VK_NULL_HANDLE;
+            lastAref   = -999.f;
+        }
+        if (pipe != lastPipe) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            lastPipe = pipe; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE;
+        }
+
+        if (at) {
+            if (mat->set != lastMatSet) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &mat->set, 0, nullptr);
+                lastMatSet = mat->set;
+            }
+            if (!haveXform || aref != lastAref || 0 != memcmp(&it.xform, &lastXform, sizeof(Fmatrix))) {
+                ATPush push{};
+                push.mvp.mul(lightVP, it.xform);
+                push.uvScale[0] = 1.0f / 1024.0f;   // level statics' SHORT2 quant
+                push.uvScale[1] = 1.0f / 1024.0f;
+                push.aref       = aref;
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(push), &push);
+                lastXform = it.xform; haveXform = true; lastAref = aref;
+            }
+        } else if (!haveXform || 0 != memcmp(&it.xform, &lastXform, sizeof(Fmatrix))) {
+            Fmatrix lmvp; lmvp.mul(lightVP, it.xform);   // = it.xform · lightVP
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), &lmvp);
+            lastXform = it.xform; haveXform = true;
+        }
+
+        VkBuffer vb = fv->m_mesh.p_rm_Vertices->GetHandle();
+        if (vb != lastVB) { VkDeviceSize o = 0; vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &o); lastVB = vb; }
+
+        VkBuffer ib = fv->m_mesh.p_rm_Indices->GetHandle();
+        VkIndexType it2 = fv->m_mesh.iType;
+        if (ib != lastIB || it2 != lastIType) { vkCmdBindIndexBuffer(cmd, ib, 0, it2); lastIB = ib; lastIType = it2; }
+
+        const u32 firstIndex = it.iCountOverride ? it.iBaseOverride  : fv->m_mesh.iBase;
+        const u32 indexCount = it.iCountOverride ? it.iCountOverride : fv->m_mesh.iCount;
+        vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex, (s32)fv->m_mesh.vBase, 0);
+        ++nDraw;
+    }
+
+    static bool s_diagD = false;
+    if (!s_diagD) { s_diagD = true; Msg("[VK Shadow] FlushDepth: items=%zu draws=%u", m_Items.size(), nDraw); }
 }
 
 }  // namespace VK

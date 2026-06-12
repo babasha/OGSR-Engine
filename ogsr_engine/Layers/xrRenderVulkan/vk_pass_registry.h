@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - Minimal render-pass registry (framegraph seam).
 //
 // The thin seam between "hardcoded pass order in CRender::Render()" and a full
@@ -39,4 +46,7 @@ namespace VK
 
     // Drop all registrations (device teardown).
     void ClearPasses();
+
+    // Destroy the GPU pass-timing query pool (device teardown, before vkDestroyDevice).
+    void PassTimingDestroy();
 }

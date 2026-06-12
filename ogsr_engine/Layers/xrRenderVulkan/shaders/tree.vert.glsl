@@ -31,10 +31,16 @@ layout(push_constant) uniform PC {
     mat4  mViewProj;    // world → clip
     float uvScale;      // 1/2048 — tree UV quant (FTreeVisual_quant = 32768/16)
     float alphaRef;     // fragment alpha cutoff
+    float _pad0;
+    float _pad1;
+    vec4  vSunColor;    // env sun colour (rgb)
+    vec4  vHemiColor;   // env hemi colour (rgb)
 } pc;
 
-layout(location = 0) out vec2  vUV;
-layout(location = 1) out float vLight;   // per-instance hemi modulation
+layout(location = 0) out vec2 vUV;
+layout(location = 1) out vec3 vLight;    // hemi + floor (shadow-independent part)
+layout(location = 2) out vec3 vSunLit;   // sun part — attenuated by the shadow map in frag
+layout(location = 3) out vec3 vWPos;     // world-space position (shadow lookup)
 
 void main()
 {
@@ -43,8 +49,19 @@ void main()
     vec4 worldPos = t.xform * vec4(aPos, 1.0);
     gl_Position   = pc.mViewProj * worldPos;
 
-    vUV    = aUV * pc.uvScale;
-    // c_scale.hemi defaults to ~1.0 (lit), c_bias.hemi ~0. Floor keeps shadowed
-    // trees from going fully black until real hemi lighting lands.
-    vLight = clamp(t.c_scale_hemi + t.c_bias_hemi, 0.45, 1.5);
+    vUV = aUV * pc.uvScale;
+    // c_scale.hemi defaults to ~1.0 (lit), c_bias.hemi ~0 → per-tree openness factor.
+    // The openness scalar goes to the fragment in vLight.x — it lights the
+    // crown with the SAME sky-cube ambient the world ground uses (see
+    // tree.frag), so trees/bushes track the upgraded world lighting instead of
+    // the old flat hemi (which read dark next to the sky-lit terrain).
+    // The sun part travels separately — the fragment shadows it with the sun map.
+    float hemiFac = clamp(t.c_scale_hemi + t.c_bias_hemi, 0.3, 1.5);
+    vLight  = vec3(hemiFac, 0.0, 0.0);
+    // Sun ×1.1 (was 0.6): foliage was catching HALF the sun the rest of the
+    // scene gets (world/terrain/grass run ×1.25) — at golden hour the orange
+    // sun visibly "paints" R4's bushes while ours stayed grey. R4 lights
+    // foliage through the same deferred sun as everything else.
+    vSunLit = pc.vSunColor.rgb  * hemiFac * 1.1;
+    vWPos   = worldPos.xyz;
 }

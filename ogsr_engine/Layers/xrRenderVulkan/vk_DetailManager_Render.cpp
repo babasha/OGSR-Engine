@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan — CDetailManager Session B render path.
 //
 // Per-frame flow:
@@ -21,6 +28,7 @@
 #include "vk_DetailManager.h"
 #include "vk_pass_context.h"
 #include "vk_swapchain.h"
+#include "vk_env_light.h"               // VK::EnvLight::GetCurrentSet — set 1 (shadow lookup)
 #include "HW_Vulkan.h"
 
 #include "../../xr_3da/IGame_Persistent.h"
@@ -33,6 +41,7 @@
 // vk_console_min.cpp; we just read them per frame.
 extern int   ps_r__detail_radius;       // metres, default 100, range 70..300
 extern float ps_current_detail_density; // 0..1, default 0.6 (lower = denser)
+extern float ps_current_detail_scale;   // r__detail_scale, 0.7..1.5 — per-item size multiplier
 
 namespace VK
 {
@@ -110,7 +119,12 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
         u->dtSizeX       = float(dtH.size_x);
         u->dtSizeZ       = float(dtH.size_z);
         u->slotSize      = dm_slot_size;
-        u->detailHeight  = 1.0f;       // ps_current_detail_height default
+        // The gen shader multiplies every item's scale by this — the original
+        // engine does `Item.scale *= ps_current_detail_scale` in Decompress
+        // (DetailManager_Decompress.cpp:189). It was hardcoded 1.0 here, so the
+        // user's r__detail_scale (1.2 in user.ltx) was ignored and ALL grass /
+        // bushes / flowers rendered ~17% smaller than R4 — "не пышно".
+        u->detailHeight  = ps_current_detail_scale;
         u->hmWidth       = m_HeightmapW;
         u->hmHeight      = m_HeightmapH;
         m_GenUBO->Flush();
@@ -131,6 +145,10 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     Fvector wind_dir{};      wind_dir.set(0.7f, 0.0f, 0.7f);   // fallback SE
     Fvector sun_dir{};       sun_dir.set(0.0f, 1.0f, 0.0f);
     float   wind_strength = 0.0f;                              // 0..1 lerp factor
+    // Env lighting for the grass (colorize the baked sun/hemi scalars to match the
+    // world ground). Neutral fallback when env isn't up yet.
+    m_GfxConstants.vSunColor.set(0.6f, 0.6f, 0.6f, 0.0f);
+    m_GfxConstants.vHemiColor.set(0.45f, 0.45f, 0.45f, 0.0f);
     if (g_pGamePersistent) {
         auto& env = g_pGamePersistent->Environment();
         if (env.CurrentEnv) {
@@ -141,6 +159,8 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
             // then clamp.
             wind_strength = clampr(env.CurrentEnv->wind_velocity * 0.001f, 0.0f, 1.0f);
             sun_dir       = env.CurrentEnv->sun_dir;
+            m_GfxConstants.vSunColor.set(env.CurrentEnv->sun_color.x, env.CurrentEnv->sun_color.y, env.CurrentEnv->sun_color.z, 0.0f);
+            m_GfxConstants.vHemiColor.set(env.CurrentEnv->hemi_color.x, env.CurrentEnv->hemi_color.y, env.CurrentEnv->hemi_color.z, 0.0f);
         }
     }
     swing_current.lerp(swing_desc[0], swing_desc[1], wind_strength);
@@ -461,6 +481,11 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     vkCmdPushConstants(cmd, m_GfxPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(m_GfxConstants), &m_GfxConstants);
+
+    // set 1 = shared env lighting (sun_vp + sun shadow map) — updated by Pass_World.
+    if (VkDescriptorSet envSet = VK::EnvLight::GetCurrentSet())
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                m_GfxPipelineLayout, 1, 1, &envSet, 0, nullptr);
 
     // Per-type: bind diffuse, bind VBs, bind IB, draw indirect.
     for (u32 i = 0; i < nObj; ++i) {

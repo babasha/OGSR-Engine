@@ -21,11 +21,15 @@ layout(push_constant) uniform DetailConstants {
     vec4 vWind;             // (dir.x, 0, dir.z, amplitude)
     vec4 vConsts;           // (s_x, s_y, sun.y, ambient_floor)
     vec4 vInteractors[4];   // xyz=pos, w=radius (0 = unused)
+    vec4 vSunColor;         // env sun colour (rgb)
+    vec4 vHemiColor;        // env hemi colour (rgb)
 } pc;
 
 layout(location = 0) out vec2  vUV;
-layout(location = 1) out vec4  vColor;
+layout(location = 1) out vec4  vColor;    // hemi + floor (shadow-independent part)
 layout(location = 2) out float vHeight;
+layout(location = 3) out vec3  vSunLit;   // sun part — attenuated by the shadow map in frag
+layout(location = 4) out vec3  vWPos;     // world-space position (shadow lookup)
 
 vec3 ApplyWind(vec3 pos, float h)
 {
@@ -79,10 +83,17 @@ void main()
     gl_Position = pc.mViewProj * vec4(worldPos, 1.0);
     vUV         = aUV;
 
+    // Pass the baked per-slot scalars to the fragment: the hemi-occlusion goes
+    // in vColor.r — the fragment lights it with the SAME sky-cube ambient the
+    // world ground uses (world_lmap skyAmbient), so grass no longer reads dark
+    // against the terrain it grows on (R4 lights grass through the same hmodel
+    // as the ground — deferred gbuffer). Sun part still travels separately and
+    // is shadowed in the fragment.
     float sun  = aInstColor.r;
     float hemi = aInstColor.a;
     float L    = max(hemi + sun, pc.vConsts.w);   // ambient_floor floor (0.2)
-    L          = clamp(L, 0.0, 2.0);
-    vColor     = vec4(L, L, L, 1.0);
+    vColor     = vec4(hemi, 0.0, 0.0, 1.0);
+    vSunLit    = pc.vSunColor.rgb * (sun * 1.25);   // sun ×1.25 — matches the world
+    vWPos      = worldPos;
     vHeight    = aHeight;
 }

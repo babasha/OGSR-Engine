@@ -1,7 +1,10 @@
 // xrRenderVulkan - Vulkan renderer for X-Ray Engine
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
-// Licensed under the same terms as X-Ray Engine (see root License.txt)
 //
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // CFrameRingAllocator — single persistent-mapped VkBuffer split into
 // FRAMES_IN_FLIGHT equal regions.  Each frame gets its own region so
 // GPU from frame N-2 can still read its slice while CPU writes into N.

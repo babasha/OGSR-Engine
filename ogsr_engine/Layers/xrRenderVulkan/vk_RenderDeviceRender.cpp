@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 #include "stdafx.h"
 #include "vk_RenderDeviceRender.h"
 #include "HW_Vulkan.h"
@@ -7,7 +14,15 @@
 #include "vk_UIPipeline.h"
 #include "vk_pipeline_cache.h"
 #include "vk_world_material.h"
+#include "vk_env_light.h"      // VK::EnvLight — shared per-frame sun/hemi/ambient UBO (set 1/2)
+#include "vk_shadow.h"         // VK::ShadowMap — sun shadow map (created with EnvLight)
 #include "vk_pass_sky.h"
+#include "vk_scene_color.h"    // VK::SceneColor — HDR scene target
+#include "vk_pass_tonemap.h"   // VK::TonemapPass — HDR → swapchain composite
+#include "vk_pass_bloom.h"     // VK::BloomPass — bright-pass + blur for the composite
+#include "vk_pass_ssao.h"      // VK::SSAOPass — GTAO (depth prepass → EnvLight binding 8)
+#include "vk_pass_registry.h"  // VK::PassTimingDestroy() — GPU timing query pool teardown
+#include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
 #include "vk_pass_particles.h" // VK::ParticlePass_Init/Destroy — billboard particle pass
 #include "vk_shader.h"   // g_VulkanShaderManager (level-shader table)
@@ -78,8 +93,12 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     // invoked. WorldMaterialCache must come first — PipelineCache builds
     // pipelines whose layout includes the material descriptor set layout.
     VK::WorldMaterialCache::Init();
+    VK::EnvLight::Init();          // before PipelineCache — its set layout joins the world pipeline layout (set 1)
     VK::PipelineCache::Init();
     VK::SkyPass::Init();
+    VK::TonemapPass::Init();       // HDR → swapchain composite (after SkyPass — shares the SPIRV loader)
+    VK::BloomPass::Init();         // bright-pass + blur feeding the tonemap composite
+    VK::SSAOPass::Init();          // GTAO from the depth prepass (EnvLight binding 8)
     VK::ParticlePass_Init();
 
     // Load the particle-definition library (particles.xr / .pe-.pg) so
@@ -129,7 +148,15 @@ void vkRenderDeviceRender::Destroy()
     { extern void vkParticles_OnDestroy(); vkParticles_OnDestroy(); }
     VK::ParticlePass_Destroy();         Msg("[VK] DevRender::Destroy: ParticlePass done");
     VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
+    VK::SSAOPass::Destroy();            Msg("[VK] DevRender::Destroy: SSAOPass done");
+    VK::BloomPass::Destroy();           Msg("[VK] DevRender::Destroy: BloomPass done");
+    VK::TonemapPass::Destroy();         Msg("[VK] DevRender::Destroy: TonemapPass done");
+    VK::SceneColor::Destroy();          Msg("[VK] DevRender::Destroy: SceneColor done");
+    VK::SunShafts_Destroy();            Msg("[VK] DevRender::Destroy: SunShafts done");
     VK::Skinned_Destroy();              Msg("[VK] DevRender::Destroy: SkinnedPass done");
+    VK::EnvLight::Destroy();            Msg("[VK] DevRender::Destroy: EnvLight done");
+    VK::ShadowMap::Destroy();          Msg("[VK] DevRender::Destroy: ShadowMap done");
+    VK::PassTimingDestroy();            Msg("[VK] DevRender::Destroy: PassTiming done");
     VK::PipelineCache::Destroy();       Msg("[VK] DevRender::Destroy: PipelineCache done");
     VK::WorldMaterialCache::Destroy();  Msg("[VK] DevRender::Destroy: WorldMaterial done");
     VulkanUI::Destroy();                Msg("[VK] DevRender::Destroy: VulkanUI done");

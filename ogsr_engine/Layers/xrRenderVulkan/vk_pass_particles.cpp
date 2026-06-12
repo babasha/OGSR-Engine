@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 #include "stdafx.h"
 #include "vk_pass_particles.h"
 #include "vk_Particles.h"
@@ -6,6 +13,7 @@
 #include "vk_texture.h"
 #include "vk_buffer.h"
 #include "vk_swapchain.h"
+#include "vk_scene_color.h"       // HDR scene target format
 #include "vk_command_buffer.h"    // CommandManager.GetCurrentFrame() / FRAMES_IN_FLIGHT
 #include "vk_pipeline_cache.h"    // PipelineCache::GetCacheObject()
 #include "HW_Vulkan.h"
@@ -136,7 +144,7 @@ namespace {
         dynState.dynamicStateCount = 2;
         dynState.pDynamicStates    = dyn;
 
-        VkFormat colorFormat = Swapchain.m_Format;
+        VkFormat colorFormat = VK::SceneColor::Format();
         VkPipelineRenderingCreateInfo prci{};
         prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         prci.colorAttachmentCount    = 1;

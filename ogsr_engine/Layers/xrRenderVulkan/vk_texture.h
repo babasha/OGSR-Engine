@@ -1,6 +1,9 @@
 // xrRenderVulkan - Vulkan renderer for X-Ray Engine
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
-// Licensed under the same terms as X-Ray Engine (see root License.txt)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
 
 #pragma once
 #include "vk_core.h"
@@ -130,6 +133,15 @@ private:
      * Рассчитать количество mip levels
      */
     static u32 CalculateMipLevels(u32 width, u32 height);
+
+    /**
+     * Build the full mip chain for a cubemap from mip-0 face data, synchronously
+     * (staging copy + vkCmdBlitImage per level, all 6 layers). The image must
+     * already be created with the full mip count and TRANSFER_SRC usage.
+     * Used so the sky cubemaps (shipped single-mip) can be sampled at a blurred
+     * high mip as diffuse sky irradiance (R4 hmodel.h CUBE_MIPS).
+     */
+    void GenerateMipsCube(const void* mip0Data, VkDeviceSize mip0Size);
 
     /**
      * Проверить является ли формат compressed (BC/DXT)

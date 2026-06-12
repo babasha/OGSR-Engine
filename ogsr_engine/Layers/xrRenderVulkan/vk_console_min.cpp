@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // Vulkan port of xrRender_console.cpp. Adapted from
 // Layers/xrRender/xrRender_console.cpp — variables + CMD registrations are
 // shared; the few R4-only command classes (CCC_DumpResources, CCC_OCC_Enable,
@@ -100,6 +107,14 @@ constexpr xr_token qssao_token[] = {{"st_opt_off", 0},
                                     {"st_opt_medium", 2},
                                     {"st_opt_high", 3},
                                     {nullptr, 0}};
+
+// Vulkan GTAO (vk_pass_ssao): live debug view + strength, no restart needed.
+int   ps_r_ssao_debug    = 0;     // 1 = draw the raw AO map instead of the scene
+// Strength is an exponent on the AO value (0 = off, 1 = raw GTAO). Default 2:
+// our AO input is the depth prepass (statics+trees, no grass/NPCs), and the
+// forward path applies AO to a smaller ambient share than R4's deferred
+// hemisphere — the deepened curve compensates to a comparable look.
+float ps_r_ssao_strength = 2.0f;
 
 u32 ps_r_sun_quality = 0;
 constexpr xr_token qsun_quality_token[] = {{"st_opt_low", 0},
@@ -654,6 +669,8 @@ void xrRender_initconsole()
 
     CMD3(CCC_Token, "r_ao_mode", &ps_r_ao_mode, ao_mode_token);
     CMD3(CCC_Token, "r2_ssao", &ps_r_ao_quality, qssao_token);
+    CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 3);   // 1=AO map, 2=depth view, 3=normal view
+    CMD4(CCC_Float, "r_ssao_strength", &ps_r_ssao_strength, 0.f, 4.f);
 
     CMD3(CCC_Mask64, "r4_enable_tessellation", &ps_r2_ls_flags_ext, R2FLAGEXT_ENABLE_TESSELLATION); // Need restart
 

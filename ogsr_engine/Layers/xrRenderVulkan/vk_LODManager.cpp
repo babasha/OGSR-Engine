@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan — LOD imposter manager implementation.
 // See vk_LODManager.h. v1: nearest-facet billboard, distance-gated.
 
@@ -9,11 +16,14 @@
 #include "vk_buffer.h"
 #include "vk_pass_context.h"
 #include "vk_swapchain.h"
+#include "vk_scene_color.h"       // HDR scene target format
 #include "vk_shaders.h"           // g_ShaderManager
 #include "vk_pipeline_cache.h"    // PipelineCache::GetCacheObject
 #include "vk_command_buffer.h"    // CommandManager
 #include "HW_Vulkan.h"
 #include "CRender_Vulkan.h"
+#include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
+#include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_color/hemi_color)
 
 // Imposters only show beyond this range so up-close trees keep their full mesh
 // (and don't overlay flat billboards on detailed geometry near the player). Far
@@ -142,9 +152,11 @@ void CLODManager::CreatePipeline()
 {
     if (!g_ShaderManager) { Msg("![VK LOD] g_ShaderManager null"); return; }
 
+    // Push: mat4 viewProj + vec4 tint + vec4 fog_color + vec4 fog_params +
+    // vec4 eye_pos = 128 bytes (the guaranteed push-constant minimum).
     VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pcr.offset = 0; pcr.size = sizeof(Fmatrix);
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.offset = 0; pcr.size = sizeof(Fmatrix) + 4 * sizeof(Fvector4);
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1; plci.pSetLayouts = &m_DescLayout;
@@ -210,7 +222,7 @@ void CLODManager::CreatePipeline()
     dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
 
-    VkFormat colorFmt = Swapchain.m_Format;
+    VkFormat colorFmt = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
@@ -304,8 +316,28 @@ void CLODManager::Render(VK::FrameContext& ctx)
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout,
                             0, 1, &m_DescSet, 0, nullptr);
-    vkCmdPushConstants(ctx.cmd, m_PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                       0, sizeof(Fmatrix), ctx.viewProj);
+    // Env tint for the pre-lit imposter atlas: clamp(hemi + sun*0.5, 0, 1). ≈1 at
+    // midday (atlas unchanged), warm & dim at sunset, dark at night — tracks the
+    // near trees without knowing the atlas bake's weather. Neutral fallback if env down.
+    struct LodPush { Fmatrix mvp; Fvector4 tint; Fvector4 fog_color; Fvector4 fog_params; Fvector4 eye_pos; } lp{};
+    lp.mvp = *ctx.viewProj;
+    lp.tint.set(0.9f, 0.9f, 0.9f, 0.0f);
+    lp.fog_params.set(0.f, 1e6f, 1e6f, 0.f);   // no fog until env is up
+    if (g_pGamePersistent) {
+        if (auto* E = g_pGamePersistent->Environment().CurrentEnv) {
+            lp.tint.x = clampr(E->hemi_color.x + E->sun_color.x * 0.5f, 0.0f, 1.0f);
+            lp.tint.y = clampr(E->hemi_color.y + E->sun_color.y * 0.5f, 0.0f, 1.0f);
+            lp.tint.z = clampr(E->hemi_color.z + E->sun_color.z * 0.5f, 0.0f, 1.0f);
+            // Distance fog (R4) — same params the world shaders use (vk_env_light).
+            const float fn = E->fog_near, ff = E->fog_far;
+            const float r  = (ff > fn + 1e-3f) ? 1.f / (ff - fn) : 0.f;
+            lp.fog_params.set(-fn * r, fn, ff, r);
+            lp.fog_color.set(E->fog_color.x, E->fog_color.y, E->fog_color.z, 0.f);
+        }
+    }
+    lp.eye_pos.set(Device.vCameraPosition.x, Device.vCameraPosition.y, Device.vCameraPosition.z, 0.f);
+    vkCmdPushConstants(ctx.cmd, m_PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(lp), &lp);
     VkBuffer h = vb->GetHandle(); VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &h, &off);
     vkCmdDraw(ctx.cmd, nVerts, 1, 0, 0);

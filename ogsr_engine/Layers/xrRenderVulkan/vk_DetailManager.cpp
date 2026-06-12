@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - CDetailManager Session A: load + heightmap bake +
 // SSBO upload. See vk_DetailManager.h header notes.
 
@@ -5,7 +12,9 @@
 #include "vk_DetailManager.h"
 #include "HW_Vulkan.h"
 #include "vk_swapchain.h"               // for color/depth formats in CreateGfxPipeline
+#include "vk_scene_color.h"             // HDR scene target format
 #include "vk_pipeline_cache.h"          // VK::PipelineCache::GetCacheObject() — shared disk-backed cache
+#include "vk_env_light.h"               // VK::EnvLight — set 1 (sun_vp + sun shadow map)
 #include "vk_shaders.h"                 // g_ShaderManager
 #include "vk_texture.h"                 // CVulkanTexture (LoadDDS)
 #include "vk_pass_context.h"            // FrameContext
@@ -1151,16 +1160,19 @@ void CDetailManager::CreateGfxPipeline()
         vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
     }
 
-    // Pipeline layout: 1 set + 176 B push (VS + FS).
+    // Pipeline layout: set0 = per-type diffuse, set1 = shared env lighting
+    // (sun_vp + sun shadow map — vk_env_light), + push (VS + FS).
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.size = sizeof(DetailGfxPushConstants);
+    VkDescriptorSetLayout gfxSetLayouts[2] = { m_GfxDescLayout, VK::EnvLight::GetSetLayout() };
     VkPipelineLayoutCreateInfo plci{};
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &m_GfxDescLayout;
+    plci.setLayoutCount         = 2;
+    plci.pSetLayouts            = gfxSetLayouts;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges    = &pcr;
+    if (gfxSetLayouts[1] == VK_NULL_HANDLE) { Msg("![VK Grass] EnvLight layout not ready"); return; }
     vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &m_GfxPipelineLayout);
 
     // Shaders
@@ -1241,7 +1253,7 @@ void CDetailManager::CreateGfxPipeline()
     dynState.dynamicStateCount = 2;
     dynState.pDynamicStates    = dyn;
 
-    VkFormat colorFmt = Swapchain.m_Format;
+    VkFormat colorFmt = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;

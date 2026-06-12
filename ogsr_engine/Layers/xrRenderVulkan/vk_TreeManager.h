@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - GPU-driven tree manager.
 //
 // Trees (MT_TREE_ST / MT_TREE_PM) extracted from Visuals[] at level load,
@@ -18,6 +25,7 @@
 class vkRender_Visual;
 class vkFTreeVisual;
 class vkFHierrarhyVisual;
+class CFrustum;   // camera-frustum cull for the depth-prepass path
 
 namespace VK
 {
@@ -28,11 +36,15 @@ struct FrameContext;
 // Tree graphics push constants (72 B, VS+FS). Matches tree.vert/frag.
 struct TreeGfxPush
 {
-    Fmatrix mViewProj;   // 64 B  world → clip
-    float   uvScale;     //  4 B  1/2048 (FTreeVisual_quant = 32768/16)
-    float   alphaRef;    //  4 B  fragment alpha cutoff
+    Fmatrix  mViewProj;   // 64 B  world → clip
+    float    uvScale;     //  4 B  1/2048 (FTreeVisual_quant = 32768/16)
+    float    alphaRef;    //  4 B  fragment alpha cutoff
+    float    _pad0;       //  4 B  (vec4 below needs 16-byte alignment → offset 80)
+    float    _pad1;       //  4 B
+    Fvector4 vSunColor;   // 16 B  env sun colour (rgb); w unused
+    Fvector4 vHemiColor;  // 16 B  env hemi colour (rgb); w unused
 };
-static_assert(sizeof(TreeGfxPush) == 72, "TreeGfxPush must be 72 B");
+static_assert(sizeof(TreeGfxPush) == 112, "TreeGfxPush must be 112 B");
 
 // View frustum UBO (binding 1 of the cull set). 6 normalized planes, std140.
 struct TreeFrustumUBO
@@ -112,6 +124,18 @@ public:
     // pipelines are built and at least one tree group exists.
     void Render(VK::FrameContext& ctx);
 
+    // Shadow caster path: depth-only, alpha-tested draws of the trees whose
+    // sphere intersects the sun ortho box, CPU-recorded per tree (no compute
+    // cull). cascade < 0: the far static map (ShadowMap::SphereVisible, runs
+    // only on sun static redraws). cascade >= 0: the per-frame near cascade
+    // with that index (ShadowMap::CascadeSphereVisible). frustum != null
+    // overrides both culls: camera depth-PREPASS path — trees join the scene
+    // depth so GTAO sees them and the foliage color passes get early-Z
+    // (same VP + alpha-ref as the LEQUAL color pass → re-raster matches).
+    // Caller owns render begin/end, viewport and bias.
+    void RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade = -1,
+                     const CFrustum* frustum = nullptr);
+
     bool IsBuilt() const { return m_bBuilt; }
     bool IsReady() const;
     u32  GetTotalCount() const { return m_TotalCount; }
@@ -177,6 +201,12 @@ private:
     VkPipelineLayout m_GfxPipelineLayout = VK_NULL_HANDLE;
     VkPipeline       m_GfxPipeline24     = VK_NULL_HANDLE;
     VkPipeline       m_GfxPipeline28     = VK_NULL_HANDLE;
+
+    // Shadow caster: depth-only alpha-tested variants (tree_depth.{vert,frag},
+    // same layout) + a CPU copy of the per-mesh metadata for CPU-side culling.
+    VkPipeline       m_DepthPipeline24   = VK_NULL_HANDLE;
+    VkPipeline       m_DepthPipeline28   = VK_NULL_HANDLE;
+    xr_vector<GpuTreeMeta> m_MetaCPU;
 };
 
 }  // namespace VK

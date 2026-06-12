@@ -1,6 +1,9 @@
 // xrRenderVulkan - Vulkan renderer for X-Ray Engine
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
-// Licensed under the same terms as X-Ray Engine (see root License.txt)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
 #include "vk_texture.h"
@@ -591,33 +594,123 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle)
 
     u32 width = header.dwWidth;
     u32 height = header.dwHeight;
-    u32 mipLevels = (header.dwFlags & 0x20000) ? header.dwMipMapCount : 1;
-    if (mipLevels == 0) mipLevels = 1;
+    u32 srcMips = (header.dwFlags & 0x20000) ? header.dwMipMapCount : 1;
+    if (srcMips == 0) srcMips = 1;
+
+    // Sky cubemaps ship single-mip + uncompressed (BGRA8). The hemisphere sky
+    // ambient (vk_env_light + world shaders) samples a blurred HIGH mip as a
+    // diffuse-irradiance approximation (R4 hmodel.h CUBE_MIPS), so build the
+    // full chain at load. Compressed cubes can't be linear-blit-filtered — keep
+    // those single-mip (rare; ambient just samples sharper there).
+    const bool genMips   = !IsCompressedFormat(format) && width > 1 && srcMips == 1;
+    const u32  totalMips = genMips ? CalculateMipLevels(width, height) : srcMips;
 
     // Setup cubemap flags before Create()
     m_bCubemap = true;
     m_ArrayLayers = 6;
 
-    Create(width, height, format, mipLevels);
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (genMips) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // blit source for mip-gen
+
+    Create(width, height, format, totalMips, usage);
     if (m_Image == VK_NULL_HANDLE) {
         FS.r_close(F);
         return false;
     }
     if (m_Allocation) vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, filename);  // leak-dump name
 
-    // Read remaining data (all 6 faces with mipmaps)
+    // Read remaining data (6 faces; mip0 only when srcMips==1).
     VkDeviceSize dataSize = F->length() - F->tell();
     void* data = xr_malloc(dataSize);
     F->r(data, dataSize);
     FS.r_close(F);
 
-    // Upload all faces
-    UploadData(data, dataSize);
+    if (genMips) GenerateMipsCube(data, dataSize);   // synchronous staging copy + blit chain
+    else         UploadData(data, dataSize);
     xr_free(data);
 
     Msg("[Vulkan] Loaded cubemap DDS: %s (%dx%d, mips=%d, format=%d, caps2=0x%X, dataSize=%llu)",
-        filename, width, height, mipLevels, (int)format, header.dwCaps2, (unsigned long long)dataSize);
+        filename, width, height, totalMips, (int)format, header.dwCaps2, (unsigned long long)dataSize);
     return true;
+}
+
+// Build the full mip chain for a cubemap from mip-0 face data — synchronous.
+// The image is created with the full mip count + TRANSFER_SRC; here we copy the
+// 6 mip-0 faces from a staging buffer then vkCmdBlitImage each level into the
+// next (all 6 layers per blit). One immediate cmd buffer, fence-waited, so it's
+// safe to call mid-frame (sky cube loads happen at weather boundaries, rare).
+void CVulkanTexture::GenerateMipsCube(const void* mip0Data, VkDeviceSize mip0Size)
+{
+    CVulkanBuffer staging;
+    staging.Create(mip0Size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    void* p = staging.Map();
+    if (!p) { Msg("![Vulkan] GenerateMipsCube: staging map failed"); staging.Destroy(); return; }
+    memcpy(p, mip0Data, mip0Size);
+
+    const VkDeviceSize faceSize = mip0Size / 6;   // tightly-packed mip0, 6 faces
+
+    VkCommandBuffer cmd = CommandManager.BeginImmediate();
+    if (cmd == VK_NULL_HANDLE) { staging.Destroy(); return; }
+
+    auto barrier = [&](u32 baseMip, u32 mipCount, VkImageLayout oldL, VkImageLayout newL,
+                       VkAccessFlags srcA, VkAccessFlags dstA,
+                       VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b{};
+        b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout           = oldL; b.newLayout = newL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image               = m_Image;
+        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, baseMip, mipCount, 0, 6 };
+        b.srcAccessMask       = srcA; b.dstAccessMask = dstA;
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    // Whole image UNDEFINED → TRANSFER_DST, then copy the 6 mip-0 faces.
+    barrier(0, m_MipLevels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy regions[6]{};
+    for (u32 f = 0; f < 6; ++f) {
+        regions[f].bufferOffset      = f * faceSize;
+        regions[f].imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, f, 1 };
+        regions[f].imageExtent       = { m_Width, m_Height, 1 };
+    }
+    vkCmdCopyBufferToImage(cmd, staging.GetHandle(), m_Image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 6, regions);
+
+    // mip0 → TRANSFER_SRC (blit source for mip1).
+    barrier(0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    s32 mw = (s32)m_Width, mh = (s32)m_Height;
+    for (u32 i = 1; i < m_MipLevels; ++i) {
+        const s32 nw = mw > 1 ? mw / 2 : 1;
+        const s32 nh = mh > 1 ? mh / 2 : 1;
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 6 };
+        blit.srcOffsets[1]  = { mw, mh, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 6 };
+        blit.dstOffsets[1]  = { nw, nh, 1 };
+        vkCmdBlitImage(cmd, m_Image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       m_Image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        // This level becomes the next blit's source.
+        barrier(i, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        mw = nw; mh = nh;
+    }
+
+    // All mips are TRANSFER_SRC now → SHADER_READ for the samplers.
+    barrier(0, m_MipLevels, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    CommandManager.EndAndSubmitImmediate(cmd);   // fence-waited
+    staging.Destroy();
+    m_CurrentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 // Рассчет количества mip levels

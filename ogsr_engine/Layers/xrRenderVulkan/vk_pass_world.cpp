@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 #include "stdafx.h"
 #include "vk_pass_world.h"
 #include "vk_pipeline_cache.h"
@@ -6,6 +13,11 @@
 #include "CRender_Vulkan.h"    // RImplementation, vkRender_Visual ref
 #include "vk_Visual.h"         // vkRender_Visual::Submit
 #include "vk_pass_skinned.h"   // Pass_Skinned (skinned dynamic leaves)
+#include "vk_env_light.h"      // EnvLight::Update — per-frame sun/hemi/ambient UBO (set 1)
+#include "vk_command_buffer.h" // CommandManager.GetCurrentFrame() — in-flight slot
+#include "vk_barriers.h"       // SceneAttachmentBarrier — prepass → color ordering
+#include "vk_pass_ssao.h"      // GTAO from the prepass depth (before the color pass)
+#include "vk_TreeManager.h"    // trees join the prepass depth (GTAO occluders + early-Z)
 
 namespace VK {
 
@@ -44,6 +56,95 @@ void Pass_World(FrameContext& ctx)
 
     VkCommandBuffer cmd = ctx.cmd;
 
+    // (The shared depth pipelines are baked for D32 — if the driver fell back to
+    // another depth format, skip the prepass rather than mismatch formats.)
+    const bool prepass = PipelineCache::GetDepthLayout() != VK_NULL_HANDLE
+                      && Swapchain.m_DepthFormat == VK_FORMAT_D32_SFLOAT;
+
+    // SSAO targets must exist BEFORE EnvLight::Update binds the AO view at
+    // binding 8 — a resize re-creates them here, not mid-frame after the bind.
+    // Only when the prepass will run: without it Execute never transitions the
+    // fresh image out of UNDEFINED, and binding it would be invalid to sample.
+    if (prepass)
+        SSAOPass::EnsureTargets(ctx.extent);
+
+    // Refresh this frame's env-lighting UBO (sun/hemi/ambient) once, before any
+    // draw. RenderQueue::Flush binds the resulting set at set 1; Pass_Skinned
+    // reuses the same set (at set 2). Fence-guarded slot → no in-flight write hazard.
+    EnvLight::Update(CommandManager.GetCurrentFrame());
+
+    // Collect + sort the static queue up front — the depth prepass and the
+    // color pass below both consume it.
+    Fmatrix identity;
+    identity.identity();
+    g_RenderQueue.Clear();
+    for (IRenderVisual* iv : RImplementation.Visuals) {
+        if (!iv) continue;
+        static_cast<vkRender_Visual*>(iv)->Submit(g_RenderQueue, identity, 0.0f);
+    }
+    g_RenderQueue.SortByKey();
+
+    // --- DEPTH PREPASS: statics into the scene depth (CLEAR). The color pass
+    // then LOADs depth and early-Z rejects every occluded pixel BEFORE the
+    // (heavy) forward fragment shader runs — kills overdraw cost. Alpha-tested
+    // items go through the AT depth variant (same discard threshold as the
+    // color pass → identical coverage, no holes).
+    if (prepass)
+    {
+        VkRenderingAttachmentInfo pdAtt{};
+        pdAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        pdAtt.imageView               = ctx.depthView;
+        pdAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        pdAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        pdAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
+        pdAtt.clearValue.depthStencil = { 1.0f, 0 };
+
+        VkRenderingInfo pri{};
+        pri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        pri.renderArea.extent = ctx.extent;
+        pri.layerCount        = 1;
+        pri.pDepthAttachment  = &pdAtt;
+        vkCmdBeginRendering(cmd, &pri);
+
+        VkViewport pvp{ 0.f, (float)ctx.extent.height, (float)ctx.extent.width, -(float)ctx.extent.height, 0.f, 1.f };
+        vkCmdSetViewport(cmd, 0, 1, &pvp);
+        VkRect2D psc{ {}, ctx.extent };
+        vkCmdSetScissor(cmd, 0, 1, &psc);
+        vkCmdSetDepthBias(cmd, 0.f, 0.f, 0.f);   // depth pipelines have dynamic bias — none here
+
+        g_RenderQueue.FlushDepth(cmd, *ctx.viewProj, false /*include alpha-tested via AT variant*/);
+
+        // Trees into the prepass depth too: GTAO sees trunks/canopies (R4's
+        // gbuffer includes trees — most wilderness SSAO comes from them) and
+        // the foliage color passes get early-Z. Same VP + alpha-ref as the
+        // tree color pass (LEQUAL, no vertex animation) → re-raster matches.
+        if (RImplementation.Trees) {
+            CFrustum f;
+            Fmatrix fullT = *ctx.viewProj;   // CreateFromMatrix takes a non-const ref
+            f.CreateFromMatrix(fullT, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+            RImplementation.Trees->RenderDepth(cmd, *ctx.viewProj, -1, &f);
+        }
+
+        // NPCs too (alpha-tested) — GTAO contact darkening under characters +
+        // early-Z behind them. Identical skinning math → depths match the
+        // color pass exactly (LEQUAL).
+        Skinned_RenderDepthPrepass(cmd, *ctx.viewProj);
+
+        vkCmdEndRendering(cmd);
+        SceneAttachmentBarrier(cmd);   // order prepass depth writes before the color pass
+
+        // GTAO from the prepass depth (R4 SSAO analog): flip depth to
+        // SHADER_READ, render half-res AO + blur, flip back. The color pass
+        // below samples the result via EnvLight binding 8 (ambient/hemi only).
+        if (SSAOPass::Enabled()) {
+            ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            SSAOPass::Execute(cmd, ctx.extent);
+            ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+    }
+
     // Targets travel in FrameContext; both are already in their attachment layout
     // (Begin set them, ExecutePasses ordered prior passes). No transition here.
 
@@ -58,7 +159,9 @@ void Pass_World(FrameContext& ctx)
     dAtt.sType                       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     dAtt.imageView                   = ctx.depthView;
     dAtt.imageLayout                 = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp                      = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // Prepass already laid the depth down — LOAD it so early-Z can reject;
+    // without a prepass keep the old CLEAR behaviour.
+    dAtt.loadOp                      = prepass ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     // STORE so Pass_Sky can run depth-test against world's z and only paint
     // cleared pixels (z == 1.0).
     dAtt.storeOp                     = VK_ATTACHMENT_STORE_OP_STORE;
@@ -143,19 +246,9 @@ void Pass_World(FrameContext& ctx)
         s_diag_done = true;
     }
 
-    // Phase 3: Submit → Sort → Flush. Visuals push DrawItems during
-    // traversal (Hier nodes recurse into children); the queue sorts by
-    // (depthTest, stride, tcOffset, VB hash) so adjacent items share
-    // pipeline/VB binds, then Flush issues the actual Vulkan draws.
-    Fmatrix identity;
-    identity.identity();
-
-    g_RenderQueue.Clear();
-    for (IRenderVisual* iv : RImplementation.Visuals) {
-        if (!iv) continue;
-        static_cast<vkRender_Visual*>(iv)->Submit(g_RenderQueue, identity, 0.0f);
-    }
-    g_RenderQueue.SortByKey();
+    // Phase 3: Flush the statics queue collected (and sorted) above, before the
+    // prepass. With the prepass depth already in place, early-Z rejects every
+    // occluded fragment before the forward shader runs.
     g_RenderQueue.Flush(ctx);
 
     // Dynamic (spawned) visuals — collected by CRender::add_Visual this frame.
@@ -166,9 +259,12 @@ void Pass_World(FrameContext& ctx)
     if (!g_DynamicVisuals.empty()) {
         g_RenderQueue.Clear();
         for (const DynVisual& d : g_DynamicVisuals) {
-            if (d.vis)
+            if (d.vis) {
+                g_RenderQueue.SetSubmitHemi(d.hemi);   // per-object sky-ambient gate
                 d.vis->Submit(g_RenderQueue, d.xform, 0.0f);
+            }
         }
+        g_RenderQueue.SetSubmitHemi(1.0f);             // reset for the next (static) flush
         g_RenderQueue.SortByKey();
         g_RenderQueue.Flush(ctx);
     }

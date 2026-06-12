@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - GPU-driven grass / detail-objects manager.
 //
 // Three-session port from monolith. THIS HEADER COVERS SESSION A ONLY:
@@ -117,8 +124,10 @@ struct DetailGfxPushConstants
     Fvector4 vWind;                                // 16  (dir.x, 0, dir.z, amplitude)
     Fvector4 vConsts;                              // 16  (1, 1, sun.y, ambient_floor)
     Fvector4 vInteractors[MAX_GRASS_INTERACTORS];  // 64  xyz=pos, w=radius (0=unused)
+    Fvector4 vSunColor;                            // 16  env sun colour (rgb); w unused
+    Fvector4 vHemiColor;                           // 16  env hemi colour (rgb); w unused
 };
-static_assert(sizeof(DetailGfxPushConstants) == 176, "Gfx push must be 176 B");
+static_assert(sizeof(DetailGfxPushConstants) == 208, "Gfx push must be 208 B");
 
 // HZB build push (32 B) — matches hzb_build.comp.glsl. srcMip/dstMip select
 // levels; isFirstPass=1 reads the depth buffer, =0 reads the previous HZB mip.

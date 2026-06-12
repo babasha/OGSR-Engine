@@ -1,8 +1,17 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 #include "stdafx.h"
 #include "vk_pipeline_cache.h"
 #include "vk_swapchain.h"
+#include "vk_scene_color.h"   // HDR scene target format (passes render to it, not the swapchain)
 #include "vk_shaders.h"
 #include "vk_world_material.h"  // descriptor set 0 layout
+#include "vk_env_light.h"       // descriptor set 1 layout (per-frame sun/hemi/ambient)
 #include "HW_Vulkan.h"
 
 #include <unordered_map>
@@ -23,6 +32,19 @@ namespace {
     VkShaderModule                         s_TerrainFS       = VK_NULL_HANDLE;
     VkPipelineLayout                       s_TerrainLayout   = VK_NULL_HANDLE;
     VkPipeline                             s_TerrainPipeline = VK_NULL_HANDLE;
+
+    // Sun shadow caster: depth-only VS (no FS), own layout (push: mat4 lightMVP),
+    // per-stride lazily-built pipelines into the shadow map's D32 format.
+    VkShaderModule                         s_DepthVS         = VK_NULL_HANDLE;
+    VkPipelineLayout                       s_DepthLayout     = VK_NULL_HANDLE;
+    std::unordered_map<u32, VkPipeline>    s_DepthPipelines;
+
+    // Alpha-tested caster variant (foliage silhouettes): VS+FS, material set 0,
+    // pipelines keyed by (stride << 8) | tcOffset.
+    VkShaderModule                         s_DepthATVS       = VK_NULL_HANDLE;
+    VkShaderModule                         s_DepthATFS       = VK_NULL_HANDLE;
+    VkPipelineLayout                       s_DepthATLayout   = VK_NULL_HANDLE;
+    std::unordered_map<u32, VkPipeline>    s_DepthATPipelines;
 
     constexpr const char* kCacheFile = "vk_pipeline_cache.bin";  // under $app_data_root$
 
@@ -87,13 +109,13 @@ namespace {
     //   vec2 uvScale   — VS, offset 64,  8 bytes
     //   float alphaRef — FS, offset 72,  4 bytes  (<0 disables aref discard)
     //   float _pad     — pad to 16-byte multiple (offset 76, 4 bytes)
-    constexpr u32 kPushSize = 80;
+    constexpr u32 kPushSize = 84;   // mat4 mvp + vec2 uvScale + alphaRef + detailScale + dynHemi
 }
 
 // Defined below; GetTerrainPipeline() (right after Init) needs it forward.
 static void BuildVertexInputForStride(u32 stride, u32 tcOffset,
                                       VkVertexInputBindingDescription&  binding,
-                                      VkVertexInputAttributeDescription attrs[5]);
+                                      VkVertexInputAttributeDescription attrs[6]);
 
 VkPipelineLayout GetLayout()      { return s_Layout; }
 VkPipelineCache  GetCacheObject() { return s_CacheObject; }
@@ -131,12 +153,28 @@ bool Init()
     if (s_TerrainVS == VK_NULL_HANDLE || s_TerrainFS == VK_NULL_HANDLE)
         Msg("![VK PipelineCache] terrain splat shaders missing — terrain falls back to single-detail path");
 
+    // Sun shadow caster VS — optional; absence disables shadow casting.
+    s_DepthVS = g_ShaderManager->Load("shadow_depth.vert.spv");
+    if (s_DepthVS == VK_NULL_HANDLE)
+        Msg("![VK PipelineCache] shadow_depth.vert.spv missing — sun shadow casting disabled");
+    // Alpha-tested caster pair — optional; absence keeps solid-quad shadows.
+    s_DepthATVS = g_ShaderManager->Load("shadow_depth_at.vert.spv");
+    s_DepthATFS = g_ShaderManager->Load("shadow_depth_at.frag.spv");
+    if (s_DepthATVS == VK_NULL_HANDLE || s_DepthATFS == VK_NULL_HANDLE)
+        Msg("![VK PipelineCache] shadow_depth_at.{vert,frag}.spv missing — alpha-tested casters disabled");
+
     VkPushConstantRange pc{};
     pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pc.offset     = 0;
     pc.size       = kPushSize;
 
-    VkDescriptorSetLayout setLayouts[1] = { WorldMaterialCache::GetSetLayout() };
+    // set 0 = material textures; set 1 = per-frame env lighting (sun/hemi/ambient).
+    VkDescriptorSetLayout envLayout = EnvLight::GetSetLayout();
+    if (envLayout == VK_NULL_HANDLE) {
+        Msg("![VK PipelineCache] EnvLight layout not initialised — call EnvLight::Init() first");
+        return false;
+    }
+    VkDescriptorSetLayout setLayouts[2] = { WorldMaterialCache::GetSetLayout(), envLayout };
     if (setLayouts[0] == VK_NULL_HANDLE) {
         Msg("![VK PipelineCache] WorldMaterialCache layout not initialised — call WorldMaterialCache::Init() first");
         return false;
@@ -144,7 +182,7 @@ bool Init()
 
     VkPipelineLayoutCreateInfo plci{};
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
+    plci.setLayoutCount         = 2;
     plci.pSetLayouts            = setLayouts;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges    = &pc;
@@ -153,14 +191,15 @@ bool Init()
         return false;
     }
 
-    // Terrain pipeline layout: set 0 = the 7-binding terrain set, same push range.
+    // Terrain pipeline layout: set 0 = the 7-binding terrain set, set 1 = env lighting; same push range.
     if (s_TerrainVS != VK_NULL_HANDLE && s_TerrainFS != VK_NULL_HANDLE) {
         VkDescriptorSetLayout tset = WorldMaterialCache::GetTerrainSetLayout();
         if (tset != VK_NULL_HANDLE) {
+            VkDescriptorSetLayout tsetLayouts[2] = { tset, envLayout };
             VkPipelineLayoutCreateInfo tplci{};
             tplci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-            tplci.setLayoutCount         = 1;
-            tplci.pSetLayouts            = &tset;
+            tplci.setLayoutCount         = 2;
+            tplci.pSetLayouts            = tsetLayouts;
             tplci.pushConstantRangeCount = 1;
             tplci.pPushConstantRanges    = &pc;
             if (vkCreatePipelineLayout(VulkanHW.m_Device, &tplci, nullptr, &s_TerrainLayout) != VK_SUCCESS) {
@@ -170,9 +209,206 @@ bool Init()
         }
     }
 
-    Msg("[VK PipelineCache] Init OK (layout, push=%u bytes, terrain=%s)",
-        kPushSize, s_TerrainLayout != VK_NULL_HANDLE ? "on" : "off");
+    // Shadow caster pipeline layout: single push { mat4 lightMVP } (VERTEX), no sets.
+    if (s_DepthVS != VK_NULL_HANDLE) {
+        VkPushConstantRange dpc{ VK_SHADER_STAGE_VERTEX_BIT, 0, (u32)sizeof(Fmatrix) };
+        VkPipelineLayoutCreateInfo dplci{};
+        dplci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        dplci.setLayoutCount         = 0;
+        dplci.pushConstantRangeCount = 1;
+        dplci.pPushConstantRanges    = &dpc;
+        if (vkCreatePipelineLayout(VulkanHW.m_Device, &dplci, nullptr, &s_DepthLayout) != VK_SUCCESS) {
+            Msg("![VK PipelineCache] shadow depth layout failed — casting disabled");
+            s_DepthLayout = VK_NULL_HANDLE;
+        }
+    }
+
+    // Alpha-tested caster layout: set 0 = material textures (diffuse sampled in
+    // FS), push { mat4; vec2 uvScale; float aref; pad } (VERTEX|FRAGMENT).
+    if (s_DepthATVS != VK_NULL_HANDLE && s_DepthATFS != VK_NULL_HANDLE) {
+        VkPushConstantRange apc{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                 (u32)(sizeof(Fmatrix) + 4 * sizeof(float)) };
+        VkDescriptorSetLayout matLayout = WorldMaterialCache::GetSetLayout();
+        VkPipelineLayoutCreateInfo aplci{};
+        aplci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        aplci.setLayoutCount         = 1;
+        aplci.pSetLayouts            = &matLayout;
+        aplci.pushConstantRangeCount = 1;
+        aplci.pPushConstantRanges    = &apc;
+        if (vkCreatePipelineLayout(VulkanHW.m_Device, &aplci, nullptr, &s_DepthATLayout) != VK_SUCCESS) {
+            Msg("![VK PipelineCache] AT shadow depth layout failed");
+            s_DepthATLayout = VK_NULL_HANDLE;
+        }
+    }
+
+    Msg("[VK PipelineCache] Init OK (layout, push=%u bytes, terrain=%s, shadow=%s)",
+        kPushSize, s_TerrainLayout != VK_NULL_HANDLE ? "on" : "off",
+        s_DepthLayout != VK_NULL_HANDLE ? "on" : "off");
     return true;
+}
+
+VkPipelineLayout GetDepthLayout() { return s_DepthLayout; }
+
+// Depth-only caster pipeline for a given vertex stride. One vertex attribute
+// (position FLOAT3 @ 0) + the stride-sized binding; depth write on, no color
+// attachment, front-face depth bias to fight self-shadow acne.
+VkPipeline GetDepthPipeline(u32 stride)
+{
+    if (s_DepthLayout == VK_NULL_HANDLE || s_DepthVS == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    auto it = s_DepthPipelines.find(stride);
+    if (it != s_DepthPipelines.end()) return it->second;
+
+    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
+    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &attr;
+
+    VkPipelineShaderStageCreateInfo stage{};   // VERTEX only — depth-only pass
+    stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage  = VK_SHADER_STAGE_VERTEX_BIT; stage.module = s_DepthVS; stage.pName = "main";
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType        = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode  = VK_POLYGON_MODE_FILL;
+    rs.cullMode     = VK_CULL_MODE_NONE;
+    rs.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth    = 1.0f;
+    rs.depthBiasEnable         = VK_TRUE;          // constant + slope bias vs acne (dynamic)
+    rs.depthBiasConstantFactor = 0.0f;
+    rs.depthBiasSlopeFactor    = 0.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendStateCreateInfo cb{};       // no color attachments
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 0;
+
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+    VkPipelineDynamicStateCreateInfo dynState{};
+    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+
+    VkPipelineRenderingCreateInfo prci{};
+    prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    prci.colorAttachmentCount  = 0;
+    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;   // matches the shadow map
+
+    VkGraphicsPipelineCreateInfo pi{};
+    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pi.pNext               = &prci;
+    pi.stageCount          = 1;        pi.pStages = &stage;
+    pi.pVertexInputState   = &vi;      pi.pInputAssemblyState = &ia;
+    pi.pViewportState      = &vp;      pi.pRasterizationState = &rs;
+    pi.pMultisampleState   = &ms;      pi.pDepthStencilState  = &ds;
+    pi.pColorBlendState    = &cb;      pi.pDynamicState       = &dynState;
+    pi.layout              = s_DepthLayout;
+
+    VkPipeline h = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h);
+    if (r != VK_SUCCESS) { Msg("![VK PipelineCache] shadow depth pipeline failed (%d) stride=%u", r, stride); h = VK_NULL_HANDLE; }
+    else                 Msg("[VK PipelineCache] shadow depth pipeline stride=%u", stride);
+    s_DepthPipelines.emplace(stride, h);
+    return h;
+}
+
+VkPipelineLayout GetDepthATLayout() { return s_DepthATLayout; }
+
+// Alpha-tested caster pipeline: position + UV attributes, VS+FS (FS discards
+// transparent texels), otherwise identical to the solid depth pipeline.
+VkPipeline GetDepthATPipeline(u32 stride, u32 tcOffset)
+{
+    if (s_DepthATLayout == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    const u32 key = (stride << 8) | tcOffset;
+    auto it = s_DepthATPipelines.find(key);
+    if (it != s_DepthATPipelines.end()) return it->second;
+
+    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attrs[2]{};
+    attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+    attrs[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
+    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs;
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_DepthATVS; stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_DepthATFS; stages[1].pName = "main";
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType        = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode  = VK_POLYGON_MODE_FILL;
+    rs.cullMode     = VK_CULL_MODE_NONE;
+    rs.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth    = 1.0f;
+    rs.depthBiasEnable = VK_TRUE;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendStateCreateInfo cb{};       // no color attachments
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+    VkPipelineDynamicStateCreateInfo dynState{};
+    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+
+    VkPipelineRenderingCreateInfo prci{};
+    prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+    VkGraphicsPipelineCreateInfo pi{};
+    pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pi.pNext             = &prci;
+    pi.stageCount        = 2;      pi.pStages             = stages;
+    pi.pVertexInputState = &vi;    pi.pInputAssemblyState = &ia;
+    pi.pViewportState    = &vp;    pi.pRasterizationState = &rs;
+    pi.pMultisampleState = &ms;    pi.pDepthStencilState  = &ds;
+    pi.pColorBlendState  = &cb;    pi.pDynamicState       = &dynState;
+    pi.layout            = s_DepthATLayout;
+
+    VkPipeline h = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h);
+    if (r != VK_SUCCESS) { Msg("![VK PipelineCache] AT shadow pipeline failed (%d) stride=%u tcOff=%u", r, stride, tcOffset); h = VK_NULL_HANDLE; }
+    else                 Msg("[VK PipelineCache] AT shadow pipeline stride=%u tcOff=%u", stride, tcOffset);
+    s_DepthATPipelines.emplace(key, h);
+    return h;
 }
 
 VkPipelineLayout GetTerrainLayout() { return s_TerrainLayout; }
@@ -184,14 +420,14 @@ VkPipeline GetTerrainPipeline()
 
     // Terrain is always the lmap sub-layout: stride 32, tcOffset 24, depth on.
     VkVertexInputBindingDescription   binding{};
-    VkVertexInputAttributeDescription attrs[5]{};
+    VkVertexInputAttributeDescription attrs[6]{};
     BuildVertexInputForStride(32, 24, binding, attrs);
 
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vi.vertexBindingDescriptionCount   = 1;
     vi.pVertexBindingDescriptions      = &binding;
-    vi.vertexAttributeDescriptionCount = 5;
+    vi.vertexAttributeDescriptionCount = 6;
     vi.pVertexAttributeDescriptions    = attrs;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -240,7 +476,7 @@ VkPipeline GetTerrainPipeline()
     dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
 
-    VkFormat colorFormat = Swapchain.m_Format;
+    VkFormat colorFormat = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
@@ -296,6 +532,21 @@ void Destroy()
         vkDestroyPipelineLayout(VulkanHW.m_Device, s_TerrainLayout, nullptr);
         s_TerrainLayout = VK_NULL_HANDLE;
     }
+    for (auto& kv : s_DepthPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+    s_DepthPipelines.clear();
+    if (s_DepthLayout) {
+        vkDestroyPipelineLayout(VulkanHW.m_Device, s_DepthLayout, nullptr);
+        s_DepthLayout = VK_NULL_HANDLE;
+    }
+    s_DepthVS = VK_NULL_HANDLE;   // owned by g_ShaderManager
+    for (auto& kv : s_DepthATPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+    s_DepthATPipelines.clear();
+    if (s_DepthATLayout) {
+        vkDestroyPipelineLayout(VulkanHW.m_Device, s_DepthATLayout, nullptr);
+        s_DepthATLayout = VK_NULL_HANDLE;
+    }
+    s_DepthATVS = VK_NULL_HANDLE;
+    s_DepthATFS = VK_NULL_HANDLE;
     if (s_Layout) {
         vkDestroyPipelineLayout(VulkanHW.m_Device, s_Layout, nullptr);
         s_Layout = VK_NULL_HANDLE;
@@ -326,9 +577,14 @@ void Destroy()
 // du/dv eliminate UV stripe artifacts at triangle edges (R4 unpack_tc_base
 // equivalent). Sub-layout choice drives lit/lmap shader selection at the
 // pipeline level — caller picks vs/fs accordingly.
+//
+// loc 5 = NORMAL, D3DCOLOR @ 12 (STEP 3 dynamic lights): packed (N*0.5+0.5)
+// with D3DCOLOR byte order B,G,R,A → reading as R8G8B8A8 the shader decodes
+// N = attr.zyx*2-1 (y is order-independent; if x/z look flipped in-game the
+// swizzle here in the shaders is the knob).
 static void BuildVertexInputForStride(u32 stride, u32 tcOffset,
                                       VkVertexInputBindingDescription&    binding,
-                                      VkVertexInputAttributeDescription   attrs[5])
+                                      VkVertexInputAttributeDescription   attrs[6])
 {
     binding  = { 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
     attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT,  0  };
@@ -342,19 +598,20 @@ static void BuildVertexInputForStride(u32 stride, u32 tcOffset,
         // vert-lit variant: pre-baked vertex color at offset 24
         attrs[4] = { 4, 0, VK_FORMAT_R8G8B8A8_UNORM, 24 };
     }
+    attrs[5] = { 5, 0, VK_FORMAT_R8G8B8A8_UNORM, 12 };   // packed vertex normal
 }
 
 static VkPipeline CreatePipeline(const Key& k)
 {
     VkVertexInputBindingDescription   binding{};
-    VkVertexInputAttributeDescription attrs[5]{};
+    VkVertexInputAttributeDescription attrs[6]{};
     BuildVertexInputForStride(k.stride, k.tcOffset, binding, attrs);
 
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vi.vertexBindingDescriptionCount   = 1;
     vi.pVertexBindingDescriptions      = &binding;
-    vi.vertexAttributeDescriptionCount = 5;
+    vi.vertexAttributeDescriptionCount = 6;
     vi.pVertexAttributeDescriptions    = attrs;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -409,7 +666,7 @@ static VkPipeline CreatePipeline(const Key& k)
     dynState.dynamicStateCount = 2;
     dynState.pDynamicStates    = dyn;
 
-    VkFormat colorFormat = Swapchain.m_Format;
+    VkFormat colorFormat = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;

@@ -1,3 +1,8 @@
+// xrRenderVulkan - compatibility stub for shared X-Ray Engine code.
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha) for the
+// stub itself; the interface it mirrors is GSC Game World code (root LICENSE.md).
+// Non-commercial use only; keep this notice on redistribution.
+
 // xrRenderVulkan - compat wrapper: compiles OGSR's shared PSLibrary.cpp
 // (CPSLibrary — loads all particle definitions from particles.xr). Engine-
 // agnostic; needed so model_CreateParticles can FindPED/FindPGD by name.

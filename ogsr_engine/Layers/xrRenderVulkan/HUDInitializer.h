@@ -1,3 +1,8 @@
+// xrRenderVulkan - compatibility stub for shared X-Ray Engine code.
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha) for the
+// stub itself; the interface it mirrors is GSC Game World code (root LICENSE.md).
+// Non-commercial use only; keep this notice on redistribution.
+
 #pragma once
 // xrRenderVulkan stub for the shared ParticleEffect.cpp's "HUDInitializer.h".
 // The R4 original (Layers/xrRenderPC_R4) saves/restores HUD view matrices on

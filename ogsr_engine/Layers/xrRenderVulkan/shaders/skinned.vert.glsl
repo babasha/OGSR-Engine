@@ -13,6 +13,9 @@
 // Bone index stored RAW (0..BoneCount-1) -> direct index into bones[].
 // bones[] holds the Fmatrix render transforms written row-major; GLSL reads them
 // column-major, which transposes, so `bones[i] * v` == X-Ray's `v * Mbone`.
+// Bones are PRE-MULTIPLIED by the object's world matrix at upload, so S*pos is
+// WORLD-space: pc.mvp is the plain viewProj, v_wpos feeds the shadow lookup,
+// and normals carry the object rotation.
 // ============================================================================
 
 layout(location = 0) in vec4 a_Position;     // FLOAT4 xyz=pos
@@ -24,12 +27,14 @@ layout(location = 5) in vec4 a_BoneIndices;  // u8x4 unorm: 4 idx*3 (4W only)
 
 layout(location = 0) out vec2 v_uv;
 layout(location = 1) out vec3 v_nrm;
+layout(location = 2) out vec3 v_wpos;   // world-space position (shadow lookup)
 
 layout(push_constant) uniform PC {
-    mat4 mvp;        // offset 0:  model->clip = objectXform * viewProj
-    uint skinMode;   // offset 64: 1=1W,2=2W,3=3W,4=4W
-    uint baseBone;   // offset 68: this skeleton's first bone slot in bones[]
-    uint boneCount;  // offset 72: this skeleton's bone count (for index clamp)
+    mat4  mvp;       // offset 0:  world->clip (bones are pre-multiplied to world)
+    uint  skinMode;  // offset 64: 1=1W,2=2W,3=3W,4=4W
+    uint  baseBone;  // offset 68: this skeleton's first bone slot in bones[]
+    uint  boneCount; // offset 72: this skeleton's bone count (for index clamp)
+    float hudMode;   // offset 76: 1 = first-person HUD (read by the fragment shader)
 } pc;
 
 // All skeletons' bone matrices concatenated; this skeleton's start = pc.baseBone.
@@ -74,8 +79,9 @@ void main()
           + bones[bb + clampB(dN(a_BoneIndices.a))] * (1.0 - w0 - w1 - w2);
     }
 
-    vec4 sp = S * vec4(pos, 1.0);
+    vec4 sp = S * vec4(pos, 1.0);    // world-space (bones pre-multiplied)
     gl_Position = pc.mvp * sp;
-    v_uv  = a_TexCoordExt.xy;
-    v_nrm = normalize(mat3(S) * nrm);
+    v_uv   = a_TexCoordExt.xy;
+    v_nrm  = normalize(mat3(S) * nrm);
+    v_wpos = sp.xyz;
 }

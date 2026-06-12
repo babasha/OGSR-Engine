@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - CTreeManager Session A: extract MT_TREE_ST/PM visuals
 // from the level, group by (vb,ib,tcOffset,texture), upload metadata +
 // transforms SSBOs, allocate indirect/draw-count buffers + per-texture
@@ -276,6 +283,7 @@ void CTreeManager::UploadMetadata(const xr_vector<GpuTreeMeta>& meta)
 {
     UploadDeviceLocal(m_TreeMetadataBuffer, meta.data(),
                       meta.size() * sizeof(GpuTreeMeta), 0);
+    m_MetaCPU = meta;   // kept for the CPU-culled shadow caster path (RenderDepth)
 }
 
 void CTreeManager::UploadTransforms(const xr_vector<GpuTreeInstance>& xforms)

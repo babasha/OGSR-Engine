@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - Pipeline cache keyed by vertex layout + shader program.
 //
 // Phase-2 lazy creation of forward graphics pipelines so we stop hardcoding
@@ -65,6 +72,21 @@ VkShaderModule WorldVlitFS();
 // formats like the world pipelines. Both return VK_NULL_HANDLE before Init().
 VkPipelineLayout GetTerrainLayout();
 VkPipeline       GetTerrainPipeline();
+
+// Sun shadow caster (STEP 2): depth-only pipelines (shadow_depth.vert, no FS),
+// keyed by vertex stride (position is at offset 0 for every level layout). The
+// shared layout has a single push range { mat4 lightMVP } (VERTEX). Used by
+// RenderQueue::FlushDepth from Pass_SunShadow. VK_NULL_HANDLE if the shader is
+// missing. The pipelines render into the shadow map's D32 format.
+VkPipelineLayout GetDepthLayout();
+VkPipeline       GetDepthPipeline(u32 stride);
+
+// Alpha-tested shadow caster variant (bushes, grates): VS passes the base UV,
+// FS samples the material diffuse (set 0 = WorldMaterial set) and discards
+// below alphaRef — depth keeps the foliage silhouette instead of solid quads.
+// Push: { mat4 lightMVP; vec2 uvScale; float alphaRef } (VERTEX|FRAGMENT).
+VkPipelineLayout GetDepthATLayout();
+VkPipeline       GetDepthATPipeline(u32 stride, u32 tcOffset);
 
 }}  // namespace VK::PipelineCache
 

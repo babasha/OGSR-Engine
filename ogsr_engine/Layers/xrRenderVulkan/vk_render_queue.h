@@ -1,3 +1,10 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 // xrRenderVulkan - Per-frame draw queue.
 //
 // Phase 3 splits "scene assembled this DrawItem" from "GPU executed it".
@@ -28,6 +35,11 @@ struct DrawItem
     // + sw_offsets[lod]).
     u32              iBaseOverride  = 0;
     u32              iCountOverride = 0;
+
+    // Sky-ambient occlusion for dynamic objects (1.0 = open sky / statics).
+    // Stamped by Push() from the queue's current submit-hemi; Flush feeds it to
+    // the world shader so indoor dynamics don't glow. See CRender::add_Visual.
+    float            hemi           = 1.0f;
 };
 
 class RenderQueue
@@ -38,10 +50,24 @@ public:
     void SortByKey();
     void Flush(FrameContext& ctx);
 
+    // Sky-ambient occlusion stamped onto every subsequently-pushed item (until
+    // changed). Set per dynamic object before its Submit; reset to 1.0 for
+    // statics. Lets one shared queue carry per-object hemi without touching the
+    // many Submit() overrides.
+    void SetSubmitHemi(float h) { m_SubmitHemi = h; }
+
+    // Depth-only flush: binds PipelineCache depth pipelines (by stride) and
+    // pushes mvp = item.xform · vp per item. No materials/colour — position
+    // only. Used by the sun/spot shadow casters AND the camera depth prepass;
+    // the prepass passes skipAlphaTested=true (a position-only shader can't
+    // discard, so punch-out materials would poke opaque holes in the depth).
+    void FlushDepth(VkCommandBuffer cmd, const Fmatrix& vp, bool skipAlphaTested = false);
+
     size_t Size() const { return m_Items.size(); }
 
 private:
     xr_vector<DrawItem> m_Items;
+    float               m_SubmitHemi = 1.0f;
 };
 
 extern RenderQueue g_RenderQueue;

@@ -1,6 +1,14 @@
+// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
 #include "stdafx.h"
 #include "vk_pass_sky.h"
 #include "vk_swapchain.h"
+#include "vk_scene_color.h"                // HDR scene target format
 #include "vk_shaders.h"
 #include "vk_texture.h"
 #include "HW_Vulkan.h"
@@ -180,6 +188,32 @@ namespace {
 
 namespace SkyPass {
 
+bool AcquireAmbientCubes(VkImageView& v0, VkImageView& v1, VkSampler& sampler, float& weight)
+{
+    // Sky system not up yet (no sampler / fallback) — caller keeps its fallback.
+    if (s_Sampler == VK_NULL_HANDLE || !s_FallbackCube) return false;
+
+    const char* n0 = nullptr;
+    const char* n1 = nullptr;
+    GetCurrentSkyNames(&n0, &n1);
+
+    // Same cached load the sky draw uses — first sight of a sky triggers the
+    // synchronous DDS load + mip-gen; cached forever after, so this is cheap.
+    CVulkanTexture* t0 = n0 ? LoadOrGet(n0) : s_FallbackCube;
+    CVulkanTexture* t1 = n1 ? LoadOrGet(n1) : t0;
+    if (!t0) t0 = s_FallbackCube;
+    if (!t1) t1 = t0;
+
+    v0      = t0->GetView();
+    v1      = t1->GetView();
+    sampler = s_Sampler;
+    weight  = 0.0f;
+    if (g_pGamePersistent)
+        if (auto* mix = g_pGamePersistent->Environment().CurrentEnv)
+            weight = mix->weight;
+    return true;
+}
+
 bool Init()
 {
     if (s_Pipeline) return true;
@@ -336,7 +370,7 @@ bool Init()
     dynState.dynamicStateCount = 2;
     dynState.pDynamicStates    = dyn;
 
-    VkFormat colorFormat = Swapchain.m_Format;
+    VkFormat colorFormat = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
