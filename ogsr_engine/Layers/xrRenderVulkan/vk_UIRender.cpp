@@ -143,11 +143,14 @@ public:
             ++VulkanUI::s_FrameStats.bufferWraps;
         }
 
+        // Writes land in THIS frame-slot's ring region (s_VBBase) — see
+        // VulkanUI::OnFrameBegin for the frames-in-flight discipline.
+        u8* base = static_cast<u8*>(VulkanUI::s_pMappedVB) + VulkanUI::s_VBBase + VulkanUI::s_UIVertexOffset;
         if (pointType == pttTL) {
-            m_pWriteTL      = reinterpret_cast<FVF::TL*>(static_cast<u8*>(VulkanUI::s_pMappedVB) + VulkanUI::s_UIVertexOffset);
+            m_pWriteTL      = reinterpret_cast<FVF::TL*>(base);
             m_pWriteTLStart = m_pWriteTL;
         } else {
-            m_pWriteLIT      = reinterpret_cast<FVF::LIT*>(static_cast<u8*>(VulkanUI::s_pMappedVB) + VulkanUI::s_UIVertexOffset);
+            m_pWriteLIT      = reinterpret_cast<FVF::LIT*>(base);
             m_pWriteLITStart = m_pWriteLIT;
         }
     }
@@ -181,7 +184,7 @@ public:
             if (VulkanUI::s_DeferredCmdCount < VulkanUI::MAX_DEFERRED_CMDS) {
                 auto& dcmd = VulkanUI::s_DeferredCmds[VulkanUI::s_DeferredCmdCount++];
                 dcmd.type               = VulkanUI::DeferredUICmd::Draw;
-                dcmd.vertexBufferOffset = VulkanUI::s_UIVertexOffset;
+                dcmd.vertexBufferOffset = VulkanUI::s_VBBase + VulkanUI::s_UIVertexOffset;  // absolute (ring slot)
                 dcmd.vertexCount        = vertCount;
                 dcmd.textureSet         = m_CurrentTextureSet;
                 dcmd.pipeline           = pipe;
@@ -202,7 +205,7 @@ public:
         vkCmdPushConstants(cmd, VulkanUI::s_PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, screenSize);
 
         VkBuffer     vbs[]     = { VulkanUI::GetVertexBufferHandle() };
-        VkDeviceSize offsets[] = { VulkanUI::s_UIVertexOffset };
+        VkDeviceSize offsets[] = { VulkanUI::s_VBBase + VulkanUI::s_UIVertexOffset };
         vkCmdBindVertexBuffers(cmd, 0, 1, vbs, offsets);
 
         VkDescriptorSet texSet = (m_CurrentTextureSet != VK_NULL_HANDLE) ? m_CurrentTextureSet : VulkanUI::s_WhiteTextureSet;

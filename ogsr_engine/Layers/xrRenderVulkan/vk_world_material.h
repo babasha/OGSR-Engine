@@ -40,16 +40,30 @@ struct WorldMaterial
     // is always valid; the vert-lit fragment shader simply doesn't read it.
     VkImageView     view_lmap    = VK_NULL_HANDLE;
 
+    // Heightmap tessellation (R4 TESS_HM): set 0, binding 3 = `<bump>#.dds`
+    // whose ALPHA is the displacement height, sampled by the tessellation
+    // evaluation shader. `tessellated` is the opt-in: true only when the
+    // diffuse .thm declares a bump association AND the # texture loads AND
+    // the material is plain opaque (no aref/wmark — those must match the
+    // flat depth prepass exactly). Others bind a 1×1 zero-alpha fallback.
+    bool            tessellated  = false;
+
     VkDescriptorSet set      = VK_NULL_HANDLE;
     float           alphaRef = -1.0f;
 
     // --- Terrain splatting (R4 CBlender_BmmD) ---
-    // When the diffuse name starts with "terrain\", this material also gets a
-    // 7-binding terrain set {base, mask, dt_r, dt_g, dt_b, dt_a, lmap} and is
-    // rendered with the terrain pipeline. `terrainSet` is VK_NULL_HANDLE for
+    // When the diffuse name starts with "terrain\", this material also gets an
+    // 11-binding terrain set {base, mask, dt_r..dt_a, lmap, dn_r..dn_a} and is
+    // rendered with the terrain pipeline. dn_* are the <detail>_bump tangent
+    // normal maps (R4 CBlender_BmmD). `terrainSet` is VK_NULL_HANDLE for
     // non-terrain materials, which keep the plain 3-binding `set` above.
     bool            isTerrain  = false;
     VkDescriptorSet terrainSet = VK_NULL_HANDLE;
+
+    // Baked level decal (newspapers / dirt overlays — level shader effects\
+    // wallmark*): geometry coplanar with the surface beneath. Rendered last,
+    // alpha-blended, no depth write, negative depth bias (else z-fight).
+    bool            isWmark    = false;
 };
 
 namespace WorldMaterialCache {
@@ -63,7 +77,7 @@ void Destroy();
 // for non-lightmapped materials → binding 2 falls back to 1×1 white.
 // Cache keys both names together so the same diffuse can pair with
 // different lmaps.
-WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef);
+WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark = false);
 
 VkDescriptorSetLayout GetSetLayout();
 VkDescriptorSetLayout GetTerrainSetLayout();   // 7-binding terrain splat set

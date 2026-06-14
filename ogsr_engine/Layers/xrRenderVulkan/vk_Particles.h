@@ -128,11 +128,13 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-// Particle group — N timed child effects (campfires, explosions, ...).
-// Time-windowed playback of children; the advanced on-birth/on-dead/on-play
-// related/free child spawning is not ported (rare), so flOnPlayChild etc. are
-// ignored — the core timed child effects cover the common cases.
+// Particle group — N timed child effects (campfires, explosions, ...) PLUS the
+// R4 on-play / on-birth / on-dead child spawning (ParticleGroup.cpp SItem):
+// per-particle related children that follow their emitter particle, and free
+// children fired once at a particle's birth/death (secondary smoke, sparks...).
 // ----------------------------------------------------------------------------
+namespace PAPI { struct Particle; }
+
 class vkCParticleGroup final : public vkParticleVisual
 {
 public:
@@ -147,7 +149,22 @@ public:
     float   m_CurrentTime = 0.f;
     Fvector m_InitialPosition{};
 
-    xr_vector<vkCParticleEffect*> m_Items;   // one child effect per CPGDef::SEffect
+    // One item per CPGDef::SEffect. `related` runs PARALLEL to the effect's
+    // live PAPI particle array (R4 invariant: index i follows particle i —
+    // both sides remove via swap-with-last, see the dead callback).
+    struct SItem
+    {
+        vkCParticleEffect*            effect = nullptr;
+        xr_vector<vkCParticleEffect*> related;   // flOnPlayChild — one per live particle
+        xr_vector<vkCParticleEffect*> freeKids;  // flOnBirthChild/flOnDeadChild — fire & forget
+    };
+    xr_vector<SItem> m_Items;
+
+    // Child spawn/stop (called from the PAPI birth/dead callbacks in
+    // vk_ParticleGroup.cpp; public because the callbacks are free functions).
+    void StartRelatedChild(u32 item, const char* eff_name, PAPI::Particle& m);
+    void StopRelatedChild(u32 item, u32 idx);
+    void StartFreeChild(u32 item, const char* eff_name, PAPI::Particle& m);
 
 public:
     vkCParticleGroup();

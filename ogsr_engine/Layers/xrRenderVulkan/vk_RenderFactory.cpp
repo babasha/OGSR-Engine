@@ -40,6 +40,7 @@
 #include "../../Include/xrRender/LensFlareRender.h"
 #include "../../Include/xrRender/ThunderboltRender.h"
 #include "../../Include/xrRender/ThunderboltDescRender.h"
+#include "vk_rain.h"               // VK_Create{Rain,Thunderbolt,ThunderboltDesc,Flare}Render
 
 #include <unordered_map>
 #include <string>
@@ -500,14 +501,36 @@ struct vkStatsRender_Stub final : IStatsRender
     void SetDrawParams(IRenderDeviceRender*)         override {}
 };
 
-struct vkWallMarkArray_Stub final : IWallMarkArray
+// Real wallmark array: retains the decal TEXTURE NAMES the game appends from
+// materials (SGameMtlPair CollideMarks). empty() must be honest — the bullet
+// manager gates add_StaticWallmark on it (the old always-true stub meant the
+// renderer never even got asked for bullet holes).
+struct vkWallMarkArray_Real final : IWallMarkArray
 {
-    void Copy(IWallMarkArray&)        override {}
-    void AppendMark(LPCSTR)            override {}
-    void clear()                       override {}
-    bool empty()                       override { return true; }
-    wm_shader GenerateWallmark()       override { return {}; }  // default factory ctor
+    xr_vector<shared_str> m_names;
+
+    void Copy(IWallMarkArray& in)  override { m_names = static_cast<vkWallMarkArray_Real&>(in).m_names; }
+    void AppendMark(LPCSTR s)      override { if (s && s[0]) m_names.emplace_back(s); }
+    void clear()                   override { m_names.clear(); }
+    bool empty()                   override { return m_names.empty(); }
+    wm_shader GenerateWallmark()   override
+    {
+        // wm_shader = FactoryPtr<IUIShader>; the texture name travels inside
+        // the vkUIShader_Real (read back via VK_UIShaderTexName).
+        wm_shader S;
+        if (!m_names.empty())
+            S->create("effects\\wallmark", m_names[::Random.randI((u32)m_names.size())].c_str());
+        return S;
+    }
+
+    const char* PickName()
+    {
+        return m_names.empty() ? nullptr : m_names[::Random.randI((u32)m_names.size())].c_str();
+    }
 };
+
+// (The external bridge functions for these types live AFTER the anonymous
+// namespace closes — see VK_WallmarkArray_Pick / VK_UIShaderTexName below.)
 
 // CEnvironment / CEnvDescriptor / WeatherFX subsystem ------------------------
 // CGamePersistent ctor → IGame_Persistent ctor → CEnvironment ctor →
@@ -541,13 +564,7 @@ struct vkEnvDescriptorMixerRender_Stub final : IEnvDescriptorMixerRender
     void lerp(IEnvDescriptorRender*, IEnvDescriptorRender*) override {}
 };
 
-struct vkRainRender_Stub final : IRainRender
-{
-    void Copy(IRainRender&)                      override {}
-    void Render(CBackend&, CEffect_Rain&)        override {}
-    void Calculate(CEffect_Rain&)                override {}
-    const Fsphere& GetDropBounds() const         override { static Fsphere s{ {0,0,0}, 0.f }; return s; }
-};
+// Rain / thunderbolt / flare renders are REAL now — see vk_rain.cpp.
 
 struct vkLensFlareRender_Stub final : ILensFlareRender
 {
@@ -557,27 +574,21 @@ struct vkLensFlareRender_Stub final : ILensFlareRender
     void OnDeviceDestroy()                                         override {}
 };
 
-struct vkFlareRender_Stub final : IFlareRender
-{
-    void Copy(IFlareRender&)                     override {}
-    void CreateShader(LPCSTR, LPCSTR)            override {}
-    void DestroyShader()                          override {}
-};
-
-struct vkThunderboltRender_Stub final : IThunderboltRender
-{
-    void Copy(IThunderboltRender&)               override {}
-    void Render(CBackend&, CEffect_Thunderbolt&) override {}
-};
-
-struct vkThunderboltDescRender_Stub final : IThunderboltDescRender
-{
-    void Copy(IThunderboltDescRender&)           override {}
-    void CreateModel(LPCSTR)                     override {}
-    void DestroyModel()                          override {}
-};
-
 } // namespace
+
+// Bridges for CRender::add_StaticWallmark (CRender_Vulkan.cpp can't see the
+// concrete types defined in this TU). EXTERNAL linkage — outside the anonymous
+// namespace above.
+const char* VK_WallmarkArray_Pick(IWallMarkArray* A)
+{
+    return A ? static_cast<vkWallMarkArray_Real*>(A)->PickName() : nullptr;
+}
+const char* VK_UIShaderTexName(IUIShader* S)
+{
+    if (!S) return nullptr;
+    auto* r = static_cast<vkUIShader_Real*>(S);
+    return r->m_TexName.empty() ? nullptr : r->m_TexName.c_str();
+}
 
 // ---------------------------------------------------------------------------
 // IRenderFactory implementations — only the menu-path ones return real stubs.
@@ -595,7 +606,7 @@ void         vkRenderFactory::DestroyFontRender(IFontRender* p)    { xr_delete(p
 IStatsRender* vkRenderFactory::CreateStatsRender()                 { return xr_new<vkStatsRender_Stub>(); }
 void          vkRenderFactory::DestroyStatsRender(IStatsRender* p) { xr_delete(p); }
 
-IWallMarkArray* vkRenderFactory::CreateWallMarkArray()             { return xr_new<vkWallMarkArray_Stub>(); }
+IWallMarkArray* vkRenderFactory::CreateWallMarkArray()             { return xr_new<vkWallMarkArray_Real>(); }
 void            vkRenderFactory::DestroyWallMarkArray(IWallMarkArray* p) { xr_delete(p); }
 
 // xr_new keeps engine-side ownership semantics consistent with dxRenderFactory.
@@ -619,17 +630,19 @@ void                  vkRenderFactory::DestroyEnvDescriptorRender(IEnvDescriptor
 IEnvDescriptorMixerRender* vkRenderFactory::CreateEnvDescriptorMixerRender()     { return xr_new<vkEnvDescriptorMixerRender_Stub>(); }
 void                       vkRenderFactory::DestroyEnvDescriptorMixerRender(IEnvDescriptorMixerRender* p) { xr_delete(p); }
 
-IRainRender*  vkRenderFactory::CreateRainRender()                                { return xr_new<vkRainRender_Stub>(); }
+// Rain / thunderbolt / flare: REAL implementations live in vk_rain.cpp (the
+// "Rain" pass draws what these build). Lens flare itself is still stubbed.
+IRainRender*  vkRenderFactory::CreateRainRender()                                { return VK_CreateRainRender(); }
 void          vkRenderFactory::DestroyRainRender(IRainRender* p)                 { xr_delete(p); }
 
 ILensFlareRender* vkRenderFactory::CreateLensFlareRender()                       { return xr_new<vkLensFlareRender_Stub>(); }
 void              vkRenderFactory::DestroyLensFlareRender(ILensFlareRender* p)   { xr_delete(p); }
 
-IFlareRender* vkRenderFactory::CreateFlareRender()                               { return xr_new<vkFlareRender_Stub>(); }
+IFlareRender* vkRenderFactory::CreateFlareRender()                               { return VK_CreateFlareRender(); }
 void          vkRenderFactory::DestroyFlareRender(IFlareRender* p)               { xr_delete(p); }
 
-IThunderboltRender* vkRenderFactory::CreateThunderboltRender()                   { return xr_new<vkThunderboltRender_Stub>(); }
+IThunderboltRender* vkRenderFactory::CreateThunderboltRender()                   { return VK_CreateThunderboltRender(); }
 void                vkRenderFactory::DestroyThunderboltRender(IThunderboltRender* p) { xr_delete(p); }
 
-IThunderboltDescRender* vkRenderFactory::CreateThunderboltDescRender()           { return xr_new<vkThunderboltDescRender_Stub>(); }
+IThunderboltDescRender* vkRenderFactory::CreateThunderboltDescRender()           { return VK_CreateThunderboltDescRender(); }
 void                    vkRenderFactory::DestroyThunderboltDescRender(IThunderboltDescRender* p) { xr_delete(p); }

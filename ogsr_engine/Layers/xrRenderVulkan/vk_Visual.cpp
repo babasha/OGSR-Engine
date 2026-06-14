@@ -91,6 +91,7 @@ void vkRender_Visual::Copy(vkRender_Visual* from)
     dbg_name = from->dbg_name;
     m_pMaterial = from->m_pMaterial;
     m_fAlphaRef = from->m_fAlphaRef;
+    m_bEmissiveAdd = from->m_bEmissiveAdd;
     // Pool instances are built via Copy(); without this the instance's diffuse
     // descriptor stays null and it renders white (the base had it from LoadTexture).
     // (Same latent class as the Update_Callback ctor bug.) WorldMaterial* is a shared
@@ -165,6 +166,17 @@ void vkRender_Visual::LoadTexture(IReader* data)
             {
                 m_fAlphaRef = 200.0f / 255.0f;  // DX11 def_aref uses oAREF=200
             }
+            // Collimator / red-dot sight marks (R4 hud_reddotsight*.s: additive
+            // blend(srcalpha, one), unlit). Through the regular lit skinned path
+            // they rendered as a dark, barely visible smudge on the sight glass.
+            if (sn_lower.find("reddot")     != xr_string::npos ||
+                sn_lower.find("collimator") != xr_string::npos ||
+                sn_lower.find("holo")       != xr_string::npos)
+            {
+                m_bEmissiveAdd = true;
+                static int s_diag = 0;
+                if (s_diag < 8) { ++s_diag; Msg("[VK Skinned] emissive-add leaf: shader='%s' tex='%s'", shader_name, texture_name); }
+            }
         }
     }
 
@@ -190,11 +202,13 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // — null on vert-lit / unlit materials, which fall back to white.
     const char* diffuse_name = nullptr;
     const char* lmap_name    = nullptr;
+    bool wmark = false;
     if (shader_id < (u16)RImplementation.Shaders.size()) {
         VK::CVulkanShader* pShader = RImplementation.Shaders[shader_id];
         if (pShader) {
             if (pShader->m_TexDiffuse.size() > 0) diffuse_name = pShader->m_TexDiffuse.c_str();
             if (pShader->m_TexLmap.size()    > 0) lmap_name    = pShader->m_TexLmap.c_str();
+            wmark = pShader->m_bWmark;   // baked level decal (effects\wallmark*)
         }
     }
     // Dynamic models (NPCs/weapons/items) carry their diffuse in OGF_TEXTURE, not in
@@ -202,7 +216,7 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // OGF's own texture is authoritative, so prefer it whenever present; level statics
     // (no OGF_TEXTURE) keep the shader-table diffuse.
     if (ogf_diffuse[0]) diffuse_name = ogf_diffuse;
-    m_pWorldMaterial = VK::WorldMaterialCache::GetOrCreate(diffuse_name, lmap_name, m_fAlphaRef);
+    m_pWorldMaterial = VK::WorldMaterialCache::GetOrCreate(diffuse_name, lmap_name, m_fAlphaRef, wmark);
 }
 
 // ============================================================================
@@ -288,7 +302,9 @@ void vkFVisual::Submit(VK::RenderQueue& q, const Fmatrix& xform, float LOD)
     it.sortKey = VK::makeSortKey(m_mesh.vStride, m_mesh.tcOffset,
                                  /*depthTest*/ true,
                                  m_pWorldMaterial,
-                                 m_mesh.p_rm_Vertices);
+                                 m_mesh.p_rm_Vertices,
+                                 m_pWorldMaterial && m_pWorldMaterial->isWmark,
+                                 m_pWorldMaterial && m_pWorldMaterial->tessellated);
     q.Push(it);
 }
 
@@ -623,7 +639,9 @@ void vkFProgressive::Submit(VK::RenderQueue& q, const Fmatrix& xform, float LOD)
     it.sortKey        = VK::makeSortKey(m_mesh.vStride, m_mesh.tcOffset,
                                         /*depthTest*/ true,
                                         m_pWorldMaterial,
-                                        m_mesh.p_rm_Vertices);
+                                        m_mesh.p_rm_Vertices,
+                                        m_pWorldMaterial && m_pWorldMaterial->isWmark,
+                                        m_pWorldMaterial && m_pWorldMaterial->tessellated);
     q.Push(it);
 
     last_lod = lod_idx;
@@ -1146,6 +1164,61 @@ static void vk_skinned_analyse(TLeaf* leaf, u32 dwVertType, void* _verts_, u32 d
     }
 }
 
+// Retain a CPU copy of the boned vertices + indices and build per-bone face
+// lists — skeleton wallmarks (blood on NPCs) and bone ray-picks read these
+// (the GPU path only keeps the converted vertHW VB). Mirrors what R4 keeps in
+// CSkeletonX (VerticesXW/m_Indices) + CBoneData face lists.
+static std::shared_ptr<vkSkinCPUData> vk_skinned_retain_cpu(u32 dwVertType, void* _verts_, u32 dwVertCount, IReader* data)
+{
+    u32 links = 0, vsize = 0;
+    switch (dwVertType) {
+    case OGF_VERTEXFORMAT_FVF_1L: case 1: links = 1; vsize = sizeof(vertBoned1W); break;
+    case OGF_VERTEXFORMAT_FVF_2L: case 2: links = 2; vsize = sizeof(vertBoned2W); break;
+    case OGF_VERTEXFORMAT_FVF_3L: case 3: links = 3; vsize = sizeof(vertBoned3W); break;
+    case OGF_VERTEXFORMAT_FVF_4L: case 4: links = 4; vsize = sizeof(vertBoned4W); break;
+    default: return nullptr;
+    }
+    if (!data->find_chunk(OGF_INDICES)) return nullptr;
+    const u32 iCount = data->r_u32();
+    if (!iCount) return nullptr;
+
+    auto d = std::make_shared<vkSkinCPUData>();
+    d->links     = links;
+    d->vertCount = dwVertCount;
+    d->verts.assign((u8*)_verts_, (u8*)_verts_ + (size_t)vsize * dwVertCount);
+    d->indices.assign((u16*)data->pointer(), (u16*)data->pointer() + iCount);
+
+    // Per-face bone set (deduped within the face) -> boneFaces[bone].
+    const u32 fCount = iCount / 3;
+    auto addFace = [&](u32 face, u16 bone) {
+        if (bone >= d->boneFaces.size()) d->boneFaces.resize(bone + 1);
+        auto& v = d->boneFaces[bone];
+        if (v.empty() || v.back() != face) v.push_back(face);
+    };
+    for (u32 f = 0; f < fCount; ++f) {
+        u16 fb[12]; u32 nb = 0;
+        for (u32 k = 0; k < 3; ++k) {
+            const u32 vi = d->indices[f * 3 + k];
+            if (vi >= dwVertCount) { nb = 0; break; }
+            u16 b[4]; u32 cnt = 0;
+            switch (links) {
+            case 1: { auto& v = ((vertBoned1W*)_verts_)[vi]; b[0] = (u16)v.matrix; cnt = 1; } break;
+            case 2: { auto& v = ((vertBoned2W*)_verts_)[vi]; b[0] = v.matrix0; b[1] = v.matrix1; cnt = 2; } break;
+            case 3: { auto& v = ((vertBoned3W*)_verts_)[vi]; b[0] = v.m[0]; b[1] = v.m[1]; b[2] = v.m[2]; cnt = 3; } break;
+            case 4: { auto& v = ((vertBoned4W*)_verts_)[vi]; b[0] = v.m[0]; b[1] = v.m[1]; b[2] = v.m[2]; b[3] = v.m[3]; cnt = 4; } break;
+            }
+            for (u32 j = 0; j < cnt; ++j) {
+                bool dup = false;
+                for (u32 e = 0; e < nb; ++e) if (fb[e] == b[j]) { dup = true; break; }
+                if (!dup && nb < 12) fb[nb++] = b[j];
+            }
+        }
+        for (u32 e = 0; e < nb; ++e)
+            addFace(f, fb[e]);
+    }
+    return d;
+}
+
 void vkSkeletonX_ST::Load(const char* name, IReader* data, u32 flags)
 {
     R_ASSERT(data->find_chunk(OGF_VERTICES));
@@ -1161,12 +1234,13 @@ void vkSkeletonX_ST::Load(const char* name, IReader* data, u32 flags)
     m_mesh.vBase = 0;
     m_mesh.vCount = dwVertCount;
     _Load_hw_VK(_verts_, dwVertType, dwVertCount);
+    wmCPU = vk_skinned_retain_cpu(dwVertType, _verts_, dwVertCount, data);
 }
 void vkSkeletonX_ST::_Load_hw_VK(void* verts, u32 /*vertType*/, u32 vertCount) { vkLoadSkinnedVertices(m_mesh, RenderMode, verts, vertCount, "SKL-ST"); }
 void vkSkeletonX_ST::Copy(vkRender_Visual* from)
 {
     vkFVisual::Copy(from);
-    if (auto* s = dynamic_cast<vkSkeletonX_ST*>(from)) { RenderMode = s->RenderMode; BonesUsed = s->BonesUsed; RMS_bonecount = s->RMS_bonecount; }
+    if (auto* s = dynamic_cast<vkSkeletonX_ST*>(from)) { RenderMode = s->RenderMode; BonesUsed = s->BonesUsed; RMS_bonecount = s->RMS_bonecount; wmCPU = s->wmCPU; }
 }
 
 void vkSkeletonX_PM::Load(const char* name, IReader* data, u32 flags)
@@ -1184,12 +1258,15 @@ void vkSkeletonX_PM::Load(const char* name, IReader* data, u32 flags)
     m_mesh.vBase = 0;
     m_mesh.vCount = dwVertCount;
     _Load_hw_VK(_verts_, dwVertType, dwVertCount);
+    // NOTE: progressive leaves keep the FULL index chunk (all LOD windows) —
+    // wallmark faces may overlap across LODs; visually negligible (alpha decal).
+    wmCPU = vk_skinned_retain_cpu(dwVertType, _verts_, dwVertCount, data);
 }
 void vkSkeletonX_PM::_Load_hw_VK(void* verts, u32 /*vertType*/, u32 vertCount) { vkLoadSkinnedVertices(m_mesh, RenderMode, verts, vertCount, "SKL-PM"); }
 void vkSkeletonX_PM::Copy(vkRender_Visual* from)
 {
     vkFProgressive::Copy(from);
-    if (auto* s = dynamic_cast<vkSkeletonX_PM*>(from)) { RenderMode = s->RenderMode; BonesUsed = s->BonesUsed; RMS_bonecount = s->RMS_bonecount; }
+    if (auto* s = dynamic_cast<vkSkeletonX_PM*>(from)) { RenderMode = s->RenderMode; BonesUsed = s->BonesUsed; RMS_bonecount = s->RMS_bonecount; wmCPU = s->wmCPU; }
 }
 
 vkRender_Visual* vkVisual_CreateDummy()

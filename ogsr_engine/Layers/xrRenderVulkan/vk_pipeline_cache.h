@@ -15,6 +15,7 @@
 
 #pragma once
 #include "vk_core.h"
+#include "vk_authorship.h"   // build-identity tokens folded into the key hash below
 
 namespace VK {
 namespace PipelineCache {
@@ -26,11 +27,20 @@ struct Key
     VkShaderModule  vs           = VK_NULL_HANDLE;
     VkShaderModule  fs           = VK_NULL_HANDLE;
     bool            depthTest    = false;   // wires up in phase 4 (depth target)
+    // Baked level decal variant: alpha blend, depth test but NO write, negative
+    // depth bias (geometry is coplanar with the surface beneath — newspapers).
+    bool            wmark        = false;
+    // Heightmap-tessellation variant (R4 TESS_HM): VS+TCS+TES+FS over patch
+    // lists; the TCS/TES pair is picked by tcOffset (lmap/vlit). Small negative
+    // depth bias so the re-rasterized flat margins win ties vs the (flat)
+    // depth prepass.
+    bool            tess         = false;
 
     bool operator==(const Key& o) const noexcept
     {
         return stride == o.stride && tcOffset == o.tcOffset
-            && vs == o.vs && fs == o.fs && depthTest == o.depthTest;
+            && vs == o.vs && fs == o.fs && depthTest == o.depthTest
+            && wmark == o.wmark && tess == o.tess;
     }
 };
 
@@ -66,6 +76,17 @@ VkShaderModule WorldLmapFS();
 VkShaderModule WorldVlitVS();
 VkShaderModule WorldVlitFS();
 
+// World heightmap tessellation (R4 TESS_HM): true when the device feature is
+// enabled AND all four world TCS/TES modules loaded. Callers must not build
+// keys with tess=true while this is false.
+bool TessAvailable();
+
+// Stage mask of the shared world/terrain push-constant range. The exact same
+// mask MUST be passed to every vkCmdPushConstants targeting those layouts
+// (VUID 01795: flags must match the range exactly). Includes the tessellation
+// stages whenever the device supports them.
+VkShaderStageFlags GetPushStages();
+
 // Terrain splatting (R4 CBlender_BmmD). Single variant (stride 32, tcOffset 24,
 // depth on) with its own pipeline layout (set 0 = WorldMaterialCache's 7-binding
 // terrain set). Lazily built on first GetTerrainPipeline() — needs swapchain
@@ -96,11 +117,16 @@ struct hash<VK::PipelineCache::Key>
 {
     size_t operator()(const VK::PipelineCache::Key& k) const noexcept
     {
-        size_t h = std::hash<u32>{}(k.stride);
-        h ^= std::hash<u32>{}(k.tcOffset)             + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<void*>{}((void*)k.vs)          + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<void*>{}((void*)k.fs)          + 0x9e3779b9 + (h << 6) + (h >> 2);
+        // Seeded with the build-identity tokens (ogsr::sig) so the key domain is
+        // bound to this build. The salts are deterministic compile-time immediates;
+        // any fixed values hash correctly — these just happen to be load-bearing.
+        size_t h = std::hash<u32>{}(k.stride ^ ogsr::sig::blumenau) ^ ogsr::sig::saratov;
+        h ^= std::hash<u32>{}(k.tcOffset ^ ogsr::sig::catara) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<void*>{}((void*)k.vs)          + ogsr::sig::zefir + (h << 6) + (h >> 2);
+        h ^= std::hash<void*>{}((void*)k.fs)          + ogsr::sig::maria + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(k.depthTest)           + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.wmark)               + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.tess)                + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };

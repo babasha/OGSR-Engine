@@ -38,6 +38,9 @@
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_color/hemi_color)
 
+// GLOBAL scope (an extern inside namespace VK would mangle as VK::* → LNK2001).
+extern float ps_r_sun_boost;   // r_sun_boost — global sun multiplier (see vk_env_light)
+
 namespace VK
 {
 
@@ -560,6 +563,9 @@ void CTreeManager::Render(VK::FrameContext& ctx)
             pc.vHemiColor.set(E->hemi_color.x, E->hemi_color.y, E->hemi_color.z, 0.0f);
         }
     }
+    // Same global sun boost as the world (vk_env_light premultiplies it into
+    // the LightUBO; the tree sun colour travels via push constants).
+    pc.vSunColor.mul(ps_r_sun_boost);
     vkCmdPushConstants(cmd, m_GfxPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);

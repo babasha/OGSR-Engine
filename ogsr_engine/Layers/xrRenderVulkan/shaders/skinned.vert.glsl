@@ -57,16 +57,20 @@ void main()
     vec3 nrm = a_Normal.xyz * 2.0 - 1.0;
     uint bb = pc.baseBone;
 
+    // Low 4 bits = skinning mode; bit 4 (16) = emissive-add flag for the
+    // fragment shader (collimator marks) — mask it off before the switch.
+    uint mode = pc.skinMode & 15u;
+
     mat4 S;
-    if (pc.skinMode == 1u) {
+    if (mode == 1u) {
         S = bones[bb + clampB(dN(a_Normal.a))];
-    } else if (pc.skinMode == 2u) {
+    } else if (mode == 2u) {
         // R4 (FSkinned vertHW_2W::get_pos_bones): lerp(boneA, boneB, w) =
         // boneA*(1-w) + boneB*w, with w stored in N.a and A=matrix0, B=matrix1.
         // So matrix0 gets (1-w), matrix1 gets w — NOT the other way round.
         float w0 = a_Normal.a;
         S = bones[bb + clampB(dF(a_TexCoordExt.z))] * (1.0 - w0) + bones[bb + clampB(dF(a_TexCoordExt.w))] * w0;
-    } else if (pc.skinMode == 3u) {
+    } else if (mode == 3u) {
         float w0 = a_Normal.a, w1 = a_Tangent.a;
         S = bones[bb + clampB(dF(a_TexCoordExt.z))] * w0
           + bones[bb + clampB(dF(a_TexCoordExt.w))] * w1

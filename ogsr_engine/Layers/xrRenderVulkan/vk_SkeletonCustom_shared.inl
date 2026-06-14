@@ -32,6 +32,152 @@ static void vk_child_SetParent(dxRender_Visual* V, CKinematics* parent)
     if (auto* pm = dynamic_cast<vkSkeletonX_PM*>(V)) { pm->SetParent(parent); return; }
 }
 
+// ============================================================================
+// Skeleton wallmarks on vk leaves (blood decals on NPCs). The R4 CSkeletonX
+// PickBone/FillVertices machinery is dead here (leaves aren't CSkeletonX), so
+// these helpers reimplement _PickBoneSoftXW/_FillVerticesSoftXW over the CPU
+// data the leaves retain at load (vkSkinCPUData — see vk_Visual.h/.cpp).
+// ============================================================================
+namespace {
+
+const vkSkinCPUData* vk_child_wmData(dxRender_Visual* V)
+{
+    if (auto* st = dynamic_cast<vkSkeletonX_ST*>(V)) return st->wmCPU.get();
+    if (auto* pm = dynamic_cast<vkSkeletonX_PM*>(V)) return pm->wmCPU.get();
+    return nullptr;
+}
+
+// Per-layout bone/weight extraction (mirrors _FillVerticesSoftXW id/weight fill).
+inline void vkWM_Extract(const vertBoned1W& v, u16 b[4], float w[3])
+{ b[0] = b[1] = b[2] = b[3] = (u16)v.matrix; w[0] = w[1] = w[2] = 0.f; }
+inline void vkWM_Extract(const vertBoned2W& v, u16 b[4], float w[3])
+{ b[0] = v.matrix0; b[1] = v.matrix1; b[2] = b[3] = b[1]; w[0] = v.w; w[1] = w[2] = 0.f; }
+inline void vkWM_Extract(const vertBoned3W& v, u16 b[4], float w[3])
+{ b[0] = v.m[0]; b[1] = v.m[1]; b[2] = v.m[2]; b[3] = b[2]; w[0] = v.w[0]; w[1] = v.w[1]; w[2] = 0.f; }
+inline void vkWM_Extract(const vertBoned4W& v, u16 b[4], float w[3])
+{ b[0] = v.m[0]; b[1] = v.m[1]; b[2] = v.m[2]; b[3] = v.m[3]; w[0] = v.w[0]; w[1] = v.w[1]; w[2] = v.w[2]; }
+
+// Skin a bind-pose point into MODEL space (mRenderTransform — same branch
+// scheme RenderWallmark uses on the WMFace it produces).
+inline Fvector vkWM_Skin(CKinematics* P, const Fvector& pos, const u16 b[4], const float w[3])
+{
+    Fvector R;
+    if (b[0] == b[1]) {
+        P->LL_GetBoneInstance(b[0]).mRenderTransform.transform_tiny(R, pos);
+    } else if (b[1] == b[2]) {
+        Fvector P0, P1;
+        P->LL_GetBoneInstance(b[0]).mRenderTransform.transform_tiny(P0, pos);
+        P->LL_GetBoneInstance(b[1]).mRenderTransform.transform_tiny(P1, pos);
+        R.lerp(P0, P1, w[0]);
+    } else if (b[2] == b[3]) {
+        Fvector P0, P1, P2;
+        P->LL_GetBoneInstance(b[0]).mRenderTransform.transform_tiny(P0, pos);
+        P->LL_GetBoneInstance(b[1]).mRenderTransform.transform_tiny(P1, pos);
+        P->LL_GetBoneInstance(b[2]).mRenderTransform.transform_tiny(P2, pos);
+        P0.mul(w[0]); P1.mul(w[1]); P2.mul(1.f - w[0] - w[1]);
+        R = P0; R.add(P1); R.add(P2);
+    } else {
+        Fvector PB[4]; float s = 0.f;
+        for (int i = 0; i < 4; ++i)
+            P->LL_GetBoneInstance(b[i]).mRenderTransform.transform_tiny(PB[i], pos);
+        for (int i = 0; i < 3; ++i) { PB[i].mul(w[i]); s += w[i]; }
+        PB[3].mul(1.f - s);
+        R = PB[0]; R.add(PB[1]); R.add(PB[2]); R.add(PB[3]);
+    }
+    return R;
+}
+
+template <typename TV>
+BOOL vkWM_PickT(const vkSkinCPUData& d, CKinematics* P, IKinematics::pick_result& r,
+                float dist, const Fvector& S, const Fvector& D, u16 bone)
+{
+    if (bone >= d.boneFaces.size()) return FALSE;
+    const TV* verts = (const TV*)d.verts.data();
+    for (u32 face : d.boneFaces[bone])
+    {
+        const u32 idx = face * 3;
+        for (u32 k = 0; k < 3; ++k) {
+            const TV& v = verts[d.indices[idx + k]];
+            u16 b[4]; float w[3];
+            vkWM_Extract(v, b, w);
+            r.tri[k] = vkWM_Skin(P, v.P, b, w);
+        }
+        float u, v;
+        r.dist = flt_max;
+        if (CDB::TestRayTri(S, D, r.tri, u, v, r.dist, true) && (r.dist < dist)) {
+            r.normal.mknormal(r.tri[0], r.tri[1], r.tri[2]);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+template <typename TV>
+void vkWM_FillT(const vkSkinCPUData& d, CKinematics* P, const Fmatrix& view,
+                CSkeletonWallmark& wm, const Fvector& normal, float size, u16 bone)
+{
+    if (bone >= d.boneFaces.size()) return;
+    const TV* verts = (const TV*)d.verts.data();
+    for (u32 face : d.boneFaces[bone])
+    {
+        const u32 idx = face * 3;
+        CSkeletonWallmark::WMFace F;
+        Fvector p[3];
+        for (u32 k = 0; k < 3; ++k) {
+            const TV& v = verts[d.indices[idx + k]];
+            u16 b[4]; float w[3];
+            vkWM_Extract(v, b, w);
+            for (int j = 0; j < 4; ++j) F.bone_id[k][j] = b[j];
+            for (int j = 0; j < 3; ++j) F.weight[k][j] = w[j];
+            F.vert[k].set(v.P);
+            p[k] = vkWM_Skin(P, v.P, b, w);
+        }
+        Fvector test_normal;
+        test_normal.mknormal(p[0], p[1], p[2]);
+        if (test_normal.dotproduct(normal) < EPS)
+            continue;
+        if (CDB::TestSphereTri(wm.ContactPoint(), size, p))
+        {
+            Fvector UV;
+            for (u32 k = 0; k < 3; ++k) {
+                view.transform_tiny(UV, p[k]);
+                F.uv[k].x = (1 + UV.x) * .5f;
+                F.uv[k].y = (1 - UV.y) * .5f;
+            }
+            wm.m_Faces.push_back(F);
+        }
+    }
+}
+
+BOOL vkWM_PickChild(dxRender_Visual* child, CKinematics* P, IKinematics::pick_result& r,
+                    float dist, const Fvector& S, const Fvector& D, u16 bone)
+{
+    const vkSkinCPUData* d = vk_child_wmData(child);
+    if (!d || d->indices.empty()) return FALSE;
+    switch (d->links) {
+    case 1: return vkWM_PickT<vertBoned1W>(*d, P, r, dist, S, D, bone);
+    case 2: return vkWM_PickT<vertBoned2W>(*d, P, r, dist, S, D, bone);
+    case 3: return vkWM_PickT<vertBoned3W>(*d, P, r, dist, S, D, bone);
+    case 4: return vkWM_PickT<vertBoned4W>(*d, P, r, dist, S, D, bone);
+    }
+    return FALSE;
+}
+
+void vkWM_FillChild(dxRender_Visual* child, CKinematics* P, const Fmatrix& view,
+                    CSkeletonWallmark& wm, const Fvector& normal, float size, u16 bone)
+{
+    const vkSkinCPUData* d = vk_child_wmData(child);
+    if (!d || d->indices.empty()) return;
+    switch (d->links) {
+    case 1: vkWM_FillT<vertBoned1W>(*d, P, view, wm, normal, size, bone); break;
+    case 2: vkWM_FillT<vertBoned2W>(*d, P, view, wm, normal, size, bone); break;
+    case 3: vkWM_FillT<vertBoned3W>(*d, P, view, wm, normal, size, bone); break;
+    case 4: vkWM_FillT<vertBoned4W>(*d, P, view, wm, normal, size, bone); break;
+    }
+}
+
+}  // namespace
+
 int psSkeletonUpdate = 32;
 
 u16 CKinematics::LL_BoneID(const char* B) const
@@ -703,7 +849,7 @@ bool CKinematics::PickBone(const Fmatrix& parent_xform, IKinematics::pick_result
     P.transform_tiny(S, start);
     P.transform_dir(D, dir);
     for (u32 i = 0; i < children.size(); i++)
-        if (CSkeletonX* c = LL_GetChild(i); c && c->PickBone(r, dist, S, D, bone_id))  // vk: null for vkSkeletonX_*
+        if (vkWM_PickChild(children[i], this, r, dist, S, D, bone_id))  // vk leaves: CPU data pick
         {
             parent_xform.transform_dir(r.normal);
             parent_xform.transform_tiny(r.tri[0]);
@@ -744,7 +890,7 @@ void CKinematics::wallmark_calculate_details::add_wallmark_internal(CKinematics*
             if (CDB::TestRayOBB(S, D, obb))
                 for (u32 i = 0; i < parent->children.size(); i++)
                 {
-                    if (CSkeletonX* c = parent->LL_GetChild(i); c && c->PickBone(r, dist, S, D, k))  // vk: null-safe
+                    if (vkWM_PickChild(parent->children[i], parent, r, dist, S, D, k))  // vk leaves: CPU data pick
                     {
                         picked = TRUE;
                         dist = r.dist;
@@ -794,14 +940,10 @@ void CKinematics::wallmark_calculate_details::add_wallmark_internal(CKinematics*
     mRot.rotateZ(::Random.randF(deg2rad(-20.f), deg2rad(20.f)));
     mView.mulA_43(mRot);
 
-    // fill vertices
+    // fill vertices (vk leaves: CPU data fill — see vkWM_FillChild above)
     for (u32 i = 0; i < parent->children.size(); i++)
-    {
-        CSkeletonX* S = parent->LL_GetChild(i);
-        if (!S) continue;  // vk leaf: no CSkeletonX vertex data
         for (u16& test_bone : test_bones)
-            S->FillVertices(mView, *wm, normal, size, test_bone);
-    }
+            vkWM_FillChild(parent->children[i], parent, mView, *wm, normal, size, test_bone);
 
     {
         parent->wallmarks_lock.lock();
@@ -953,10 +1095,26 @@ void CKinematics::RenderWallmark(intrusive_ptr<CSkeletonWallmark> wm, FVF::LIT*&
                     P.add(PB[i]);
             }
             wm->XFORM()->transform_tiny(V->p, P);
+            // vk: lift the decal towards the CAMERA — its triangles are exactly
+            // coplanar with the body mesh (z-fight flicker otherwise). Statics
+            // solve this with a build-time normal push; a skinned surface
+            // deforms every frame, so push at skinning time instead (R4 shifts
+            // the projection matrix — Device.mProject is unusable on VK).
+            {
+                Fvector toCam;
+                toCam.sub(Device.vCameraPosition, V->p);
+                const float len = toCam.magnitude();
+                if (len > EPS)
+                    V->p.mad(V->p, toCam.div(len), 0.012f);
+            }
             V->t.set(F.uv[k]);
-            int aC = iFloor(w * 255.f);
+            // vk: straight alpha blend (our PBM_BLEND pipeline) — R4 wrote the
+            // AGE into alpha for an inverse-alpha blender; we write the
+            // remaining-life fade directly. Capped at ~0.7 so the cloth/armor
+            // texture reads through the blood — "soaked in", not a sticker.
+            int aC = iFloor((1.f - w) * 178.f);
             clamp(aC, 0, 255);
-            V->color = color_rgba(128, 128, 128, aC);
+            V->color = color_rgba(255, 255, 255, aC);
             V++;
         }
     }

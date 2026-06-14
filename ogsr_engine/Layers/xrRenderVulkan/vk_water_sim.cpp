@@ -1,0 +1,271 @@
+// xrRenderVulkan - Water flow simulation (compute) — velocity/momentum model.
+// Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
+//
+// Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
+// use only (per the X-Ray Engine license); redistribution in source or binary
+// form must keep this notice and credit the author in-game (credits or splash).
+
+#include "stdafx.h"
+#include "vk_water_sim.h"
+#include "vk_shadow.h"          // rain ortho VP / views / size / sampler (the grid)
+#include "vk_shaders.h"         // g_ShaderManager
+#include "vk_pipeline_cache.h"  // shared pipeline cache object
+
+// Console knobs (global scope — block-scope extern inside namespace VK mangles).
+extern int   ps_r_water_sim;    // r_water_sim  — master enable
+extern float ps_r_water_rain;   // r_water_rain — rain input rate (depth/s at density 1)
+extern float ps_r_water_evap;   // r_water_evap — exponential leak rate
+extern float ps_r_water_flow;   // r_water_flow — downhill ACCEL (gravity) — drives flow speed/streams
+extern int   ps_r_water_iters;  // r_water_iters — sim steps per frame (1 = no leak compounding)
+
+namespace VK { namespace WaterSim {
+
+namespace {
+    bool          s_inited = false, s_failed = false, s_first = true;
+    u32           s_size = 0;
+    Fmatrix       s_prevVP;
+
+    // Two ping-pong pairs: water DEPTH (R16F, sampled by receivers) and VELOCITY
+    // (RG16F). Each: a sampled "state" + a storage "scratch" copied back to state.
+    struct Buf { VkImage img = VK_NULL_HANDLE; VmaAllocation alloc = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
+    Buf s_depth, s_depthScr, s_vel, s_velScr;
+
+    VkSampler             s_sampler   = VK_NULL_HANDLE;
+    VkDescriptorSetLayout s_setLayout = VK_NULL_HANDLE;
+    VkDescriptorPool      s_pool      = VK_NULL_HANDLE;
+    VkDescriptorSet       s_set       = VK_NULL_HANDLE;
+    VkPipelineLayout      s_pipeLayout = VK_NULL_HANDLE;
+    VkPipeline            s_pipe       = VK_NULL_HANDLE;
+
+    struct PushConstants {
+        Fmatrix curInvVP;
+        Fmatrix prevVP;
+        float   p0[4];   // N, rainAdd·dt, leak·dt, accel
+        float   p1[4];   // rainDensity, zNear, zRange, hasPrev
+        float   p2[4];   // damping, dt, maxVel, 0
+    };
+
+    void barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout oldL, VkImageLayout newL,
+                 VkPipelineStageFlags srcS, VkPipelineStageFlags dstS, VkAccessFlags srcA, VkAccessFlags dstA)
+    {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = oldL; b.newLayout = newL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+
+    bool createImage(VkFormat fmt, VkImageUsageFlags usage, Buf& out)
+    {
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent = { s_size, s_size, 1 };
+        ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = usage;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &out.img, &out.alloc, nullptr) != VK_SUCCESS)
+            return false;
+        VkImageViewCreateInfo vci{};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = out.img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        return vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &out.view) == VK_SUCCESS;
+    }
+
+    void destroyBuf(Buf& b)
+    {
+        if (b.view) { vkDestroyImageView(VulkanHW.m_Device, b.view, nullptr); b.view = VK_NULL_HANDLE; }
+        if (b.img)  { vmaDestroyImage(VulkanHW.m_Allocator, b.img, b.alloc); b.img = VK_NULL_HANDLE; }
+    }
+
+    // compute write (GENERAL) -> copy to state -> back to working layouts.
+    void copyBack(VkCommandBuffer cmd, Buf& scr, Buf& state)
+    {
+        barrier(cmd, scr.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageCopy cp{};
+        cp.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        cp.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        cp.extent = { s_size, s_size, 1 };
+        vkCmdCopyImage(cmd, scr.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+        barrier(cmd, state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        barrier(cmd, scr.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    }
+}
+
+bool Ready() { return s_inited && !s_failed; }
+VkImageView GetStateView() { return s_depth.view; }   // water depth, for EnvLight binding 11
+VkImageView GetVelView()   { return s_vel.view; }     // water velocity, for EnvLight binding 12
+VkSampler   GetSampler()   { return s_sampler; }
+
+bool Init()
+{
+    if (s_inited) return true;
+    if (s_failed) return false;
+    if (ShadowMap::GetRainView() == VK_NULL_HANDLE || ShadowMap::GetGroundView() == VK_NULL_HANDLE) return false;
+    s_size = ShadowMap::RainSize();
+    if (s_size == 0) return false;
+    s_prevVP.identity();
+
+    const VkImageUsageFlags stateUse = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkImageUsageFlags scrUse   = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!createImage(VK_FORMAT_R16_SFLOAT,    stateUse, s_depth)    ||
+        !createImage(VK_FORMAT_R16_SFLOAT,    scrUse,   s_depthScr) ||
+        !createImage(VK_FORMAT_R16G16_SFLOAT, stateUse, s_vel)      ||
+        !createImage(VK_FORMAT_R16G16_SFLOAT, scrUse,   s_velScr)) {
+        Msg("![VK Water] image create failed"); s_failed = true; return false;
+    }
+
+    VkSamplerCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.maxLod = 0.25f;
+    if (vkCreateSampler(VulkanHW.m_Device, &si, nullptr, &s_sampler) != VK_SUCCESS) {
+        Msg("![VK Water] sampler create failed"); s_failed = true; return false;
+    }
+
+    if (!g_ShaderManager) { Msg("![VK Water] g_ShaderManager null"); s_failed = true; return false; }
+
+    VkDescriptorSetLayoutBinding b[6]{};
+    for (int i = 0; i < 6; ++i) { b[i].binding = (u32)i; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+    b[0].descriptorType = b[1].descriptorType = b[2].descriptorType = b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[4].descriptorType = b[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    VkDescriptorSetLayoutCreateInfo slci{};
+    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    slci.bindingCount = 6; slci.pBindings = b;
+    vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout);
+
+    VkDescriptorPoolSize ps[2]{};
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 4;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = 2;
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool);
+
+    VkDescriptorSetAllocateInfo dai{};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setLayout;
+    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) {
+        Msg("![VK Water] descriptor alloc failed"); s_failed = true; return false;
+    }
+
+    const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo ii[6] = {
+        { ShadowMap::GetSampler(), ShadowMap::GetGroundView(), RO },   // 0 terrain (no trees)
+        { ShadowMap::GetSampler(), ShadowMap::GetRainView(),   RO },   // 1 rain occ (exposure)
+        { s_sampler, s_depth.view, RO },                              // 2 prev depth
+        { s_sampler, s_vel.view,   RO },                              // 3 prev velocity
+        { VK_NULL_HANDLE, s_depthScr.view, VK_IMAGE_LAYOUT_GENERAL }, // 4 out depth
+        { VK_NULL_HANDLE, s_velScr.view,   VK_IMAGE_LAYOUT_GENERAL }, // 5 out velocity
+    };
+    VkWriteDescriptorSet w[6]{};
+    for (int i = 0; i < 6; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set; w[i].dstBinding = (u32)i; w[i].descriptorCount = 1;
+        w[i].descriptorType = (i < 4) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[i].pImageInfo = &ii[i];
+    }
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants) };
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setLayout;
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_pipeLayout);
+
+    VkShaderModule cs = g_ShaderManager->Load("water_sim.comp.spv");
+    if (cs == VK_NULL_HANDLE) { Msg("![VK Water] water_sim.comp.spv load failed"); s_failed = true; return false; }
+    VkComputePipelineCreateInfo cpi{};
+    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = cs; cpi.stage.pName = "main";
+    cpi.layout = s_pipeLayout;
+    if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &s_pipe) != VK_SUCCESS) {
+        Msg("![VK Water] compute pipeline create failed"); s_failed = true; return false;
+    }
+
+    s_inited = true; s_first = true;
+    Msg("[VK Water] velocity sim init OK (%ux%u, depth R16F + vel RG16F)", s_size, s_size);
+    return true;
+}
+
+void Dispatch(VkCommandBuffer cmd, float rainDensity01)
+{
+    if (!ps_r_water_sim) return;
+    if (!s_inited && !Init()) return;
+
+    if (s_first) {
+        for (Buf* st : { &s_depth, &s_vel })
+            barrier(cmd, st->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
+        for (Buf* sc : { &s_depthScr, &s_velScr })
+            barrier(cmd, sc->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
+    const Fmatrix& curVP = ShadowMap::GetRainVP();
+    Fmatrix curInv; curInv.invert(curVP);
+    const float dt = _min(Device.fTimeDelta, 0.066f);
+
+    PushConstants pc{};
+    pc.curInvVP = curInv;
+    pc.prevVP   = s_prevVP;
+    pc.p0[0] = float(s_size);
+    pc.p0[1] = ps_r_water_rain * dt;
+    pc.p0[2] = ps_r_water_evap * dt;          // exponential leak
+    pc.p0[3] = ps_r_water_flow;               // downhill accel (gravity)
+    pc.p1[0] = clampr(rainDensity01, 0.f, 1.f);
+    pc.p1[1] = 1.f;                           // rain ortho zNear
+    pc.p1[2] = 349.f;                         // rain ortho zRange
+    pc.p1[3] = s_first ? 0.f : 1.f;
+    pc.p2[0] = 0.90f;                         // velocity damping (friction)
+    pc.p2[1] = dt;
+    pc.p2[2] = 0.05f;                         // max speed (uv/sec)
+    pc.p2[3] = 0.f;
+
+    const u32 groups = (s_size + 7u) / 8u;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipeLayout, 0, 1, &s_set, 0, nullptr);
+    vkCmdPushConstants(cmd, s_pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, groups, groups, 1);
+
+    copyBack(cmd, s_depthScr, s_depth);
+    copyBack(cmd, s_velScr,   s_vel);
+
+    s_prevVP = curVP;
+    s_first  = false;
+}
+
+void Destroy()
+{
+    if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+    if (s_pipe)       { vkDestroyPipeline(VulkanHW.m_Device, s_pipe, nullptr); s_pipe = VK_NULL_HANDLE; }
+    if (s_pipeLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_pipeLayout, nullptr); s_pipeLayout = VK_NULL_HANDLE; }
+    if (s_pool)       { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
+    if (s_setLayout)  { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }
+    if (s_sampler)    { vkDestroySampler(VulkanHW.m_Device, s_sampler, nullptr); s_sampler = VK_NULL_HANDLE; }
+    destroyBuf(s_depth); destroyBuf(s_depthScr); destroyBuf(s_vel); destroyBuf(s_velScr);
+    s_set = VK_NULL_HANDLE;
+    s_inited = false; s_failed = false; s_first = true;
+}
+
+}}  // namespace VK::WaterSim

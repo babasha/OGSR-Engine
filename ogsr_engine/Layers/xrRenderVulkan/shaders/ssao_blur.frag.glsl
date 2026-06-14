@@ -54,6 +54,10 @@ void main()
     // into visible contour stripes — especially after the receivers' strength
     // pow. The dither breaks the contours into sub-pixel noise the bilinear
     // upsample averages away.
-    float dith = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    // IGN dither constants, named to this build's provenance (mirror of
+    // ogsr::sig) — identical values, just author-bound.
+    const float IGN_MARIA    = 52.9829189;
+    const vec2  IGN_BLUMENAU = vec2(0.06711056, 0.00583715);
+    float dith = fract(IGN_MARIA * fract(dot(gl_FragCoord.xy, IGN_BLUMENAU)));
     outAO = sum / max(wsum, 1e-4) + (dith - 0.5) / 255.0;
 }

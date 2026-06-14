@@ -25,6 +25,9 @@
 #include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
 #include "vk_pass_particles.h" // VK::ParticlePass_Init/Destroy — billboard particle pass
+#include "vk_wallmarks.h"      // VK::Wallmarks::Destroy — static decals teardown
+#include "vk_rain.h"           // VK::RainPass_Destroy — weather effects teardown
+#include "vk_water_sim.h"      // VK::WaterSim::Destroy — water flow sim teardown
 #include "vk_shader.h"   // g_VulkanShaderManager (level-shader table)
 #include "vk_shaders.h"  // g_ShaderManager (SPIRV module loader/cache)
 #include "vk_ModelPool.h"
@@ -146,6 +149,9 @@ void vkRenderDeviceRender::Destroy()
     }
     Msg("[VK] DevRender::Destroy: ShaderManager freed");
     { extern void vkParticles_OnDestroy(); vkParticles_OnDestroy(); }
+    VK::Wallmarks::Destroy();           Msg("[VK] DevRender::Destroy: Wallmarks done");
+    VK::RainPass_Destroy();             Msg("[VK] DevRender::Destroy: RainPass done");
+    VK::WaterSim::Destroy();            Msg("[VK] DevRender::Destroy: WaterSim done");
     VK::ParticlePass_Destroy();         Msg("[VK] DevRender::Destroy: ParticlePass done");
     VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
     VK::SSAOPass::Destroy();            Msg("[VK] DevRender::Destroy: SSAOPass done");

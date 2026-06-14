@@ -65,6 +65,21 @@ VkImage        GetCascadeImage(u32 i);
 VkImageView    GetCascadeView(u32 i);
 u32            CascadeSize(u32 i);
 
+// ---- Rain occlusion map (R4 rt_smap_rain analogue): one top-down ortho
+// depth render of the statics around the camera. Receivers sample it to mask
+// WETNESS — surfaces with geometry overhead (roofs, tunnels) stay dry.
+// Cached like the static sun map (re-rendered on camera move, vk_pass_shadow).
+VkImage        GetRainImage();
+VkImageView    GetRainView();
+// Clean ground-height map (statics+terrain, NO trees) for the water flow sim —
+// same ortho box/VP/size as the rain map. See vk_water_sim.
+VkImage        GetGroundImage();
+VkImageView    GetGroundView();
+u32            RainSize();                    // 1024 (shared by rain + ground maps)
+void           ComputeRainVP();               // straight-down ortho box at the camera
+const Fmatrix& GetRainVP();
+bool           RainSphereVisible(const Fvector& center, float radius);
+
 // ---- Dynamic light shadows (STEP 3b): 1 spot + 1 point cube per frame. ----
 // Spot (flashlight): perspective map along the light cone.
 VkImage        GetSpotImage();

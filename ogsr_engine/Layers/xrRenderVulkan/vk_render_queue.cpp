@@ -13,15 +13,19 @@
 #include "vk_Visual.h"
 #include "vk_UIPipeline.h"   // g_VkUI_FrameCmd
 
+#include "../../xr_3da/device.h"   // Device.vCameraPosition (tess distance factors)
+
 #include <algorithm>
 
 namespace VK {
 
 RenderQueue g_RenderQueue;
 
-u64 makeSortKey(u32 stride, u32 tcOffset, bool depthTest, const void* mat, const void* vb)
+u64 makeSortKey(u32 stride, u32 tcOffset, bool depthTest, const void* mat, const void* vb, bool wmark, bool tess)
 {
     u64 k = 0;
+    k |= (u64(wmark     ? 1 : 0)) << 59;   // decals LAST — blend over the opaque world
+    k |= (u64(tess      ? 1 : 0)) << 58;   // tessellated materials cluster (one pipeline flip)
     k |= (u64(depthTest ? 1 : 0)) << 56;
     k |= (u64(stride   & 0xFF))   << 48;
     k |= (u64(tcOffset & 0xFF))   << 40;
@@ -57,6 +61,31 @@ void RenderQueue::Flush(FrameContext& ctx)
 
     VkCommandBuffer cmd = ctx.cmd;
 
+    // Stage mask of the world/terrain push range — must match the layouts'
+    // declared range exactly (includes TCS/TES when the device has tess).
+    const VkShaderStageFlags kStages = PipelineCache::GetPushStages();
+
+    // World heightmap tessellation (R4 TESS_HM). The per-frame tess block
+    // (push offsets 84..116) is owned here: pushed on every layout flip so it
+    // survives terrain↔world transitions. tessMax=0 turns the TES into a
+    // pass-through and routes items to the flat pipelines below.
+    // pnScale (offset 112) is the PN-triangle silhouette-curvature factor: it
+    // MUST be pushed here — it lives past the 84-byte VS/FS block, so nothing
+    // else writes it. (Was previously uninitialized → garbage curvature warped
+    // tessellated props; default r_tess_pn 0 = PN off, heightmap-only.)
+    extern float ps_r_tess, ps_r_tess_max, ps_r_tess_near, ps_r_tess_far, ps_r_tess_height, ps_r_tess_pn;
+    const bool  tessAvail = m_AllowTess && PipelineCache::TessAvailable() && ps_r_tess > 0.5f;
+    const float tessMax   = tessAvail ? ps_r_tess_max : 0.0f;
+    const Fvector eye     = Device.vCameraPosition;
+    struct TessBlock { float tessMax, tessNear, tessFar; float eyeHeight[4]; float pnScale; };
+    const TessBlock tessBlock = {
+        tessMax, ps_r_tess_near, ps_r_tess_far,
+        // R4 amplitude: ComputeDisplacedVertex's `P += N * height * 0.07`.
+        { eye.x, eye.y, eye.z, 0.07f * ps_r_tess_height },
+        ps_r_tess_pn,
+    };
+    constexpr u32 kTessOffset = sizeof(Fmatrix) + 5 * sizeof(float);   // 84
+
     // State tracking: each bind only fires when the next item differs from
     // what's already bound. After a sort by sortKey, runs of identical
     // (pipeline, material, VB, IB) collapse to one bind apiece.
@@ -76,6 +105,7 @@ void RenderQueue::Flush(FrameContext& ctx)
     VkPipelineLayout lastLayout = VK_NULL_HANDLE;
 
     u32 nDraw = 0, nPipeBind = 0, nMatBind = 0, nTailPush = 0, nVBBind = 0, nIBBind = 0;
+    u32 nTessMat = 0, nTessDraw = 0;   // tessellation diag: opted-in mats / actually-tess draws
 
     for (const DrawItem& it : m_Items)
     {
@@ -112,6 +142,16 @@ void RenderQueue::Flush(FrameContext& ctx)
             k.vs        = lmap ? PipelineCache::WorldLmapVS() : PipelineCache::WorldVlitVS();
             k.fs        = lmap ? PipelineCache::WorldLmapFS() : PipelineCache::WorldVlitFS();
             k.depthTest = true;
+            k.wmark     = mat && mat->isWmark;   // baked decal: blend + bias + no z-write
+            // Heightmap tessellation: only for opted-in materials (bump# in
+            // the .thm) whose bounds reach inside the tess range — beyond
+            // tessFar the factors would all be 1, so a flat pipeline is free.
+            if (tessMax > 0.0f && mat && mat->tessellated && !k.wmark) {
+                const Fsphere& s = fv->vis.sphere;
+                k.tess = (s.P.distance_to(eye) - s.R) < ps_r_tess_far;
+                ++nTessMat;
+                if (k.tess) ++nTessDraw;
+            }
             pipe   = PipelineCache::Get(k);
             layout = PipelineCache::GetLayout();
             set    = mat ? mat->set : VK_NULL_HANDLE;
@@ -136,6 +176,11 @@ void RenderQueue::Flush(FrameContext& ctx)
             VkDescriptorSet envSet = EnvLight::GetCurrentSet();
             if (envSet != VK_NULL_HANDLE)
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &envSet, 0, nullptr);
+
+            // Per-frame tess block (tess factors + camera). Constant across the
+            // flush; re-pushed per flip because a layout change formally
+            // invalidates push-constant state.
+            vkCmdPushConstants(cmd, layout, kStages, kTessOffset, sizeof(TessBlock), &tessBlock);
         }
 
         // Per-item MVP (push-constant offset 0). Dynamic visuals carry their own
@@ -144,9 +189,7 @@ void RenderQueue::Flush(FrameContext& ctx)
         if (ctx.viewProj && (!haveXform || 0 != memcmp(&it.xform, &lastXform, sizeof(Fmatrix)))) {
             Fmatrix mvp;
             mvp.mul(*ctx.viewProj, it.xform);   // = it.xform · viewProj (model->clip)
-            vkCmdPushConstants(cmd, layout,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, sizeof(Fmatrix), &mvp);
+            vkCmdPushConstants(cmd, layout, kStages, 0, sizeof(Fmatrix), &mvp);
             lastXform = it.xform;
             haveXform = true;
         }
@@ -173,9 +216,7 @@ void RenderQueue::Flush(FrameContext& ctx)
         if (aref != lastAref || detailScale != lastDetailScale || it.hemi != lastHemi) {
             constexpr u32 kTailOffset = sizeof(Fmatrix) + 2 * sizeof(float);
             float tail[3] = { aref, detailScale, it.hemi };
-            vkCmdPushConstants(cmd, layout,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               kTailOffset, sizeof(tail), tail);
+            vkCmdPushConstants(cmd, layout, kStages, kTailOffset, sizeof(tail), tail);
             lastAref        = aref;
             lastDetailScale = detailScale;
             lastHemi        = it.hemi;
@@ -210,6 +251,9 @@ void RenderQueue::Flush(FrameContext& ctx)
     if (!s_diag_done) {
         Msg("[VK Queue] Flush: items=%zu draws=%u pipeBinds=%u matBinds=%u tailPush=%u vbBinds=%u ibBinds=%u",
             m_Items.size(), nDraw, nPipeBind, nMatBind, nTailPush, nVBBind, nIBBind);
+        Msg("[VK Tess] avail=%s tessMax=%.1f pn=%.2f near=%.1f far=%.1f height=%.2f | this flush: %u tess-mat draws, %u in range (tessellated)",
+            (tessMax > 0.f) ? "yes" : "no", tessMax, ps_r_tess_pn, ps_r_tess_near, ps_r_tess_far, ps_r_tess_height,
+            nTessMat, nTessDraw);
         s_diag_done = true;
     }
 }
@@ -243,6 +287,7 @@ void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool s
         // Alpha-tested items go through the AT variant (punch-out silhouette in
         // the depth); without it (shader missing / caller opted out) skip them.
         WorldMaterial* mat = fv->m_pWorldMaterial ? fv->m_pWorldMaterial : WorldMaterialCache::GetDefault();
+        if (mat && mat->isWmark) continue;   // baked decals never write depth (prepass/shadows)
         const float aref = mat ? mat->alphaRef : -1.f;
         const bool  at   = aref >= 0.f;
         if (at && (skipAlphaTested || layoutAT == VK_NULL_HANDLE

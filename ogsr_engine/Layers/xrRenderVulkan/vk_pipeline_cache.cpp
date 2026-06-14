@@ -27,6 +27,13 @@ namespace {
     VkShaderModule                         s_WorldVlitFS = VK_NULL_HANDLE;
     std::unordered_map<Key, VkPipeline>    s_Pipelines;
 
+    // World heightmap tessellation (R4 TESS_HM): TCS/TES pair per sub-layout.
+    // All four must load (and the device feature be enabled) for tess keys.
+    VkShaderModule                         s_WorldLmapTCS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldLmapTES = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldVlitTCS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldVlitTES = VK_NULL_HANDLE;
+
     // Terrain splatting: own layout + single lazily-built pipeline + shaders.
     VkShaderModule                         s_TerrainVS       = VK_NULL_HANDLE;
     VkShaderModule                         s_TerrainFS       = VK_NULL_HANDLE;
@@ -103,13 +110,23 @@ namespace {
         }
     }
 
-    // Push range, shared by VS+FS (matches WorldPush in vk_pass_world.cpp /
-    // PushConstants block in world.{vert,frag}.glsl):
-    //   mat4 mvp       — VS, offset 0,  64 bytes
-    //   vec2 uvScale   — VS, offset 64,  8 bytes
-    //   float alphaRef — FS, offset 72,  4 bytes  (<0 disables aref discard)
-    //   float _pad     — pad to 16-byte multiple (offset 76, 4 bytes)
-    constexpr u32 kPushSize = 84;   // mat4 mvp + vec2 uvScale + alphaRef + detailScale + dynHemi
+    // Push range, shared by VS+FS(+TCS/TES) — matches the PushConstants block
+    // in world_{lmap,vlit}.{vert,frag,tesc,tese}.glsl:
+    //   mat4  mvp         — offset 0,  64 bytes
+    //   vec2  uvScale     — offset 64,  8 bytes
+    //   float alphaRef    — offset 72   (<0 disables aref discard)
+    //   float detailScale — offset 76
+    //   float dynHemi     — offset 80
+    //   float tessMax     — offset 84   (0 = tessellation off)
+    //   float tessNear    — offset 88   (full-factor distance, m)
+    //   float tessFar     — offset 92   (factor-1 / flat distance, m)
+    //   vec4  eyeHeight   — offset 96   (xyz camera pos, w displacement amplitude)
+    //   float pnScale     — offset 112  (PN-triangle curvature; TCS/TES only)
+    // The 84..116 tail is owned by RenderQueue::Flush (re-pushed on layout
+    // flips); FS/VS shaders only declare the first 84 bytes. The range MUST
+    // cover pnScale (116) — the TCS/TES read it, so a 112-byte range left it
+    // outside the layout and the shader sampled uninitialized memory.
+    constexpr u32 kPushSize = 116;
 }
 
 // Defined below; GetTerrainPipeline() (right after Init) needs it forward.
@@ -123,6 +140,21 @@ VkShaderModule   WorldLmapVS() { return s_WorldLmapVS; }
 VkShaderModule   WorldLmapFS() { return s_WorldLmapFS; }
 VkShaderModule   WorldVlitVS() { return s_WorldVlitVS; }
 VkShaderModule   WorldVlitFS() { return s_WorldVlitFS; }
+
+bool TessAvailable()
+{
+    return VulkanHW.m_bTessellationSupported
+        && s_WorldLmapTCS != VK_NULL_HANDLE && s_WorldLmapTES != VK_NULL_HANDLE
+        && s_WorldVlitTCS != VK_NULL_HANDLE && s_WorldVlitTES != VK_NULL_HANDLE;
+}
+
+VkShaderStageFlags GetPushStages()
+{
+    VkShaderStageFlags f = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    if (VulkanHW.m_bTessellationSupported)
+        f |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    return f;
+}
 
 bool Init()
 {
@@ -153,6 +185,16 @@ bool Init()
     if (s_TerrainVS == VK_NULL_HANDLE || s_TerrainFS == VK_NULL_HANDLE)
         Msg("![VK PipelineCache] terrain splat shaders missing — terrain falls back to single-detail path");
 
+    // World tessellation TCS/TES — optional; absence keeps the flat pipelines.
+    if (VulkanHW.m_bTessellationSupported) {
+        s_WorldLmapTCS = g_ShaderManager->Load("world_lmap.tesc.spv");
+        s_WorldLmapTES = g_ShaderManager->Load("world_lmap.tese.spv");
+        s_WorldVlitTCS = g_ShaderManager->Load("world_vlit.tesc.spv");
+        s_WorldVlitTES = g_ShaderManager->Load("world_vlit.tese.spv");
+        if (!TessAvailable())
+            Msg("![VK PipelineCache] world tess shaders missing (world_*.tesc/.tese.spv) — tessellation disabled");
+    }
+
     // Sun shadow caster VS — optional; absence disables shadow casting.
     s_DepthVS = g_ShaderManager->Load("shadow_depth.vert.spv");
     if (s_DepthVS == VK_NULL_HANDLE)
@@ -164,7 +206,7 @@ bool Init()
         Msg("![VK PipelineCache] shadow_depth_at.{vert,frag}.spv missing — alpha-tested casters disabled");
 
     VkPushConstantRange pc{};
-    pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pc.stageFlags = GetPushStages();   // VS|FS (+TCS|TES when tess is supported)
     pc.offset     = 0;
     pc.size       = kPushSize;
 
@@ -558,6 +600,10 @@ void Destroy()
     s_WorldLmapFS = VK_NULL_HANDLE;
     s_WorldVlitVS = VK_NULL_HANDLE;
     s_WorldVlitFS = VK_NULL_HANDLE;
+    s_WorldLmapTCS = VK_NULL_HANDLE;
+    s_WorldLmapTES = VK_NULL_HANDLE;
+    s_WorldVlitTCS = VK_NULL_HANDLE;
+    s_WorldVlitTES = VK_NULL_HANDLE;
 }
 
 // Build vertex input for X-Ray level static vertex layouts (stride 32).
@@ -614,17 +660,38 @@ static VkPipeline CreatePipeline(const Key& k)
     vi.vertexAttributeDescriptionCount = 6;
     vi.pVertexAttributeDescriptions    = attrs;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
+    // Heightmap tessellation (R4 TESS_HM): the tess variant inserts the
+    // TCS/TES pair (picked by sub-layout) and assembles patch lists. Guard
+    // against keys built while the modules are unavailable.
+    const bool tess = k.tess && TessAvailable();
+    const VkShaderModule tcs = (k.tcOffset == 24) ? s_WorldLmapTCS : s_WorldVlitTCS;
+    const VkShaderModule tes = (k.tcOffset == 24) ? s_WorldLmapTES : s_WorldVlitTES;
+
+    u32 stageCount = 2;
+    VkPipelineShaderStageCreateInfo stages[4]{};
     stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = k.vs; stages[0].pName = "main";
     stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = k.fs; stages[1].pName = "main";
+    if (tess) {
+        stages[2].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[2].stage  = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+        stages[2].module = tcs; stages[2].pName = "main";
+        stages[3].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[3].stage  = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        stages[3].module = tes; stages[3].pName = "main";
+        stageCount = 4;
+    }
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineTessellationStateCreateInfo ts{};
+    ts.sType              = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+    ts.patchControlPoints = 3;
 
     VkPipelineViewportStateCreateInfo vp{};
     vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -637,6 +704,24 @@ static VkPipeline CreatePipeline(const Key& k)
     rs.cullMode    = VK_CULL_MODE_NONE;     // no winding info yet → don't drop faces
     rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth   = 1.0f;
+    if (k.wmark) {
+        // Baked level decals (newspapers/dirt) lie exactly on the surface
+        // beneath — pull them towards the camera (LESS_OR_EQUAL: smaller
+        // depth = closer → bias NEGATIVE) so they pass the depth test
+        // without z-fight flicker.
+        rs.depthBiasEnable         = VK_TRUE;
+        rs.depthBiasConstantFactor = -2.0f;
+        rs.depthBiasSlopeFactor    = -2.0f;
+    } else if (tess) {
+        // The depth prepass rasterizes these surfaces FLAT as plain triangles;
+        // the tessellated color pass re-rasterizes the same planes as many
+        // small triangles whose snapped vertices can land ±1 ulp off the
+        // prepass depth. A ~1-gradient-step pull toward the camera makes the
+        // un-displaced margins win those ties instead of sparkling.
+        rs.depthBiasEnable         = VK_TRUE;
+        rs.depthBiasConstantFactor = -2.0f;
+        rs.depthBiasSlopeFactor    = -1.0f;
+    }
 
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -645,7 +730,7 @@ static VkPipeline CreatePipeline(const Key& k)
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable  = k.depthTest ? VK_TRUE : VK_FALSE;
-    ds.depthWriteEnable = k.depthTest ? VK_TRUE : VK_FALSE;
+    ds.depthWriteEnable = (k.depthTest && !k.wmark) ? VK_TRUE : VK_FALSE;   // decals never write depth
     ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
     // Phase 4 wires up an actual depth attachment; right now no depth target
     // is bound at draw time so these flags only affect future passes.
@@ -654,6 +739,17 @@ static VkPipeline CreatePipeline(const Key& k)
     ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     ba.blendEnable    = VK_FALSE;
+    if (k.wmark) {
+        // Alpha-blend the decal over the lit surface (the texture alpha masks
+        // the sheet/stain shape).
+        ba.blendEnable         = VK_TRUE;
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        ba.colorBlendOp        = VK_BLEND_OP_ADD;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+    }
 
     VkPipelineColorBlendStateCreateInfo cb{};
     cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -680,10 +776,11 @@ static VkPipeline CreatePipeline(const Key& k)
     VkGraphicsPipelineCreateInfo pi{};
     pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pi.pNext               = &prci;
-    pi.stageCount          = 2;
+    pi.stageCount          = stageCount;
     pi.pStages             = stages;
     pi.pVertexInputState   = &vi;
     pi.pInputAssemblyState = &ia;
+    pi.pTessellationState  = tess ? &ts : nullptr;
     pi.pViewportState      = &vp;
     pi.pRasterizationState = &rs;
     pi.pMultisampleState   = &ms;
@@ -695,11 +792,12 @@ static VkPipeline CreatePipeline(const Key& k)
     VkPipeline handle = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &handle);
     if (r != VK_SUCCESS) {
-        Msg("![VK PipelineCache] vkCreateGraphicsPipelines failed (%d) for stride=%u tcOff=%u depth=%d",
-            r, k.stride, k.tcOffset, (int)k.depthTest);
+        Msg("![VK PipelineCache] vkCreateGraphicsPipelines failed (%d) for stride=%u tcOff=%u depth=%d tess=%d",
+            r, k.stride, k.tcOffset, (int)k.depthTest, (int)tess);
         return VK_NULL_HANDLE;
     }
-    Msg("[VK PipelineCache] Created pipeline stride=%u tcOff=%u depth=%d", k.stride, k.tcOffset, (int)k.depthTest);
+    Msg("[VK PipelineCache] Created pipeline stride=%u tcOff=%u depth=%d wmark=%d tess=%d",
+        k.stride, k.tcOffset, (int)k.depthTest, (int)k.wmark, (int)tess);
     return handle;
 }
 

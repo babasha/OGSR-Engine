@@ -56,6 +56,12 @@ public:
     // many Submit() overrides.
     void SetSubmitHemi(float h) { m_SubmitHemi = h; }
 
+    // Heightmap tessellation is statics-only: dynamic visuals carry a model
+    // xform, but the world VS emits MODEL-space vWorldPos, so the TES distance
+    // factor (vs the camera) would be garbage for them. Pass_World flips this
+    // off for the dynamic-visuals flush. Default on.
+    void SetAllowTess(bool b) { m_AllowTess = b; }
+
     // Depth-only flush: binds PipelineCache depth pipelines (by stride) and
     // pushes mvp = item.xform · vp per item. No materials/colour — position
     // only. Used by the sun/spot shadow casters AND the camera depth prepass;
@@ -68,6 +74,7 @@ public:
 private:
     xr_vector<DrawItem> m_Items;
     float               m_SubmitHemi = 1.0f;
+    bool                m_AllowTess  = true;
 };
 
 extern RenderQueue g_RenderQueue;
@@ -77,11 +84,13 @@ extern RenderQueue g_RenderQueue;
 // items sharing a prefix collapse into a single bind in Flush.
 //
 // Layout (MSB → LSB):
+//   [59]      wmark — baked level decal (1 bit, sorts LAST: blends over opaque)
+//   [58]      tess — heightmap-tessellated material (clusters tess pipelines)
 //   [56]      depthTest                (1 bit)
 //   [48..55]  stride                   (8 bits)
 //   [40..47]  tcOffset                 (8 bits)
 //   [16..39]  material descriptor hash (24 bits) — clusters by descriptor set
 //   [0..15]   VB pointer hash          (16 bits) — sub-clusters by VB
-u64 makeSortKey(u32 stride, u32 tcOffset, bool depthTest, const void* mat, const void* vb);
+u64 makeSortKey(u32 stride, u32 tcOffset, bool depthTest, const void* mat, const void* vb, bool wmark = false, bool tess = false);
 
 }  // namespace VK

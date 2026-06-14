@@ -58,10 +58,10 @@ void main()
     // The sun part travels separately — the fragment shadows it with the sun map.
     float hemiFac = clamp(t.c_scale_hemi + t.c_bias_hemi, 0.3, 1.5);
     vLight  = vec3(hemiFac, 0.0, 0.0);
-    // Sun ×1.1 (was 0.6): foliage was catching HALF the sun the rest of the
-    // scene gets (world/terrain/grass run ×1.25) — at golden hour the orange
-    // sun visibly "paints" R4's bushes while ours stayed grey. R4 lights
-    // foliage through the same deferred sun as everything else.
-    vSunLit = pc.vSunColor.rgb  * hemiFac * 1.1;
+    // vSunColor arrives pre-boosted (r_sun_boost, same as the whole scene).
+    // ×0.88 preserves the tuned crown level: foliage ran ×1.1 against the
+    // world's ×1.25 (1.1/1.25 = 0.88) — slightly under full sun reads right
+    // for translucent crowns.
+    vSunLit = pc.vSunColor.rgb  * hemiFac * 0.88;
     vWPos   = worldPos.xyz;
 }

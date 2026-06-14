@@ -213,6 +213,11 @@ public:
     // Alpha-test threshold: -1.0 = disabled (solid), 0.5 = enabled (foliage/aref)
     float               m_fAlphaRef = -1.0f;
 
+    // Additive unlit part (collimator/red-dot sight marks — OGF shader
+    // hud\reddotsight*): rendered with (SRC_ALPHA, ONE) blend, no lighting,
+    // no depth write, excluded from depth prepass + shadow casting.
+    bool                m_bEmissiveAdd = false;
+
     // Debug name
     shared_str          dbg_name;
 
@@ -409,6 +414,23 @@ protected:
 };
 
 // ============================================================================
+// CPU copy of a skinned leaf's boned vertices + indices + per-bone face lists.
+// Needed for skeleton wallmarks (blood decals on NPCs) and bone ray-picking —
+// the GPU-skinning path otherwise discards the vertex data after upload.
+// Shared (shared_ptr) across model-pool copies of the same visual.
+// ============================================================================
+#include <memory>
+
+struct vkSkinCPUData
+{
+    u32                       links = 0;       // bones per vertex (1..4) — picks the vertBoned*W layout
+    u32                       vertCount = 0;
+    xr_vector<u8>             verts;           // raw OGF vertBoned*W array
+    xr_vector<u16>            indices;
+    xr_vector<xr_vector<u32>> boneFaces;       // bone id -> face indices (face = 3 consecutive indices)
+};
+
+// ============================================================================
 // vkSkeletonX_ST / vkSkeletonX_PM — skinned-mesh leaves (children of CKinematics).
 // Ported from the monolith. STEP B sub-step 1: Load reads the OGF boned vertices,
 // analyses bones -> RenderMode, loads indices via the base Load(VLOAD_NOVERTICES),
@@ -428,6 +450,9 @@ public:
     CKinematics* Parent     = nullptr;
     u16          child_idx  = 0;
     union { u32 RMS_boneid; u32 RMS_bonecount; };   // RM_SINGLE: bone id | skinning: max bone id+1
+
+    // CPU skinning data for skeleton wallmarks / bone picks.
+    std::shared_ptr<vkSkinCPUData> wmCPU;
 
     vkSkeletonX_ST() : RMS_bonecount(0) {}
 
@@ -453,6 +478,9 @@ public:
     CKinematics* Parent     = nullptr;
     u16          child_idx  = 0;
     union { u32 RMS_boneid; u32 RMS_bonecount; };
+
+    // CPU skinning data for skeleton wallmarks / bone picks.
+    std::shared_ptr<vkSkinCPUData> wmCPU;
 
     vkSkeletonX_PM() : RMS_bonecount(0) {}
 

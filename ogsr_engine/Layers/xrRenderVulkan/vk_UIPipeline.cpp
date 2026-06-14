@@ -16,6 +16,7 @@
 #include "vk_swapchain.h"
 #include "vk_pipeline_cache.h"     // VK::PipelineCache::GetCacheObject() — shared disk-backed cache
 #include "vk_barriers.h"           // VK::SceneAttachmentBarrier — inter-pass ordering
+#include "vk_command_buffer.h"     // CVulkanCommandManager::FRAMES_IN_FLIGHT — VB ring slots
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"   // Device.dwWidth / dwHeight
 
@@ -40,7 +41,8 @@ namespace VulkanUI
 
     // Frame state ------------------------------------------------------------
     bool   s_bUIPassActive  = false;
-    u32    s_UIVertexOffset = 0;
+    u32    s_UIVertexOffset = 0;   // slot-relative write offset
+    u32    s_VBBase         = 0;   // byte base of this frame-slot's VB region
     void*  s_pMappedVB      = nullptr;
 
     // Deferred command queue --------------------------------------------------
@@ -63,8 +65,11 @@ namespace VulkanUI
     {
         Msg("[Vulkan UI] Creating UI infrastructure...");
 
-        // 1. Vertex buffer (persistent-mapped).
-        s_VertexBuffer.Create(VERTEX_BUFFER_SIZE,
+        // 1. Vertex buffer (persistent-mapped) — a frame-fenced RING: one
+        // VERTEX_BUFFER_SIZE region per in-flight frame. Each slot is written
+        // only after CRender::Begin waited that slot's fence (OnFrameBegin),
+        // so the CPU never overwrites vertex data the GPU still reads.
+        s_VertexBuffer.Create(VERTEX_BUFFER_SIZE * CVulkanCommandManager::FRAMES_IN_FLIGHT,
                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                               VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
         s_pMappedVB = s_VertexBuffer.Map();
@@ -348,6 +353,15 @@ namespace VulkanUI
         // owns the single COLOR→PRESENT transition for the whole frame.
         Swapchain.m_bRenderedThisFrame = true;   // vestigial; End no longer branches on it
         s_bUIPassActive  = false;
+        // NOTE: the vertex offset is NOT reset here — the GPU reads this
+        // frame's vertex data long after EndUIPass records. OnFrameBegin
+        // resets it when this slot's fence proves the read finished.
+    }
+
+    void OnFrameBegin(u32 frameSlot)
+    {
+        if (frameSlot >= CVulkanCommandManager::FRAMES_IN_FLIGHT) frameSlot = 0;
+        s_VBBase         = frameSlot * (u32)VERTEX_BUFFER_SIZE;
         s_UIVertexOffset = 0;
     }
 

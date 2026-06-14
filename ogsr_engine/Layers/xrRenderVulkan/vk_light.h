@@ -33,6 +33,7 @@ public:
     float   range  = 8.f;
     float   cone   = deg2rad(120.f);   // full apex angle (spot)
     Fcolor  color{};
+    shared_str texture;                // spot projection texture (flashlight cookie)
 
     vkLight();
     ~vkLight() override;
@@ -54,7 +55,7 @@ public:
     void  set_range(float r)                override { range = r; }
     float get_range() const                 override { return range; }
     void  set_virtual_size(float)           override {}
-    void  set_texture(LPCSTR)               override {}
+    void  set_texture(LPCSTR n)             override { texture = (n && n[0]) ? n : nullptr; }
     void  set_color(const Fcolor& c)        override { color = c; }
     void  set_color(float r, float g, float b) override { color.set(r, g, b, 1.f); }
     Fcolor get_color() const                override { return color; }
@@ -84,6 +85,7 @@ struct FrameLights {
     // Source params of the shadowed picks (for the shadow-pass cameras):
     Fvector  spotPos{};  Fvector spotDir{ 0.f, 0.f, 1.f }; float spotRange = 0.f; float spotCone = 0.f;
     Fvector  pointPos{}; float pointRange = 0.f;
+    shared_str spotTexture;   // the picked spot's cookie (flashlight beam pattern)
 };
 
 // Collect the nearest active lights around `eye` and pick the shadowed ones.

@@ -91,7 +91,7 @@ namespace {
         }
     }
 
-    static VkPipeline CreatePipeline(u32 stride)
+    static VkPipeline CreatePipeline(u32 stride, bool additive)
     {
         VkVertexInputBindingDescription   binding{};
         VkVertexInputAttributeDescription attrs[6]{};
@@ -132,13 +132,24 @@ namespace {
         VkPipelineDepthStencilStateCreateInfo ds{};
         ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_TRUE;
+        ds.depthWriteEnable = additive ? VK_FALSE : VK_TRUE;   // marks don't write depth (R4 zb(true,false))
         ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
         VkPipelineColorBlendAttachmentState ba{};
         ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
         ba.blendEnable    = VK_FALSE;
+        if (additive) {
+            // Collimator marks (R4 hud_reddotsight: blend(srcalpha, one)) —
+            // the dot ADDS light over the sight glass.
+            ba.blendEnable         = VK_TRUE;
+            ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            ba.colorBlendOp        = VK_BLEND_OP_ADD;
+            ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+        }
         VkPipelineColorBlendStateCreateInfo cb{};
         cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         cb.attachmentCount = 1; cb.pAttachments = &ba;
@@ -168,16 +179,17 @@ namespace {
         VkPipeline h = VK_NULL_HANDLE;
         VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
         if (r != VK_SUCCESS) { Msg("![VK Skinned] pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
-        Msg("[VK Skinned] pipeline created stride=%u", stride);
+        Msg("[VK Skinned] pipeline created stride=%u additive=%d", stride, (int)additive);
         return h;
     }
 
-    static VkPipeline GetPipeline(u32 stride)
+    static VkPipeline GetPipeline(u32 stride, bool additive = false)
     {
-        auto it = s_pipelines.find(stride);
+        const u32 key = stride | (additive ? 0x10000u : 0u);
+        auto it = s_pipelines.find(key);
         if (it != s_pipelines.end()) return it->second;
-        VkPipeline p = CreatePipeline(stride);
-        s_pipelines.emplace(stride, p);
+        VkPipeline p = CreatePipeline(stride, additive);
+        s_pipelines.emplace(key, p);
         return p;
     }
 
@@ -457,7 +469,10 @@ namespace {
                 u16 rmode = 0;
                 if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
 
-                VkPipeline pipe = GetPipeline(mesh->vStride);
+                // Collimator/red-dot marks: additive unlit pipeline (R4
+                // hud_reddotsight) instead of the lit opaque one.
+                const bool emissive = child->m_bEmissiveAdd;
+                VkPipeline pipe = GetPipeline(mesh->vStride, emissive);
                 if (pipe == VK_NULL_HANDLE) continue;
 
                 if (pipe != lastPipe) {
@@ -477,8 +492,11 @@ namespace {
                     lastMatSet = matSet;
                 }
 
-                // RenderMode enum -> skinMode: RM_SINGLE(1)/RM_SKINNING_1B(2)->1, 2B(3)->2, 3B(4)->3, 4B(5)->4
-                const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+                // RenderMode enum -> skinMode: RM_SINGLE(1)/RM_SKINNING_1B(2)->1, 2B(3)->2, 3B(4)->3, 4B(5)->4.
+                // Bit 4 (16) = emissive-add flag for the fragment (unlit output);
+                // the vertex shader masks it off before the skinning switch.
+                u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+                if (emissive) skinMode |= 16u;
                 SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, hudMode, u.hemi };
                 vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
@@ -575,6 +593,7 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
             VK_Render_Mesh* mesh = nullptr;
             u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+            if (child->m_bEmissiveAdd) continue;   // collimator marks don't cast shadows
 
             VkPipeline pipe = GetShadowPipeline(mesh->vStride);
             if (pipe == VK_NULL_HANDLE) continue;
@@ -640,6 +659,7 @@ void Skinned_RenderDepthPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
             VK_Render_Mesh* mesh = nullptr;
             u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+            if (child->m_bEmissiveAdd) continue;   // collimator marks: blended, no depth
 
             VkPipeline pipe = GetPrepassPipeline(mesh->vStride);
             if (pipe == VK_NULL_HANDLE) continue;

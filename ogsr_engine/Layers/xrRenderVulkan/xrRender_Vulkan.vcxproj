@@ -116,6 +116,7 @@
     <ClInclude Include="vk_render_queue.h" />
     <ClInclude Include="vk_world_material.h" />
     <ClInclude Include="vk_KinematicsStub.h" />
+    <ClInclude Include="vk_authorship.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CRender_Vulkan.cpp" />
@@ -124,6 +125,7 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="HW_Vulkan.cpp" />
+    <ClCompile Include="vk_authorship.cpp" />
     <ClCompile Include="HWCaps_Vulkan.cpp" />
     <ClCompile Include="vk_DebugRender.cpp" />
     <ClCompile Include="vk_DrawUtils.cpp" />
@@ -187,6 +189,9 @@
     <ClCompile Include="vk_ParticleGroup.cpp" />
     <ClCompile Include="vk_ParticleEffect.cpp" />
     <ClCompile Include="vk_pass_particles.cpp" />
+    <ClCompile Include="vk_wallmarks.cpp" />    <!-- static decals (bullet holes) — R4 CWallmarksEngine port -->
+    <ClCompile Include="vk_rain.cpp" />         <!-- rain drops/splashes + thunderbolt (dxRainRender port) -->
+    <ClCompile Include="vk_water_sim.cpp" />    <!-- shallow-water flow/accumulation sim (compute) -->
 
     <ClCompile Include="vk_Detail.cpp" />
     <ClCompile Include="vk_DetailManager.cpp" />

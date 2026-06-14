@@ -50,6 +50,9 @@ public:
     // Hardware ray tracing support (VK_KHR_ray_query + acceleration_structure)
     bool m_bRayQuerySupported = false;
 
+    // tessellationShader device feature (world heightmap tessellation, R4 TESS_HM)
+    bool m_bTessellationSupported = false;
+
     // Window handle (аналог m_hWnd из DX11)
     HWND m_hWnd = nullptr;
 

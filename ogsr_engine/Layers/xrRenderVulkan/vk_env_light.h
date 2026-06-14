@@ -53,8 +53,30 @@ struct LightUBO {
     // parity). z = strength EXPONENT (pow(ao, z): 0 = off, 1 = raw, 2-3 deeper),
     // w = debug flag (world shaders draw the raw AO map).
     float ao_params[4];     // x = 1/screenW, y = 1/screenH, z = strength exp, w = debug
+    // Rain wetness (binding 9 = top-down rain occlusion map, vk_shadow):
+    // receivers darken albedo + add a sky reflection where wetness × rain-map
+    // visibility says the surface is rained on. Appended last (prefix-safe).
+    float rain_vp[16];      // straight-down ortho view·proj for the rain map lookup
+    float rain_params[4];   // x = rain_density, y = wetness_factor, z = darken, w = reflection scale
+    // Scene camera (tonemap SSR puddles): this frame's view·proj + the
+    // frustum-ray basis (SSAO DeriveProjTerms scheme) for depth→world.
+    float scene_vp[16];
+    float cam_dir[4];       // xyz = camera forward (unit), w = proj _33
+    float cam_rightT[4];    // xyz = right × tan(fovX/2),   w = proj _43
+    float cam_topT[4];      // xyz = top × tan(fovY/2),     w unused
+    // Parallax occlusion mapping (world lmap/vlit fragment): x = UV-space
+    // march amplitude, y = max steps, z = distance fade (m), w = on/off.
+    float pom_params[4];
+    float pom_params2[4];   // x = blur (extra mip LOD), y = normal, z = self-shadow, w = contact AO
+    float pom_params3[4];   // x = debug view, y = ao_flat, z = ceil strength, w = floor strength
+    float pom_params4[4];   // x = terrain POM enable, y = detail-normal strength, z = micro-AO, w = debug view
+    float pom_params5[4];   // x = terrain dry gloss strength, y = geo-puddle radius, z = geo-puddle depth, w = puddle debug
+    float pom_params6[4];   // x = water-sim enable (puddles come from the flow sim), y = murk, z = refract, w unused
+    // SSS per-pixel puddles (SSFX deffer_terrain_high_flat port): water as a rising
+    // LEVEL vs the detail micro-height — terrain texture relief (ruts) pools first.
+    float pom_params7[4];   // x = enable, y = water level, z = micro-height contrast, w unused
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
 
 bool                  Init();                 // idempotent; safe to call from multiple pass inits

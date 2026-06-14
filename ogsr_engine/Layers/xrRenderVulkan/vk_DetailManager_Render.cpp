@@ -42,6 +42,7 @@
 extern int   ps_r__detail_radius;       // metres, default 100, range 70..300
 extern float ps_current_detail_density; // 0..1, default 0.6 (lower = denser)
 extern float ps_current_detail_scale;   // r__detail_scale, 0.7..1.5 — per-item size multiplier
+extern float ps_r_sun_boost;            // r_sun_boost — global sun multiplier (see vk_env_light)
 
 namespace VK
 {
@@ -163,6 +164,9 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
             m_GfxConstants.vHemiColor.set(env.CurrentEnv->hemi_color.x, env.CurrentEnv->hemi_color.y, env.CurrentEnv->hemi_color.z, 0.0f);
         }
     }
+    // The same global sun boost the world receives — vk_env_light premultiplies
+    // it into the LightUBO; the grass sun colour travels via push constants.
+    m_GfxConstants.vSunColor.mul(ps_r_sun_boost);
     swing_current.lerp(swing_desc[0], swing_desc[1], wind_strength);
 
     m_GfxConstants.vWave.set(0.5f, 0.5f, swing_current.speed, m_time_pos);

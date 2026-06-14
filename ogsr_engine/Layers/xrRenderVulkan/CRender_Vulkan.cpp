@@ -27,6 +27,8 @@
 #include "../../Include/xrRender/ParticleCustom.h"
 #include "vk_Particles.h"        // vkCreateParticle (real particle visuals)
 #include "vk_pass_particles.h"   // VK::Pass_Particles registration
+#include "vk_wallmarks.h"        // VK::Wallmarks — bullet holes / decals on level geometry
+#include "vk_rain.h"             // VK::Pass_Rain — rain drops/splashes + thunderbolt
 #include "vk_pass_shadow.h"      // VK::Pass_SunShadow (sun shadow caster, before World)
 #include "vk_pass_sunshafts.h"   // VK::Pass_SunShafts (volumetric god rays, after Sky)
 #include "vk_light.h"            // VK::vkLight (dynamic point/spot lights, STEP 3)
@@ -403,18 +405,37 @@ void CRender::add_Visual(u32, IRenderable* root, IRenderVisual* V, Fmatrix& m)
         hemi = ComputeObjectHemi(root, center);
     }
     list.push_back({ rv, m, hemi });
+
+    // Skeleton wallmarks (blood on NPCs): age + append this skeleton's visible
+    // marks for the Wallmarks pass (self-guarded per frame; bridge defined in
+    // vk_SkeletonCustom.cpp — needs the full CKinematics type).
+    extern void VK_SkelWM_Calculate(IRenderVisual* V, bool hud);
+    VK_SkelWM_Calculate(V, isHud);
 }
 
-void CRender::add_StaticWallmark(const wm_shader&, const Fvector&, float,
-                                        CDB::TRI*, Fvector*) {}
+// Wallmark bridges (vk_RenderFactory.cpp) — pull the decal texture name out of
+// the renderer-side IWallMarkArray / IUIShader implementations.
+extern const char* VK_WallmarkArray_Pick(IWallMarkArray* A);
+extern const char* VK_UIShaderTexName(IUIShader* S);
 
-void CRender::add_StaticWallmark(IWallMarkArray*, const Fvector&, float,
-                                        CDB::TRI*, Fvector*) {}
+void CRender::add_StaticWallmark(const wm_shader& S, const Fvector& P, float s,
+                                        CDB::TRI* T, Fvector* V)
+{
+    if (const char* tex = VK_UIShaderTexName(S.operator->()))
+        VK::Wallmarks::AddStatic(tex, P, s, T, V);
+}
 
-void CRender::add_SkeletonWallmark(Fmatrix*, IKinematics*, IWallMarkArray*,
-                                          Fvector&, Fvector&, float) {}
+void CRender::add_StaticWallmark(IWallMarkArray* pArray, const Fvector& P, float s,
+                                        CDB::TRI* T, Fvector* V)
+{
+    if (const char* tex = VK_WallmarkArray_Pick(pArray))
+        VK::Wallmarks::AddStatic(tex, P, s, T, V);
+}
 
-void CRender::clear_static_wallmarks() {}
+// add_SkeletonWallmark (blood on NPCs) is defined in vk_SkeletonCustom.cpp —
+// it needs the full CKinematics/CSkeletonWallmark compat context.
+
+void CRender::clear_static_wallmarks() { VK::Wallmarks::Clear(); }
 
 // Minimal IRender_ObjectSpecific so AI memory (CVisualMemoryManager) and rain
 // queries can read neutral luminocity without nulldereffing.
@@ -529,8 +550,8 @@ void CRender::models_Clear(BOOL b_complete) { if (Models) Models->ClearPool(b_co
 void CRender::models_savePrefetch() {}
 void CRender::models_begin_prefetch1(bool) {}
 
-// Skeleton wallmarks not rendered on the Vulkan path yet — accept and drop.
-void CRender::append_SkeletonWallmark(const intrusive_ptr<CSkeletonWallmark>&) { VK_STUB_ONCE("CRender"); }
+// append_SkeletonWallmark is defined in vk_SkeletonCustom.cpp (needs the
+// complete CSkeletonWallmark type) — it queues the mark for VK::Wallmarks.
 
 // ----- Frame ----------------------------------------------------------------
 void CRender::Calculate()
@@ -550,6 +571,10 @@ void CRender::Calculate()
     CFrustum frustum;
     Fmatrix fullT = Device.mFullTransform;   // CreateFromMatrix takes a non-const ref
     frustum.CreateFromMatrix(fullT, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
+    // Publish the camera frustum on the interface: CKinematics::CalculateWallmarks
+    // (skeleton blood decals) and engine code (IGame_Persistent grass benders)
+    // read ::Render->ViewBase — it was never set on the VK path before.
+    ViewBase = frustum;
 
     static xr_vector<ISpatial*> lstRenderables;
     lstRenderables.clear();
@@ -619,7 +644,15 @@ void CRender::Render()
         VK::RegisterPass("Shafts", [](VK::FrameContext& c) { VK::Pass_SunShafts(c); });
         // Particles last: camera-facing billboards composited over the scene
         // (depth-tested vs world, additive/alpha blend, no depth write).
+        // Wallmarks (bullet holes / scorch decals) over the lit world, before
+        // particles so impact smoke composites on top of the fresh hole.
+        VK::RegisterPass("Wallmarks", [](VK::FrameContext& c) { VK::Wallmarks::Render(c); });
         VK::RegisterPass("Particles", [](VK::FrameContext& c) { VK::Pass_Particles(c); });
+        // Weather: rain drop streaks + ground splashes + thunderbolt, drawn
+        // over everything (alpha/additive, depth-tested). Also ticks the rain
+        // simulation (CEffect_Rain::Calculate) — the engine's RenderLast path
+        // is never called on the VK build, so the pass owns it.
+        VK::RegisterPass("Rain", [](VK::FrameContext& c) { VK::Pass_Rain(c); });
         s_registered = true;
     }
 
@@ -689,6 +722,9 @@ void CRender::Begin()
     // Expose this frame's command buffer to vkUIRender / VulkanUI so they
     // hit the immediate path instead of buffering into deferred queue.
     g_VkUI_FrameCmd = g_FrameInFlight.cmd;
+    // Rotate the UI vertex-buffer ring to this slot's region (fence above
+    // proved the GPU finished reading it) and reset the write offset.
+    VulkanUI::OnFrameBegin(frame);
 
     // HDR scene target: all scene passes render into this floating-point image
     // (so highlights exceed 1.0); the Tonemap pass maps it to the swapchain.

@@ -9,6 +9,7 @@
 #include "HW_Vulkan.h"
 #include "vk_geometry.h"
 #include "vk_lighting.h"
+#include "vk_authorship.h"
 #include <vector>
 #include <set>
 
@@ -183,6 +184,19 @@ bool CVulkanHW::CreateLogicalDevice()
     deviceFeatures.features.multiDrawIndirect = VK_TRUE;
     deviceFeatures.features.drawIndirectFirstInstance = VK_TRUE;  // trees: firstInstance encodes global tree index
     deviceFeatures.pNext = &features12;
+
+    // Tessellation (world heightmap displacement, R4 TESS_HM). Universal on
+    // desktop GPUs, but query anyway — when absent the renderer keeps the
+    // plain triangle pipelines and PipelineCache::TessAvailable() stays false.
+    {
+        VkPhysicalDeviceFeatures supportedBase{};
+        vkGetPhysicalDeviceFeatures(m_PhysicalDevice, &supportedBase);
+        m_bTessellationSupported = supportedBase.tessellationShader == VK_TRUE;
+        if (m_bTessellationSupported)
+            deviceFeatures.features.tessellationShader = VK_TRUE;
+        else
+            Msg("[Vulkan] tessellationShader not supported — world tessellation disabled");
+    }
 
     // Build final extension list: required + optional NGX extensions if available
     std::vector<const char*> enabledExtensions(g_DeviceExtensions, g_DeviceExtensions + g_DeviceExtensionCount);
@@ -621,6 +635,9 @@ bool CVulkanHW::CreateDevice(HWND hWnd)
     Msg("[Vulkan] Initialization completed successfully!");
     Msg("[Vulkan] All systems ready");
     Msg("=================================================================");
+
+    // Build provenance / fingerprint banner (decoded from vk_authorship).
+    ogsr::sig::Register();
 
     return true;
 }

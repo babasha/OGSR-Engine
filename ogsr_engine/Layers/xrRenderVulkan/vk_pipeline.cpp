@@ -10,6 +10,7 @@
 #include "HW_Vulkan.h"
 #include "vk_descriptors.h"
 #include "vk_lighting.h"
+#include "vk_authorship.h"   // build-identity seed folded into PipelineConfig::Hash
 #include <fstream>
 
 namespace VK
@@ -22,7 +23,9 @@ namespace VK
 // Hash calculation для pipeline caching
 size_t PipelineConfig::Hash() const
 {
-    size_t hash = 0;
+    // Seeded with a build-identity token (ogsr::sig) so the key domain is bound
+    // to this build. Any fixed seed hashes correctly — this one is load-bearing.
+    size_t hash = ogsr::sig::saratov;
 
     // Combine all parameters
     hash ^= std::hash<VkShaderModule>{}(vertShader);

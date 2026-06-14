@@ -25,7 +25,10 @@ namespace VK {
 bool ParticlePass_Init();
 void ParticlePass_Destroy();
 
-// Registered pass entry — iterates g_DynamicVisuals for particle visuals.
+// Registered pass entry — iterates g_DynamicVisuals + g_HudVisuals for
+// particle visuals. Three phases: world effects (scene projection), HUD
+// effects (HUD-FOV projection + near depth range — muzzle flashes), and
+// PBM_DISTORT effects (rendered into the distortion buffer for the tonemap).
 void Pass_Particles(FrameContext& ctx);
 
 // Resources shared with the particle visual classes.
@@ -36,6 +39,25 @@ namespace ParticlePass {
     // Load (or fetch from cache) the sprite texture's descriptor set, keyed by
     // texture name. Returns VK_NULL_HANDLE if the texture can't be loaded.
     VkDescriptorSet  GetTextureSet(const char* texture_name);
+
+    // Heat-haze distortion buffer (PBM_DISTORT effects): full-res RGBA8, neutral
+    // 0.5, written by Pass_Particles, consumed by the tonemap composite which
+    // offsets the scene UVs by (rg - 0.5) * kDistortAmount. Created lazily the
+    // first frame a distort effect is visible; null until then (tonemap skips).
+    VkImageView      GetDistortView();
+    u32              DistortGeneration();   // bumps on (re)create — rebind trigger
+
+    // Decal pipelines (VK::Wallmarks): generic = MODULATE2X (R4
+    // effects_wallmark parity); blood = alpha blend with the SSS
+    // effects_wallmark_blood alpha remap (readable on dark clothing).
+    VkPipeline       GetWallmarkPipeline();
+    VkPipeline       GetBloodWallmarkPipeline();
+
+    // Rain (VK::Pass_Rain): splashes = alpha blend, shape from tex.a, colour
+    // from vertex tint (fx_rain rgb is a refraction normal map); drop streaks
+    // = procedural shape (the fx_rain alpha reads empty — rain_drop.frag).
+    VkPipeline       GetRainPipeline();
+    VkPipeline       GetRainDropPipeline();
 }
 
 }  // namespace VK

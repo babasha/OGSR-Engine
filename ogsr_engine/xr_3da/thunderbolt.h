@@ -74,6 +74,7 @@ public:
 class ENGINE_API CEffect_Thunderbolt
 {
     friend class dxThunderboltRender;
+    friend class vkThunderboltRender;
 
 protected:
     DEFINE_VECTOR(SThunderboltCollection*, CollectionVec, CollectionVecIt);

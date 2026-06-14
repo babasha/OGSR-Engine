@@ -192,15 +192,16 @@ void Pass_World(FrameContext& ctx)
 
     // MVP + uvScale are constant across the whole pass: world-space verts
     // (model = identity), and every level vertex format we render uses
-    // SHORT2 SSCALED TCs. Push once before the loop.
+    // SHORT2 SSCALED TCs. Push once before the loop. (The tess block at
+    // offsets 84..112 is owned by RenderQueue::Flush.) Stage flags must
+    // match the layout's push range exactly — GetPushStages, not VS|FS.
     WorldPush push{};
     push.mvp        = *ctx.viewProj;
     push.uvScale[0] = 1.0f / 1024.0f;
     push.uvScale[1] = 1.0f / 1024.0f;
     push.alphaRef    = -1.0f;  // Flush patches FS-tail (alphaRef + detailScale) per material
     push.detailScale = 0.0f;
-    vkCmdPushConstants(cmd, PipelineCache::GetLayout(),
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    vkCmdPushConstants(cmd, PipelineCache::GetLayout(), PipelineCache::GetPushStages(),
                        0, sizeof(WorldPush), &push);
 
     // Per-pass DIAG: counts visuals by type and stride. The 'unsupported'
@@ -266,7 +267,12 @@ void Pass_World(FrameContext& ctx)
         }
         g_RenderQueue.SetSubmitHemi(1.0f);             // reset for the next (static) flush
         g_RenderQueue.SortByKey();
+        // No tessellation for dynamics: the world VS emits MODEL-space
+        // vWorldPos, so the TES camera-distance factor would be garbage
+        // under a non-identity model xform.
+        g_RenderQueue.SetAllowTess(false);
         g_RenderQueue.Flush(ctx);
+        g_RenderQueue.SetAllowTess(true);
     }
 
     // Skinned dynamic leaves (NPCs / weapons / hands): GPU skinning, own pipeline +

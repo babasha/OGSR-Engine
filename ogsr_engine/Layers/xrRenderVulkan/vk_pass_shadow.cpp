@@ -10,6 +10,7 @@
 #include "vk_pass_shadow.h"
 #include "vk_shadow.h"
 #include "vk_render_queue.h"               // RenderQueue (local caster queue)
+#include "vk_water_sim.h"                  // WaterSim::Dispatch (shallow-water flow sim)
 #include "vk_pipeline_cache.h"             // depth pipelines/layout
 #include "vk_barriers.h"                   // ImageBarrier
 #include "vk_pass_skinned.h"               // Skinned_UploadBones / Skinned_RenderShadow
@@ -21,6 +22,11 @@
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_dir)
 #include "../../xr_3da/device.h"           // Device.vCameraPosition (cache check)
+
+// GLOBAL scope (NOT inside namespace VK — a block-scope extern there would
+// mangle as VK::ps_r_rain_enable → LNK2001). r_rain master off skips the map.
+extern int ps_r_rain_enable;
+extern int ps_r_water_sim;   // gate the ground-height map render (only the sim uses it)
 
 namespace VK {
 
@@ -97,6 +103,17 @@ namespace {
     Fvector s_stableSunDir{};
     bool    s_stableSunInit = false;
     u32     s_sunHoldFrames = 0;
+
+    // Rain occlusion map cache: statics + trees from straight above, redrawn
+    // when the camera moved far enough or the level changed. Rendered only
+    // while it's raining (or surfaces are still drying) — but at least once,
+    // so the sampled image is never in UNDEFINED layout.
+    RenderQueue s_RainQueue;
+    bool        s_rainFirst  = true;
+    bool        s_rainValid  = false;
+    Fvector     s_rainCamPos{};
+    size_t      s_rainVis    = 0;
+    constexpr float kRainRedrawDist = 8.f;
 }
 
 void Pass_SunShadow(FrameContext& ctx)
@@ -271,6 +288,129 @@ void Pass_SunShadow(FrameContext& ctx)
     // DEPTH_ATTACHMENT → SHADER_READ for the world/skinned receivers this frame.
     ImageBarrier(cmd, ShadowMap::GetImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // ---- RAIN occlusion map: top-down statics+trees depth, cached. Receivers
+    // multiply wetness by it — geometry overhead (roof/tunnel) keeps a surface
+    // dry. Rendered on demand: only while rain_density or wetness_factor is
+    // non-zero (plus one initial clear so the bound image has a defined layout).
+    {
+        float rainNeed = 0.f;
+        if (g_pGamePersistent && ps_r_rain_enable) {
+            const auto& env = g_pGamePersistent->Environment();
+            rainNeed = env.wetness_factor;
+            if (env.CurrentEnv) rainNeed = _max(rainNeed, env.CurrentEnv->rain_density);
+        }
+        const bool wantRain = rainNeed > 0.001f;
+        const bool stale = !s_rainValid || nVis != s_rainVis
+            || Device.vCameraPosition.distance_to_sqr(s_rainCamPos) > kRainRedrawDist * kRainRedrawDist;
+
+        if (s_rainFirst || (wantRain && stale))
+        {
+            ShadowMap::ComputeRainVP();
+
+            s_RainQueue.Clear();
+            if (loaded && wantRain) {
+                Fmatrix identity; identity.identity();
+                for (IRenderVisual* iv : RImplementation.Visuals) {
+                    if (!iv) continue;
+                    auto* rv = static_cast<vkRender_Visual*>(iv);
+                    const Fsphere& bs = rv->vis.sphere;
+                    if (bs.R > 0.f && !ShadowMap::RainSphereVisible(bs.P, bs.R)) continue;
+                    rv->Submit(s_RainQueue, identity, 0.0f);
+                }
+                s_RainQueue.SortByKey();
+            }
+            s_rainValid  = wantRain;     // a pure-clear first frame stays "stale" until rain starts
+            s_rainCamPos = Device.vCameraPosition;
+            s_rainVis    = nVis;
+
+            ImageBarrier(cmd, ShadowMap::GetRainImage(),
+                         s_rainFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            s_rainFirst = false;
+
+            const u32 rsz = ShadowMap::RainSize();
+            VkRenderingAttachmentInfo dAtt{};
+            dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            dAtt.imageView               = ShadowMap::GetRainView();
+            dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            dAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
+            dAtt.clearValue.depthStencil = { 1.0f, 0 };
+
+            VkRenderingInfo ri{};
+            ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.extent    = { rsz, rsz };
+            ri.layerCount           = 1;
+            ri.colorAttachmentCount = 0;
+            ri.pDepthAttachment     = &dAtt;
+            vkCmdBeginRendering(cmd, &ri);
+
+            const VkViewport vpR{ 0.f, (float)rsz, (float)rsz, -(float)rsz, 0.f, 1.f };
+            const VkRect2D   scR{ {0,0}, { rsz, rsz } };
+            vkCmdSetViewport(cmd, 0, 1, &vpR);
+            vkCmdSetScissor(cmd, 0, 1, &scR);
+            vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
+
+            s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP());
+            if (wantRain && RImplementation.Trees && RImplementation.Trees->IsBuilt())
+                RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetRainVP());
+
+            vkCmdEndRendering(cmd);
+
+            ImageBarrier(cmd, ShadowMap::GetRainImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            // Clean GROUND-height map for the water sim (only when the sim runs).
+            static bool s_groundFirst = true;
+            if (ps_r_water_sim) {
+            ImageBarrier(cmd, ShadowMap::GetGroundImage(),
+                         s_groundFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            s_groundFirst = false;
+            {
+                VkRenderingAttachmentInfo gAtt{};
+                gAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                gAtt.imageView               = ShadowMap::GetGroundView();
+                gAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                gAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                gAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
+                gAtt.clearValue.depthStencil = { 1.0f, 0 };
+                VkRenderingInfo gri{};
+                gri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                gri.renderArea.extent    = { rsz, rsz };
+                gri.layerCount           = 1;
+                gri.colorAttachmentCount = 0;
+                gri.pDepthAttachment     = &gAtt;
+                vkCmdBeginRendering(cmd, &gri);
+                vkCmdSetViewport(cmd, 0, 1, &vpR);
+                vkCmdSetScissor(cmd, 0, 1, &scR);
+                vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
+                s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP());   // statics+terrain, NO trees
+                vkCmdEndRendering(cmd);
+            }
+            ImageBarrier(cmd, ShadowMap::GetGroundImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            } // ps_r_water_sim
+
+            static bool s_diag = false;
+            if (!s_diag && wantRain) { s_diag = true;
+                Msg("[VK Rain] occlusion map drawn (%u items, need %.2f)", s_RainQueue.Size(), rainNeed); }
+        }
+
+        // ---- Water flow sim: advance the shallow-water field on the rain map
+        // (top-down ground height = a height field). Drives geometric puddles +
+        // the volumetric water render. Runs every frame while rain is enabled
+        // (water keeps flowing and drains via evaporation after the rain stops).
+        if (ps_r_rain_enable) {
+            float rd = 0.f;
+            if (g_pGamePersistent) {
+                const auto& env = g_pGamePersistent->Environment();
+                if (env.CurrentEnv) rd = env.CurrentEnv->rain_density;
+            }
+            VK::WaterSim::Dispatch(cmd, rd);
+        }
+    }
 
     // ---- NEAR cascades (R4 port): both re-rendered EVERY frame with the
     // continuous (low-passed) sun. Stability against the per-frame sun creep

@@ -11,6 +11,7 @@
 #include "vk_buffer.h"                     // CVulkanBuffer
 #include "vk_command_buffer.h"             // CVulkanCommandManager::FRAMES_IN_FLIGHT
 #include "vk_shadow.h"                     // ShadowMap (binding 1 = shadow map, sun_vp)
+#include "vk_water_sim.h"                  // WaterSim (binding 11 = water depth)
 #include "vk_texture.h"                    // CVulkanTexture (fallback ambient cube)
 #include "vk_pass_sky.h"                   // SkyPass::AcquireAmbientCubes (hemisphere sky ambient)
 #include "vk_pass_ssao.h"                  // GTAO result (binding 8, white fallback until ready)
@@ -22,6 +23,38 @@
 
 extern int   ps_r_ssao_debug;     // r_ssao_debug — draw the raw AO map (vk_console_min.cpp)
 extern float ps_r_ssao_strength;  // r_ssao_strength — live AO depth knob
+extern float ps_r_sun_boost;      // r_sun_boost — global sun multiplier (was ×1.25 literals in 5 shaders)
+extern float ps_r_ambient_floor;  // r_ambient_floor — flat ambient lift (was +0.05 literals in 4 shaders)
+extern float ps_r_wet_darken;     // r_wet_darken — wet albedo darkening strength (0..1)
+extern float ps_r_wet_refl;       // r_wet_refl — wet sky-reflection strength
+extern int   ps_r_wet_debug;      // r_wet_debug — draw the wet mask (negative darken = flag)
+extern int   ps_r_pom;            // r_pom — parallax occlusion mapping on/off
+extern float ps_r_pom_height;     // r_pom_height — POM march amplitude (UV space)
+extern float ps_r_pom_steps;      // r_pom_steps — POM max ray samples
+extern float ps_r_pom_far;        // r_pom_far — POM distance fade (m)
+extern float ps_r_pom_blur;       // r_pom_blur — POM heightfield extra mip blur
+extern float ps_r_pom_normal;     // r_pom_normal — POM normal-perturbation strength
+extern float ps_r_pom_shadow;     // r_pom_shadow — POM groove self-shadow strength
+extern float ps_r_pom_ao;         // r_pom_ao — POM view-independent contact AO strength
+extern int   ps_r_pom_debug;      // r_pom_debug — draw the POM AO×self-shadow mask
+extern int   ps_r_rain_enable;    // r_rain — master rain on/off (forces wetness 0 when off)
+extern int   ps_r_ao_flat;        // r_ao_flat — debug: neutralize all ambient occlusion
+extern float ps_r_pom_ceil;       // r_pom_ceil — POM strength on down-facing surfaces (ceilings)
+extern float ps_r_pom_floor;      // r_pom_floor — POM strength on up-facing surfaces (floors)
+extern int   ps_r_pom_terrain;    // r_pom_terrain — terrain POM enable (experimental, default off)
+extern float ps_r_terrain_normal; // r_terrain_normal — terrain detail normal-mapping strength
+extern float ps_r_terrain_ao;     // r_terrain_ao — terrain micro contact AO strength
+extern int   ps_r_terrain_debug;  // r_terrain_debug — terrain debug view (0..3)
+extern float ps_r_terrain_gloss;  // r_terrain_gloss — terrain dry sun-gloss strength
+extern float ps_r_puddle_size;    // r_puddle_size — geometric puddle ring radius (0 = off)
+extern float ps_r_puddle_depth;   // r_puddle_depth — geometric puddle depth→fill scale
+extern int   ps_r_puddle_debug;   // r_puddle_debug — draw the geometric puddle mask
+extern int   ps_r_water_sim;      // r_water_sim — water flow sim enable (puddles from the sim)
+extern float ps_r_water_murk;     // r_water_murk — volumetric absorption per metre
+extern float ps_r_water_refract;  // r_water_refract — bottom refraction strength
+extern int   ps_r_puddle_sss;     // r_puddle_sss — SSS per-pixel puddles (default source)
+extern float ps_r_puddle_level;   // r_puddle_level — water rise level vs micro-height
+extern float ps_r_puddle_micro;   // r_puddle_micro — micro-height contrast
 
 namespace VK { namespace EnvLight {
 
@@ -58,6 +91,37 @@ namespace {
     CVulkanTexture*       s_fallbackWhite = nullptr;
     VkImageView           s_boundAO[kFramesInFlight] = {};
 
+    // Spot light cookie (flashlight beam texture, binding 10): loaded once per
+    // texture name (Torch config "spot_texture"), per-slot bound-view tracking.
+    VkImageView           s_boundCookie[kFramesInFlight] = {};
+    xr_map<shared_str, CVulkanTexture*> s_cookieCache;
+
+    // Water depth (sim, binding 11): per-slot bound-view tracking. Swapped from
+    // the white fallback to the WaterSim buffer once it exists (lazy, like AO).
+    VkImageView           s_boundWater[kFramesInFlight] = {};
+    // Water velocity (sim, binding 12): same lazy-bind tracking.
+    VkImageView           s_boundFlow[kFramesInFlight]  = {};
+
+    // Load-once cookie lookup: "$game_textures$\<name>.dds". Negative results
+    // cached too (null) so a missing texture logs once, not per frame.
+    VkImageView GetCookieView(const shared_str& name)
+    {
+        auto it = s_cookieCache.find(name);
+        if (it != s_cookieCache.end()) return it->second ? it->second->GetView() : VK_NULL_HANDLE;
+        CVulkanTexture* t = nullptr;
+        string_path leaf, full;
+        xr_sprintf(leaf, "%s.dds", name.c_str());
+        FS.update_path(full, "$game_textures$", leaf);
+        if (FS.exist(full)) {
+            t = xr_new<CVulkanTexture>();
+            if (!t->LoadDDS(full, /*applyBCSwizzle*/ false)) { xr_delete(t); t = nullptr; }
+        }
+        if (t) Msg("[VK Light] spot cookie loaded: '%s'", name.c_str());
+        else   Msg("![VK Light] spot cookie not found: '%s'", name.c_str());
+        s_cookieCache.emplace(name, t);
+        return t ? t->GetView() : VK_NULL_HANDLE;
+    }
+
     // 2.6 was LDR-era compensation (pre-HDR/auto-exposure) — with the tonemap
     // it flooded terrain so bright the sun shadow under trees washed out
     // ("земля не имеет затенения"). R4's effective ambient scale is ~1.0
@@ -82,24 +146,26 @@ bool Init()
 
     // Set layout: binding 0 = UBO, 1 = far sun map, 2 = spot map, 3 = point
     // shadow cube, 4 = sun cascade 0, 5 = sun cascade 1, 6/7 = sky ambient
-    // cubes (hemisphere fill), 8 = GTAO. All FRAGMENT, combined samplers.
-    VkDescriptorSetLayoutBinding b[9]{};
+    // cubes (hemisphere fill), 8 = GTAO, 9 = rain occlusion map (wetness),
+    // 10 = spot light cookie, 11 = water depth (sim), 12 = water velocity (sim).
+    // All FRAGMENT samplers.
+    VkDescriptorSetLayoutBinding b[13]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (u32 i = 1; i < 9; ++i) {
+    for (u32 i = 1; i < 13; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 9; slci.pBindings = b;
+    slci.bindingCount = 13; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
     VkDescriptorPoolSize ps[2]{
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 8 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 12 },
     };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -169,6 +235,10 @@ bool Init()
         si[4].sampler = ShadowMap::GetSampler(); si[4].imageView = ShadowMap::GetCascadeView(1);   // 5: sun cascade 1
         for (auto& s : si) s.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+        // Binding 9: rain occlusion map (white border sampler — outside = open sky).
+        VkDescriptorImageInfo rainI{ ShadowMap::GetSampler(), ShadowMap::GetRainView(),
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+
         // Bindings 6/7: sky ambient cubes — start on the neutral fallback;
         // Update() swaps in the real weather cubes once SkyPass has them.
         VkDescriptorImageInfo cube[2]{};
@@ -182,7 +252,20 @@ bool Init()
         VkDescriptorImageInfo aoI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundAO[i] = fbWhite;
 
-        VkWriteDescriptorSet w[9]{};
+        // Binding 10: spot cookie — white until the flashlight's texture loads
+        // (shadow_params.z gates sampling anyway).
+        VkDescriptorImageInfo ckI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundCookie[i] = fbWhite;
+
+        // Binding 11: water depth (sim) — white fallback until WaterSim runs;
+        // Update() swaps in the real water buffer once it exists.
+        VkDescriptorImageInfo wtI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundWater[i] = fbWhite;
+        // Binding 12: water velocity — white fallback until WaterSim runs.
+        VkDescriptorImageInfo flI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundFlow[i] = fbWhite;
+
+        VkWriteDescriptorSet w[13]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
@@ -205,6 +288,24 @@ bool Init()
         w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[count].dstSet = s_set[i]; w[count].dstBinding = 8; w[count].descriptorCount = 1;
         w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &aoI;
+        ++count;
+        if (rainI.imageView != VK_NULL_HANDLE && rainI.sampler != VK_NULL_HANDLE) {
+            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[count].dstSet = s_set[i]; w[count].dstBinding = 9; w[count].descriptorCount = 1;
+            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &rainI;
+            ++count;
+        }
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 10; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &ckI;
+        ++count;
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 11; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &wtI;
+        ++count;
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 12; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &flI;
         ++count;
         vkUpdateDescriptorSets(VulkanHW.m_Device, count, w, 0, nullptr);
     }
@@ -252,6 +353,17 @@ void Update(u32 slot)
             }
         }
     }
+    // LDR-era brightness hacks, centralized: the sun boost (was a ×1.25 literal
+    // in five shaders) and the ambient floor (was +0.05 in four) apply ONCE
+    // here, so every receiver consumes FINAL values. Live knobs r_sun_boost /
+    // r_ambient_floor; 1.0/0.0 = raw env values. The grass/tree sun pushes get
+    // the same boost in their managers (they bypass this UBO); sunshafts
+    // kDensity is retuned ÷1.25 to keep shaft brightness unchanged.
+    for (int c = 0; c < 3; ++c) {
+        ub.sun_color[c] *= ps_r_sun_boost;
+        ub.ambient[c]   += ps_r_ambient_floor;
+    }
+
     // Sun light view·proj for the shadow lookup (Pass_SunShadow ran earlier this
     // frame and stored it). Fmatrix is 16 floats row-major → straight copy.
     memcpy(ub.sun_vp, &ShadowMap::GetLightVP(), sizeof(ub.sun_vp));
@@ -265,7 +377,27 @@ void Update(u32 slot)
     memcpy(ub.spot_vp, &ShadowMap::GetSpotVP(), sizeof(ub.spot_vp));
     ub.shadow_params[0] = float(FL.spotIdx);
     ub.shadow_params[1] = float(FL.pointIdx);
-    ub.shadow_params[2] = 0.f;
+    // Spot cookie (R4 projective light texture — the flashlight beam pattern):
+    // load the picked spot's texture once, bind it at binding 10 for this slot,
+    // and flag its presence in shadow_params.z (shaders project it with the
+    // SAME spot_vp the shadow lookup uses).
+    {
+        VkImageView cookie = VK_NULL_HANDLE;
+        if (FL.spotIdx >= 0 && FL.spotTexture.size())
+            cookie = GetCookieView(FL.spotTexture);
+        ub.shadow_params[2] = (cookie != VK_NULL_HANDLE) ? 1.f : 0.f;
+        VkImageView want = cookie ? cookie
+                                  : (s_fallbackWhite ? s_fallbackWhite->GetView() : VK_NULL_HANDLE);
+        if (want != VK_NULL_HANDLE && want != s_boundCookie[slot]) {
+            VkDescriptorImageInfo ii{ s_cubeSampler, want, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet wck{};
+            wck.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wck.dstSet = s_set[slot]; wck.dstBinding = 10; wck.descriptorCount = 1;
+            wck.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wck.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &wck, 0, nullptr);
+            s_boundCookie[slot] = want;
+        }
+    }
     ub.shadow_params[3] = 0.f;
     // Sun cascade VPs — recomputed every frame in Pass_SunShadow (earlier this
     // frame), so receivers always sample the freshly rendered cascade maps.
@@ -315,7 +447,9 @@ void Update(u32 slot)
     ub.sky_params[0] = skyWeight;
     ub.sky_params[1] = kAmbientScale;
     ub.sky_params[2] = kAmbientLod;
-    ub.sky_params[3] = 0.f;
+    // Animation clock for the wet-surface ripples (wrapped to keep float sin()
+    // precision; 1000×2π → a re-phase only every ~1.7 h).
+    ub.sky_params[3] = fmodf(Device.fTimeGlobal, 6283.185f);
 
     // GTAO (binding 8): swap the real AO view in when the pass has one, back to
     // the white fallback when it doesn't (prepass off / not rendered yet).
@@ -351,10 +485,122 @@ void Update(u32 slot)
             } else --s_aoLogCd;
         }
     }
+
+    // Binding 11: water depth (sim). Swap the white fallback for the real water
+    // buffer once WaterSim has created it (lazy, one update per slot).
+    {
+        VkImageView wv = WaterSim::GetStateView();
+        VkSampler   ws = WaterSim::GetSampler();
+        if (wv != VK_NULL_HANDLE && ws != VK_NULL_HANDLE && wv != s_boundWater[slot]) {
+            VkDescriptorImageInfo ii{ ws, wv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 11; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundWater[slot] = wv;
+        }
+        VkImageView fv = WaterSim::GetVelView();
+        if (fv != VK_NULL_HANDLE && ws != VK_NULL_HANDLE && fv != s_boundFlow[slot]) {
+            VkDescriptorImageInfo ii{ ws, fv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 12; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundFlow[slot] = fv;
+        }
+    }
     ub.ao_params[0] = Device.dwWidth  ? 1.f / float(Device.dwWidth)  : 0.f;
     ub.ao_params[1] = Device.dwHeight ? 1.f / float(Device.dwHeight) : 0.f;
     ub.ao_params[2] = SSAOPass::Strength() * ps_r_ssao_strength;
     ub.ao_params[3] = (SSAOPass::Strength() > 0.f && ps_r_ssao_debug) ? 1.f : 0.f;
+
+    // Rain wetness: the engine accumulates wetness_factor from rain_density
+    // (Environment_misc.cpp) — surfaces stay wet a while after the rain stops.
+    // The rain map VP comes from Pass_SunShadow earlier this frame.
+    memcpy(ub.rain_vp, &ShadowMap::GetRainVP(), sizeof(ub.rain_vp));
+    if (g_pGamePersistent && ps_r_rain_enable) {
+        const auto& env = g_pGamePersistent->Environment();
+        const float density = env.CurrentEnv ? env.CurrentEnv->rain_density : 0.f;
+        ub.rain_params[0] = density;
+        // OWN wetness accumulator: the engine's env.wetness_factor is freely
+        // overwritten by mod scripts (Gunslinger's weather script bounced it
+        // 0.28 → 0.11 mid-rain). Soak ~45 s of full-density rain, dry ~3 min.
+        // The engine value still contributes via max() if a script drives it
+        // ABOVE ours (e.g. level designer forces wet ground).
+        static float s_wet = 0.f;
+        const float dt = clampr(Device.fTimeDelta, 0.f, 0.1f);
+        if (density > 0.001f) s_wet += density * dt / 45.f;
+        else                  s_wet -= dt / 180.f;
+        clamp(s_wet, 0.f, 1.f);
+        const float wet = _max(s_wet, clampr(env.wetness_factor, 0.f, 1.f));
+        // sqrt = perceptual ramp: the wet look shows up in the first minute of
+        // rain instead of creeping linearly toward the full soak.
+        ub.rain_params[1] = _sqrt(wet);
+    } else {
+        // r_rain master OFF → force density + wetness to 0 so the wet shading and
+        // puddles disappear immediately (the sim buffer freezes but isn't drawn).
+        ub.rain_params[0] = 0.f;
+        ub.rain_params[1] = 0.f;
+    }
+    // Debug flag rides as a NEGATIVE darken (z) — shaders early-out on z<0 and
+    // draw the wet mask grayscale; no extra UBO slot needed.
+    ub.rain_params[2] = ps_r_wet_debug ? -1.f : ps_r_wet_darken;
+    ub.rain_params[3] = ps_r_wet_refl;
+
+    // Scene camera for the tonemap SSR puddles: depth→world reconstruction
+    // (frustum-ray basis) + world→uv projection for the ray march.
+    memcpy(ub.scene_vp, &Device.mFullTransform, sizeof(ub.scene_vp));
+    {
+        const ProjTerms pt = DeriveProjTerms(Device.mFullTransform);
+        ub.cam_dir[0] = pt.dir.x;   ub.cam_dir[1] = pt.dir.y;   ub.cam_dir[2] = pt.dir.z;   ub.cam_dir[3] = pt.p33;
+        ub.cam_rightT[0] = pt.right.x * pt.tanX; ub.cam_rightT[1] = pt.right.y * pt.tanX;
+        ub.cam_rightT[2] = pt.right.z * pt.tanX; ub.cam_rightT[3] = pt.p43;
+        ub.cam_topT[0] = pt.top.x * pt.tanY; ub.cam_topT[1] = pt.top.y * pt.tanY;
+        ub.cam_topT[2] = pt.top.z * pt.tanY; ub.cam_topT[3] = 0.f;
+    }
+
+    // POM params (world lmap/vlit fragment parallax).
+    ub.pom_params[0] = ps_r_pom ? ps_r_pom_height : 0.f;
+    ub.pom_params[1] = ps_r_pom_steps;
+    ub.pom_params[2] = ps_r_pom_far;
+    ub.pom_params[3] = ps_r_pom ? 1.f : 0.f;
+    ub.pom_params2[0] = ps_r_pom_blur;
+    ub.pom_params2[1] = ps_r_pom_normal;
+    ub.pom_params2[2] = ps_r_pom_shadow;
+    ub.pom_params2[3] = ps_r_pom_ao;
+    ub.pom_params3[0] = ps_r_pom_debug ? 1.f : 0.f;
+    ub.pom_params3[1] = ps_r_ao_flat ? 1.f : 0.f;
+    ub.pom_params3[2] = ps_r_pom_ceil;
+    ub.pom_params3[3] = ps_r_pom_floor;
+    ub.pom_params4[0] = ps_r_pom_terrain ? 1.f : 0.f;
+    ub.pom_params4[1] = ps_r_terrain_normal;        // terrain detail normal-mapping strength
+    ub.pom_params4[2] = ps_r_terrain_ao;            // terrain micro contact AO strength
+    ub.pom_params4[3] = (float)ps_r_terrain_debug;  // terrain debug view (0..3)
+    ub.pom_params5[0] = ps_r_terrain_gloss;         // terrain dry sun-gloss strength
+    ub.pom_params5[1] = ps_r_puddle_size;           // geometric puddle ring radius (0 = off)
+    ub.pom_params5[2] = ps_r_puddle_depth;          // geometric puddle depth→fill scale
+    ub.pom_params5[3] = (float)ps_r_puddle_debug;   // puddle/water debug mode (0 off,1 depth,2 flow)
+    ub.pom_params6[0] = (ps_r_water_sim && ps_r_rain_enable) ? 1.f : 0.f;  // sim puddles off when r_rain off
+    ub.pom_params6[1] = ps_r_water_murk;                // volumetric absorption /m
+    ub.pom_params6[2] = ps_r_water_refract;             // bottom refraction strength
+    ub.pom_params6[3] = 0.f;
+    // SSS per-pixel puddles (the default puddle source). Gate off when r_rain is
+    // off so dry weather clears them like the sim/geo sources.
+    ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? 1.f : 0.f;
+    ub.pom_params7[1] = ps_r_puddle_level;              // water plane rise vs micro-height
+    ub.pom_params7[2] = ps_r_puddle_micro;              // micro-height contrast
+    ub.pom_params7[3] = 0.f;
+    // Periodic state log while debugging wetness (pairs with the mask view).
+    if (ps_r_wet_debug) {
+        static u32 s_wetLogCd = 0;
+        if (s_wetLogCd == 0) {
+            s_wetLogCd = 300;
+            Msg("[VK Rain] wet state: density=%.3f wetness=%.3f darken=%.2f refl=%.2f",
+                ub.rain_params[0], ub.rain_params[1], ps_r_wet_darken, ps_r_wet_refl);
+        } else --s_wetLogCd;
+    }
 
     memcpy(s_mapped + size_t(slot) * kSlotStride, &ub, sizeof(LightUBO));
     s_current = s_set[slot];
@@ -365,13 +611,17 @@ void Destroy()
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     if (s_fallbackCube) { s_fallbackCube->Destroy(); xr_delete(s_fallbackCube); }
     if (s_fallbackWhite) { s_fallbackWhite->Destroy(); xr_delete(s_fallbackWhite); }
+    for (auto& kv : s_cookieCache) {
+        if (kv.second) { kv.second->Destroy(); xr_delete(kv.second); }
+    }
+    s_cookieCache.clear();
     if (s_cubeSampler) { vkDestroySampler(VulkanHW.m_Device, s_cubeSampler, nullptr); s_cubeSampler = VK_NULL_HANDLE; }
     if (s_pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_setLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }
     s_ubo.Destroy();
     s_mapped = nullptr;
     s_current = VK_NULL_HANDLE;
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; }
     s_inited = false; s_failed = false;
 }
 

@@ -91,9 +91,8 @@ void main()
     // is shadowed in the fragment.
     float sun  = aInstColor.r;
     float hemi = aInstColor.a;
-    float L    = max(hemi + sun, pc.vConsts.w);   // ambient_floor floor (0.2)
     vColor     = vec4(hemi, 0.0, 0.0, 1.0);
-    vSunLit    = pc.vSunColor.rgb * (sun * 1.25);   // sun ×1.25 — matches the world
+    vSunLit    = pc.vSunColor.rgb * sun;   // sun colour arrives pre-boosted (r_sun_boost)
     vWPos      = worldPos;
     vHeight    = aHeight;
 }

@@ -139,8 +139,10 @@ void main()
 
     // Ambient = sky-cube light × baked per-slot hemi occlusion (vColor.r) —
     // matches world_lmap's skyAmbient(N)*(hemiOcc*sky_params.y) on the ground.
+    // L.ambient replaces the old literal +0.05 floor: grass now gets the real
+    // env ambient (which carries r_ambient_floor) like every other receiver.
     // GTAO gates it like every other receiver (sun/dyn lights untouched).
-    vec3 ambient = (skyAmbientUp() * (vColor.r * L.sky_params.y) + 0.05)
+    vec3 ambient = (skyAmbientUp() * (vColor.r * L.sky_params.y) + L.ambient.rgb)
                  * coloredAO(gtaoVis(), diff.rgb);
 
     vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos));

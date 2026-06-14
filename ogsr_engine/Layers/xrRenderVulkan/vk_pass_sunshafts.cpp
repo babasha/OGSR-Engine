@@ -37,7 +37,9 @@ namespace {
     VkPipeline            s_pipeline  = VK_NULL_HANDLE;
 
     // Tuning: overall shaft strength and how far the ray marches.
-    constexpr float kDensity   = 0.35f;
+    // 0.28 = old 0.35 ÷ 1.25: the shader reads LightUBO sun_color, which now
+    // arrives pre-boosted by r_sun_boost (vk_env_light) — keeps shafts unchanged.
+    constexpr float kDensity   = 0.28f;
     constexpr float kMaxMarch  = 60.f;
 
     struct ShaftsPush {

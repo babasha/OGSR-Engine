@@ -110,11 +110,168 @@ constexpr xr_token qssao_token[] = {{"st_opt_off", 0},
 
 // Vulkan GTAO (vk_pass_ssao): live debug view + strength, no restart needed.
 int   ps_r_ssao_debug    = 0;     // 1 = draw the raw AO map instead of the scene
+// Global GTAO on/off (r_ssao): 0 SKIPS the whole pass (depth flip + Execute) →
+// zero GPU cost, binding 8 falls back to white. For A/B perf measurement and a
+// real off switch (r2_ssao 0 is treated as "medium", not off).
+int   ps_r_ssao_enable   = 1;
 // Strength is an exponent on the AO value (0 = off, 1 = raw GTAO). Default 2:
 // our AO input is the depth prepass (statics+trees, no grass/NPCs), and the
 // forward path applies AO to a smaller ambient share than R4's deferred
 // hemisphere — the deepened curve compensates to a comparable look.
 float ps_r_ssao_strength = 2.0f;
+
+// Vulkan lighting normalization knobs (live, no restart). Both used to be
+// literals scattered across the scene shaders (LDR-era compensation that
+// predates the HDR tonemap): sun ×1.25 in world/terrain/vlit/skinned/grass
+// and +0.05 ambient floors. They now apply ONCE on the CPU (vk_env_light UBO
+// fill + the grass/tree sun pushes), so shaders consume final values and the
+// look can be A/B'd in-game: r_sun_boost 1 + r_ambient_floor 0 = raw env values.
+float ps_r_sun_boost     = 1.25f;
+float ps_r_ambient_floor = 0.05f;
+
+// Rain wetness knobs (live): darken = how much wet albedo darkens (0 = off,
+// 0.4 ≈ wet asphalt), refl = sky-reflection strength on wet surfaces.
+// r_wet_debug 1 = world shaders draw the wet mask (wetness × rain-map
+// visibility) grayscale — white = soaked, black = dry/covered.
+float ps_r_wet_darken = 0.4f;
+float ps_r_wet_refl   = 0.6f;
+int   ps_r_wet_debug  = 0;
+// r_rain_debug 1 = rain streaks drawn SOLID RED (triage: geometry vs texture).
+int   ps_r_rain_debug = 0;
+// r_rain 0 = master OFF: skips the whole Rain pass (drops/splashes/thunderbolt)
+// AND forces wetness/density to 0 (dry surfaces, no rain occlusion map). Does
+// NOT change the weather — just suppresses the rain effect for testing.
+int   ps_r_rain_enable = 1;
+
+// World heightmap tessellation (R4 TESS_HM port, live): bump-mapped statics
+// displace along the normal by the `<bump>#` alpha height near the camera.
+// r_tess 0 routes everything back to the flat pipelines. max = subdivision
+// factor at point-blank; near/far = distance band over which the factor (and
+// the displacement amplitude) fades to flat; height scales R4's 0.07 m
+// amplitude. Consumed by RenderQueue::Flush (vk_render_queue.cpp).
+// Default OFF: vertex tessellation inflates on this content (the `#` alpha is
+// unsigned parallax/error-height, not a centered displacement map). POM
+// (r_pom) is the relief mechanism for now; re-enable r_tess once the "done
+// right" roadmap lands (high-pass centered height + tess depth-prepass).
+float ps_r_tess        = 0.0f;
+float ps_r_tess_max    = 8.0f;
+float ps_r_tess_near   = 3.0f;
+float ps_r_tess_far    = 18.0f;
+float ps_r_tess_height = 1.0f;
+// Parallax occlusion mapping (per-pixel brick/cobble relief — the right tool
+// for un-authored content, vs vertex tessellation). Reads the same `<bump>#`
+// height (alpha) as tess but per-pixel: carves grooves, never inflates. Only
+// world lmap/vlit materials with a real `#` height (flat-bump = no-op).
+// height = UV-space march amplitude; steps = max ray samples; far = fade dist.
+int   ps_r_pom        = 1;
+float ps_r_pom_height = 0.02f;
+float ps_r_pom_steps  = 24.0f;
+float ps_r_pom_far    = 12.0f;
+// Extra mip blur on the POM heightfield: removes fine albedo speckle (which
+// the diffuse-luminance height would otherwise turn into "spikes" on brick
+// faces) while the large-scale mortar grid survives. Visible texture stays
+// sharp — only the displacement is smoothed. Raise if bricks look spiky.
+float ps_r_pom_blur   = 0.5f;
+// Strength of the POM normal perturbation (relief catches sun/dyn/hemi light).
+// 0 = flat lighting (offset only), 1 = default, higher = deeper-looking grooves.
+float ps_r_pom_normal = 1.0f;
+// POM self-shadow strength: contact shadows the relief casts in its own grooves
+// toward the sun. 0 = off, 1 = default. Adds 8 height taps on sun-facing pixels.
+float ps_r_pom_shadow = 1.0f;
+// POM contact AO: view-independent groove darkening on the AMBIENT term, so the
+// relief reads with depth even out of direct sun. 0 = off, 1 = default.
+float ps_r_pom_ao     = 1.0f;
+// r_pom_debug 1 = world shaders draw the POM occlusion mask (AO × self-shadow)
+// grayscale — white = lit/open, dark = occluded grooves. Like r_ssao_debug but
+// for the per-pixel POM contributions (which the GTAO debug view can't show).
+int   ps_r_pom_debug  = 0;
+// r_ao_flat 1 = DEBUG: force ALL ambient occlusion to neutral on world lmap/vlit
+// — GTAO, POM-AO, the baked lightmap hemi-occlusion AND the dynamic hemi gate.
+// Shows the scene with perfectly flat ambient (looks "wrong" by design) so you
+// can see how much each occlusion source contributes. The baked lightmap is the
+// dominant interior AO and this is the only way to neutralize it at runtime.
+int   ps_r_ao_flat    = 0;
+// Per-orientation POM strength. Walls/fences (horizontal normal) always full;
+// floors (normal up) scale toward r_pom_floor; ceilings (normal down) toward
+// r_pom_ceil. Defaults: floor 0.75, ceiling 0.25 (overhead POM reads strong).
+float ps_r_pom_ceil   = 0.25f;
+float ps_r_pom_floor  = 0.75f;
+// Terrain POM is EXPERIMENTAL / off by default: the ground is viewed at grazing
+// angles almost always and its base texture is high-contrast, so POM there
+// "swims"/mirrors. Walls/fences/floors-of-structures (lmap/vlit) keep POM.
+int   ps_r_pom_terrain = 0;
+// Terrain DETAIL NORMAL MAPPING strength (independent of POM). Perturbs the
+// ground normal from the per-channel <detail>_bump maps (grass/asphalt/earth/
+// gravel), blended by the splat mask — feeds sun + dyn lights only (the sharp
+// sky cube stays on the flat geometric normal, else up-facing ground mirrors).
+// No UV march → no grazing-angle "swim". 0 = off; 1 = full.
+float ps_r_terrain_normal = 1.0f;
+// Terrain MICRO contact AO: darkens micro-grooves using the detail-normal tilt
+// (cavity) AND the detail height (R4 terrain AO = detail diffuse alpha). Cheap,
+// no UV march, no swim — deepens the relief the detail normals create. 0 = off.
+float ps_r_terrain_ao    = 0.5f;
+// Terrain debug view: 0 off, 1 = world normal (Nw*0.5+0.5), 2 = micro-AO,
+// 3 = detail height (splat-blended detail alpha).
+int   ps_r_terrain_debug = 0;
+// Terrain DRY sun gloss: a material-aware specular highlight from the bump .r
+// channel (R4 gloss). Asphalt/gravel catch the sun even when dry; grass stays
+// matte. Fades out as the ground wets (the wet reflection takes over). 0 = off.
+float ps_r_terrain_gloss = 0.5f;
+// GEOMETRIC PUDDLES: water pools in REAL terrain depressions instead of the
+// procedural sine mask. The rain occlusion map is a top-down ortho depth of the
+// scene (terrain is in it) = a height field; a pixel deeper than its neighbours
+// sits in a dip and holds water. r_puddle_size = neighbourhood ring radius in
+// rain-map texels (puddle blob size); 0 = geometric OFF (procedural fallback).
+// r_puddle_depth = depth→fill scale (how shallow a dip already reads as water).
+float ps_r_puddle_size   = 0.0f;    // geometric puddles OFF (0 → procedural mask); revisit with SSS water
+float ps_r_puddle_depth  = 350.0f;
+int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = depth (colour ramp), 2 = flow direction
+
+// SSS PER-PIXEL PUDDLES (SSFX deffer_terrain_high_flat.ps port): the DEFAULT
+// terrain puddle source. Water is a rising LEVEL vs the per-pixel detail micro-
+// height — grooves/ruts of the ground TEXTURE fill first, raised bumps stay dry,
+// so puddles follow the texture (not a coarse grid → no stripes/teleport, no
+// compute sim). Slope-masked to flat ground. r_puddle_sss = master; r_puddle_level
+// = how high the water plane rises with wetness (bigger = more/larger puddles);
+// r_puddle_micro = micro-height contrast (bigger = only the deepest grooves fill).
+int   ps_r_puddle_sss    = 1;
+float ps_r_puddle_level  = 0.5f;
+float ps_r_puddle_micro  = 1.0f;
+
+// WATER FLOW SIMULATION (compute, vk_water_sim): a shallow-water field on the
+// rain ortho box. Rain feeds it, water flows downhill (surface relaxation) and
+// pools in basins, evaporation drains it. Drives puddles + the volumetric water
+// render. r_water_sim = master enable; r_water_rain = input rate (depth/s at full
+// rain); r_water_evap = drain rate (depth/s); r_water_flow = relaxation per step
+// (<0.25 stable); r_water_iters = steps/frame (more = faster fill, costs compute).
+int   ps_r_water_sim    = 0;   // water flow sim OFF by default (experimental; revisit for SSS+RDR2 water)
+float ps_r_water_rain   = 0.4f;
+// Leak RATE (exponential drain ∝ water amount). Flat ground settles at depth
+// ≈ rainRate/leak (shallow, self-limiting — no flood, no knife-edge); dips fed
+// by runoff settle deeper. Higher = drier/shallower everywhere. ~3–8 is sane.
+// Exponential leak. With the velocity sim the FLOW drains flats into dips, so the
+// leak only needs to dry things over time — keep it LOW so water accumulates and
+// stays visible (high leak = water evaporates before it can pool/stream).
+// Flat-ground equilibrium depth ≈ rain/leak — keep leak high enough that light
+// rain leaves flats only DAMP (sub-threshold), while dips collect runoff into
+// small visible puddles. Too low = whole ground floods like a downpour.
+float ps_r_water_evap   = 3.0f;
+// Downhill ACCELERATION (gravity) for the velocity sim — how fast water runs /
+// how strongly streams form (replaces the old relaxation factor). Higher = faster.
+float ps_r_water_flow   = 0.5f;
+int   ps_r_water_iters  = 1;   // legacy (velocity sim runs 1 step/frame)
+// Volumetric water render (tonemap raymarch): r_water_murk = absorption per metre
+// (higher = murkier / floor hidden sooner / "deeper" feel); r_water_refract =
+// how much the surface ripples bend the view of the bottom.
+float ps_r_water_murk   = 1.2f;
+float ps_r_water_refract = 0.02f;
+
+// PN-triangle silhouette curvature (R4 TESS_PN). OFF by default: it rounds
+// hard-surface props (barrels/crates/walls) by inflating along smoothed
+// vertex normals — meant for organic curves, looks wrong on world geometry.
+// Was previously read UNINITIALIZED (push offset 112 sat outside the 112-byte
+// range and was never pushed → garbage curvature warped tessellated props).
+float ps_r_tess_pn     = 0.0f;
 
 u32 ps_r_sun_quality = 0;
 constexpr xr_token qsun_quality_token[] = {{"st_opt_low", 0},
@@ -669,8 +826,54 @@ void xrRender_initconsole()
 
     CMD3(CCC_Token, "r_ao_mode", &ps_r_ao_mode, ao_mode_token);
     CMD3(CCC_Token, "r2_ssao", &ps_r_ao_quality, qssao_token);
+    CMD4(CCC_Integer, "r_ssao", &ps_r_ssao_enable, 0, 1);        // global GTAO on/off (perf A/B + real off)
     CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 3);   // 1=AO map, 2=depth view, 3=normal view
     CMD4(CCC_Float, "r_ssao_strength", &ps_r_ssao_strength, 0.f, 4.f);
+    CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
+    CMD4(CCC_Float, "r_ambient_floor", &ps_r_ambient_floor, 0.f, 0.5f);
+    CMD4(CCC_Float, "r_wet_darken", &ps_r_wet_darken, 0.f, 1.f);
+    CMD4(CCC_Float, "r_wet_refl", &ps_r_wet_refl, 0.f, 3.f);
+    CMD4(CCC_Integer, "r_wet_debug", &ps_r_wet_debug, 0, 1);
+    CMD4(CCC_Integer, "r_rain_debug", &ps_r_rain_debug, 0, 1);
+    CMD4(CCC_Integer, "r_rain", &ps_r_rain_enable, 0, 1);   // master rain on/off (effect only, not weather)
+
+    // World heightmap tessellation (live, no restart) — see vk_render_queue.cpp.
+    CMD4(CCC_Float, "r_tess", &ps_r_tess, 0.f, 1.f);
+    CMD4(CCC_Float, "r_tess_max", &ps_r_tess_max, 1.f, 64.f);
+    CMD4(CCC_Float, "r_tess_near", &ps_r_tess_near, 0.f, 50.f);
+    CMD4(CCC_Float, "r_tess_far", &ps_r_tess_far, 1.f, 100.f);
+    CMD4(CCC_Float, "r_tess_height", &ps_r_tess_height, 0.f, 4.f);
+    CMD4(CCC_Float, "r_tess_pn", &ps_r_tess_pn, 0.f, 1.f);
+    CMD4(CCC_Integer, "r_pom", &ps_r_pom, 0, 1);
+    CMD4(CCC_Float, "r_pom_height", &ps_r_pom_height, 0.f, 0.1f);
+    CMD4(CCC_Float, "r_pom_steps", &ps_r_pom_steps, 8.f, 64.f);
+    CMD4(CCC_Float, "r_pom_far", &ps_r_pom_far, 1.f, 50.f);
+    CMD4(CCC_Float, "r_pom_blur", &ps_r_pom_blur, 0.f, 4.f);
+    CMD4(CCC_Float, "r_pom_normal", &ps_r_pom_normal, 0.f, 4.f);
+    CMD4(CCC_Float, "r_pom_shadow", &ps_r_pom_shadow, 0.f, 3.f);
+    CMD4(CCC_Float, "r_pom_ao", &ps_r_pom_ao, 0.f, 3.f);
+    CMD4(CCC_Integer, "r_pom_debug", &ps_r_pom_debug, 0, 1);
+    CMD4(CCC_Integer, "r_ao_flat", &ps_r_ao_flat, 0, 1);   // debug: kill ALL ambient occlusion (incl. baked lmap)
+    CMD4(CCC_Float, "r_pom_ceil", &ps_r_pom_ceil, 0.f, 1.f);     // POM strength on ceilings (down-facing)
+    CMD4(CCC_Float, "r_pom_floor", &ps_r_pom_floor, 0.f, 1.f);   // POM strength on floors (up-facing)
+    CMD4(CCC_Integer, "r_pom_terrain", &ps_r_pom_terrain, 0, 1); // terrain POM (experimental, default off)
+    CMD4(CCC_Float, "r_terrain_normal", &ps_r_terrain_normal, 0.f, 3.f); // terrain detail normal-mapping strength
+    CMD4(CCC_Float, "r_terrain_ao", &ps_r_terrain_ao, 0.f, 1.f);         // terrain micro contact AO strength
+    CMD4(CCC_Integer, "r_terrain_debug", &ps_r_terrain_debug, 0, 3);     // 0 off,1 normal,2 AO,3 height
+    CMD4(CCC_Float, "r_terrain_gloss", &ps_r_terrain_gloss, 0.f, 2.f);   // terrain dry sun-gloss strength
+    CMD4(CCC_Float, "r_puddle_size", &ps_r_puddle_size, 0.f, 64.f);      // geometric puddle ring radius (0=off)
+    CMD4(CCC_Float, "r_puddle_depth", &ps_r_puddle_depth, 0.f, 5000.f);  // geometric puddle depth→fill scale
+    CMD4(CCC_Integer, "r_puddle_debug", &ps_r_puddle_debug, 0, 2);       // 0 off,1 depth colour,2 flow direction
+    CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS per-pixel puddles (default source)
+    CMD4(CCC_Float, "r_puddle_level", &ps_r_puddle_level, 0.f, 1.f);     // water plane rise vs micro-height
+    CMD4(CCC_Float, "r_puddle_micro", &ps_r_puddle_micro, 0.f, 4.f);     // micro-height contrast
+    CMD4(CCC_Integer, "r_water_sim", &ps_r_water_sim, 0, 1);             // water flow sim master enable
+    CMD4(CCC_Float, "r_water_rain", &ps_r_water_rain, 0.f, 5.f);         // sim rain input rate (depth/s)
+    CMD4(CCC_Float, "r_water_evap", &ps_r_water_evap, 0.f, 20.f);        // sim leak rate (exp drain ∝ amount)
+    CMD4(CCC_Float, "r_water_flow", &ps_r_water_flow, 0.f, 4.f);         // sim downhill accel (flow speed / streams)
+    CMD4(CCC_Integer, "r_water_iters", &ps_r_water_iters, 1, 6);         // sim relaxation steps per frame
+    CMD4(CCC_Float, "r_water_murk", &ps_r_water_murk, 0.f, 8.f);         // volumetric absorption /m (deeper feel)
+    CMD4(CCC_Float, "r_water_refract", &ps_r_water_refract, 0.f, 0.2f);  // bottom refraction strength
 
     CMD3(CCC_Mask64, "r4_enable_tessellation", &ps_r2_ls_flags_ext, R2FLAGEXT_ENABLE_TESSELLATION); // Need restart
 

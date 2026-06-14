@@ -95,7 +95,8 @@ const FrameLights& CollectFrame(const Fvector& eye)
             if (!l->shadow) continue;
             if (c.d2 < spotBestD2) { spotBest = int(i); spotBestD2 = c.d2;
                           s_frame.spotPos = l->pos; s_frame.spotDir = d;
-                          s_frame.spotRange = l->range; s_frame.spotCone = l->cone; }
+                          s_frame.spotRange = l->range; s_frame.spotCone = l->cone;
+                          s_frame.spotTexture = l->texture; }
         }
         else
         {

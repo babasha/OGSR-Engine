@@ -74,6 +74,29 @@ namespace {
     Fmatrix       s_cascVP[kNumSunCascades];
     Fmatrix       s_cascViewM[kNumSunCascades];   // world→light-view, kept for CascadeSphereVisible
 
+    // Rain occlusion map: straight-down ortho box around the camera. The fixed
+    // (vertical) direction means a plain view-translation texel snap fully
+    // stabilizes re-renders — no rotating lattice like the sun cascades.
+    constexpr u32   kRainSize    = 1024;    // shared by rain + ground/water maps (2048 cost SunShadow w/o helping puddles)
+    constexpr float kRainHalf    = 75.f;    // ±75 m around the camera (~14.6 cm texels)
+    constexpr float kRainEyeUp   = 100.f;   // eye this far above the camera
+    constexpr float kRainZNear   = 1.f;
+    constexpr float kRainZFar    = 350.f;   // covers 100 m above to 250 m below
+    VkImage       s_rainImage = VK_NULL_HANDLE;
+    VmaAllocation s_rainAlloc = VK_NULL_HANDLE;
+    VkImageView   s_rainView  = VK_NULL_HANDLE;
+    Fmatrix       s_rainVP;
+    Fmatrix       s_rainViewM;   // world→light-view, kept for RainSphereVisible
+
+    // Ground-height map: same ortho box/VP as the rain map but rendered from
+    // STATICS+TERRAIN ONLY (no trees) — a CLEAN, stable top-down height field
+    // for the water flow sim. Trees in the rain map flicker (LOD/canopy) and
+    // their tops dominate the height, which made puddles jump and pool beside
+    // (not in) the ground's real dips. Same size/VP → the sim grid still aligns.
+    VkImage       s_groundImage = VK_NULL_HANDLE;
+    VmaAllocation s_groundAlloc = VK_NULL_HANDLE;
+    VkImageView   s_groundView  = VK_NULL_HANDLE;
+
     bool CreateDepthImageEx(u32 size, u32 layers, VkImageCreateFlags flags, VkImageUsageFlags usage,
                             VkImage& image, VmaAllocation& alloc)
     {
@@ -138,6 +161,12 @@ VkImage     GetPointImage()   { return s_pointImage; }
 VkImageView GetPointCubeView(){ return s_pointCubeView; }
 VkImageView GetPointFaceView(u32 face) { return (face < 6) ? s_pointFaceView[face] : VK_NULL_HANDLE; }
 u32         PointSize()       { return kPointSize; }
+VkImage     GetRainImage()    { return s_rainImage; }
+VkImageView GetRainView()     { return s_rainView; }
+VkImage     GetGroundImage()  { return s_groundImage; }
+VkImageView GetGroundView()   { return s_groundView; }
+u32         RainSize()        { return kRainSize; }
+const Fmatrix& GetRainVP()    { return s_rainVP; }
 const Fmatrix& GetCascadeVP(u32 i) { return s_cascVP[i < kNumSunCascades ? i : 0]; }
 VkImage     GetCascadeImage(u32 i) { return (i < kNumSunCascades) ? s_cascImage[i] : VK_NULL_HANDLE; }
 VkImageView GetCascadeView(u32 i)  { return (i < kNumSunCascades) ? s_cascView[i]  : VK_NULL_HANDLE; }
@@ -149,6 +178,8 @@ bool Init()
     s_inited = true;
     s_lightVP.identity();
     s_lightView.identity();
+    s_rainVP.identity();
+    s_rainViewM.identity();
     for (u32 i = 0; i < kNumSunCascades; ++i) {
         s_cascVP[i].identity();
         s_cascViewM[i].identity();
@@ -173,6 +204,14 @@ bool Init()
             !CreateDepthView(s_cascImage[i], VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_cascView[i])) {
             s_failed = true; return false;
         }
+    if (!CreateDepthImageEx(kRainSize, 1, 0, dynUsage, s_rainImage, s_rainAlloc) ||
+        !CreateDepthView(s_rainImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_rainView)) {
+        s_failed = true; return false;
+    }
+    if (!CreateDepthImageEx(kRainSize, 1, 0, dynUsage, s_groundImage, s_groundAlloc) ||
+        !CreateDepthView(s_groundImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_groundView)) {
+        s_failed = true; return false;
+    }
     if (!CreateDepthImageEx(kSpotSize, 1, 0, dynUsage, s_spotImage, s_spotAlloc) ||
         !CreateDepthView(s_spotImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_spotView) ||
         !CreateDepthImageEx(kPointSize, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, dynUsage, s_pointImage, s_pointAlloc) ||
@@ -293,6 +332,35 @@ bool CascadeSphereVisible(u32 i, const Fvector& center, float radius, float infl
     return true;
 }
 
+void ComputeRainVP()
+{
+    // Straight down. Up = +Z (any horizontal works — direction never rotates).
+    const Fvector dir{ 0.f, -1.f, 0.f };
+    const Fvector up { 0.f,  0.f, 1.f };
+    Fvector eye; eye.set(Device.vCameraPosition.x, Device.vCameraPosition.y + kRainEyeUp, Device.vCameraPosition.z);
+
+    Fmatrix view; view.build_camera_dir(eye, dir, up);
+
+    // Texel snap (same idea as ComputeLightVP): vertical direction → the
+    // lattice basis is fixed, snapping the view translation is sufficient.
+    const float texel = (2.f * kRainHalf) / float(kRainSize);
+    view.c.x = floorf(view.c.x / texel) * texel;
+    view.c.y = floorf(view.c.y / texel) * texel;
+
+    s_rainViewM = view;
+    Fmatrix proj; proj.build_projection_ortho(2.f * kRainHalf, 2.f * kRainHalf, kRainZNear, kRainZFar);
+    s_rainVP.mul(proj, view);
+}
+
+bool RainSphereVisible(const Fvector& center, float radius)
+{
+    Fvector vs; s_rainViewM.transform_tiny(vs, center);
+    if (_abs(vs.x) > kRainHalf + radius) return false;
+    if (_abs(vs.y) > kRainHalf + radius) return false;
+    if (vs.z < kRainZNear - radius || vs.z > kRainZFar + radius) return false;
+    return true;
+}
+
 void ComputeSpotVP(const Fvector& pos, const Fvector& dirIn, float range, float cone)
 {
     Fvector dir = dirIn;
@@ -342,6 +410,10 @@ void Destroy()
         if (s_cascImage[i]) { vmaDestroyImage(VulkanHW.m_Allocator, s_cascImage[i], s_cascAlloc[i]); s_cascImage[i] = VK_NULL_HANDLE; s_cascAlloc[i] = VK_NULL_HANDLE; }
     }
     if (s_imageStatic){ vmaDestroyImage(VulkanHW.m_Allocator, s_imageStatic, s_allocStatic); s_imageStatic = VK_NULL_HANDLE; s_allocStatic = VK_NULL_HANDLE; }
+    if (s_rainView)   { vkDestroyImageView(VulkanHW.m_Device, s_rainView, nullptr); s_rainView = VK_NULL_HANDLE; }
+    if (s_rainImage)  { vmaDestroyImage(VulkanHW.m_Allocator, s_rainImage, s_rainAlloc); s_rainImage = VK_NULL_HANDLE; s_rainAlloc = VK_NULL_HANDLE; }
+    if (s_groundView) { vkDestroyImageView(VulkanHW.m_Device, s_groundView, nullptr); s_groundView = VK_NULL_HANDLE; }
+    if (s_groundImage){ vmaDestroyImage(VulkanHW.m_Allocator, s_groundImage, s_groundAlloc); s_groundImage = VK_NULL_HANDLE; s_groundAlloc = VK_NULL_HANDLE; }
     if (s_spotView)   { vkDestroyImageView(VulkanHW.m_Device, s_spotView, nullptr); s_spotView = VK_NULL_HANDLE; }
     if (s_spotImage)  { vmaDestroyImage(VulkanHW.m_Allocator, s_spotImage, s_spotAlloc); s_spotImage = VK_NULL_HANDLE; s_spotAlloc = VK_NULL_HANDLE; }
     for (u32 f = 0; f < 6; ++f)

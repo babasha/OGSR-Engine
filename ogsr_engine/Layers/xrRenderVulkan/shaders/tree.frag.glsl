@@ -162,8 +162,9 @@ void main()
 
     // Ambient = sky-cube light × per-tree openness (vLight.x). ×0.75 keeps the
     // old grass:tree ambient ratio (grass 2.0 vs tree 1.5 in the flat model).
-    // GTAO gates it (softened — see gtaoVis); sun/dyn lights untouched.
-    vec3 ambient = (skyAmbientUp() * (vLight.x * L.sky_params.y * 0.75) + 0.05)
+    // L.ambient replaces the old literal +0.05 floor (real env ambient, carries
+    // r_ambient_floor). GTAO gates it (softened — see gtaoVis); sun untouched.
+    vec3 ambient = (skyAmbientUp() * (vLight.x * L.sky_params.y * 0.75) + L.ambient.rgb)
                  * coloredAO(gtaoVis(), diff.rgb);
 
     vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos));

@@ -30,9 +30,20 @@ namespace VulkanUI
     void BeginUIPassInternal();
     void ReplayDeferredUI();
 
+    // Per-frame ring rotation: selects this in-flight slot's vertex-buffer
+    // region and resets the write offset. MUST be called from CRender::Begin
+    // AFTER the slot's fence was waited — that's the proof the GPU finished
+    // reading this region (frames-in-flight discipline, same as the bone SSBO).
+    // Resetting the offset anywhere else (it used to happen in EndUIPass) lets
+    // the CPU overwrite vertex data the GPU is still reading → in Release the
+    // HUD flickered with alien fragments (font glyphs on the minimap etc.);
+    // Debug masked it by being too slow to outrun the GPU.
+    void OnFrameBegin(u32 frameSlot);
+
     // Exposed for vkUIRender — write target for PushPoint, drain for FlushPrimitive.
     extern void*           s_pMappedVB;
-    extern u32             s_UIVertexOffset;
+    extern u32             s_UIVertexOffset;   // slot-relative write offset
+    extern u32             s_VBBase;           // byte base of this frame-slot's region
     extern VkDescriptorSet s_WhiteTextureSet;
     extern bool            s_bUIPassActive;
     extern VkPipeline      s_Pipeline;          // TRIANGLE_LIST
@@ -42,12 +53,12 @@ namespace VulkanUI
     extern VkDescriptorSetLayout s_DescriptorSetLayout;
     extern VkDescriptorPool s_DescriptorPool;
 
-    // Settings menu draws hundreds of widgets per frame (ui_common-backed
-    // panels + every option label). 256KB wraps mid-frame and the wraparound
-    // path resets s_UIVertexOffset = 0, overwriting still-pending draws — that
-    // produced the "only right side of settings renders" bug.
-    // 8MB is wasteful but cheap (host-coherent VMA), and avoids needing a
-    // proper frame-fenced ring buffer for now.
+    // PER-SLOT region size (the actual buffer is this × FRAMES_IN_FLIGHT — a
+    // frame-fenced ring; see OnFrameBegin). Settings menu draws hundreds of
+    // widgets per frame (ui_common-backed panels + every option label). 256KB
+    // wraps mid-frame and the wraparound path resets s_UIVertexOffset = 0,
+    // overwriting still-pending draws — that produced the "only right side of
+    // settings renders" bug. 8MB per slot is wasteful but cheap (host VMA).
     static const VkDeviceSize VERTEX_BUFFER_SIZE = 8 * 1024 * 1024;
 
     struct DeferredUICmd

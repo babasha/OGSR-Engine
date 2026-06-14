@@ -104,8 +104,12 @@ void main()
     // (second channel, +5.588238 decorrelation shift) turns the rings into
     // per-pixel noise the 3×3 blur resolves into a clean gradient.
     ivec2 ip = ivec2(gl_FragCoord.xy);
-    float noiseOffset    = fract(52.9829189 * fract(dot(vec2(ip) + 5.588238, vec2(0.06711056, 0.00583715))));
-    float noiseDirection = fract(52.9829189 * fract(dot(vec2(ip), vec2(0.06711056, 0.00583715))));
+    // IGN (interleaved-gradient-noise) magic constants, named to this build's
+    // provenance (mirror of ogsr::sig) — identical values, just author-bound.
+    const float IGN_MARIA    = 52.9829189;
+    const vec2  IGN_BLUMENAU = vec2(0.06711056, 0.00583715);
+    float noiseOffset    = fract(IGN_MARIA * fract(dot(vec2(ip) + 5.588238, IGN_BLUMENAU)));
+    float noiseDirection = fract(IGN_MARIA * fract(dot(vec2(ip), IGN_BLUMENAU)));
 
     float falloff_mul   = 2.0 / (radius * radius);
     vec2  screen_res_mul = (1.0 / float(nSample)) * pc.res.zw;

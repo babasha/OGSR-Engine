@@ -9,9 +9,10 @@
 //
 // Dedicated Vulkan particle group (NOT the R4 PS::CParticleGroup). Holds one
 // child vkCParticleEffect per CPGDef::SEffect and plays/stops them on their
-// [Time0,Time1] windows — the core of campfires, explosions, etc. The advanced
-// on-play / on-birth / on-dead related/free child spawning is NOT ported (rare),
-// so those SEffect flags are ignored.
+// [Time0,Time1] windows — the core of campfires, explosions, etc. — PLUS the
+// R4 on-play / on-birth / on-dead child spawning (ported from ParticleGroup.cpp
+// SItem + OnGroupParticleBirth/Dead): related children follow their emitter
+// particle 1:1; free children are fired once at a particle's birth/death.
 //
 // The compat header (vk_FBasicVisual.h) maps dxRender_Visual -> vkRender_Visual
 // so ParticleGroup.h (CPGDef lives there, next to the unused CParticleGroup)
@@ -26,9 +27,138 @@
 
 #include "vk_Particles.h"
 #include "../../xrParticles/psystem.h"     // PAPI:: — MUST precede ParticleGroup.h
+#include "../xrRender/ParticleEffectDef.h" // PS::CPEDef (random-frame flags in the birth callback)
 #include "../xrRender/ParticleGroup.h"     // PS::CPGDef
 
+#include <algorithm>                       // std::min / std::remove
+
 using namespace PS;
+
+// ============================================================================
+// PAPI callbacks for group-owned effects (R4 OnGroupParticleBirth/Dead).
+// `param` = item index inside the group; `idx` = particle index — PAPI removes
+// particles via swap-with-last, so StopRelatedChild mirrors that exactly to
+// keep `related[i] follows particle[i]` true.
+// ============================================================================
+static void vk_OnGroupParticleBirth(void* owner, u32 param, PAPI::Particle& m, u32 /*idx*/)
+{
+    auto* PG = static_cast<vkCParticleGroup*>(owner);
+    if (!PG || param >= PG->m_Items.size()) return;
+    vkCParticleEffect* PE = PG->m_Items[param].effect;
+    if (!PE) return;
+
+    // Base birth behaviour — same as vk_OnEffectParticleBirth in
+    // vk_ParticleEffect.cpp (the group callback REPLACES it on the handle).
+    if (const CPEDef* PED = PE->GetDefinition())
+    {
+        if (PED->m_Flags.is(CPEDef::dfRandomFrame))
+            m.frame = (u16)iFloor(Random.randI(PED->m_Frame.m_iFrameCount) * 255.f);
+        if (PED->m_Flags.is(CPEDef::dfAnimated) && PED->m_Flags.is(CPEDef::dfRandomPlayback) && Random.randI(2))
+            m.flags.set(PAPI::Particle::ANIMATE_CCW, TRUE);
+    }
+
+    const CPGDef::SEffect* eff = PG->m_Def->m_Effects[param];
+    if (eff->m_Flags.is(CPGDef::SEffect::flOnBirthChild))
+        PG->StartFreeChild(param, eff->m_OnBirthChildName.c_str(), m);
+    if (eff->m_Flags.is(CPGDef::SEffect::flOnPlayChild))
+        PG->StartRelatedChild(param, eff->m_OnPlayChildName.c_str(), m);
+}
+
+static void vk_OnGroupParticleDead(void* owner, u32 param, PAPI::Particle& m, u32 idx)
+{
+    auto* PG = static_cast<vkCParticleGroup*>(owner);
+    if (!PG || param >= PG->m_Items.size()) return;
+
+    const CPGDef::SEffect* eff = PG->m_Def->m_Effects[param];
+    if (eff->m_Flags.is(CPGDef::SEffect::flOnPlayChild))
+        PG->StopRelatedChild(param, idx);
+    if (eff->m_Flags.is(CPGDef::SEffect::flOnDeadChild))
+        PG->StartFreeChild(param, eff->m_OnDeadChildName.c_str(), m);
+}
+
+// ============================================================================
+// Child spawn helpers (R4 SItem::Start{Related,Free}Child / StopRelatedChild)
+// ============================================================================
+namespace {
+// Position/velocity for a spawned child: world point of the emitter particle +
+// its per-step velocity (R4 derives it from pos-posB).
+void ChildSpawnTransform(vkCParticleEffect* emitter, vkCParticleEffect* child,
+                         PAPI::Particle& m, Fmatrix& M, Fvector& vel)
+{
+    M.identity();
+    vel.sub(m.pos, m.posB);
+    const float step = child->GetDefinition() ? child->GetDefinition()->GetFStep() : 0.f;
+    if (step > EPS_S) vel.div(step);
+    if (emitter->m_RT_Flags.is(vkCParticleEffect::flRT_XFORM))
+    {
+        M.set(emitter->m_XFORM);
+        M.transform_dir(vel);
+    }
+    Fvector p;
+    M.transform_tiny(p, m.pos);
+    M.c.set(p);
+}
+}  // namespace
+
+void vkCParticleGroup::StartRelatedChild(u32 item, const char* eff_name, PAPI::Particle& m)
+{
+    vkCParticleEffect* C = vkCreateParticleEffect(eff_name);
+    if (!C) return;   // unknown effect — keep parallel-array invariant broken-safe (see Stop below)
+    vkCParticleEffect* E = m_Items[item].effect;
+    C->SetHudMode(E ? E->GetHudMode() : FALSE);
+
+    Fmatrix M; Fvector vel;
+    ChildSpawnTransform(E, C, m, M, vel);
+    C->Play();
+    C->UpdateParent(M, vel, FALSE);
+    m_Items[item].related.push_back(C);
+}
+
+void vkCParticleGroup::StopRelatedChild(u32 item, u32 idx)
+{
+    auto& rel = m_Items[item].related;
+    if (idx >= rel.size()) return;   // defensive (R4 VERIFYs)
+    vkCParticleEffect* C = rel[idx];
+    if (C) { C->Stop(TRUE); m_Items[item].freeKids.push_back(C); }
+    rel[idx] = rel.back();
+    rel.pop_back();
+}
+
+void vkCParticleGroup::StartFreeChild(u32 item, const char* eff_name, PAPI::Particle& m)
+{
+    vkCParticleEffect* C = vkCreateParticleEffect(eff_name);
+    if (!C) return;
+    // R4 FATALs on a looped on-birth child (it would never die); we just refuse.
+    if (C->GetTimeLimit() < 0.f)
+    {
+        static bool s_warned = false;
+        if (!s_warned) { s_warned = true; Msg("![VK Particles] looped effect '%s' used as group child — skipped", eff_name); }
+        xr_delete(C);
+        return;
+    }
+    vkCParticleEffect* E = m_Items[item].effect;
+    C->SetHudMode(E ? E->GetHudMode() : FALSE);
+
+    Fmatrix M; Fvector vel;
+    ChildSpawnTransform(E, C, m, M, vel);
+    C->Play();
+    C->UpdateParent(M, vel, FALSE);
+    m_Items[item].freeKids.push_back(C);
+}
+
+// ============================================================================
+// vkCParticleGroup
+// ============================================================================
+namespace {
+void ClearItem(vkCParticleGroup::SItem& I)
+{
+    xr_delete(I.effect);
+    for (auto*& e : I.related)  xr_delete(e);
+    for (auto*& e : I.freeKids) xr_delete(e);
+    I.related.clear();
+    I.freeKids.clear();
+}
+}  // namespace
 
 vkCParticleGroup::vkCParticleGroup()
 {
@@ -41,32 +171,44 @@ vkCParticleGroup::vkCParticleGroup()
 
 vkCParticleGroup::~vkCParticleGroup()
 {
-    for (auto* e : m_Items)
-        xr_delete(e);
+    for (auto& I : m_Items)
+        ClearItem(I);
     m_Items.clear();
 }
 
 BOOL vkCParticleGroup::Compile(PS::CPGDef* def)
 {
     m_Def = def;
-    for (auto* e : m_Items)
-        xr_delete(e);
+    for (auto& I : m_Items)
+        ClearItem(I);
     m_Items.clear();
 
     if (m_Def)
     {
-        m_Items.resize(m_Def->m_Effects.size(), nullptr);
+        m_Items.resize(m_Def->m_Effects.size());
         for (size_t i = 0; i < m_Def->m_Effects.size(); ++i)
-            m_Items[i] = vkCreateParticleEffect(m_Def->m_Effects[i]->m_EffectName.c_str());
+        {
+            vkCParticleEffect* E = vkCreateParticleEffect(m_Def->m_Effects[i]->m_EffectName.c_str());
+            m_Items[i].effect = E;
+            // Group-owned effects report births/deaths to the GROUP so it can
+            // spawn/stop children (replaces the effect's own callback set in
+            // Compile; param = item index — R4 OnGroupParticleBirth scheme).
+            if (E)
+                PAPI::ParticleManager()->SetCallback(E->GetHandleEffect(),
+                    vk_OnGroupParticleBirth, vk_OnGroupParticleDead, this, (u32)i);
+        }
     }
     return TRUE;
 }
 
 void vkCParticleGroup::CollectEffects(xr_vector<vkCParticleEffect*>& out)
 {
-    for (auto* e : m_Items)
-        if (e)
-            e->CollectEffects(out);
+    for (auto& I : m_Items)
+    {
+        if (I.effect) I.effect->CollectEffects(out);
+        for (auto* e : I.related)  if (e) e->CollectEffects(out);
+        for (auto* e : I.freeKids) if (e) e->CollectEffects(out);
+    }
 }
 
 void vkCParticleGroup::Play()
@@ -83,17 +225,30 @@ void vkCParticleGroup::Stop(BOOL bDefferedStop)
     else
         m_RT_Flags.set(flRT_Playing, FALSE);
 
-    for (auto* e : m_Items)
-        if (e)
-            e->Stop(bDefferedStop);
+    for (auto& I : m_Items)
+    {
+        if (I.effect) I.effect->Stop(bDefferedStop);
+        for (auto* e : I.related)  if (e) e->Stop(bDefferedStop);
+        for (auto* e : I.freeKids) if (e) e->Stop(bDefferedStop);
+        // Hard stop releases children immediately (R4 SItem::Stop).
+        if (!bDefferedStop)
+        {
+            for (auto*& e : I.related)  xr_delete(e);
+            for (auto*& e : I.freeKids) xr_delete(e);
+            I.related.clear();
+            I.freeKids.clear();
+        }
+    }
 }
 
 void vkCParticleGroup::UpdateParent(const Fmatrix& m, const Fvector& velocity, BOOL bXFORM)
 {
     m_InitialPosition = m.c;
-    for (auto* e : m_Items)
-        if (e)
-            e->UpdateParent(m, velocity, bXFORM);
+    // Children keep their own transforms (R4: SItem::UpdateParent moves the
+    // emitter effect only; related children re-anchor in OnFrame).
+    for (auto& I : m_Items)
+        if (I.effect)
+            I.effect->UpdateParent(m, velocity, bXFORM);
 }
 
 void vkCParticleGroup::OnFrame(u32 u_dt)
@@ -107,7 +262,7 @@ void vkCParticleGroup::OnFrame(u32 u_dt)
         {
             const CPGDef::SEffect* e = m_Def->m_Effects[i];
             if (!e->m_Flags.is(CPGDef::SEffect::flEnabled)) continue;
-            vkCParticleEffect* I = (i < m_Items.size()) ? m_Items[i] : nullptr;
+            vkCParticleEffect* I = (i < m_Items.size()) ? m_Items[i].effect : nullptr;
             if (!I) continue;
 
             if (I->IsPlaying())
@@ -131,15 +286,81 @@ void vkCParticleGroup::OnFrame(u32 u_dt)
         bool bPlaying = false;
         Fbox box;
         box.invalidate();
-        for (auto* I : m_Items)
+        for (size_t i = 0; i < m_Items.size(); ++i)
         {
-            if (!I) continue;
-            I->OnFrame(u_dt);
-            if (I->IsPlaying())
+            SItem& item = m_Items[i];
+            const CPGDef::SEffect* def = m_Def->m_Effects[i];
+            vkCParticleEffect* E = item.effect;
+
+            if (E)
             {
-                bPlaying = true;
-                if (I->getVisData().box.is_valid())
-                    box.merge(I->getVisData().box);
+                // Ticking the emitter fires the birth/dead callbacks above —
+                // related/freeKids may grow/shrink during this call.
+                E->OnFrame(u_dt);
+                if (E->IsPlaying())
+                {
+                    bPlaying = true;
+                    if (E->getVisData().box.is_valid())
+                        box.merge(E->getVisData().box);
+
+                    // Related children follow their emitter particle (R4
+                    // SItem::OnFrame): related[i] anchors to particles[i].
+                    if (def->m_Flags.is(CPGDef::SEffect::flOnPlayChild) && !item.related.empty())
+                    {
+                        PAPI::Particle* particles;
+                        u32 p_cnt;
+                        PAPI::ParticleManager()->GetParticles(E->GetHandleEffect(), particles, p_cnt);
+                        const u32 n = std::min(p_cnt, (u32)item.related.size());
+                        for (u32 k = 0; k < n; ++k)
+                        {
+                            vkCParticleEffect* C = item.related[k];
+                            if (!C) continue;
+                            PAPI::Particle& m = particles[k];
+                            Fmatrix M;
+                            M.translate(m.pos);
+                            Fvector vel;
+                            vel.sub(m.pos, m.posB);
+                            const float step = C->GetDefinition() ? C->GetDefinition()->GetFStep() : 0.f;
+                            if (step > EPS_S) vel.div(step);
+                            C->UpdateParent(M, vel, FALSE);
+                        }
+                    }
+                }
+            }
+
+            for (auto* C : item.related)
+            {
+                if (!C) continue;
+                C->OnFrame(u_dt);
+                if (C->IsPlaying())
+                {
+                    bPlaying = true;
+                    if (C->getVisData().box.is_valid())
+                        box.merge(C->getVisData().box);
+                }
+                else if (def->m_Flags.is(CPGDef::SEffect::flOnPlayChildRewind))
+                    C->Play();
+            }
+
+            if (!item.freeKids.empty())
+            {
+                u32 rem = 0;
+                for (auto*& C : item.freeKids)
+                {
+                    if (!C) continue;
+                    C->OnFrame(u_dt);
+                    if (C->IsPlaying())
+                    {
+                        bPlaying = true;
+                        if (C->getVisData().box.is_valid())
+                            box.merge(C->getVisData().box);
+                    }
+                    else { xr_delete(C); ++rem; }
+                }
+                if (rem)
+                    item.freeKids.erase(
+                        std::remove(item.freeKids.begin(), item.freeKids.end(), nullptr),
+                        item.freeKids.end());
             }
         }
 
@@ -163,9 +384,12 @@ void vkCParticleGroup::OnFrame(u32 u_dt)
 u32 vkCParticleGroup::ParticlesCount()
 {
     u32 c = 0;
-    for (auto* e : m_Items)
-        if (e)
-            c += e->ParticlesCount();
+    for (auto& I : m_Items)
+    {
+        if (I.effect) c += I.effect->ParticlesCount();
+        for (auto* e : I.related)  if (e) c += e->ParticlesCount();
+        for (auto* e : I.freeKids) if (e) c += e->ParticlesCount();
+    }
     return c;
 }
 
@@ -182,14 +406,14 @@ const shared_str vkCParticleGroup::Name()
 
 void vkCParticleGroup::SetHudMode(BOOL b)
 {
-    for (auto* e : m_Items)
-        if (e)
-            e->SetHudMode(b);
+    for (auto& I : m_Items)
+        if (I.effect)
+            I.effect->SetHudMode(b);
 }
 
 BOOL vkCParticleGroup::GetHudMode()
 {
-    return (!m_Items.empty() && m_Items[0]) ? m_Items[0]->GetHudMode() : FALSE;
+    return (!m_Items.empty() && m_Items[0].effect) ? m_Items[0].effect->GetHudMode() : FALSE;
 }
 
 #undef FBasicVisualH

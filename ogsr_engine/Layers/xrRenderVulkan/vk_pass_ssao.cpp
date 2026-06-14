@@ -18,6 +18,7 @@
 #include "../../xr_3da/device.h"   // Device camera basis + mProject
 
 extern u32 ps_r_ao_quality;        // r2_ssao token (0 off / 1 low / 2 med / 3 high / 4 ultra)
+extern int ps_r_ssao_enable;       // r_ssao — global GTAO on/off (GLOBAL scope: block-scope extern inside the namespace would mangle as VK::SSAOPass::* → LNK2001)
 extern int ps_r_ssao_debug;        // r_ssao_debug — also enables the readback stats below
 
 namespace VK {
@@ -239,8 +240,8 @@ namespace {
 // the prepass is unavailable) Strength() keeps the receivers on plain 1.0.
 static bool s_hasResult = false;
 
-bool        Enabled()       { return s_inited && !s_failed; }
-VkImageView GetResultView() { return s_view[0]; }
+bool        Enabled()       { return s_inited && !s_failed && ps_r_ssao_enable != 0; }
+VkImageView GetResultView() { return Enabled() ? s_view[0] : VK_NULL_HANDLE; }  // disabled → EnvLight uses white fallback
 VkSampler   GetSampler()    { return s_sampLin; }
 u32         Generation()    { return s_generation; }
 float       Strength()      { return (Enabled() && s_hasResult && s_view[0]) ? kStrength : 0.f; }

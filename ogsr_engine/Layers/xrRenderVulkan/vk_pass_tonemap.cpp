@@ -10,10 +10,12 @@
 #include "vk_pass_tonemap.h"
 #include "vk_scene_color.h"
 #include "vk_pass_bloom.h"         // BloomPass — bright-pass + blur before the composite
-#include "vk_swapchain.h"          // Swapchain.m_Images / m_ImageViews / m_Format
+#include "vk_pass_particles.h"     // ParticlePass::GetDistortView — heat-haze offsets (binding 2)
+#include "vk_swapchain.h"          // Swapchain.m_Images / m_ImageViews / m_Format (+ depth for SSR puddles)
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
+#include "vk_env_light.h"          // EnvLight set (set 1) — rain map/VP + camera terms for SSR puddles
 #include "HW_Vulkan.h"
 #include "../xrRender/xrRender_console.h"  // ps_r2_img_* — R4 color-grading console knobs
 
@@ -32,6 +34,12 @@ namespace {
     VkSampler             s_Sampler        = VK_NULL_HANDLE;
     u32                   s_boundGen       = 0;   // SceneColor generation the sets were written for
     u32                   s_boundBloomGen  = 0;   // BloomPass RT generation (binding 1)
+    u32                   s_boundDistortGen = 0;  // distort RT generation (binding 2)
+    VkImageView           s_boundDepth     = VK_NULL_HANDLE;  // scene depth (binding 3, SSR puddles)
+
+    // Heat-haze strength: scene UV offset = (distort.rg - 0.5) * kDistortAmount —
+    // R2/R4 combine_2.ps: (distort.xy - 127/255) * def_distort, def_distort 0.05.
+    constexpr float kDistortAmount = 0.05f;
 
     // R4 auto-exposure (bloom_luminance_3.ps): exposure = middlegray/(avgLum +
     // low), measured from the whole-frame average luminance (the HDR target's
@@ -71,20 +79,21 @@ bool Init()
         return false;
     }
 
-    // Set 0: binding 0 = HDR scene target, binding 1 = blurred bloom (both FS).
-    VkDescriptorSetLayoutBinding b[2]{};
-    for (u32 i = 0; i < 2; ++i) {
+    // Set 0: binding 0 = HDR scene, 1 = blurred bloom, 2 = distortion,
+    // 3 = scene depth (SSR puddles). All FS.
+    VkDescriptorSetLayoutBinding b[4]{};
+    for (u32 i = 0; i < 4; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 2; lci.pBindings = b;
+    lci.bindingCount = 4; lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
         Msg("![VK Tonemap] set layout failed"); return false;
     }
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxImages * 2 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxImages * 4 };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = kMaxImages; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -112,9 +121,12 @@ bool Init()
 
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; pcr.offset = 0; pcr.size = sizeof(TonemapPush);
+    // Set 1 = the shared EnvLight set: the SSR puddles read rain_vp/rain_params,
+    // the camera frustum terms and the rain occlusion map (binding 9) from it.
+    VkDescriptorSetLayout sets[2] = { s_SetLayout, EnvLight::GetSetLayout() };
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_SetLayout;
+    plci.setLayoutCount = (sets[1] != VK_NULL_HANDLE) ? 2u : 1u; plci.pSetLayouts = sets;
     plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_PipelineLayout) != VK_SUCCESS) {
         Msg("![VK Tonemap] pipeline layout failed"); return false;
@@ -198,29 +210,43 @@ void Pass_TonemapComposite(FrameContext& ctx)
     // lands SHADER_READ for binding 1.
     BloomPass::Execute(cmd, idx, ctx.extent, SceneColor::Generation());
 
-    // Rebind the per-image descriptor sets when the HDR target or the bloom RT
-    // was (re)created.
-    const u32 gen      = SceneColor::Generation();
-    const u32 bloomGen = BloomPass::Generation();
-    if (gen != s_boundGen || bloomGen != s_boundBloomGen) {
+    // Rebind the per-image descriptor sets when the HDR target, the bloom RT or
+    // the distortion RT was (re)created.
+    const u32 gen        = SceneColor::Generation();
+    const u32 bloomGen   = BloomPass::Generation();
+    const u32 distortGen = ParticlePass::DistortGeneration();
+    if (gen != s_boundGen || bloomGen != s_boundBloomGen || distortGen != s_boundDistortGen
+        || Swapchain.m_DepthView != s_boundDepth) {
         const u32 n = SceneColor::Count();
         for (u32 i = 0; i < n && i < kMaxImages; ++i) {
-            VkDescriptorImageInfo ii[2]{};
+            VkDescriptorImageInfo ii[4]{};
             ii[0].sampler = s_Sampler; ii[0].imageView = SceneColor::GetSampleView(i);  // full mip chain
             ii[1].sampler = s_Sampler; ii[1].imageView = BloomPass::GetResultView();
-            ii[0].imageLayout = ii[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            ii[2].sampler = s_Sampler; ii[2].imageView = ParticlePass::GetDistortView();
+            ii[3].sampler = s_Sampler; ii[3].imageView = Swapchain.m_DepthView;          // SSR puddles
+            ii[0].imageLayout = ii[1].imageLayout = ii[2].imageLayout = ii[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             if (ii[1].imageView == VK_NULL_HANDLE) ii[1].imageView = SceneColor::GetSampleView(i); // pre-bloom fallback
-            VkWriteDescriptorSet w[2]{};
-            for (u32 k = 0; k < 2; ++k) {
+            if (ii[2].imageView == VK_NULL_HANDLE) ii[2].imageView = SceneColor::GetSampleView(i); // no-distort fallback (never sampled: scale 0)
+            VkWriteDescriptorSet w[4]{};
+            u32 wc = (ii[3].imageView != VK_NULL_HANDLE) ? 4u : 3u;
+            for (u32 k = 0; k < wc; ++k) {
                 w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 w[k].dstSet = s_Set[i]; w[k].dstBinding = k; w[k].descriptorCount = 1;
                 w[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[k].pImageInfo = &ii[k];
             }
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+            vkUpdateDescriptorSets(VulkanHW.m_Device, wc, w, 0, nullptr);
         }
-        s_boundGen = gen;
-        s_boundBloomGen = bloomGen;
+        s_boundGen        = gen;
+        s_boundBloomGen   = bloomGen;
+        s_boundDistortGen = distortGen;
+        s_boundDepth      = Swapchain.m_DepthView;
     }
+
+    // Scene depth → SHADER_READ for the SSR puddle march (binding 3). NOT
+    // transitioned back: CRender::Begin re-acquires depth from UNDEFINED each
+    // frame (its contents are clear-loaded, never carried over).
+    ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
     // Swapchain image: UNDEFINED (untouched this frame) → COLOR_ATTACHMENT for the composite.
     ImageBarrier(cmd, Swapchain.m_Images[idx],
@@ -248,6 +274,9 @@ void Pass_TonemapComposite(FrameContext& ctx)
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_PipelineLayout, 0, 1, &s_Set[idx], 0, nullptr);
+    // Set 1: the shared EnvLight set (rain map + camera terms for SSR puddles).
+    if (VkDescriptorSet env = EnvLight::GetCurrentSet())
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_PipelineLayout, 1, 1, &env, 0, nullptr);
 
     TonemapPush push{};
     push.p0[0] = kWhitePoint;
@@ -263,6 +292,9 @@ void Pass_TonemapComposite(FrameContext& ctx)
     push.p2[0] = ps_r2_img_exposure;
     push.p2[1] = ps_r2_img_saturation;
     push.p2[2] = 1.0f / (ps_r2_img_gamma > 0.05f ? ps_r2_img_gamma : 1.0f);
+    // Heat-haze: scale 0 until the distort RT exists (binding 2 then holds the
+    // scene-view fallback and the shader skips the sample entirely).
+    push.p2[3] = (ParticlePass::GetDistortView() != VK_NULL_HANDLE) ? kDistortAmount : 0.0f;
     push.p3[0] = 2.0f * (1.0f - ps_r2_img_cg.x);
     push.p3[1] = 2.0f * (1.0f - ps_r2_img_cg.y);
     push.p3[2] = 2.0f * (1.0f - ps_r2_img_cg.z);

@@ -16,10 +16,12 @@
 #include "vk_scene_color.h"       // HDR scene target format
 #include "vk_command_buffer.h"    // CommandManager.GetCurrentFrame() / FRAMES_IN_FLIGHT
 #include "vk_pipeline_cache.h"    // PipelineCache::GetCacheObject()
+#include "vk_barriers.h"          // ImageBarrier — distort RT layout flips
 #include "HW_Vulkan.h"
 
 #include "../xrRender/FVF.h"
 #include "../../xr_3da/fmesh.h"   // MT_PARTICLE_EFFECT / MT_PARTICLE_GROUP
+#include "../../xr_3da/device.h"  // Device.mFullTransform_hud2 — HUD-FOV projection
 
 #include <unordered_map>
 #include <string>
@@ -49,6 +51,83 @@ namespace {
 
     bool             s_Init = false;
 
+    // Heat-haze distortion target (PBM_DISTORT): full-res RGBA8, neutral
+    // (0.5, 0.5). Produced and consumed inside the same command buffer every
+    // frame, so a single image is safe across frames-in-flight (same argument
+    // as the bloom ping-pong). Created lazily on first distort sighting.
+    VkImage          s_DistortImg   = VK_NULL_HANDLE;
+    VmaAllocation    s_DistortAlloc = VK_NULL_HANDLE;
+    VkImageView      s_DistortView  = VK_NULL_HANDLE;
+    VkExtent2D       s_DistortExtent{};
+    u32              s_DistortGen   = 0;
+    bool             s_DistortFirst = true;        // image still UNDEFINED
+    VkPipeline       s_DistortPipe  = VK_NULL_HANDLE;
+    // Wallmark variants: generic decals = MODULATE2X + wallmark.frag (R4
+    // effects_wallmark.s parity); blood decals = alpha blend + the SSS
+    // effects_wallmark_blood port (readable red on dark clothing).
+    VkShaderModule   s_WallmarkFS   = VK_NULL_HANDLE;
+    VkPipeline       s_WallmarkPipe = VK_NULL_HANDLE;
+    VkShaderModule   s_BloodFS      = VK_NULL_HANDLE;
+    VkPipeline       s_BloodPipe    = VK_NULL_HANDLE;
+    // Rain variants: splashes = shape from tex ALPHA (fx_rain rgb is a
+    // refraction normal map); drop streaks = fully PROCEDURAL shape (the
+    // fx_rain alpha reads ~0 through our loader) — see rain*.frag.glsl.
+    VkShaderModule   s_RainFS       = VK_NULL_HANDLE;
+    VkPipeline       s_RainPipe     = VK_NULL_HANDLE;
+    VkShaderModule   s_RainDropFS   = VK_NULL_HANDLE;
+    VkPipeline       s_RainDropPipe = VK_NULL_HANDLE;
+    constexpr VkFormat kDistortFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    void DestroyDistortRT()
+    {
+        if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+        if (s_DistortView) { vkDestroyImageView(VulkanHW.m_Device, s_DistortView, nullptr); s_DistortView = VK_NULL_HANDLE; }
+        if (s_DistortImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_DistortImg, s_DistortAlloc); s_DistortImg = VK_NULL_HANDLE; s_DistortAlloc = VK_NULL_HANDLE; }
+        s_DistortExtent = {};
+        s_DistortFirst  = true;
+    }
+
+    bool EnsureDistortRT(VkExtent2D extent)
+    {
+        if (s_DistortImg && extent.width == s_DistortExtent.width && extent.height == s_DistortExtent.height)
+            return true;
+        DestroyDistortRT();
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = kDistortFormat;
+        ici.extent = { extent.width, extent.height, 1 };
+        ici.mipLevels = 1; ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_DistortImg, &s_DistortAlloc, nullptr) != VK_SUCCESS) {
+            Msg("![VK Particles] distort RT create failed");
+            return false;
+        }
+        VkImageViewCreateInfo vci{};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = s_DistortImg;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = kDistortFormat;
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_DistortView) != VK_SUCCESS) {
+            Msg("![VK Particles] distort view create failed");
+            DestroyDistortRT();
+            return false;
+        }
+        s_DistortExtent = extent;
+        s_DistortFirst  = true;
+        ++s_DistortGen;
+        Msg("[VK Particles] distort RT ready (%ux%u, gen %u)", extent.width, extent.height, s_DistortGen);
+        return true;
+    }
+
     // Sprite texture descriptor cache, keyed by texture name. Many effects share
     // a handful of textures (fire/smoke/sparks), so this bounds the pool.
     struct PTex { CVulkanTexture* tex = nullptr; VkDescriptorSet set = VK_NULL_HANDLE; };
@@ -67,7 +146,12 @@ namespace {
         }
     }
 
-    VkPipeline BuildPipeline(EParticleBlendMode mode)
+    // `distortTarget` builds the PBM_DISTORT variant: renders into the RGBA8
+    // distortion buffer with standard alpha blending (sprite rg = UV offset
+    // around neutral 0.5, alpha = haze mask) instead of the HDR scene target.
+    // `fsOverride` swaps the fragment shader (wallmark.frag for decals).
+    VkPipeline BuildPipeline(EParticleBlendMode mode, bool distortTarget = false,
+                             VkShaderModule fsOverride = VK_NULL_HANDLE)
     {
         VkVertexInputBindingDescription bind{};
         bind.binding   = 0;
@@ -92,7 +176,7 @@ namespace {
         stages[0].module = s_VS; stages[0].pName = "main";
         stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = s_FS; stages[1].pName = "main";
+        stages[1].module = fsOverride ? fsOverride : s_FS; stages[1].pName = "main";
 
         VkPipelineInputAssemblyStateCreateInfo ia{};
         ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -121,7 +205,8 @@ namespace {
         ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
         VkBlendFactor src, dst;
-        BlendFactors(mode, src, dst);
+        if (distortTarget) { src = VK_BLEND_FACTOR_SRC_ALPHA; dst = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; }
+        else               BlendFactors(mode, src, dst);
         VkPipelineColorBlendAttachmentState ba{};
         ba.blendEnable         = VK_TRUE;
         ba.srcColorBlendFactor = src;
@@ -144,7 +229,7 @@ namespace {
         dynState.dynamicStateCount = 2;
         dynState.pDynamicStates    = dyn;
 
-        VkFormat colorFormat = VK::SceneColor::Format();
+        VkFormat colorFormat = distortTarget ? kDistortFormat : VK::SceneColor::Format();
         VkPipelineRenderingCreateInfo prci{};
         prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         prci.colorAttachmentCount    = 1;
@@ -279,6 +364,16 @@ void ParticlePass_Destroy()
     for (u32 i = 0; i < PBM_COUNT; ++i) {
         if (s_Pipelines[i]) { vkDestroyPipeline(VulkanHW.m_Device, s_Pipelines[i], nullptr); s_Pipelines[i] = VK_NULL_HANDLE; }
     }
+    if (s_DistortPipe)  { vkDestroyPipeline(VulkanHW.m_Device, s_DistortPipe, nullptr); s_DistortPipe = VK_NULL_HANDLE; }
+    if (s_WallmarkPipe) { vkDestroyPipeline(VulkanHW.m_Device, s_WallmarkPipe, nullptr); s_WallmarkPipe = VK_NULL_HANDLE; }
+    if (s_BloodPipe)    { vkDestroyPipeline(VulkanHW.m_Device, s_BloodPipe, nullptr); s_BloodPipe = VK_NULL_HANDLE; }
+    if (s_RainPipe)     { vkDestroyPipeline(VulkanHW.m_Device, s_RainPipe, nullptr); s_RainPipe = VK_NULL_HANDLE; }
+    if (s_RainDropPipe) { vkDestroyPipeline(VulkanHW.m_Device, s_RainDropPipe, nullptr); s_RainDropPipe = VK_NULL_HANDLE; }
+    s_WallmarkFS = VK_NULL_HANDLE;
+    s_BloodFS    = VK_NULL_HANDLE;
+    s_RainFS     = VK_NULL_HANDLE;
+    s_RainDropFS = VK_NULL_HANDLE;
+    DestroyDistortRT();
     if (s_Layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_Layout, nullptr); s_Layout = VK_NULL_HANDLE; }
     if (s_Pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr); s_Pool = VK_NULL_HANDLE; }
     if (s_Sampler)   { vkDestroySampler(VulkanHW.m_Device, s_Sampler, nullptr); s_Sampler = VK_NULL_HANDLE; }
@@ -295,10 +390,72 @@ VkPipelineLayout GetLayout()  { return s_Layout; }
 VkPipeline GetPipeline(EParticleBlendMode mode)
 {
     if (!s_Init || mode < 0 || mode >= PBM_COUNT) return VK_NULL_HANDLE;
-    if (mode == PBM_DISTORT) return VK_NULL_HANDLE;       // unsupported — skip
+    if (mode == PBM_DISTORT) return VK_NULL_HANDLE;       // own pass — see Pass_Particles phase 3
     if (s_Pipelines[mode] == VK_NULL_HANDLE)
         s_Pipelines[mode] = BuildPipeline(mode);
     return s_Pipelines[mode];
+}
+
+VkImageView GetDistortView()      { return s_DistortView; }
+u32         DistortGeneration()   { return s_DistortGen; }
+
+VkPipeline GetWallmarkPipeline()
+{
+    if (!s_Init) return VK_NULL_HANDLE;
+    if (s_WallmarkPipe == VK_NULL_HANDLE) {
+        if (s_WallmarkFS == VK_NULL_HANDLE && g_ShaderManager)
+            s_WallmarkFS = g_ShaderManager->Load("wallmark.frag.spv");
+        if (s_WallmarkFS == VK_NULL_HANDLE)
+            return GetPipeline(PBM_BLEND);      // shader missing — plain blend fallback
+        // MODULATE2X like R4's effects_wallmark.s — wm_* textures are authored
+        // for multiply blending (neutral-grey backgrounds, junk alpha).
+        s_WallmarkPipe = BuildPipeline(PBM_MUL_2X, /*distortTarget*/ false, s_WallmarkFS);
+    }
+    return s_WallmarkPipe;
+}
+
+VkPipeline GetRainPipeline()
+{
+    if (!s_Init) return VK_NULL_HANDLE;
+    if (s_RainPipe == VK_NULL_HANDLE) {
+        if (s_RainFS == VK_NULL_HANDLE && g_ShaderManager)
+            s_RainFS = g_ShaderManager->Load("rain.frag.spv");
+        if (s_RainFS == VK_NULL_HANDLE)
+            return GetPipeline(PBM_BLEND);      // shader missing — plain blend fallback
+        // Alpha blend; shape from tex.a only — the fx_rain rgb is a refraction
+        // normal map, not a colour sprite (see rain.frag.glsl).
+        s_RainPipe = BuildPipeline(PBM_BLEND, /*distortTarget*/ false, s_RainFS);
+    }
+    return s_RainPipe;
+}
+
+VkPipeline GetRainDropPipeline()
+{
+    if (!s_Init) return VK_NULL_HANDLE;
+    if (s_RainDropPipe == VK_NULL_HANDLE) {
+        if (s_RainDropFS == VK_NULL_HANDLE && g_ShaderManager)
+            s_RainDropFS = g_ShaderManager->Load("rain_drop.frag.spv");
+        if (s_RainDropFS == VK_NULL_HANDLE)
+            return GetRainPipeline();           // shader missing — tex-alpha fallback
+        // ALPHA_ADD: the SSFX drop is refracted-background + hemi lift — its
+        // net effect over the backdrop is a faint ADDITIVE glint, not a
+        // painted-over streak (alpha blend read as "ливень"/tracers).
+        s_RainDropPipe = BuildPipeline(PBM_ALPHA_ADD, /*distortTarget*/ false, s_RainDropFS);
+    }
+    return s_RainDropPipe;
+}
+
+VkPipeline GetBloodWallmarkPipeline()
+{
+    if (!s_Init) return VK_NULL_HANDLE;
+    if (s_BloodPipe == VK_NULL_HANDLE) {
+        if (s_BloodFS == VK_NULL_HANDLE && g_ShaderManager)
+            s_BloodFS = g_ShaderManager->Load("wallmark_blood.frag.spv");
+        if (s_BloodFS == VK_NULL_HANDLE)
+            return GetWallmarkPipeline();       // shader missing — generic decal fallback
+        s_BloodPipe = BuildPipeline(PBM_BLEND, /*distortTarget*/ false, s_BloodFS);
+    }
+    return s_BloodPipe;
 }
 
 VkDescriptorSet GetTextureSet(const char* texture_name)
@@ -309,9 +466,25 @@ VkDescriptorSet GetTextureSet(const char* texture_name)
     auto it = s_TexCache.find(key);
     if (it != s_TexCache.end()) return it->second.set;
 
+    // Normalize legacy particle texture names (matches the DX texture loader):
+    // defs may carry a comma-separated list (base texture = the FIRST entry)
+    // and a .tga/.bmp source extension — the cooked asset on disk is .dds
+    // ('pfx\pfx_flame_01.tga' → 'pfx\pfx_flame_01.dds').
+    string_path nm;
+    xr_strcpy(nm, texture_name);
+    if (char* comma = strchr(nm, ','))
+        *comma = 0;
+    if (char* dot = strrchr(nm, '.')) {
+        const char* sep1 = strrchr(nm, '\\');
+        const char* sep2 = strrchr(nm, '/');
+        const char* sep  = (sep1 > sep2) ? sep1 : sep2;
+        if (!sep || dot > sep)   // only strip a real extension, not a dotted folder
+            *dot = 0;
+    }
+
     // Resolve "$game_textures$\<name>.dds".
     string_path leaf, full;
-    xr_sprintf(leaf, "%s.dds", texture_name);
+    xr_sprintf(leaf, "%s.dds", nm);
     FS.update_path(full, "$game_textures$", leaf);
 
     PTex entry;
@@ -365,18 +538,39 @@ void Pass_Particles(FrameContext& ctx)
 {
     if (!s_Init)                   return;
     if (ctx.cmd == VK_NULL_HANDLE) return;
-    if (g_DynamicVisuals.empty())  return;
+    if (g_DynamicVisuals.empty() && g_HudVisuals.empty() && s_DistortImg == VK_NULL_HANDLE) return;
 
-    // Flatten visible particle visuals into leaf effects.
-    static xr_vector<vkCParticleEffect*> s_effects;
-    s_effects.clear();
-    for (const DynVisual& d : g_DynamicVisuals) {
-        if (!d.vis) continue;
-        const u32 t = d.vis->Type;
-        if (t != MT_PARTICLE_EFFECT && t != MT_PARTICLE_GROUP) continue;
-        static_cast<vkParticleVisual*>(d.vis)->CollectEffects(s_effects);
-    }
-    if (s_effects.empty()) return;
+    // Flatten visible particle visuals into leaf effects, split by phase:
+    //   1. world  — scene projection, the bulk (fire/smoke/anomalies);
+    //   2. HUD    — muzzle flashes etc. (GetHudMode): WORLD-space positions but
+    //      the HUD-FOV projection (Device.mFullTransform_hud2, the R4
+    //      CHUDTransformHelper path) + near depth range [0, 0.02] (R4 rmNear)
+    //      so they sit on the weapon and never clip into walls;
+    //   3. distort — PBM_DISTORT heat haze, rendered into the distortion
+    //      buffer the tonemap composite uses to offset scene UVs.
+    static xr_vector<vkCParticleEffect*> s_world, s_hud, s_distort, s_collect;
+    s_world.clear(); s_hud.clear(); s_distort.clear();
+    auto collectList = [&](const xr_vector<DynVisual>& list) {
+        for (const DynVisual& d : list) {
+            if (!d.vis) continue;
+            const u32 t = d.vis->Type;
+            if (t != MT_PARTICLE_EFFECT && t != MT_PARTICLE_GROUP) continue;
+            s_collect.clear();
+            static_cast<vkParticleVisual*>(d.vis)->CollectEffects(s_collect);
+            for (vkCParticleEffect* e : s_collect) {
+                if (!e) continue;
+                if (e->GetBlendMode() == PBM_DISTORT) s_distort.push_back(e);
+                else if (e->GetHudMode())             s_hud.push_back(e);
+                else                                  s_world.push_back(e);
+            }
+        }
+    };
+    collectList(g_DynamicVisuals);
+    collectList(g_HudVisuals);
+    // Once the distort RT exists it must be refreshed (cleared) EVERY frame —
+    // otherwise the tonemap would re-apply last frame's frozen haze.
+    const bool runDistort = !s_distort.empty() || s_DistortImg != VK_NULL_HANDLE;
+    if (s_world.empty() && s_hud.empty() && !runDistort) return;
 
     VkCommandBuffer cmd = ctx.cmd;
     const u32 slot = CommandManager.GetCurrentFrame();
@@ -386,83 +580,160 @@ void Pass_Particles(FrameContext& ctx)
     u8* base = (u8*)ring.Map();
     if (!base) return;
 
-    // Begin rendering: preserve scene colour + world depth, no depth write.
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    VkPipeline      lastPipe = VK_NULL_HANDLE;
+    VkDescriptorSet lastSet  = VK_NULL_HANDLE;
+    u32 vtxUsed = 0;
+    u32 nDraw = 0, nHud = 0, nDistort = 0;
 
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView   = ctx.depthView;
-    dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // Shared draw loop: builds billboards into the ring at the running offset
+    // and issues one draw per effect. `forcedPipe` overrides the per-blend
+    // pipeline (distort phase renders every effect with the distort pipeline).
+    auto drawList = [&](xr_vector<vkCParticleEffect*>& list, VkPipeline forcedPipe, u32& counter) {
+        for (vkCParticleEffect* e : list) {
+            VkPipeline pipe = forcedPipe ? forcedPipe : ParticlePass::GetPipeline(e->GetBlendMode());
+            if (pipe == VK_NULL_HANDLE) continue;          // build failure
 
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = &dAtt;
-    vkCmdBeginRendering(cmd, &ri);
+            VkDescriptorSet set = e->ResolveTextureSet();
+            if (set == VK_NULL_HANDLE) continue;           // missing texture
 
-    VkViewport vp{};
-    vp.x = 0.0f; vp.y = (float)ctx.extent.height;
-    vp.width = (float)ctx.extent.width; vp.height = -(float)ctx.extent.height;
-    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+            if (vtxUsed >= kRingVerts) break;              // ring full
+            const u32 avail = kRingVerts - vtxUsed;
+            FVF::LIT* dst = (FVF::LIT*)(base + (size_t)vtxUsed * kVtxStride);
+            const u32 vcount = e->BuildVertices(dst, avail);
+            if (vcount == 0) continue;
 
-    // viewProj is constant for the pass (particle verts are world-space).
-    if (ctx.viewProj)
-        vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), ctx.viewProj);
+            if (pipe != lastPipe) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); lastPipe = pipe; }
+            if (set  != lastSet)  { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 0, 1, &set, 0, nullptr); lastSet = set; }
+
+            vkCmdDraw(cmd, vcount, 1, vtxUsed, 0);
+            vtxUsed += vcount;
+            ++counter;
+        }
+    };
 
     VkBuffer vbuf = ring.GetHandle();
     VkDeviceSize voff = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voff);
 
-    VkPipeline      lastPipe = VK_NULL_HANDLE;
-    VkDescriptorSet lastSet  = VK_NULL_HANDLE;
-    u32 vtxUsed = 0;
-    u32 nDraw = 0;
+    VkRect2D sc{ {}, ctx.extent };
 
-    for (vkCParticleEffect* e : s_effects) {
-        if (!e) continue;
-        const EParticleBlendMode bm = e->GetBlendMode();
-        VkPipeline pipe = ParticlePass::GetPipeline(bm);
-        if (pipe == VK_NULL_HANDLE) continue;          // distortion / build failure
+    // ---- Phases 1+2: scene colour + world depth, no depth write -------------
+    if (!s_world.empty() || !s_hud.empty()) {
+        VkRenderingAttachmentInfo cAtt{};
+        cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        cAtt.imageView   = ctx.colorView;
+        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
 
-        VkDescriptorSet set = e->ResolveTextureSet();
-        if (set == VK_NULL_HANDLE) continue;           // missing texture
+        VkRenderingAttachmentInfo dAtt{};
+        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        dAtt.imageView   = ctx.depthView;
+        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+        dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 
-        if (vtxUsed >= kRingVerts) break;              // ring full
-        const u32 avail = kRingVerts - vtxUsed;
-        FVF::LIT* dst = (FVF::LIT*)(base + (size_t)vtxUsed * kVtxStride);
-        const u32 vcount = e->BuildVertices(dst, avail);
-        if (vcount == 0) continue;
+        VkRenderingInfo ri{};
+        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.extent    = ctx.extent;
+        ri.layerCount           = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments    = &cAtt;
+        ri.pDepthAttachment     = &dAtt;
+        vkCmdBeginRendering(cmd, &ri);
 
-        if (pipe != lastPipe) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); lastPipe = pipe; }
-        if (set  != lastSet)  { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 0, 1, &set, 0, nullptr); lastSet = set; }
+        VkViewport vp{};
+        vp.x = 0.0f; vp.y = (float)ctx.extent.height;
+        vp.width = (float)ctx.extent.width; vp.height = -(float)ctx.extent.height;
+        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
 
-        vkCmdDraw(cmd, vcount, 1, vtxUsed, 0);
-        vtxUsed += vcount;
-        ++nDraw;
+        if (!s_world.empty() && ctx.viewProj) {
+            vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), ctx.viewProj);
+            drawList(s_world, VK_NULL_HANDLE, nDraw);
+        }
+
+        if (!s_hud.empty()) {
+            // R4 HUD-mode particles: positions stay world-space, but the
+            // projection switches to the HUD FOV (mFullTransform_hud2 = real
+            // view × HUD-FOV proj) and the depth range compresses to
+            // [0, 0.02] (rmNear) — in front of the world, depth-tested only
+            // against the HUD weapon itself.
+            vp.minDepth = 0.0f; vp.maxDepth = 0.02f;
+            vkCmdSetViewport(cmd, 0, 1, &vp);
+            vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), &Device.mFullTransform_hud2);
+            drawList(s_hud, VK_NULL_HANDLE, nHud);
+        }
+
+        vkCmdEndRendering(cmd);
     }
 
-    vkCmdEndRendering(cmd);
+    // ---- Phase 3: distortion buffer (heat haze) ------------------------------
+    if (runDistort && EnsureDistortRT(ctx.extent)) {
+        if (s_DistortPipe == VK_NULL_HANDLE)
+            s_DistortPipe = BuildPipeline(PBM_BLEND, /*distortTarget*/ true);
+
+        // UNDEFINED on the first use; SHADER_READ (tonemap sampled it) after.
+        ImageBarrier(cmd, s_DistortImg,
+                     s_DistortFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        s_DistortFirst = false;
+
+        VkRenderingAttachmentInfo cAtt{};
+        cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        cAtt.imageView   = s_DistortView;
+        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;       // neutral = no offset
+        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+        cAtt.clearValue.color = { { 0.5f, 0.5f, 0.5f, 0.0f } };
+
+        // World depth (LOAD, no write): haze behind walls must not bleed through.
+        VkRenderingAttachmentInfo dAtt{};
+        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        dAtt.imageView   = ctx.depthView;
+        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+        dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+        VkRenderingInfo ri{};
+        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.extent    = ctx.extent;
+        ri.layerCount           = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments    = &cAtt;
+        ri.pDepthAttachment     = &dAtt;
+        vkCmdBeginRendering(cmd, &ri);
+
+        VkViewport vp{};
+        vp.x = 0.0f; vp.y = (float)ctx.extent.height;
+        vp.width = (float)ctx.extent.width; vp.height = -(float)ctx.extent.height;
+        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+
+        if (!s_distort.empty() && ctx.viewProj) {
+            vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), ctx.viewProj);
+            drawList(s_distort, s_DistortPipe, nDistort);
+        }
+
+        vkCmdEndRendering(cmd);
+        ImageBarrier(cmd, s_DistortImg,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
     ring.Flush();
     ring.Unmap();
 
     static bool s_diag = false;
-    if (!s_diag && nDraw) {
-        Msg("[VK Particles] first frame drawn: effects=%u draws=%u verts=%u", (u32)s_effects.size(), nDraw, vtxUsed);
+    if (!s_diag && (nDraw + nHud + nDistort)) {
+        Msg("[VK Particles] first frame drawn: world=%u hud=%u distort=%u verts=%u", nDraw, nHud, nDistort, vtxUsed);
         s_diag = true;
     }
+    static bool s_diagHud = false;
+    if (!s_diagHud && nHud) { Msg("[VK Particles] first HUD effect drawn (hud draws=%u)", nHud); s_diagHud = true; }
+    static bool s_diagDist = false;
+    if (!s_diagDist && nDistort) { Msg("[VK Particles] first DISTORT effect drawn (draws=%u)", nDistort); s_diagDist = true; }
 }
 
 }  // namespace VK

@@ -1,22 +1,23 @@
 #version 450
 
-// World pass — vert-lit variant. Final colour = albedo × pre-baked
+// World pass - vert-lit variant. Final colour = albedo - pre-baked
 // vertex lighting + small ambient floor.
 //
 // vBakedColor is what the level compiler computed offline (point-light
-// contributions + bounce). It does NOT include direct sun — that needs
+// contributions + bounce). It does NOT include direct sun - that needs
 // runtime sun direction, deferred until env subsystem lands. As an
 // approximation we add a constant ambient term and a sun-direction-
 // independent fake-sun term gated by the per-vertex sun mask.
 //
 // Binding 2 (lmap) is bound for descriptor-layout compatibility but
-// not sampled here — vert-lit materials don't have a lightmap.
+// not sampled here - vert-lit materials don't have a lightmap.
 
 layout(set = 0, binding = 0) uniform sampler2D uTexDiffuse;
 layout(set = 0, binding = 1) uniform sampler2D uTexDetail;
 layout(set = 0, binding = 2) uniform sampler2D uTexLmap;  // unused (white fallback)
+layout(set = 0, binding = 3) uniform sampler2D uTexBumpX; // .a = height (POM); flat=1 → no parallax
 
-// Per-frame environment lighting (set 1) — see vk_env_light.{h,cpp}.
+// Per-frame environment lighting (set 1) - see vk_env_light.{h,cpp}.
 struct DynLight {
     vec4 pos;     // xyz = world position, w = range
     vec4 color;   // rgb = colour,         w = 1 spot / 0 point
@@ -27,18 +28,30 @@ layout(set = 1, binding = 0) uniform Lighting {
     vec4 sun_color;
     vec4 hemi_color;
     vec4 ambient;
-    mat4 sun_vp;      // sun light view·proj (shadow lookup)
+    mat4 sun_vp;      // sun light view-proj (shadow lookup)
     vec4 counts;      // x = dynamic light count
     DynLight lights[16];
-    mat4 spot_vp;        // spot (flashlight) shadow view·proj
+    mat4 spot_vp;        // spot (flashlight) shadow view-proj
     vec4 shadow_params;  // x = spot-shadowed light index (-1 none), y = point-shadowed index
-    mat4 sun_near_vp;    // sun cascade 0 view·proj (25 m, per-frame, R4 scheme)
-    mat4 sun_c1_vp;      // sun cascade 1 view·proj (60 m, per-frame)
+    mat4 sun_near_vp;    // sun cascade 0 view-proj (25 m, per-frame, R4 scheme)
+    mat4 sun_c1_vp;      // sun cascade 1 view-proj (60 m, per-frame)
     vec4 fog_color;      // rgb haze colour (env)
     vec4 fog_params;     // x=-near*r, y=near, z=far, w=r; fog = saturate(dist*w + x)
     vec4 eye_pos;        // xyz camera world pos
     vec4 sky_params;     // x=cube cross-fade weight, y=ambient scale, z=sample LOD
     vec4 ao_params;      // x=1/screenW, y=1/screenH, z=AO strength (0=off)
+    mat4 rain_vp;        // straight-down ortho VP for the rain occlusion map
+    vec4 rain_params;    // x=rain density, y=wetness, z=darken, w=reflection scale
+    mat4 scene_vp;       // (SSR puddles — declared for layout match, unused here)
+    vec4 cam_dir;
+    vec4 cam_rightT;
+    vec4 cam_topT;
+    vec4 pom_params;     // x=POM amplitude (UV), y=max steps, z=fade dist (m), w=on
+    vec4 pom_params2;    // x=blur, y=normal, z=self-shadow, w=contact AO
+    vec4 pom_params3;    // x=debug view, y=ao_flat, z=ceil strength, w=floor strength
+    vec4 pom_params4;    // x=terrain POM enable, y=detail-normal, z=micro-AO, w=debug (terrain only)
+    vec4 pom_params5;    // x=terrain gloss, y=geo-puddle radius (0=off), z=geo-puddle depth scale, w=puddle debug
+    vec4 pom_params6;    // x=water-sim enable (puddles from the flow sim)
 } L;
 layout(set = 1, binding = 1) uniform sampler2D uShadow;
 layout(set = 1, binding = 2) uniform sampler2D uSpotShadow;
@@ -48,15 +61,19 @@ layout(set = 1, binding = 5) uniform sampler2D uShadowC1;      // sun cascade 1 
 layout(set = 1, binding = 6) uniform samplerCube uSky0;        // sky ambient cube 0 (weather A)
 layout(set = 1, binding = 7) uniform samplerCube uSky1;        // sky ambient cube 1 (weather B)
 layout(set = 1, binding = 8) uniform sampler2D uAO;            // GTAO (half-res)
+layout(set = 1, binding = 9) uniform sampler2D uRainMap;       // top-down rain occlusion (wetness mask)
+layout(set = 1, binding = 11) uniform sampler2D uWater;        // water depth (flow sim, metres)
+layout(set = 1, binding = 12) uniform sampler2D uFlow;         // water velocity (flow sim, uv/sec)
+layout(set = 1, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
 
-// GTAO visibility — see world_lmap.frag (occludes hemi+ambient only).
+// GTAO visibility - see world_lmap.frag (occludes hemi+ambient only).
 float gtaoVis()
 {
     float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
     return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);   // strength = exponent (0 = off)
 }
 
-// Colored AO — see world_lmap.frag (R4 compute_colored_ao port).
+// Colored AO - see world_lmap.frag (R4 compute_colored_ao port).
 vec3 coloredAO(float ao, vec3 albedo)
 {
     vec3 a =  2.0404 * albedo - 0.3324;
@@ -65,15 +82,16 @@ vec3 coloredAO(float ao, vec3 albedo)
     return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
 }
 
-// Hemisphere sky ambient (R4 hmodel.h) — see world_lmap.frag.
+// Hemisphere sky ambient (R4 hmodel.h) - see world_lmap.frag.
 vec3 skyAmbient(vec3 N)
 {
     float lod = L.sky_params.z;
-    return mix(textureLod(uSky0, N, lod).rgb, textureLod(uSky1, N, lod).rgb,
-               clamp(L.sky_params.x, 0.0, 1.0));
+    float xf = clamp(L.sky_params.x, 0.0, 1.0);   // weather cross-fade — usually 0/1
+    vec3 a = textureLod(uSky0, N, lod).rgb;
+    return (xf > 0.01) ? mix(a, textureLod(uSky1, N, lod).rgb, xf) : a;  // 2nd cube only in transition
 }
 
-// Spot/point shadow + dynamic lights — same model as world_lmap.frag.
+// Spot/point shadow + dynamic lights - same model as world_lmap.frag.
 float spotShadowF(vec3 wp)
 {
     vec4 c = L.spot_vp * vec4(wp, 1.0);
@@ -118,14 +136,27 @@ vec3 dynLights(vec3 wp, vec3 N)
         if (L.lights[i].color.w > 0.5)
             att *= clamp((dot(-ld, L.lights[i].dir.xyz) - L.lights[i].dir.w)
                          / max(1.0 - L.lights[i].dir.w, 1e-3), 0.0, 1.0);
-        if (i == sIdx)      att *= spotShadowF(wp);
+        vec3 tint = L.lights[i].color.rgb;
+        if (i == sIdx) {
+            att *= spotShadowF(wp);
+            // Flashlight cookie (R4 projective light texture): the beam pattern
+            // projected through the SAME spot_vp the shadow lookup uses.
+            if (L.shadow_params.z > 0.5) {
+                vec4 cc = L.spot_vp * vec4(wp, 1.0);
+                if (cc.w > 0.0) {
+                    vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
+                    cuv.y = 1.0 - cuv.y;
+                    tint *= textureLod(uSpotCookie, clamp(cuv, 0.0, 1.0), 0.0).rgb;
+                }
+            }
+        }
         else if (i == pIdx) att *= pointShadowF(wp, L.lights[i].pos.xyz, r);
-        acc += L.lights[i].color.rgb * (att * max(dot(N, ld), 0.0));
+        acc += tint * (att * max(dot(N, ld), 0.0));
     }
     return acc;
 }
 
-// Bilinear-weighted near-cascade PCF tap (textureGather) — see world_lmap.frag.
+// Bilinear-weighted near-cascade PCF tap (textureGather) - see world_lmap.frag.
 float cascTap(sampler2D smap, vec2 uv, float ref)
 {
     vec2 sz = vec2(textureSize(smap, 0));
@@ -152,7 +183,215 @@ float cascSample(sampler2D smap, mat4 vp, vec3 wp, float bias_)
                  + cascTap(smap, uv + vec2( 0.5,  0.5) * tx, ref));
 }
 
-// NEAR cascade first (leaf-shaped dapples, smooth motion) — see world_lmap.frag.
+// Rain visibility + wet shading - see world_lmap.frag.
+float rainVis(vec3 wp)
+{
+    vec3 n = (L.rain_vp * vec4(wp, 1.0)).xyz;
+    vec2 uv = n.xy * 0.5 + 0.5;
+    uv.y = 1.0 - uv.y;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || n.z <= 0.0 || n.z >= 1.0)
+        return 1.0;
+    return cascTap(uRainMap, uv, n.z - 0.0015);
+}
+
+// Procedural puddle patches - see world_lmap.frag (uniform film reads waxy).
+float puddleMask(vec2 p)
+{
+    float n = sin(p.x * 0.71 + sin(p.y * 0.53) * 1.7)
+            * sin(p.y * 0.67 + sin(p.x * 0.49) * 1.7);
+    return smoothstep(0.15, 0.65, n * 0.5 + 0.5);
+}
+
+// GEOMETRIC puddles - see world_lmap.frag. Water collects in real depressions
+// read from the rain occlusion map (top-down ortho depth = height field).
+float geoPuddle(vec3 wp)
+{
+    vec4 c = L.rain_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return 0.0;
+    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (uv.x < 0.03 || uv.x > 0.97 || uv.y < 0.03 || uv.y > 0.97) return 0.0;
+    float myD = c.z;
+    vec2  px  = 1.0 / vec2(textureSize(uRainMap, 0));
+    float R   = L.pom_params5.y;                      // basin scale (outer ring radius, texels)
+    vec2  o   = R * px, ii = (R * 0.5) * px;
+    // Local "water level" = blurred ground height over a WIDE neighbourhood (two
+    // rings → smoother). Below the level = underwater → water fills valleys.
+    float lvl =
+        ( textureLod(uRainMap, uv + vec2( o.x, 0.0), 0.0).r
+        + textureLod(uRainMap, uv + vec2(-o.x, 0.0), 0.0).r
+        + textureLod(uRainMap, uv + vec2(0.0,  o.y), 0.0).r
+        + textureLod(uRainMap, uv + vec2(0.0, -o.y), 0.0).r
+        + textureLod(uRainMap, uv + vec2( o.x,  o.y), 0.0).r
+        + textureLod(uRainMap, uv + vec2(-o.x,  o.y), 0.0).r
+        + textureLod(uRainMap, uv + vec2( o.x, -o.y), 0.0).r
+        + textureLod(uRainMap, uv + vec2(-o.x, -o.y), 0.0).r ) * (0.5 / 8.0)
+      + ( textureLod(uRainMap, uv + vec2( ii.x, 0.0), 0.0).r
+        + textureLod(uRainMap, uv + vec2(-ii.x, 0.0), 0.0).r
+        + textureLod(uRainMap, uv + vec2(0.0,  ii.y), 0.0).r
+        + textureLod(uRainMap, uv + vec2(0.0, -ii.y), 0.0).r ) * (0.5 / 4.0);
+    return smoothstep(0.08, 1.0, (myD - lvl) * L.pom_params5.z);
+}
+
+// Water DEPTH (metres) from the flow sim, sampled via rain_vp. 0 where dry.
+float simWater(vec3 wp)
+{
+    vec4 c = L.rain_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return 0.0;
+    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
+    return textureLod(uWater, uv, 0.0).r;
+}
+
+// Blurred water depth for puddle placement (spreads crease/seam line-pooling
+// into smooth area puddles) — see world_terrain.frag.
+float simWaterSoft(vec3 wp)
+{
+    vec4 c = L.rain_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return 0.0;
+    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
+    vec2 px = 5.0 / vec2(textureSize(uWater, 0));
+    return textureLod(uWater, uv, 0.0).r * 0.4
+         + (textureLod(uWater, uv + vec2(px.x, 0.0), 0.0).r
+          + textureLod(uWater, uv - vec2(px.x, 0.0), 0.0).r
+          + textureLod(uWater, uv + vec2(0.0, px.y), 0.0).r
+          + textureLod(uWater, uv - vec2(0.0, px.y), 0.0).r) * 0.15;
+}
+
+// Water VELOCITY (uv/sec) from the flow sim — drives the moving-water surface.
+vec2 simFlow(vec3 wp)
+{
+    vec4 c = L.rain_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return vec2(0.0);
+    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec2(0.0);
+    return vec2(textureLod(uFlow, uv, 0.0).r, -textureLod(uFlow, uv, 0.0).g);  // uv-vel -> world XZ (Z axis is flipped)
+}
+
+// Ground height (metres, relative) from the rain map ortho depth — flow debug.
+float groundHm(vec3 wp)
+{
+    vec4 c = L.rain_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return 0.0;
+    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    return -textureLod(uRainMap, uv, 0.0).r * 349.0;
+}
+
+// Water debug colour. 1 = DEPTH ramp, 2 = FLOW direction (downhill gradient).
+vec3 waterDebugColor(vec3 wp, int mode)
+{
+    float d = simWater(wp);
+    if (mode == 2) {
+        float e = 0.6;
+        float sx1 = groundHm(wp + vec3( e,0,0)) + simWater(wp + vec3( e,0,0));
+        float sx0 = groundHm(wp + vec3(-e,0,0)) + simWater(wp + vec3(-e,0,0));
+        float sz1 = groundHm(wp + vec3(0,0, e)) + simWater(wp + vec3(0,0, e));
+        float sz0 = groundHm(wp + vec3(0,0,-e)) + simWater(wp + vec3(0,0,-e));
+        vec2 flow = -vec2(sx1 - sx0, sz1 - sz0);
+        float sp  = clamp(length(flow) * 2.0, 0.0, 1.0);
+        vec2 dir  = (length(flow) > 1e-5) ? normalize(flow) : vec2(0.0);
+        vec3 c = vec3(dir * 0.5 + 0.5, 0.3) * sp;
+        return (d > 0.005) ? c : c * 0.15;
+    }
+    float t = clamp(d / 0.6, 0.0, 1.0);
+    vec3 c = vec3(0.0, t * 0.55, t) + vec3(smoothstep(0.75, 1.0, t));
+    return (d < 0.005) ? vec3(0.02) : c;
+}
+
+// Travelling surface waves ALONG the water flow — see world_terrain.frag.
+vec2 flowWaves(vec3 wp, float t)
+{
+    float d = simWater(wp);
+    if (d < 0.003) return vec2(0.0);
+    float e = 0.6;
+    float sx1 = groundHm(wp + vec3( e,0,0)) + simWater(wp + vec3( e,0,0));
+    float sx0 = groundHm(wp + vec3(-e,0,0)) + simWater(wp + vec3(-e,0,0));
+    float sz1 = groundHm(wp + vec3(0,0, e)) + simWater(wp + vec3(0,0, e));
+    float sz0 = groundHm(wp + vec3(0,0,-e)) + simWater(wp + vec3(0,0,-e));
+    vec2 flow = -vec2(sx1 - sx0, sz1 - sz0);
+    float spd = length(flow);
+    if (spd < 1e-4) return vec2(0.0);
+    vec2 dir = flow / spd;
+    float along = dot(wp.xz, dir);
+    float w = sin(along * 7.0  - t * (2.0 + spd * 30.0))
+            + 0.5 * sin(along * 16.0 - t * (3.5 + spd * 50.0) + 1.3);
+    float amp = clamp(spd * 6.0, 0.0, 1.0) * clamp(d * 8.0, 0.0, 1.0);
+    return dir * (w * amp * 0.5);
+}
+
+// Lagarde ring ripples - see world_lmap.frag.
+vec2 rippleLayer(vec2 p, float t)
+{
+    vec2 cell = floor(p);
+    vec2 f = p - cell;
+    // procedural-noise salts — build provenance (mirror of ogsr::sig); same
+    // numbers a classic value-noise hash uses, just named/bound to this build.
+    const vec2  SALT_ZEFIR   = vec2(127.1, 311.7);
+    const vec2  SALT_CATARA  = vec2(269.5, 183.3);
+    const float SALT_SARATOV = 43758.5453;
+    float h1 = fract(sin(dot(cell, SALT_ZEFIR))  * SALT_SARATOV);
+    float h2 = fract(sin(dot(cell, SALT_CATARA)) * SALT_SARATOV);
+    vec2  c  = vec2(0.3) + 0.4 * vec2(h1, h2);
+    float ph = fract(t + h1);
+    float d  = length(f - c);
+    float ring = sin(clamp((d - ph * 0.5) * 30.0, -3.1416, 3.1416));
+    float fade = (1.0 - ph) * smoothstep(0.5, 0.25, d);
+    return (d > 1e-4 ? (f - c) / d : vec2(0.0)) * (ring * fade);
+}
+
+vec2 rainRipples(vec2 p, float t)
+{
+    return rippleLayer(p * 2.2,                     t * 1.05)
+         + rippleLayer(p * 1.34 + vec2(0.50, 0.25), t * 1.31)
+         + rippleLayer(p * 1.91 + vec2(0.31, 0.50), t * 1.58);
+}
+
+vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N)
+{
+    float wet = L.rain_params.y;
+    if (wet < 0.005)
+        return vec3(0.0);
+    wet *= rainVis(wp);
+    float upness = clamp(N.y, 0.0, 1.0);
+    // Kill wetness on DOWN-facing surfaces (ceilings/overhang undersides) — rain
+    // can't land there (stops "drops on the ceiling" from thin-roof self-pass).
+    float wetK = wet * mix(0.35, 1.0, upness) * smoothstep(-0.15, 0.05, N.y);
+    albedo *= 1.0 - L.rain_params.z * wetK;
+
+    // PERF: distance-fade + early-out the expensive reflection (see world_lmap).
+    vec3  toEye    = L.eye_pos.xyz - wp;
+    float dist     = length(toEye);
+    float reflFade = smoothstep(70.0, 35.0, dist);
+    if (wetK * reflFade < 0.004) return vec3(0.0);
+
+    float t = L.sky_params.w;
+    float ripFade = smoothstep(18.0, 8.0, dist) * clamp(L.rain_params.x * 1.5 + 0.1, 0.0, 1.0);
+    vec2  vel   = (L.pom_params6.x > 0.5) ? simFlow(wp) : vec2(0.0);
+    float velMS = length(vel) * 150.0;
+    vec2  scrl  = (velMS > 0.01) ? normalize(vel) * (t * velMS * 0.25) : vec2(0.0);
+    vec3  Nr = N;
+    if (ripFade > 0.01) {
+        vec2 rip = rainRipples(wp.xz - scrl, t * 0.6) * (0.4 * ripFade);
+        if (velMS > 0.1)
+            rip += rainRipples(wp.xz * 1.6 - scrl * 1.6, t * 0.9) * (clamp(velMS * 0.12, 0.0, 0.5) * ripFade);
+        Nr = normalize(vec3(N.x + rip.x, N.y, N.z + rip.y));
+    }
+    vec3 V = normalize(toEye);
+    vec3 R = reflect(-V, Nr);
+    float fres = pow(1.0 - clamp(dot(V, Nr), 0.0, 1.0), 3.0);
+    float xf = clamp(L.sky_params.x, 0.0, 1.0);
+    vec3 sky = textureLod(uSky0, R, 0.0).rgb;
+    if (xf > 0.01) sky = mix(sky, textureLod(uSky1, R, 0.0).rgb, xf);
+    float pud = ((L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(wp))
+                 : (L.pom_params5.y > 0.0) ? geoPuddle(wp) : puddleMask(wp.xz * 0.8)) * upness;
+    // Deep water = clear water BODY: cool dark tint + stronger sharp reflection.
+    albedo = mix(albedo, albedo * vec3(0.45, 0.55, 0.62), clamp(pud, 0.0, 1.0));
+    float reflK = wetK * (0.1 + 1.0 * pud) * (0.04 + 0.96 * fres) * reflFade;
+    float foam = smoothstep(3.0, 6.0, velMS) * clamp(pud, 0.0, 1.0) * ripFade * 0.25;
+    return sky * (reflK * L.rain_params.w) + vec3(foam);
+}
+
+// NEAR cascade first (leaf-shaped dapples, smooth motion) - see world_lmap.frag.
 float sunShadow(vec3 worldPos)
 {
     float s = cascSample(uShadowNear, L.sun_near_vp, worldPos, 0.0004);
@@ -167,7 +406,7 @@ float sunShadow(vec3 worldPos)
     uv.y = 1.0 - uv.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
     float ref   = ndc.z - 0.0015;
-    // 4 spread taps (was 3×3) — see world_lmap.frag.
+    // 4 spread taps (was 3-3) - see world_lmap.frag.
     vec2  texel = 1.0 / vec2(textureSize(uShadow, 0));
     float sum = 0.0;
     sum += (ref <= texture(uShadow, uv + vec2(-0.75, -0.75) * texel).r) ? 1.0 : 0.0;
@@ -193,18 +432,152 @@ layout(location = 4) in  vec3  vWorldPos;
 layout(location = 5) in  vec3  vNormal;
 layout(location = 0) out vec4  outColor;
 
+// POM heightfield from DIFFUSE LUMINANCE (no authored heightmaps on this
+// content; the `#` alpha is low-contrast) — see world_lmap.frag.
+// Height from the `#` alpha, high-passed - see world_lmap.frag (albedo height
+// made dark/light bricks into false cliffs → spikes; `#` is geometry-based).
+float pomDepth(vec2 uv, float lod, float baseline)
+{
+    float h = textureLod(uTexBumpX, uv, lod).a;
+    return clamp(0.5 - (h - baseline) * 4.0, 0.0, 1.0);
+}
+
+// Parallax occlusion (relief) mapping - see world_lmap.frag for full comments.
+vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, out float outAO)
+{
+    outN = N;
+    outShadow = 1.0;
+    outAO = 1.0;
+    float amp = L.pom_params.x;
+    if (amp <= 0.0) return uv;
+    if (textureLod(uTexBumpX, vec2(0.5), 8.0).a > 0.985) return uv;   // flat material → no POM
+    float dist = length(L.eye_pos.xyz - wp);
+    float fade = 1.0 - smoothstep(L.pom_params.z * 0.5, L.pom_params.z, dist);   // full to far*0.5, gone by far
+    amp *= fade;
+    // Per-orientation strength (floor→.w, ceiling→.z) - see world_lmap.frag.
+    float orient = (N.y >= 0.0)
+        ? mix(1.0, L.pom_params3.w, clamp( N.y, 0.0, 1.0))
+        : mix(1.0, L.pom_params3.z, clamp(-N.y, 0.0, 1.0));
+    amp *= orient;
+    if (amp <= 1e-5) return uv;
+
+    vec2 tsz  = vec2(textureSize(uTexBumpX, 0));
+    vec2 ddx  = dFdx(uv) * tsz, ddy = dFdy(uv) * tsz;
+    float lod = max(0.5 * log2(max(dot(ddx, ddx), dot(ddy, ddy))), 0.0) + L.pom_params2.x;
+    float baseline = textureLod(uTexBumpX, uv, lod + 3.0).a;
+
+    vec3 dp1 = dFdx(wp),  dp2 = dFdy(wp);
+    vec2 du1 = dFdx(uv),  du2 = dFdy(uv);
+    vec3 dp2p = cross(dp2, N), dp1p = cross(N, dp1);
+    vec3 T = dp2p * du1.x + dp1p * du2.x;
+    vec3 B = dp2p * du1.y + dp1p * du2.y;
+    float inv = inversesqrt(max(dot(T, T), dot(B, B)));
+    T *= inv; B *= inv;
+
+    vec3 V   = normalize(L.eye_pos.xyz - wp);
+    vec3 Vts = vec3(dot(V, T), dot(V, B), dot(V, N));
+    vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.3)) * amp;
+
+    int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)), 12.0, 64.0));
+    float layerH = 1.0 / float(steps);
+    vec2 dUV = Pmax * layerH;
+
+    float curD = 0.0;
+    vec2  curUV = uv;
+    float curH = pomDepth(curUV, lod, baseline);
+    for (int i = 0; i < 64; ++i) {
+        if (i >= steps || curD >= curH) break;
+        curUV -= dUV;
+        curD  += layerH;
+        curH   = pomDepth(curUV, lod, baseline);
+    }
+    vec2 sUV = dUV; float sD = layerH;
+    for (int j = 0; j < 6; ++j) {
+        sUV *= 0.5; sD *= 0.5;
+        if (curD < pomDepth(curUV, lod, baseline)) { curUV -= sUV; curD += sD; }
+        else                                       { curUV += sUV; curD -= sD; }
+    }
+    // Perturbed normal from the height gradient — see world_lmap.frag.
+    float tU = exp2(lod) / tsz.x, tV = exp2(lod) / tsz.y;
+    float hu = textureLod(uTexBumpX, curUV + vec2(tU, 0.0), lod).a
+             - textureLod(uTexBumpX, curUV - vec2(tU, 0.0), lod).a;
+    float hv = textureLod(uTexBumpX, curUV + vec2(0.0, tV), lod).a
+             - textureLod(uTexBumpX, curUV - vec2(0.0, tV), lod).a;
+    float ns = L.pom_params2.y * 12.0 * fade * orient;
+    vec3 nTS = normalize(vec3(-hu * ns, -hv * ns, 1.0));
+    outN = normalize(T * nTS.x + B * nTS.y + N * nTS.z);
+
+    // Self-shadow toward the sun - see world_lmap.frag.
+    if (L.pom_params2.z > 0.0) {
+        vec3 Ld  = normalize(-L.sun_dir.xyz);
+        vec3 Lts = vec3(dot(Ld, T), dot(Ld, B), dot(Ld, N));
+        vec2 lxy = Lts.xy;
+        if (Lts.z > 0.02 && dot(lxy, lxy) > 1e-6) {
+            // Horizon self-shadow toward the sun - see world_lmap.frag.
+            vec2  sdir  = normalize(lxy);
+            float reach = (exp2(lod) / min(tsz.x, tsz.y)) * 6.0;
+            float h0    = textureLod(uTexBumpX, curUV, lod).a;
+            float occ   = 0.0;
+            for (int s = 1; s <= 8; ++s) {
+                float hs = textureLod(uTexBumpX, curUV + sdir * reach * (float(s) * 0.125), lod).a;
+                occ = max(occ, hs - h0);
+            }
+            outShadow = clamp(1.0 - occ * L.pom_params2.z * 20.0 * (1.0 - Lts.z) * orient, 0.0, 1.0);
+        }
+    }
+    // POM-AO (view-independent contact occlusion) - see world_lmap.frag.
+    if (L.pom_params2.w > 0.0) {
+        float aoReach = (exp2(lod) / min(tsz.x, tsz.y)) * 4.0;
+        float h0 = textureLod(uTexBumpX, curUV, lod).a;
+        float aoSum =
+              max(0.0, textureLod(uTexBumpX, curUV + vec2( aoReach, 0.0), lod).a - h0)
+            + max(0.0, textureLod(uTexBumpX, curUV + vec2(-aoReach, 0.0), lod).a - h0)
+            + max(0.0, textureLod(uTexBumpX, curUV + vec2(0.0,  aoReach), lod).a - h0)
+            + max(0.0, textureLod(uTexBumpX, curUV + vec2(0.0, -aoReach), lod).a - h0);
+        outAO = clamp(1.0 - (aoSum * 0.25) * L.pom_params2.w * 6.0, 0.35, 1.0);
+        outAO = mix(1.0, outAO, orient);   // ceilings: dial contact AO down too
+    }
+    return curUV;
+}
+
 void main()
 {
-    vec4 base   = texture(uTexDiffuse, vUV);
+    vec3 pomN; float pomShadow, pomAO;
+    vec2 pUV = parallaxUV(vUV, normalize(vNormal), vWorldPos, pomN, pomShadow, pomAO);
+    vec2 pDetailUV = vDetailUV + (pUV - vUV) * pc.detailScale;
+
+    vec4 base   = texture(uTexDiffuse, pUV);
     if (pc.alphaRef >= 0.0 && base.a < pc.alphaRef) discard;
 
-    // r_ssao_debug 1: show the raw AO map — see world_lmap.frag.
+    // r_ssao_debug 1: show the raw AO map - see world_lmap.frag.
     if (L.ao_params.w > 0.5) {
         outColor = vec4(vec3(textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r), base.a);
         return;
     }
 
-    vec3 detail = texture(uTexDetail, vDetailUV).rgb;
+    // r_wet_debug 1: rain-map visibility - see world_lmap.frag.
+    if (L.rain_params.z < 0.0) {
+        outColor = vec4(vec3(rainVis(vWorldPos)), base.a);
+        return;
+    }
+
+    // r_puddle_debug: 1 = water depth (colour ramp), 2 = flow direction; sim off
+    // → static geometric mask (grayscale).
+    int pdbg = int(L.pom_params5.w + 0.5);
+    if (pdbg > 0) {
+        outColor = (L.pom_params6.x > 0.5)
+            ? vec4(waterDebugColor(vWorldPos, pdbg), base.a)
+            : vec4(vec3(geoPuddle(vWorldPos)), base.a);
+        return;
+    }
+
+    // r_pom_debug 1: POM occlusion mask (contact AO × sun self-shadow).
+    if (L.pom_params3.x > 0.5) {
+        outColor = vec4(vec3(pomAO * pomShadow), base.a);
+        return;
+    }
+
+    vec3 detail = texture(uTexDetail, pDetailUV).rgb;
     vec3 albedo = 2.0 * base.rgb * detail;
 
     // Lighting: baked vertex color (point lights + bounce, already coloured) +
@@ -212,30 +585,37 @@ void main()
     // vlit has no per-texel hemi occlusion (no lightmap), so the sky term is a
     // crude flat hemi*0.5; vBakedColor carries the local point-light detail.
     // Small floor avoids pitch-black. Matches world_lmap's env-driven model.
-    // DYNAMIC R4-style sun: per-pixel N·L × shadow map (the baked per-vertex
-    // vSunMask was frozen at the bake's sun angle — dawn/dusk never showed).
-    vec3  Nw      = normalize(vNormal);
+    // DYNAMIC R4-style sun: per-pixel N-L - shadow map (the baked per-vertex
+    // vSunMask was frozen at the bake's sun angle - dawn/dusk never showed).
+    vec3  geomN   = normalize(vNormal);   // flat — for the sky fill (sharp cube → perturbed = mirror)
+    vec3  Nw      = pomN;   // POM-perturbed normal → sun + dyn lights catch the relief
     float sunMask = max(dot(Nw, normalize(-L.sun_dir.xyz)), 0.0);
     if (sunMask > 0.005)
-        sunMask *= sunShadow(vWorldPos);
+        sunMask *= sunShadow(vWorldPos) * pomShadow;   // cascade × POM groove self-shadow
 
     // vlit has NO lightmap occlusion, so the dynamic sky fill was applied
-    // unoccluded → vertex-lit interior props (tables, mattresses) glowed in a
+    // unoccluded - vertex-lit interior props (tables, mattresses) glowed in a
     // dark basement. Gate it by BOTH: pc.dynHemi (ray-traced sky visibility for
     // DYNAMIC objects) AND the baked vertex brightness (occlusion for STATIC
-    // vlit geometry — dark bake = enclosed). A small floor keeps unlit-but-open
+    // vlit geometry - dark bake = enclosed). A small floor keeps unlit-but-open
     // outdoor vlit from going black if its bake carries no hemi.
     float bakeOcc = clamp(dot(vBakedColor, vec3(0.299, 0.587, 0.114)) * 2.5, 0.15, 1.0);
-    // Sun ×1.25 — match world_lmap (R4 reads a touch brighter in direct sun).
-    vec3 occ = coloredAO(gtaoVis(), albedo);
+    // sun_color/ambient arrive final from vk_env_light (r_sun_boost /
+    // r_ambient_floor). vBakedColor -1.5 is a vlit-specific baked-light scale.
+    vec3  occ      = coloredAO(gtaoVis(), albedo) * pomAO;   // GTAO × fine POM contact AO
+    float dynHemiL = pc.dynHemi;
+    if (L.pom_params3.y > 0.5) { occ = vec3(1.0); dynHemiL = 1.0; bakeOcc = 1.0; }   // r_ao_flat debug
     vec3 lighting = vBakedColor * 1.5
-                  + L.sun_color.rgb  * (sunMask * 1.25)
-                  + skyAmbient(Nw) * (L.sky_params.y * 0.5 * pc.dynHemi * bakeOcc) * occ
-                  + (L.ambient.rgb + 0.05) * occ
+                  + L.sun_color.rgb  * sunMask
+                  + skyAmbient(geomN) * (L.sky_params.y * 0.5 * dynHemiL * bakeOcc) * occ
+                  + L.ambient.rgb * occ
                   + dynLights(vWorldPos, Nw);
 
-    // Distance fog (R4) — see world_lmap.frag.
-    vec3 col = albedo * lighting;
+    // Rain wetness - see world_lmap.frag.
+    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw);
+
+    // Distance fog (R4) - see world_lmap.frag.
+    vec3 col = albedo * lighting + wetRefl;
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 

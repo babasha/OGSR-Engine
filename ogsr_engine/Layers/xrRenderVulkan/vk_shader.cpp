@@ -123,8 +123,12 @@ void CVulkanShader::Create(LPCSTR name, LPCSTR tex_diffuse)
         m_bLandscape = true;
     }
 
-    // Check for wallmarks (decals)
-    if (shader_lower.find("wmark") != xr_string::npos ||
+    // Check for wallmarks (decals). NOTE "wallmark" too — baked level decals
+    // (newspapers, dirt overlays) use shader "effects\wallmark*", and "wmark"
+    // is NOT a substring of "wallmark" (the original check silently missed
+    // every level decal → they rendered opaque + coplanar → z-fight flicker).
+    if (shader_lower.find("wallmark") != xr_string::npos ||
+        shader_lower.find("wmark") != xr_string::npos ||
         shader_lower.find("decal") != xr_string::npos) {
         m_bWmark = true;
         m_PipelineConfig.blendEnable = true;
