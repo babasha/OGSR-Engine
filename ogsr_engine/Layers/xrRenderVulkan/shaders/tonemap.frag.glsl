@@ -56,9 +56,11 @@ layout(set = 1, binding = 0) uniform Lighting {
     vec4 pom_params4;
     vec4 pom_params5;
     vec4 pom_params6;    // x=water-sim enable, y=murk extinction (/m), z=refraction scale
+    vec4 pom_params7;    // SSS puddles: x=enable, y=level, z=micro, w=macro scale
 } L;
 layout(set = 1, binding = 9)  uniform sampler2D uRainMap; // top-down rain occlusion
 layout(set = 1, binding = 11) uniform sampler2D uWater;   // water depth (flow sim, metres)
+layout(set = 1, binding = 13) uniform sampler2D uGround;  // clean ground-height map (no trees) — real-dip puddles
 
 layout(push_constant) uniform PC {
     vec4 p0;   // x=whitePoint, y=topMipLOD, z=middleGray, w=lowLum
@@ -124,6 +126,69 @@ float waterDepthAt(vec3 wp)
           + textureLod(uWater, uvr - vec2(0.0, px.y), 0.0).r) * 0.15;
 }
 
+// REAL-DIP puddle placement from the clean ground-height map (no trees) — same
+// recipe as world_terrain.frag::geoPuddle. A pixel deeper than its wide local
+// average sits in a real terrain depression → holds water. This replaces the
+// procedural sine mask so the SSR mirror appears ONLY in actual dips, not over the
+// whole wet ground (which read as a lake). pom_params5.y = ring radius, .z = scale.
+float geoLowAt(vec3 wp, float R)
+{
+    vec4 c = L.rain_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return -999.0;
+    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (uv.x < 0.02 || uv.x > 0.98 || uv.y < 0.02 || uv.y > 0.98) return -999.0;
+    float myD = c.z;
+    vec2  o = max(R, 1.0) / vec2(textureSize(uGround, 0));
+    float avg =
+        ( textureLod(uGround, uv + vec2( o.x, 0.0), 0.0).r
+        + textureLod(uGround, uv + vec2(-o.x, 0.0), 0.0).r
+        + textureLod(uGround, uv + vec2(0.0,  o.y), 0.0).r
+        + textureLod(uGround, uv + vec2(0.0, -o.y), 0.0).r
+        + textureLod(uGround, uv + vec2( o.x,  o.y), 0.0).r
+        + textureLod(uGround, uv + vec2(-o.x,  o.y), 0.0).r
+        + textureLod(uGround, uv + vec2( o.x, -o.y), 0.0).r
+        + textureLod(uGround, uv + vec2(-o.x, -o.y), 0.0).r ) * 0.125;
+    return (myD - avg) * max(L.pom_params5.z, 1.0);
+}
+// Procedural puddle-body mask (matches world_terrain): distinct organic blobs.
+float vHash(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float vNoise(vec2 p)
+{
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(vHash(i), vHash(i + vec2(1.0, 0.0)), f.x),
+               mix(vHash(i + vec2(0.0, 1.0)), vHash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float puddlesMaskProc(vec2 xz, float coverage, float scale)
+{
+    float fq = 0.18 * scale;
+    vec2  p  = xz * fq;
+    // Domain warp + softer edge — MUST match world_terrain so the SSR puddle and the
+    // world-pass puddle have the same organic (non-blocky) outline.
+    vec2 w = vec2(vNoise(p * 0.5 + 3.1), vNoise(p * 0.5 + 8.7)) - 0.5;
+    p += w * 2.2;
+    float n = vNoise(p)              * 0.55
+            + vNoise(p * 2.1 + 19.1) * 0.30
+            + vNoise(p * 4.3 + 47.7) * 0.15;
+    float thr = mix(0.82, 0.40, clamp(coverage, 0.0, 1.0));
+    return smoothstep(thr, thr + 0.24, n);
+}
+
+// Puddle coverage — SAME procedural blob as world_terrain::sssPuddle so the SSR
+// scene-mirror appears exactly where the world pass paints puddles. No ground-
+// height map (SSFX/R4 don't use one for placement). Slope/upface handled by the
+// caller's `upface` gate.
+float geoPuddle(vec3 wp)
+{
+    float wet = clamp(L.rain_params.y, 0.0, 1.0);
+    return puddlesMaskProc(wp.xz, clamp(wet * L.pom_params7.y * 2.0, 0.0, 1.0), L.pom_params7.w);
+}
+
 // Binary rain-map visibility (single tap — only gates the puddle mirror).
 float rainVisB(vec3 wp)
 {
@@ -178,7 +243,9 @@ void main()
             float upface = smoothstep(0.72, 0.85, abs(Ng.y)) * step(viewDownY, 0.0);
 
             float wd  = simOn ? waterDepthAt(wp) : 0.0;
-            float pud = simOn ? smoothstep(0.04, 0.12, wd) : puddleMask(wp.xz * 0.8);
+            // Real-dip placement (not the old procedural sine mask) → the SSR mirror
+            // only fires in actual depressions, so flat wet ground is NOT a lake.
+            float pud = simOn ? smoothstep(0.04, 0.12, wd) : geoPuddle(wp);
 
             float ripFade = smoothstep(18.0, 8.0, zview)
                           * clamp(L.rain_params.x * 1.5 + 0.1, 0.0, 1.0);
@@ -241,6 +308,34 @@ void main()
                     }
                 }
             }
+        }
+    }
+
+    // Lens raindrops: screen-space droplets "on the camera", each a tiny lens that
+    // REFRACTS the scene (magnify toward the drop centre) + a bright rim, sliding
+    // DOWN over time. Density/size scale with rain intensity. (SSFX hud_raindrops.)
+    float rainInt = clamp(L.rain_params.x, 0.0, 1.0);
+    if (rainInt > 0.04 && L.rain_params.z >= 0.0) {
+        vec2  res    = vec2(textureSize(uHDR, 0));
+        float aspect = res.x / max(res.y, 1.0);
+        float tt     = L.sky_params.w;
+        for (int li = 0; li < 2; ++li) {
+            float sc  = (li == 0) ? 13.0 : 20.0;
+            float spd = (li == 0) ? 0.5  : 0.8;
+            vec2 g = vec2(uv.x * aspect, uv.y) * sc;
+            g.y -= tt * spd;                                   // run DOWN the screen (uv.y grows downward)
+            vec2 cell = floor(g);
+            if (vHash(cell + float(li) * 37.0) < 0.72) continue;  // only ~28% of cells carry a drop
+            vec2 jit = vec2(vHash(cell + 5.0), vHash(cell + 9.0)) - 0.5;
+            vec2 f   = fract(g) - 0.5 - jit * 0.6;
+            float d  = length(f);
+            float r  = (0.09 + 0.09 * vHash(cell + 3.0)) * (0.55 + 0.45 * rainInt);
+            if (d > r) continue;
+            float inside = smoothstep(r, r * 0.4, d) * 0.7;    // subtler
+            vec2  refr   = (f / r) * inside * 0.03;            // gentle lens refraction
+            vec3  drop   = textureLod(uHDR, sceneUV - refr, 0.0).rgb * exposure;
+            c = mix(c, drop, inside);
+            c += vec3(0.025) * smoothstep(r * 0.7, r, d) * inside;  // faint rim
         }
     }
 

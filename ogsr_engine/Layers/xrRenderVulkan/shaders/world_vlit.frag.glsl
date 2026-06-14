@@ -52,6 +52,7 @@ layout(set = 1, binding = 0) uniform Lighting {
     vec4 pom_params4;    // x=terrain POM enable, y=detail-normal, z=micro-AO, w=debug (terrain only)
     vec4 pom_params5;    // x=terrain gloss, y=geo-puddle radius (0=off), z=geo-puddle depth scale, w=puddle debug
     vec4 pom_params6;    // x=water-sim enable (puddles from the flow sim)
+    vec4 pom_params7;    // SSS puddles: x=enable, y=level (coverage), z=micro, w=macro scale
 } L;
 layout(set = 1, binding = 1) uniform sampler2D uShadow;
 layout(set = 1, binding = 2) uniform sampler2D uSpotShadow;
@@ -191,7 +192,19 @@ float rainVis(vec3 wp)
     uv.y = 1.0 - uv.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || n.z <= 0.0 || n.z >= 1.0)
         return 1.0;
-    return cascTap(uRainMap, uv, n.z - 0.0015);
+    // WIDE blur — soften the BLOCKY tree-canopy occlusion ("wetness in squares").
+    float ref = n.z - 0.0015;
+    vec2  px  = 1.0 / vec2(textureSize(uRainMap, 0));
+    float s = cascTap(uRainMap, uv, ref) * 2.0
+            + cascTap(uRainMap, uv + vec2( 3.0, 0.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2(-3.0, 0.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2(0.0,  3.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2(0.0, -3.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2( 2.0,  2.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2(-2.0,  2.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2( 2.0, -2.0) * px, ref)
+            + cascTap(uRainMap, uv + vec2(-2.0, -2.0) * px, ref);
+    return s * (1.0 / 10.0);
 }
 
 // Procedural puddle patches - see world_lmap.frag (uniform film reads waxy).
@@ -319,76 +332,122 @@ vec2 flowWaves(vec3 wp, float t)
     return dir * (w * amp * 0.5);
 }
 
-// Lagarde ring ripples - see world_lmap.frag.
+// ONE small expanding ring per cell, sparse + brief (SSFX rain-splash feel).
 vec2 rippleLayer(vec2 p, float t)
 {
     vec2 cell = floor(p);
     vec2 f = p - cell;
-    // procedural-noise salts — build provenance (mirror of ogsr::sig); same
-    // numbers a classic value-noise hash uses, just named/bound to this build.
     const vec2  SALT_ZEFIR   = vec2(127.1, 311.7);
     const vec2  SALT_CATARA  = vec2(269.5, 183.3);
     const float SALT_SARATOV = 43758.5453;
     float h1 = fract(sin(dot(cell, SALT_ZEFIR))  * SALT_SARATOV);
     float h2 = fract(sin(dot(cell, SALT_CATARA)) * SALT_SARATOV);
-    vec2  c  = vec2(0.3) + 0.4 * vec2(h1, h2);
-    float ph = fract(t + h1);
+    vec2  c  = vec2(0.25) + 0.5 * vec2(h1, h2);
+    float ph = fract(t * (0.7 + 0.6 * h2) + h1);
     float d  = length(f - c);
-    float ring = sin(clamp((d - ph * 0.5) * 30.0, -3.1416, 3.1416));
-    float fade = (1.0 - ph) * smoothstep(0.5, 0.25, d);
-    return (d > 1e-4 ? (f - c) / d : vec2(0.0)) * (ring * fade);
+    float radius = ph * 0.26;
+    float front  = d - radius;
+    float ring   = sin(clamp(front * 36.0, -3.14159, 3.14159)) * smoothstep(0.08, 0.0, abs(front));
+    float life   = smoothstep(0.0, 0.05, ph) * (1.0 - smoothstep(0.25, 0.85, ph));  // smooth dissolve
+    return (d > 1e-4 ? (f - c) / d : vec2(0.0)) * (ring * life);
 }
 
 vec2 rainRipples(vec2 p, float t)
 {
-    return rippleLayer(p * 2.2,                     t * 1.05)
-         + rippleLayer(p * 1.34 + vec2(0.50, 0.25), t * 1.31)
-         + rippleLayer(p * 1.91 + vec2(0.31, 0.50), t * 1.58);
+    return rippleLayer(p * 0.85,                  t * 0.9)
+         + rippleLayer(p * 1.3 + vec2(0.5, 0.25), t * 1.15) * 0.6;
 }
 
-vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N)
+// Procedural puddle-body mask (matches world_terrain / world_lmap).
+float vHash(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float vNoise(vec2 p)
+{
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(vHash(i), vHash(i + vec2(1.0, 0.0)), f.x),
+               mix(vHash(i + vec2(0.0, 1.0)), vHash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float puddlesMaskProc(vec2 xz, float coverage, float scale)
+{
+    float fq = 0.18 * scale;
+    vec2  p  = xz * fq;
+    // Domain warp → organic (non-blocky) puddle edges; wider smoothstep softens them.
+    vec2 w = vec2(vNoise(p * 0.5 + 3.1), vNoise(p * 0.5 + 8.7)) - 0.5;
+    p += w * 2.2;
+    float n = vNoise(p)              * 0.55
+            + vNoise(p * 2.1 + 19.1) * 0.30
+            + vNoise(p * 4.3 + 47.7) * 0.15;
+    float thr = mix(0.82, 0.40, clamp(coverage, 0.0, 1.0));   // grows as wetness rises
+    return smoothstep(thr, thr + 0.24, n);
+}
+
+vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask)
 {
     float wet = L.rain_params.y;
     if (wet < 0.005)
         return vec3(0.0);
     wet *= rainVis(wp);
     float upness = clamp(N.y, 0.0, 1.0);
-    // Kill wetness on DOWN-facing surfaces (ceilings/overhang undersides) — rain
-    // can't land there (stops "drops on the ceiling" from thin-roof self-pass).
+    // Kill wetness on DOWN-facing surfaces (ceilings/overhang undersides).
     float wetK = wet * mix(0.35, 1.0, upness) * smoothstep(-0.15, 0.05, N.y);
-    albedo *= 1.0 - L.rain_params.z * wetK;
 
-    // PERF: distance-fade + early-out the expensive reflection (see world_lmap).
+    // Puddle coverage: procedural blobs on near-flat up-facing surfaces.
+    float slope = clamp((1.0 - max(abs(N.x), abs(N.z)) - 0.9) * 13.0, 0.0, 1.0);
+    float cov   = clamp(wet * L.pom_params7.y * 2.0, 0.0, 1.0);   // grows/recedes with wetness
+    float pud   = (L.pom_params7.x > 0.5)
+                ? puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope
+                : ((L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(wp))
+                   : (L.pom_params5.y > 0.0) ? geoPuddle(wp) : puddleMask(wp.xz * 0.8)) * upness;
+    pud = clamp(pud, 0.0, 1.0);
+
+    // DARKEN: FULL in deep puddles (pud² → body fills AFTER the shine), ~NONE open.
+    albedo *= 1.0 - L.rain_params.z * wetK * mix(0.05, 1.0, pud * pud);
+
     vec3  toEye    = L.eye_pos.xyz - wp;
     float dist     = length(toEye);
     float reflFade = smoothstep(70.0, 35.0, dist);
     if (wetK * reflFade < 0.004) return vec3(0.0);
 
     float t = L.sky_params.w;
-    float ripFade = smoothstep(18.0, 8.0, dist) * clamp(L.rain_params.x * 1.5 + 0.1, 0.0, 1.0);
+    float ripFade = smoothstep(18.0, 8.0, dist) * clamp(L.rain_params.x * 1.5 + 0.1, 0.0, 1.0)
+                  * smoothstep(0.05, 0.35, pud);
     vec2  vel   = (L.pom_params6.x > 0.5) ? simFlow(wp) : vec2(0.0);
     float velMS = length(vel) * 150.0;
     vec2  scrl  = (velMS > 0.01) ? normalize(vel) * (t * velMS * 0.25) : vec2(0.0);
-    vec3  Nr = N;
+    vec3  Nbase = mix(N, vec3(0.0, 1.0, 0.0), clamp(pud * pud, 0.0, 1.0));
+    vec3  Nr = Nbase;
+    float crest = 0.0;
     if (ripFade > 0.01) {
-        vec2 rip = rainRipples(wp.xz - scrl, t * 0.6) * (0.4 * ripFade);
+        float rainAmp = 0.40 + 0.40 * clamp(L.rain_params.x, 0.0, 1.0);
+        vec2 rip = rainRipples(wp.xz - scrl, t * 0.7) * (rainAmp * ripFade);
         if (velMS > 0.1)
             rip += rainRipples(wp.xz * 1.6 - scrl * 1.6, t * 0.9) * (clamp(velMS * 0.12, 0.0, 0.5) * ripFade);
-        Nr = normalize(vec3(N.x + rip.x, N.y, N.z + rip.y));
+        Nr = normalize(vec3(Nbase.x + rip.x, Nbase.y, Nbase.z + rip.y));
+        crest = clamp(length(rip) * 2.5, 0.0, 1.0);
     }
     vec3 V = normalize(toEye);
     vec3 R = reflect(-V, Nr);
     float fres = pow(1.0 - clamp(dot(V, Nr), 0.0, 1.0), 3.0);
     float xf = clamp(L.sky_params.x, 0.0, 1.0);
-    vec3 sky = textureLod(uSky0, R, 0.0).rgb;
-    if (xf > 0.01) sky = mix(sky, textureLod(uSky1, R, 0.0).rgb, xf);
-    float pud = ((L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(wp))
-                 : (L.pom_params5.y > 0.0) ? geoPuddle(wp) : puddleMask(wp.xz * 0.8)) * upness;
-    // Deep water = clear water BODY: cool dark tint + stronger sharp reflection.
-    albedo = mix(albedo, albedo * vec3(0.45, 0.55, 0.62), clamp(pud, 0.0, 1.0));
-    float reflK = wetK * (0.1 + 1.0 * pud) * (0.04 + 0.96 * fres) * reflFade;
-    float foam = smoothstep(3.0, 6.0, velMS) * clamp(pud, 0.0, 1.0) * ripFade * 0.25;
-    return sky * (reflK * L.rain_params.w) + vec3(foam);
+    float reflLod = mix(5.0, 0.0, pud);
+    vec3 sky = textureLod(uSky0, R, reflLod).rgb;
+    if (xf > 0.01) sky = mix(sky, textureLod(uSky1, R, reflLod).rgb, xf);
+    // Water BODY fills later (pud²) than the SHINE (reflection ∝ pud) — "shine first".
+    albedo = mix(albedo, albedo * vec3(0.34, 0.40, 0.46) * (1.0 - 0.25 * pud), pud * pud);
+    float puddleK = wetK * pud * (0.45 + 0.55 * fres) * reflFade * clamp(L.rain_params.w, 0.0, 2.0);
+    // SUN GLINT (SSFX specular_phong) — ripples shatter it to sparkles.
+    vec3  Ld    = normalize(-L.sun_dir.xyz);
+    vec3  Hh    = normalize(Ld + V);
+    float glint = pow(max(dot(Nr, Hh), 0.0), 220.0) * pud * sunMask;
+    float foam = smoothstep(3.0, 6.0, velMS) * pud * ripFade * 0.25;
+    // RING WAVE crests — bright leading edge of each ripple (visible drop waves).
+    vec3 crestCol = (L.sun_color.rgb + L.ambient.rgb) * (crest * pud * 0.07);
+    return sky * puddleK + L.sun_color.rgb * (glint * 3.0) + vec3(foam) + crestCol;
 }
 
 // NEAR cascade first (leaf-shaped dapples, smooth motion) - see world_lmap.frag.
@@ -612,7 +671,7 @@ void main()
                   + dynLights(vWorldPos, Nw);
 
     // Rain wetness - see world_lmap.frag.
-    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw);
+    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw, sunMask);
 
     // Distance fog (R4) - see world_lmap.frag.
     vec3 col = albedo * lighting + wetRefl;

@@ -55,6 +55,7 @@ extern float ps_r_water_refract;  // r_water_refract — bottom refraction stren
 extern int   ps_r_puddle_sss;     // r_puddle_sss — SSS per-pixel puddles (default source)
 extern float ps_r_puddle_level;   // r_puddle_level — water rise level vs micro-height
 extern float ps_r_puddle_micro;   // r_puddle_micro — micro-height contrast
+extern float ps_r_puddle_scale;   // r_puddle_scale — macro puddle-body size (procedural mask freq)
 
 namespace VK { namespace EnvLight {
 
@@ -101,6 +102,8 @@ namespace {
     VkImageView           s_boundWater[kFramesInFlight] = {};
     // Water velocity (sim, binding 12): same lazy-bind tracking.
     VkImageView           s_boundFlow[kFramesInFlight]  = {};
+    // Ground-height map (binding 13, SSS puddle real-dip placement): lazy-bind.
+    VkImageView           s_boundGround[kFramesInFlight] = {};
 
     // Load-once cookie lookup: "$game_textures$\<name>.dds". Negative results
     // cached too (null) so a missing texture logs once, not per frame.
@@ -147,25 +150,25 @@ bool Init()
     // Set layout: binding 0 = UBO, 1 = far sun map, 2 = spot map, 3 = point
     // shadow cube, 4 = sun cascade 0, 5 = sun cascade 1, 6/7 = sky ambient
     // cubes (hemisphere fill), 8 = GTAO, 9 = rain occlusion map (wetness),
-    // 10 = spot light cookie, 11 = water depth (sim), 12 = water velocity (sim).
-    // All FRAGMENT samplers.
-    VkDescriptorSetLayoutBinding b[13]{};
+    // 10 = spot light cookie, 11 = water depth (sim), 12 = water velocity (sim),
+    // 13 = clean ground-height map (SSS puddle real-dip placement). All FRAGMENT.
+    VkDescriptorSetLayoutBinding b[14]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (u32 i = 1; i < 13; ++i) {
+    for (u32 i = 1; i < 14; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 13; slci.pBindings = b;
+    slci.bindingCount = 14; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
     VkDescriptorPoolSize ps[2]{
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 12 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 13 },
     };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -264,8 +267,12 @@ bool Init()
         // Binding 12: water velocity — white fallback until WaterSim runs.
         VkDescriptorImageInfo flI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundFlow[i] = fbWhite;
+        // Binding 13: clean ground-height map — white fallback until rendered;
+        // Update() swaps in ShadowMap::GetGroundView once it exists.
+        VkDescriptorImageInfo gdI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundGround[i] = fbWhite;
 
-        VkWriteDescriptorSet w[13]{};
+        VkWriteDescriptorSet w[14]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
@@ -306,6 +313,10 @@ bool Init()
         w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[count].dstSet = s_set[i]; w[count].dstBinding = 12; w[count].descriptorCount = 1;
         w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &flI;
+        ++count;
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 13; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &gdI;
         ++count;
         vkUpdateDescriptorSets(VulkanHW.m_Device, count, w, 0, nullptr);
     }
@@ -510,6 +521,22 @@ void Update(u32 slot)
             vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
             s_boundFlow[slot] = fv;
         }
+        // Binding 13: clean ground-height map (no trees) for SSS real-dip puddle
+        // placement. Same depth image / sampler as the rain map; rendered in
+        // Pass_SunShadow when puddles/sim are on (else stays the white fallback).
+        VkImageView gv = ShadowMap::GetGroundView();
+        VkSampler   gs = ShadowMap::GetSampler();
+        if (gv != VK_NULL_HANDLE && gs != VK_NULL_HANDLE && gv != s_boundGround[slot]) {
+            VkDescriptorImageInfo ii{ gs, gv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 13; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundGround[slot] = gv;
+            { static bool s_gbl = false; if (!s_gbl) { s_gbl = true;
+                Msg("[VK Puddle] ground map bound to EnvLight binding 13 (slot %u)", slot); } }
+        }
     }
     ub.ao_params[0] = Device.dwWidth  ? 1.f / float(Device.dwWidth)  : 0.f;
     ub.ao_params[1] = Device.dwHeight ? 1.f / float(Device.dwHeight) : 0.f;
@@ -591,7 +618,7 @@ void Update(u32 slot)
     ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? 1.f : 0.f;
     ub.pom_params7[1] = ps_r_puddle_level;              // water plane rise vs micro-height
     ub.pom_params7[2] = ps_r_puddle_micro;              // micro-height contrast
-    ub.pom_params7[3] = 0.f;
+    ub.pom_params7[3] = ps_r_puddle_scale;              // macro puddle-body size (procedural mask freq)
     // Periodic state log while debugging wetness (pairs with the mask view).
     if (ps_r_wet_debug) {
         static u32 s_wetLogCd = 0;
@@ -621,7 +648,7 @@ void Destroy()
     s_ubo.Destroy();
     s_mapped = nullptr;
     s_current = VK_NULL_HANDLE;
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; }
     s_inited = false; s_failed = false;
 }
 

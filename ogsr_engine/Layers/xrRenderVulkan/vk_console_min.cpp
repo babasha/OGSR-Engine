@@ -223,8 +223,8 @@ float ps_r_terrain_gloss = 0.5f;
 // sits in a dip and holds water. r_puddle_size = neighbourhood ring radius in
 // rain-map texels (puddle blob size); 0 = geometric OFF (procedural fallback).
 // r_puddle_depth = depth→fill scale (how shallow a dip already reads as water).
-float ps_r_puddle_size   = 0.0f;    // geometric puddles OFF (0 → procedural mask); revisit with SSS water
-float ps_r_puddle_depth  = 350.0f;
+float ps_r_puddle_size   = 16.0f;   // WIDE dip ring (texels ≈ basin size); a tight 0.25x ring also runs to catch ruts. Smaller = finer ruts
+float ps_r_puddle_depth  = 600.0f;  // dip sensitivity (ortho-depth delta → fill); higher = shallower dips/ruts pool
 int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = depth (colour ramp), 2 = flow direction
 
 // SSS PER-PIXEL PUDDLES (SSFX deffer_terrain_high_flat.ps port): the DEFAULT
@@ -235,8 +235,13 @@ int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = depth (col
 // = how high the water plane rises with wetness (bigger = more/larger puddles);
 // r_puddle_micro = micro-height contrast (bigger = only the deepest grooves fill).
 int   ps_r_puddle_sss    = 1;
-float ps_r_puddle_level  = 0.5f;
+float ps_r_puddle_level  = 0.5f;    // puddle coverage (higher = more/larger puddles, lower = fewer)
 float ps_r_puddle_micro  = 1.0f;
+// Macro placement scale (procedural stand-in for SSFX's per-level puddles_mask).
+// World frequency of the puddle-body noise: bigger = smaller/tighter puddles,
+// smaller = broader pools. ~1.0 ≈ 5-6 m puddles. This is what gives DISTINCT
+// puddles instead of a uniform wet sheet on levels without an artist mask.
+float ps_r_puddle_scale  = 1.0f;
 
 // WATER FLOW SIMULATION (compute, vk_water_sim): a shallow-water field on the
 // rain ortho box. Rain feeds it, water flows downhill (surface relaxation) and
@@ -867,6 +872,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS per-pixel puddles (default source)
     CMD4(CCC_Float, "r_puddle_level", &ps_r_puddle_level, 0.f, 1.f);     // water plane rise vs micro-height
     CMD4(CCC_Float, "r_puddle_micro", &ps_r_puddle_micro, 0.f, 4.f);     // micro-height contrast
+    CMD4(CCC_Float, "r_puddle_scale", &ps_r_puddle_scale, 0.1f, 6.f);    // macro puddle size (freq; bigger=smaller pools)
     CMD4(CCC_Integer, "r_water_sim", &ps_r_water_sim, 0, 1);             // water flow sim master enable
     CMD4(CCC_Float, "r_water_rain", &ps_r_water_rain, 0.f, 5.f);         // sim rain input rate (depth/s)
     CMD4(CCC_Float, "r_water_evap", &ps_r_water_evap, 0.f, 20.f);        // sim leak rate (exp drain ∝ amount)

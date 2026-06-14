@@ -33,11 +33,25 @@ layout(set = 1, binding = 0) uniform Lighting {
     vec4 eye_pos;        // xyz camera world pos
     vec4 sky_params;     // x=cube cross-fade weight, y=ambient scale, z=sample LOD
     vec4 ao_params;      // x=1/screenW, y=1/screenH, z=AO strength exponent (0=off)
+    mat4 rain_vp;        // straight-down ortho VP for the rain occlusion map (wetness)
+    vec4 rain_params;    // x=rain density, y=wetness, z=darken, w=reflection scale
 } L;
 layout(set = 1, binding = 1) uniform sampler2D uShadow;
 layout(set = 1, binding = 6) uniform samplerCube uSky0;   // sky ambient cube (weather A)
 layout(set = 1, binding = 7) uniform samplerCube uSky1;   // sky ambient cube (weather B)
 layout(set = 1, binding = 8) uniform sampler2D uAO;       // GTAO (half-res)
+layout(set = 1, binding = 9) uniform sampler2D uRainMap;  // top-down rain occlusion (wetness gate)
+
+// Rain visibility — is this blade open to the sky (gets rained on)? Single tap is
+// fine: grass overdraw is noisy, no need for the world ground's blurred PCF.
+float rainVisGrass(vec3 wp)
+{
+    vec3 n = (L.rain_vp * vec4(wp, 1.0)).xyz;
+    vec2 uv = n.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || n.z <= 0.0 || n.z >= 1.0)
+        return 1.0;
+    return (n.z - 0.0015 <= texture(uRainMap, uv).r) ? 1.0 : 0.0;
+}
 
 // GTAO at this pixel — grass isn't in the prepass depth, so this is the AO of
 // the GROUND behind the blade: grass in a dark corner sits in the same ambient
@@ -146,6 +160,16 @@ void main()
                  * coloredAO(gtaoVis(), diff.rgb);
 
     vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos));
+
+    // Wet grass: blades open to the rain DARKEN (wet foliage is darker + a touch
+    // cooler), so grass doesn't stay bright-dry on a soaked ground. No reflection /
+    // puddle on grass — just the damp tint. Gated by rain visibility (dry under cover).
+    float wet = clamp(L.rain_params.y, 0.0, 1.0) * max(L.rain_params.z, 0.0);
+    if (wet > 0.005) {
+        float wv = wet * rainVisGrass(vWPos);
+        col *= 1.0 - 0.5 * wv;                 // darken
+        col = mix(col, col * vec3(0.85, 0.92, 1.0), 0.5 * wv);  // slight cool damp tint
+    }
 
     // Distance fog (R4) — see world_lmap.frag.
     float fog = clamp(length(vWPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);

@@ -26,7 +26,8 @@
 // GLOBAL scope (NOT inside namespace VK — a block-scope extern there would
 // mangle as VK::ps_r_rain_enable → LNK2001). r_rain master off skips the map.
 extern int ps_r_rain_enable;
-extern int ps_r_water_sim;   // gate the ground-height map render (only the sim uses it)
+extern int ps_r_water_sim;   // gate the ground-height map render (sim)
+extern int ps_r_puddle_sss;  // gate the ground-height map render (SSS puddle real-dip placement)
 
 namespace VK {
 
@@ -361,13 +362,19 @@ void Pass_SunShadow(FrameContext& ctx)
             ImageBarrier(cmd, ShadowMap::GetRainImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-            // Clean GROUND-height map for the water sim (only when the sim runs).
+            // Clean GROUND-height map (statics+terrain, NO trees) — used ONLY by the
+            // water flow sim now. SSS puddles are per-pixel (detail micro-height +
+            // procedural mask, SSFX/R4 style), they do NOT use a top-down height map,
+            // so don't pay for this render unless the sim is on.
             static bool s_groundFirst = true;
             if (ps_r_water_sim) {
             ImageBarrier(cmd, ShadowMap::GetGroundImage(),
                          s_groundFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
             s_groundFirst = false;
+            { static bool s_gl = false; if (!s_gl) { s_gl = true;
+                Msg("[VK Puddle] ground-height map rendered (sim=%d sss=%d, queue %u items)",
+                    ps_r_water_sim, ps_r_puddle_sss, s_RainQueue.Size()); } }
             {
                 VkRenderingAttachmentInfo gAtt{};
                 gAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -391,7 +398,7 @@ void Pass_SunShadow(FrameContext& ctx)
             }
             ImageBarrier(cmd, ShadowMap::GetGroundImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-            } // ps_r_water_sim
+            } // ground-height map
 
             static bool s_diag = false;
             if (!s_diag && wantRain) { s_diag = true;

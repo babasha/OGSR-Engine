@@ -74,7 +74,7 @@ struct LightUBO {
     float pom_params6[4];   // x = water-sim enable (puddles come from the flow sim), y = murk, z = refract, w unused
     // SSS per-pixel puddles (SSFX deffer_terrain_high_flat port): water as a rising
     // LEVEL vs the detail micro-height — terrain texture relief (ruts) pools first.
-    float pom_params7[4];   // x = enable, y = water level, z = micro-height contrast, w unused
+    float pom_params7[4];   // x = enable, y = water level, z = micro-height contrast, w = macro mask scale
 };
 static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
