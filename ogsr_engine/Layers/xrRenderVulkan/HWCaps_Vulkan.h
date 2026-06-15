@@ -99,6 +99,7 @@ struct VulkanCaps
     u32 maxTextureSize = 0;                     // Max 2D texture dimension
     u32 maxCubemapSize = 0;                     // Max cubemap dimension
     u32 maxViewports = 0;                       // Multi-viewport rendering
+    u32 maxPushConstantsSize = 0;               // Guaranteed >=128; desktop GPUs usually 256
 
     // ========================================================================
     // Format Support (checked at runtime)

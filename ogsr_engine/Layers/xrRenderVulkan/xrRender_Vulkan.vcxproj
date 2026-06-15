@@ -101,6 +101,9 @@
     <ClInclude Include="vk_ModelPool.h" />
     <ClInclude Include="vk_FBasicVisual.h" />
     <ClInclude Include="vk_pass_context.h" />
+    <ClInclude Include="vk_cull.h" />
+    <ClInclude Include="vk_exposure.h" />
+    <ClInclude Include="vk_fullscreen.h" />
     <ClInclude Include="vk_pass_world.h" />
     <ClInclude Include="vk_env_light.h" />
     <ClInclude Include="vk_light.h" />
@@ -117,9 +120,15 @@
     <ClInclude Include="vk_world_material.h" />
     <ClInclude Include="vk_KinematicsStub.h" />
     <ClInclude Include="vk_authorship.h" />
+    <ClInclude Include="vk_profiler.h" />
+    <ClInclude Include="vk_imgui.h" />
+    <ClInclude Include="vk_vrs.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CRender_Vulkan.cpp" />
+    <ClCompile Include="vk_profiler.cpp" />
+    <ClCompile Include="vk_imgui.cpp" />
+    <ClCompile Include="vk_vrs.cpp" />
     <ClCompile Include="stdafx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
@@ -132,11 +141,11 @@
     <ClCompile Include="vk_barriers.cpp" />
     <ClCompile Include="vk_buffer.cpp" />
     <ClCompile Include="vk_buffer_pool.cpp" />
-    <ClCompile Include="vk_buffer_utils.cpp" />
     <ClCompile Include="vk_command_buffer.cpp" />
     <ClCompile Include="vk_console_min.cpp" />
     <ClCompile Include="vk_core.cpp" />
     <ClCompile Include="vk_descriptors.cpp" />
+    <ClCompile Include="vk_fullscreen.cpp" />
     <ClCompile Include="vk_DynamicStream.cpp" />
     <ClCompile Include="vk_pipeline.cpp" />
     <ClCompile Include="vk_ring_allocator.cpp" />

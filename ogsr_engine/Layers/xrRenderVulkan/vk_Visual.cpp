@@ -1181,6 +1181,9 @@ static std::shared_ptr<vkSkinCPUData> vk_skinned_retain_cpu(u32 dwVertType, void
     if (!data->find_chunk(OGF_INDICES)) return nullptr;
     const u32 iCount = data->r_u32();
     if (!iCount) return nullptr;
+    // Bound the count against the bytes actually left in the chunk before slicing
+    // data->pointer() — a truncated/corrupt OGF would otherwise read past the map.
+    if ((size_t)iCount * sizeof(u16) > (size_t)data->elapsed()) return nullptr;
 
     auto d = std::make_shared<vkSkinCPUData>();
     d->links     = links;

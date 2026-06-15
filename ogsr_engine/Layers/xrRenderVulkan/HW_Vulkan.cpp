@@ -10,6 +10,7 @@
 #include "vk_geometry.h"
 #include "vk_lighting.h"
 #include "vk_authorship.h"
+#include "vk_command_buffer.h"   // CommandManager — single-time helpers delegate to the immediate path
 #include <vector>
 #include <set>
 
@@ -270,6 +271,40 @@ bool CVulkanHW::CreateLogicalDevice()
         } else {
             Msg("[Vulkan] RT extensions: %u/%u available (need all 3 for RTGI)", rtFound, g_RtDeviceExtensionCount);
         }
+
+        // Optional: VK_KHR_fragment_shading_rate (attachment-based VRS) — coarse-shade
+        // distant/peripheral pixels via a shading-rate image to cut forward fragment cost.
+        {
+            bool fsrAvail = false;
+            for (const auto& ext : availableExts)
+                if (strcmp(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, ext.extensionName) == 0) { fsrAvail = true; break; }
+            if (fsrAvail) {
+                VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsrFeat = {};
+                fsrFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+                VkPhysicalDeviceFeatures2 fsrQuery = {};
+                fsrQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                fsrQuery.pNext = &fsrFeat;
+                vkGetPhysicalDeviceFeatures2(m_PhysicalDevice, &fsrQuery);
+                if (fsrFeat.attachmentFragmentShadingRate) {
+                    enabledExtensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+                    m_bVRSSupported = true;
+                    VkPhysicalDeviceFragmentShadingRatePropertiesKHR fsrProps = {};
+                    fsrProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+                    VkPhysicalDeviceProperties2 props2 = {};
+                    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                    props2.pNext = &fsrProps;
+                    vkGetPhysicalDeviceProperties2(m_PhysicalDevice, &props2);
+                    // Use the coarsest allowed tile (smallest SRI). NVIDIA = 16x16.
+                    m_VRSTexelSize = fsrProps.maxFragmentShadingRateAttachmentTexelSize;
+                    Msg("[Vulkan] VRS (attachment fragment shading rate): ENABLED (tile %ux%u)",
+                        m_VRSTexelSize.width, m_VRSTexelSize.height);
+                } else {
+                    Msg("[Vulkan] VRS extension present but attachmentFragmentShadingRate unsupported");
+                }
+            } else {
+                Msg("[Vulkan] VRS extension not available");
+            }
+        }
     }
 
     // Chain RT feature structs if supported
@@ -282,6 +317,15 @@ bool CVulkanHW::CreateLogicalDevice()
     if (m_bRayQuerySupported) {
         enableAccelStruct.pNext = &enableRayQuery;
         features13.pNext = &enableAccelStruct;
+    }
+
+    // Chain VRS feature (prepend, preserving whatever is already on features13 — RT or null).
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR enableFsr = {};
+    enableFsr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+    enableFsr.attachmentFragmentShadingRate = VK_TRUE;
+    if (m_bVRSSupported) {
+        enableFsr.pNext = const_cast<void*>(features13.pNext);
+        features13.pNext = &enableFsr;
     }
 
     // Device create info
@@ -730,37 +774,19 @@ void CVulkanHW::OnAppDeactivate()
 // Single-time command helpers (for buffer uploads, layout transitions, etc.)
 // ============================================================================
 
+// These now delegate to CommandManager's immediate (one-shot) path instead of
+// hand-rolling a second submit-and-wait. That path is device-lost guarded, waits
+// on a fence (not a full vkQueueWaitIdle of the whole graphics queue), and uses a
+// graphics-family pool — the old code allocated from m_TransferCommandPool yet
+// submitted to m_GraphicsQueue, a queue-family mismatch on GPUs with a dedicated
+// transfer queue. All callers are load-time + main-thread, so reusing the single
+// shared immediate buffer is not reentrant here.
 VkCommandBuffer CVulkanHW::BeginSingleTimeCommands()
 {
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = m_TransferCommandPool;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer commandBuffer;
-    VK_CHECK(vkAllocateCommandBuffers(m_Device, &allocInfo, &commandBuffer));
-
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
-
-    return commandBuffer;
+    return CommandManager.BeginImmediate();
 }
 
 void CVulkanHW::EndSingleTimeCommands(VkCommandBuffer commandBuffer)
 {
-    VK_CHECK(vkEndCommandBuffer(commandBuffer));
-
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
-
-    VK_CHECK(vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(m_GraphicsQueue));
-
-    vkFreeCommandBuffers(m_Device, m_TransferCommandPool, 1, &commandBuffer);
+    CommandManager.EndAndSubmitImmediate(commandBuffer);
 }

@@ -14,6 +14,7 @@
 #include "vk_barriers.h"           // ImageBarrier
 #include "vk_buffer.h"             // CVulkanBuffer (debug AO readback)
 #include "vk_command_buffer.h"     // CommandManager.GetCurrentFrame()
+#include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline + draw
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"   // Device camera basis + mProject
 
@@ -166,73 +167,18 @@ namespace {
         return true;
     }
 
+    // SSAO RT is R8_UNORM, single-channel (R) write, no blend.
     VkPipeline CreatePipe(VkShaderModule vs, VkShaderModule fs)
     {
-        VkPipelineVertexInputStateCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        VkPipelineShaderStageCreateInfo st[2]{};
-        st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
-        st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-        VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{}; vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
-        VkPipelineColorBlendStateCreateInfo cb{}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{}; dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-        VkFormat fmt = VK_FORMAT_R8_UNORM;
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &fmt;
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = st;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_layout;
-        VkPipeline out = VK_NULL_HANDLE;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS)
-            Msg("![VK SSAO] pipeline create failed");
-        return out;
+        return Fullscreen::CreatePipeline(vs, fs, VK_FORMAT_R8_UNORM, s_layout,
+                                          Fullscreen::OpaqueAttachment(VK_COLOR_COMPONENT_R_BIT), "SSAO");
     }
 
     // One fullscreen draw into dst at the half-res extent.
     void Draw(VkCommandBuffer cmd, VkImageView dst, VkPipeline pipe, VkDescriptorSet set,
               const SSAOPush& push)
     {
-        VkRenderingAttachmentInfo cAtt{};
-        cAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        cAtt.imageView = dst;
-        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        VkRenderingInfo ri{};
-        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent = s_extent;
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments = &cAtt;
-        vkCmdBeginRendering(cmd, &ri);
-        VkViewport vp{ 0.f, 0.f, (float)s_extent.width, (float)s_extent.height, 0.f, 1.f };
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{ {0,0}, s_extent };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &set, 0, nullptr);
-        vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRendering(cmd);
+        Fullscreen::DrawSimple(cmd, dst, s_extent, pipe, s_layout, set, &push, sizeof(push));
     }
 }  // anon namespace
 

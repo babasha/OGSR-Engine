@@ -33,7 +33,7 @@ void VulkanCaps::Update(VkPhysicalDevice device,
     geometry.maxVertexInputBindings = props.limits.maxVertexInputBindings;
     geometry.maxVertexOutputComponents = props.limits.maxVertexOutputComponents;
     geometry.maxClipPlanes = _min(props.limits.maxClipDistances, 8u);
-    geometry.bVTF = features.vertexPipelineStoresAndAtomics;  // Vertex texture fetch
+    geometry.bVTF = true;  // Vertex texture fetch — core Vulkan guarantee (sampling in VS needs no feature flag)
     geometry.bPointSprites = true;  // Always supported in Vulkan
     geometry.bGeometryShader = features.geometryShader;
     geometry.bTessellation = features.tessellationShader;
@@ -113,6 +113,7 @@ void VulkanCaps::Update(VkPhysicalDevice device,
     maxTextureSize = _min(props.limits.maxImageDimension2D, 16384u);
     maxCubemapSize = _min(props.limits.maxImageDimensionCube, 4096u);
     maxViewports = props.limits.maxViewports;
+    maxPushConstantsSize = props.limits.maxPushConstantsSize;
 
     // VRAM is calculated separately in VK_SelectPhysicalDevice
 

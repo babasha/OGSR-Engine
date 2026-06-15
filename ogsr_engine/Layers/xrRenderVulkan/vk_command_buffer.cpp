@@ -413,6 +413,8 @@ void CVulkanCommandManager::UploadImage(VkImage dst, const void* data, VkDeviceS
     // dstStage = NONE: a transfer-only queue can't name FRAGMENT_SHADER. Visibility to
     // the graphics sampler comes from the upload timeline (graphics waits at
     // FRAGMENT_SHADER) — valid because the image is CONCURRENT (no ownership transfer).
+    // NOTE: this is why this barrier is hand-rolled and NOT VK::ImageBarrier — the
+    // latter derives FRAGMENT_SHADER for SHADER_READ, which is illegal on this queue.
     barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_PIPELINE_STAGE_2_NONE, 0,
             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);

@@ -17,6 +17,7 @@
 #include "vk_barriers.h"                // ImageBarrier
 #include "vk_pass_ssao.h"               // DeriveProjTerms (Device.mProject is identity on this path)
 #include "vk_command_buffer.h"          // CommandManager.GetCurrentFrame()
+#include "vk_fullscreen.h"              // VK::Fullscreen — shared fullscreen pipeline
 #include "CRender_Vulkan.h"             // RImplementation.b_loaded
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"        // Device camera basis + mProject
@@ -104,74 +105,9 @@ namespace {
 
         // Fullscreen-triangle pipeline: no vertex input, no depth attachment
         // (depth is SAMPLED here), additive blend over the scene colour.
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = vs; stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        ba.blendEnable         = VK_TRUE;
-        ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.colorBlendOp        = VK_BLEND_OP_ADD;
-        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        VkFormat colorFormat = VK::SceneColor::Format();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &colorFormat;
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext             = &prci;
-        pi.stageCount        = 2;     pi.pStages             = stages;
-        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
-        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
-        pi.layout            = s_layout;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &s_pipeline) != VK_SUCCESS) {
-            Msg("![VK Shafts] pipeline create failed"); s_failed = true; return false;
-        }
+        s_pipeline = Fullscreen::CreatePipeline(vs, fs, VK::SceneColor::Format(), s_layout,
+                                                Fullscreen::AdditiveAttachment(), "Shafts");
+        if (s_pipeline == VK_NULL_HANDLE) { s_failed = true; return false; }
 
         Msg("[VK Shafts] init OK");
         return true;

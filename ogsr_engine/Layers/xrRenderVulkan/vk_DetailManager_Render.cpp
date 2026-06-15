@@ -29,6 +29,7 @@
 #include "vk_pass_context.h"
 #include "vk_swapchain.h"
 #include "vk_env_light.h"               // VK::EnvLight::GetCurrentSet — set 1 (shadow lookup)
+#include "vk_cull.h"                    // VK::ExtractFrustumPlanes (shared with TreeManager)
 #include "HW_Vulkan.h"
 
 #include "../../xr_3da/IGame_Persistent.h"
@@ -48,21 +49,11 @@ namespace VK
 {
 
 // ----- Frustum plane extraction (D3D-style row-major mat4) ------------------
+// Delegates to the shared VK::ExtractFrustumPlanes (vk_cull.h). Kept as a member
+// so existing call sites and the header declaration are unchanged.
 void CDetailManager::ExtractFrustumPlanes(const Fmatrix& m, Fvector4 planes[6]) const
 {
-    planes[0].set(m._14 + m._11, m._24 + m._21, m._34 + m._31, m._44 + m._41); // left
-    planes[1].set(m._14 - m._11, m._24 - m._21, m._34 - m._31, m._44 - m._41); // right
-    planes[2].set(m._14 + m._12, m._24 + m._22, m._34 + m._32, m._44 + m._42); // bottom
-    planes[3].set(m._14 - m._12, m._24 - m._22, m._34 - m._32, m._44 - m._42); // top
-    planes[4].set(m._14 + m._13, m._24 + m._23, m._34 + m._33, m._44 + m._43); // near
-    planes[5].set(m._14 - m._13, m._24 - m._23, m._34 - m._33, m._44 - m._43); // far
-    for (int i = 0; i < 6; ++i) {
-        const float L = _sqrt(planes[i].x * planes[i].x + planes[i].y * planes[i].y + planes[i].z * planes[i].z);
-        if (L > 0.0001f) {
-            const float inv = 1.0f / L;
-            planes[i].x *= inv; planes[i].y *= inv; planes[i].z *= inv; planes[i].w *= inv;
-        }
-    }
+    VK::ExtractFrustumPlanes(m, planes);
 }
 
 // ----- PrepareFrame ---------------------------------------------------------
@@ -448,38 +439,9 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     //    DEPTH_ATTACHMENT for the whole frame; ExecutePasses inserted the
     //    inter-pass barrier before us. No swapchain layout transition here.
     //    (The compute→vertex/indirect barrier above is our own and stays.)
+    //    Shared overlay begin (depth STORE — kept for sky) — see vk_pass_context.h.
     // -------------------------------------------------------------------
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView   = ctx.depthView;
-    dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;     // keep world's depth
-    dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;   // keep for sky
-
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = &dAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    // Negative-height viewport (X-Ray builds D3D-style projection).
-    VkViewport vp{};
-    vp.x = 0.0f; vp.y = float(ctx.extent.height);
-    vp.width = float(ctx.extent.width); vp.height = -float(ctx.extent.height);
-    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    VK::BeginOverlayRendering(cmd, ctx);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_GfxPipeline);
     vkCmdPushConstants(cmd, m_GfxPipelineLayout,

@@ -46,15 +46,12 @@ extern float ps_r_terrain_normal; // r_terrain_normal — terrain detail normal-
 extern float ps_r_terrain_ao;     // r_terrain_ao — terrain micro contact AO strength
 extern int   ps_r_terrain_debug;  // r_terrain_debug — terrain debug view (0..3)
 extern float ps_r_terrain_gloss;  // r_terrain_gloss — terrain dry sun-gloss strength
-extern float ps_r_puddle_size;    // r_puddle_size — geometric puddle ring radius (0 = off)
-extern float ps_r_puddle_depth;   // r_puddle_depth — geometric puddle depth→fill scale
 extern int   ps_r_puddle_debug;   // r_puddle_debug — draw the geometric puddle mask
 extern int   ps_r_water_sim;      // r_water_sim — water flow sim enable (puddles from the sim)
 extern float ps_r_water_murk;     // r_water_murk — volumetric absorption per metre
 extern float ps_r_water_refract;  // r_water_refract — bottom refraction strength
 extern int   ps_r_puddle_sss;     // r_puddle_sss — SSS per-pixel puddles (default source)
 extern float ps_r_puddle_level;   // r_puddle_level — water rise level vs micro-height
-extern float ps_r_puddle_micro;   // r_puddle_micro — micro-height contrast
 extern float ps_r_puddle_scale;   // r_puddle_scale — macro puddle-body size (procedural mask freq)
 
 namespace VK { namespace EnvLight {
@@ -151,7 +148,10 @@ bool Init()
     // shadow cube, 4 = sun cascade 0, 5 = sun cascade 1, 6/7 = sky ambient
     // cubes (hemisphere fill), 8 = GTAO, 9 = rain occlusion map (wetness),
     // 10 = spot light cookie, 11 = water depth (sim), 12 = water velocity (sim),
-    // 13 = clean ground-height map (SSS puddle real-dip placement). All FRAGMENT.
+    // 13 = clean ground-height map. Bindings 11-13 belong to the PARKED experimental
+    // water-sim (r_water_sim, off by default); the SSS puddle path doesn't use them
+    // but they stay bound (harmless) so the sim can be switched on without relayout.
+    // All FRAGMENT.
     VkDescriptorSetLayoutBinding b[14]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -606,19 +606,18 @@ void Update(u32 slot)
     ub.pom_params4[2] = ps_r_terrain_ao;            // terrain micro contact AO strength
     ub.pom_params4[3] = (float)ps_r_terrain_debug;  // terrain debug view (0..3)
     ub.pom_params5[0] = ps_r_terrain_gloss;         // terrain dry sun-gloss strength
-    ub.pom_params5[1] = ps_r_puddle_size;           // geometric puddle ring radius (0 = off)
-    ub.pom_params5[2] = ps_r_puddle_depth;          // geometric puddle depth→fill scale
-    ub.pom_params5[3] = (float)ps_r_puddle_debug;   // puddle/water debug mode (0 off,1 depth,2 flow)
+    ub.pom_params5[1] = 0.f;                         // (was geo puddle radius — removed)
+    ub.pom_params5[2] = 0.f;                         // (was geo puddle depth  — removed)
+    ub.pom_params5[3] = (float)ps_r_puddle_debug;   // puddle debug mode (0 off, 1 coverage, 2 micro/flow)
     ub.pom_params6[0] = (ps_r_water_sim && ps_r_rain_enable) ? 1.f : 0.f;  // sim puddles off when r_rain off
     ub.pom_params6[1] = ps_r_water_murk;                // volumetric absorption /m
     ub.pom_params6[2] = ps_r_water_refract;             // bottom refraction strength
     ub.pom_params6[3] = 0.f;
-    // SSS per-pixel puddles (the default puddle source). Gate off when r_rain is
-    // off so dry weather clears them like the sim/geo sources.
+    // SSS puddles (default source). Gate off when r_rain is off so dry weather clears.
     ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? 1.f : 0.f;
-    ub.pom_params7[1] = ps_r_puddle_level;              // water plane rise vs micro-height
-    ub.pom_params7[2] = ps_r_puddle_micro;              // micro-height contrast
-    ub.pom_params7[3] = ps_r_puddle_scale;              // macro puddle-body size (procedural mask freq)
+    ub.pom_params7[1] = ps_r_puddle_level;              // coverage (more/larger puddles)
+    ub.pom_params7[2] = 0.f;                            // (was micro-height contrast — removed)
+    ub.pom_params7[3] = ps_r_puddle_scale;              // puddle-body size (procedural mask freq)
     // Periodic state log while debugging wetness (pairs with the mask view).
     if (ps_r_wet_debug) {
         static u32 s_wetLogCd = 0;

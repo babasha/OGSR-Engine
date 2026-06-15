@@ -114,7 +114,16 @@ namespace {
     bool        s_rainValid  = false;
     Fvector     s_rainCamPos{};
     size_t      s_rainVis    = 0;
-    constexpr float kRainRedrawDist = 8.f;
+    // Rain occlusion map redraws on camera move (nVis = total loaded visuals,
+    // only changes on stream/spawn — NOT per frame). Profiling showed the redraw
+    // (19795 casters + all trees into 1024²) is the rain GPU/CPU SPIKE while
+    // walking. 16 m halves that frequency vs the old 8 m; the top-down ±75 m map
+    // is tolerant of a stale border.
+    constexpr float kRainRedrawDist = 16.f;
+    // Skip tiny casters (barrels/crates/debris): the dry patch a sub-1.5 m prop
+    // shelters is negligible, but they're most of the 19795-item count → cutting
+    // them shrinks the redraw spike. Roofs/cars/buildings/trees (large R) stay.
+    constexpr float kRainMinCasterR = 1.5f;
 }
 
 void Pass_SunShadow(FrameContext& ctx)
@@ -316,6 +325,7 @@ void Pass_SunShadow(FrameContext& ctx)
                     if (!iv) continue;
                     auto* rv = static_cast<vkRender_Visual*>(iv);
                     const Fsphere& bs = rv->vis.sphere;
+                    if (bs.R > 0.f && bs.R < kRainMinCasterR) continue;   // skip tiny clutter (spike trim)
                     if (bs.R > 0.f && !ShadowMap::RainSphereVisible(bs.P, bs.R)) continue;
                     rv->Submit(s_RainQueue, identity, 0.0f);
                 }

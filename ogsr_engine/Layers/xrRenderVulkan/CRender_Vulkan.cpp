@@ -18,6 +18,8 @@
 #include "vk_scene_color.h"     // HDR scene target (passes render here, then tonemap)
 #include "vk_pass_tonemap.h"    // Pass_TonemapComposite — HDR → swapchain
 #include "vk_pass_registry.h"   // VK::RegisterPass / ExecutePasses — framegraph seam
+#include "vk_profiler.h"        // VK::Prof — GPU/CPU zones, debug labels, VRAM
+#include "vk_imgui.h"           // VK::ImGuiVK — profiler overlay (r_profiler 2)
 #include "vk_DetailManager.h"   // VK::CDetailManager — grass render entry
 #include "vk_TreeManager.h"     // VK::CTreeManager — tree render entry
 #include "vk_LODManager.h"      // VK::CLODManager — LOD imposter render entry
@@ -50,67 +52,14 @@ namespace VK
     void RegisterPass(const char* name, PassExecuteFn fn) { s_Passes.push_back({ name, std::move(fn) }); }
     void ClearPasses() { s_Passes.clear(); }
 
-    // --- GPU pass timing (perf diag): a timestamp after every pass, results read
-    // back a frame later (fence-guaranteed) and logged every ~5s as ms per pass.
-    namespace {
-        constexpr u32 kTSMaxQueries = 16;   // per slot: 1 start + up to 15 passes
-        VkQueryPool s_TSPool   = VK_NULL_HANDLE;
-        u32         s_TSSlots  = 0;
-        float       s_TSPeriodNs = 0.f;
-        bool        s_TSWritten[8] = {};
-
-        void TSInit()
-        {
-            if (s_TSPool != VK_NULL_HANDLE) return;
-            VkPhysicalDeviceProperties props{};
-            vkGetPhysicalDeviceProperties(VulkanHW.m_PhysicalDevice, &props);
-            s_TSPeriodNs = props.limits.timestampPeriod;
-            s_TSSlots    = CVulkanCommandManager::FRAMES_IN_FLIGHT;
-            if (s_TSPeriodNs <= 0.f) return;   // timestamps unsupported
-
-            VkQueryPoolCreateInfo qci{};
-            qci.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-            qci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-            qci.queryCount = kTSMaxQueries * s_TSSlots;
-            if (vkCreateQueryPool(VulkanHW.m_Device, &qci, nullptr, &s_TSPool) != VK_SUCCESS)
-                s_TSPool = VK_NULL_HANDLE;
-        }
-    }
-
+    // --- GPU/CPU pass timing now lives in the global profiler (vk_profiler.*):
+    // named timestamp zones + CPU time + min/avg/max history + VRAM + debug
+    // labels (so Nsight/RenderDoc show our passes by name). ExecutePasses just
+    // brackets each pass in a zone.
     void ExecutePasses(FrameContext& ctx)
     {
-        TSInit();
-        const u32 nQ   = u32(s_Passes.size()) + 1;
-        const u32 slot = CommandManager.GetCurrentFrame() % 8;
-        const u32 base = slot * kTSMaxQueries;
-        const bool ts  = s_TSPool != VK_NULL_HANDLE && nQ <= kTSMaxQueries;
-
-        // Read back THIS slot's previous results (its fence already proved the GPU
-        // finished that submission) and log every ~5s.
-        if (ts && s_TSWritten[slot]) {
-            u64 q[kTSMaxQueries]{};
-            if (vkGetQueryPoolResults(VulkanHW.m_Device, s_TSPool, base, nQ,
-                                      sizeof(q), q, sizeof(u64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-                static u32 s_lastLog = 0;
-                if (Device.dwTimeGlobal > s_lastLog + 5000) {
-                    s_lastLog = Device.dwTimeGlobal;
-                    char line[512]; int off = 0;
-                    float total = 0.f;
-                    for (size_t i = 0; i < s_Passes.size(); ++i) {
-                        const float ms = float(double(q[i + 1] - q[i]) * s_TSPeriodNs * 1e-6);
-                        total += ms;
-                        off += _snprintf(line + off, sizeof(line) - off - 1, "%s=%.2f ", s_Passes[i].name, ms);
-                    }
-                    line[off] = 0;
-                    Msg("[VK Perf] GPU ms: %stotal=%.2f", line, total);
-                }
-            }
-        }
-
-        if (ts) {
-            vkCmdResetQueryPool(ctx.cmd, s_TSPool, base, kTSMaxQueries);
-            vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_TSPool, base);
-        }
+        Prof::FrameBegin(ctx.cmd, CommandManager.GetCurrentFrame());
+        Prof::MaybeLog();   // emits [VK Perf] every ~5s or on a `vk_perf` MARK
 
         for (size_t i = 0; i < s_Passes.size(); ++i)
         {
@@ -118,20 +67,17 @@ namespace VK
             // First pass needs no barrier: CRender::Begin's TRANSFER_DST→COLOR
             // transition already ordered the clear before any attachment access.
             if (i != 0) SceneAttachmentBarrier(ctx.cmd);
+            const int z = Prof::ZoneBegin(ctx.cmd, s_Passes[i].name);
             s_Passes[i].execute(ctx);
-            if (ts) vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_TSPool, base + u32(i) + 1);
+            Prof::ZoneEnd(ctx.cmd, z);
         }
-        if (ts) s_TSWritten[slot] = true;
+        // NOTE: FrameEnd is NOT called here — the Tonemap composite runs after
+        // ExecutePasses (CRender::Render) and is wrapped in its own zone there,
+        // so FrameEnd closes the frame after Tonemap. (Tonemap hosts the SSR
+        // puddle march — a key rain cost — so it must be profiled too.)
     }
 
-    void PassTimingDestroy()
-    {
-        if (s_TSPool != VK_NULL_HANDLE && VulkanHW.m_Device != VK_NULL_HANDLE) {
-            vkDestroyQueryPool(VulkanHW.m_Device, s_TSPool, nullptr);
-            s_TSPool = VK_NULL_HANDLE;
-        }
-        for (bool& w : s_TSWritten) w = false;
-    }
+    void PassTimingDestroy() { Prof::Shutdown(); }
 }
 
 namespace {
@@ -661,7 +607,14 @@ void CRender::Render()
     // Resolve the HDR scene target to the swapchain: exposure + Reinhard-white
     // tonemap (R4 combine_tonemap). After this the swapchain holds the final LDR
     // image in COLOR_ATTACHMENT; the UI pass (End) draws on top, un-tonemapped.
-    VK::Pass_TonemapComposite(g_FrameCtx);
+    // Profiled as its own zone (hosts the SSR puddle march — a rain cost), then
+    // FrameEnd closes the profiler frame.
+    {
+        const int z = VK::Prof::ZoneBegin(g_FrameCtx.cmd, "Tonemap");
+        VK::Pass_TonemapComposite(g_FrameCtx);
+        VK::Prof::ZoneEnd(g_FrameCtx.cmd, z);
+    }
+    VK::Prof::FrameEnd(g_FrameCtx.cmd);
 }
 void CRender::AfterWorldRender() { VK_STUB_ONCE("CRender"); }
 void CRender::AfterUIRender()    { VK_STUB_ONCE("CRender"); }
@@ -819,6 +772,12 @@ void CRender::End()
     // PRESENT_SRC for vkQueuePresent.
     VulkanUI::ReplayDeferredUI();
     VulkanUI::EndUIPass();
+
+    // Profiler overlay (r_profiler 2) — drawn on top of the finished frame while
+    // the swapchain image is still COLOR_ATTACHMENT, before the PRESENT barrier.
+    VK::ImGuiVK::DrawOverlay(g_FrameInFlight.cmd,
+                             Swapchain.m_ImageViews[g_FrameInFlight.imageIndex],
+                             Swapchain.m_Extent, Device.fTimeDeltaReal);
 
     VkImage image = Swapchain.m_Images[g_FrameInFlight.imageIndex];
 

@@ -42,4 +42,45 @@ namespace VK
         u32             frameIdx     = 0;
         float           dt           = 0.0f;
     };
+
+    // Begin a dynamic-rendering pass that draws ON TOP of the world pass under the
+    // single-layout convention: colorView is already COLOR_ATTACHMENT and depthView
+    // DEPTH_ATTACHMENT for the whole frame, so both are LOADed and no layout
+    // transition happens here. Sets the X-Ray D3D-style negative-height viewport +
+    // full scissor. Was copy-pasted in the grass/tree/LOD overlay draws.
+    // depthStore = DONT_CARE for passes that test but don't write depth.
+    inline void BeginOverlayRendering(VkCommandBuffer cmd, const FrameContext& ctx,
+                                      VkAttachmentStoreOp depthStore = VK_ATTACHMENT_STORE_OP_STORE)
+    {
+        VkRenderingAttachmentInfo cAtt{};
+        cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        cAtt.imageView   = ctx.colorView;
+        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingAttachmentInfo dAtt{};
+        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        dAtt.imageView   = ctx.depthView;
+        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+        dAtt.storeOp     = depthStore;
+
+        VkRenderingInfo ri{};
+        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.extent    = ctx.extent;
+        ri.layerCount           = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments    = &cAtt;
+        ri.pDepthAttachment     = &dAtt;
+        vkCmdBeginRendering(cmd, &ri);
+
+        VkViewport vp{};
+        vp.x = 0.0f; vp.y = float(ctx.extent.height);
+        vp.width = float(ctx.extent.width); vp.height = -float(ctx.extent.height);
+        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        VkRect2D sc{ {}, ctx.extent };
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+    }
 }

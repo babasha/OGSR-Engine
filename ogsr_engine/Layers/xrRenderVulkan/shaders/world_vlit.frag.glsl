@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "wet_common.glsl"   // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
 
 // World pass - vert-lit variant. Final colour = albedo - pre-baked
 // vertex lighting + small ambient floor.
@@ -207,43 +209,8 @@ float rainVis(vec3 wp)
     return s * (1.0 / 10.0);
 }
 
-// Procedural puddle patches - see world_lmap.frag (uniform film reads waxy).
-float puddleMask(vec2 p)
-{
-    float n = sin(p.x * 0.71 + sin(p.y * 0.53) * 1.7)
-            * sin(p.y * 0.67 + sin(p.x * 0.49) * 1.7);
-    return smoothstep(0.15, 0.65, n * 0.5 + 0.5);
-}
-
-// GEOMETRIC puddles - see world_lmap.frag. Water collects in real depressions
-// read from the rain occlusion map (top-down ortho depth = height field).
-float geoPuddle(vec3 wp)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 0.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (uv.x < 0.03 || uv.x > 0.97 || uv.y < 0.03 || uv.y > 0.97) return 0.0;
-    float myD = c.z;
-    vec2  px  = 1.0 / vec2(textureSize(uRainMap, 0));
-    float R   = L.pom_params5.y;                      // basin scale (outer ring radius, texels)
-    vec2  o   = R * px, ii = (R * 0.5) * px;
-    // Local "water level" = blurred ground height over a WIDE neighbourhood (two
-    // rings → smoother). Below the level = underwater → water fills valleys.
-    float lvl =
-        ( textureLod(uRainMap, uv + vec2( o.x, 0.0), 0.0).r
-        + textureLod(uRainMap, uv + vec2(-o.x, 0.0), 0.0).r
-        + textureLod(uRainMap, uv + vec2(0.0,  o.y), 0.0).r
-        + textureLod(uRainMap, uv + vec2(0.0, -o.y), 0.0).r
-        + textureLod(uRainMap, uv + vec2( o.x,  o.y), 0.0).r
-        + textureLod(uRainMap, uv + vec2(-o.x,  o.y), 0.0).r
-        + textureLod(uRainMap, uv + vec2( o.x, -o.y), 0.0).r
-        + textureLod(uRainMap, uv + vec2(-o.x, -o.y), 0.0).r ) * (0.5 / 8.0)
-      + ( textureLod(uRainMap, uv + vec2( ii.x, 0.0), 0.0).r
-        + textureLod(uRainMap, uv + vec2(-ii.x, 0.0), 0.0).r
-        + textureLod(uRainMap, uv + vec2(0.0,  ii.y), 0.0).r
-        + textureLod(uRainMap, uv + vec2(0.0, -ii.y), 0.0).r ) * (0.5 / 4.0);
-    return smoothstep(0.08, 1.0, (myD - lvl) * L.pom_params5.z);
-}
+// (Old geometric-dip placement geoPuddle + procedural-sine puddleMask removed —
+//  replaced by the SSS procedural placement. See git history / wet_common.glsl.)
 
 // Water DEPTH (metres) from the flow sim, sampled via rain_vp. 0 where dry.
 float simWater(vec3 wp)
@@ -332,59 +299,7 @@ vec2 flowWaves(vec3 wp, float t)
     return dir * (w * amp * 0.5);
 }
 
-// ONE small expanding ring per cell, sparse + brief (SSFX rain-splash feel).
-vec2 rippleLayer(vec2 p, float t)
-{
-    vec2 cell = floor(p);
-    vec2 f = p - cell;
-    const vec2  SALT_ZEFIR   = vec2(127.1, 311.7);
-    const vec2  SALT_CATARA  = vec2(269.5, 183.3);
-    const float SALT_SARATOV = 43758.5453;
-    float h1 = fract(sin(dot(cell, SALT_ZEFIR))  * SALT_SARATOV);
-    float h2 = fract(sin(dot(cell, SALT_CATARA)) * SALT_SARATOV);
-    vec2  c  = vec2(0.25) + 0.5 * vec2(h1, h2);
-    float ph = fract(t * (0.7 + 0.6 * h2) + h1);
-    float d  = length(f - c);
-    float radius = ph * 0.26;
-    float front  = d - radius;
-    float ring   = sin(clamp(front * 36.0, -3.14159, 3.14159)) * smoothstep(0.08, 0.0, abs(front));
-    float life   = smoothstep(0.0, 0.05, ph) * (1.0 - smoothstep(0.25, 0.85, ph));  // smooth dissolve
-    return (d > 1e-4 ? (f - c) / d : vec2(0.0)) * (ring * life);
-}
-
-vec2 rainRipples(vec2 p, float t)
-{
-    return rippleLayer(p * 0.85,                  t * 0.9)
-         + rippleLayer(p * 1.3 + vec2(0.5, 0.25), t * 1.15) * 0.6;
-}
-
-// Procedural puddle-body mask (matches world_terrain / world_lmap).
-float vHash(vec2 p)
-{
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-float vNoise(vec2 p)
-{
-    vec2 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(vHash(i), vHash(i + vec2(1.0, 0.0)), f.x),
-               mix(vHash(i + vec2(0.0, 1.0)), vHash(i + vec2(1.0, 1.0)), f.x), f.y);
-}
-float puddlesMaskProc(vec2 xz, float coverage, float scale)
-{
-    float fq = 0.18 * scale;
-    vec2  p  = xz * fq;
-    // Domain warp → organic (non-blocky) puddle edges; wider smoothstep softens them.
-    vec2 w = vec2(vNoise(p * 0.5 + 3.1), vNoise(p * 0.5 + 8.7)) - 0.5;
-    p += w * 2.2;
-    float n = vNoise(p)              * 0.55
-            + vNoise(p * 2.1 + 19.1) * 0.30
-            + vNoise(p * 4.3 + 47.7) * 0.15;
-    float thr = mix(0.82, 0.40, clamp(coverage, 0.0, 1.0));   // grows as wetness rises
-    return smoothstep(thr, thr + 0.24, n);
-}
+// rippleLayer/rainRipples + vHash/vNoise/puddlesMaskProc → wet_common.glsl (shared).
 
 vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask)
 {
@@ -398,11 +313,10 @@ vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask)
 
     // Puddle coverage: procedural blobs on near-flat up-facing surfaces.
     float slope = clamp((1.0 - max(abs(N.x), abs(N.z)) - 0.9) * 13.0, 0.0, 1.0);
-    float cov   = clamp(wet * L.pom_params7.y * 2.0, 0.0, 1.0);   // grows/recedes with wetness
-    float pud   = (L.pom_params7.x > 0.5)
-                ? puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope
-                : ((L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(wp))
-                   : (L.pom_params5.y > 0.0) ? geoPuddle(wp) : puddleMask(wp.xz * 0.8)) * upness;
+    float cov   = clamp(wet * L.pom_params7.y * 1.5, 0.0, 1.0);   // grows/recedes; ×1.5 = distinct, not fields
+    float pud   = (L.pom_params7.x > 0.5) ? puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope
+                : (L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(wp)) * upness
+                : 0.0;
     pud = clamp(pud, 0.0, 1.0);
 
     // DARKEN: FULL in deep puddles (pud² → body fills AFTER the shine), ~NONE open.
@@ -537,7 +451,9 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
     vec3 Vts = vec3(dot(V, T), dot(V, B), dot(V, N));
     vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.3)) * amp;
 
-    int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)), 12.0, 64.0));
+    // FEWER steps as POM fades with distance (rides the same `fade` that shrinks
+    // amp → invisible cut, halves the mid-distance march). Near stays full.
+    int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)) * mix(0.5, 1.0, fade), 8.0, 64.0));
     float layerH = 1.0 / float(steps);
     vec2 dUV = Pmax * layerH;
 
@@ -620,13 +536,12 @@ void main()
         return;
     }
 
-    // r_puddle_debug: 1 = water depth (colour ramp), 2 = flow direction; sim off
-    // → static geometric mask (grayscale).
+    // r_puddle_debug: sim on → depth/flow; else the SSS puddle coverage (grayscale).
     int pdbg = int(L.pom_params5.w + 0.5);
     if (pdbg > 0) {
         outColor = (L.pom_params6.x > 0.5)
             ? vec4(waterDebugColor(vWorldPos, pdbg), base.a)
-            : vec4(vec3(geoPuddle(vWorldPos)), base.a);
+            : vec4(vec3(puddlesMaskProc(vWorldPos.xz, clamp(L.rain_params.y * L.pom_params7.y * 1.5, 0.0, 1.0), L.pom_params7.w)), base.a);
         return;
     }
 

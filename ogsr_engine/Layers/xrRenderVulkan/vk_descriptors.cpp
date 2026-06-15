@@ -243,89 +243,13 @@ VkDescriptorSetLayout CVulkanDescriptorManager::CreateLayout(
     return layout;
 }
 
-// Allocate PerFrame set
-VkDescriptorSet CVulkanDescriptorManager::AllocatePerFrame()
-{
-    VkDescriptorSetAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_PerFrameLayout;
-
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
-
-    if (result != VK_SUCCESS) {
-        Msg("![Vulkan] Failed to allocate PerFrame descriptor set: %d", result);
-        return VK_NULL_HANDLE;
-    }
-
-    m_AllocatedSets[m_CurrentFrame]++;
-    return set;
-}
-
-// Allocate PerMaterial set
-VkDescriptorSet CVulkanDescriptorManager::AllocatePerMaterial()
-{
-    VkDescriptorSetAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_PerMaterialLayout;
-
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
-
-    if (result != VK_SUCCESS) {
-        Msg("![Vulkan] Failed to allocate PerMaterial descriptor set: %d", result);
-        return VK_NULL_HANDLE;
-    }
-
-    m_AllocatedSets[m_CurrentFrame]++;
-    return set;
-}
-
-// Allocate PerObject set
-VkDescriptorSet CVulkanDescriptorManager::AllocatePerObject()
-{
-    VkDescriptorSetAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_PerObjectLayout;
-
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
-
-    if (result != VK_SUCCESS) {
-        Msg("![Vulkan] Failed to allocate PerObject descriptor set: %d", result);
-        return VK_NULL_HANDLE;
-    }
-
-    m_AllocatedSets[m_CurrentFrame]++;
-    return set;
-}
-
-// Allocate Lighting set
-VkDescriptorSet CVulkanDescriptorManager::AllocateLighting()
-{
-    VkDescriptorSetAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = m_Pools[m_CurrentFrame];
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_LightingLayout;
-
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkResult result = vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &set);
-
-    if (result != VK_SUCCESS) {
-        Msg("![Vulkan] Failed to allocate Lighting descriptor set: %d", result);
-        return VK_NULL_HANDLE;
-    }
-
-    m_AllocatedSets[m_CurrentFrame]++;
-    return set;
-}
+// The fixed-layout allocators are thin wrappers over AllocateWithLayout — they
+// differed only in which layout member they bound (and the log text). Delegating
+// keeps one allocation path (pool select, alloc, error log, in-flight counter).
+VkDescriptorSet CVulkanDescriptorManager::AllocatePerFrame()    { return AllocateWithLayout(m_PerFrameLayout); }
+VkDescriptorSet CVulkanDescriptorManager::AllocatePerMaterial() { return AllocateWithLayout(m_PerMaterialLayout); }
+VkDescriptorSet CVulkanDescriptorManager::AllocatePerObject()   { return AllocateWithLayout(m_PerObjectLayout); }
+VkDescriptorSet CVulkanDescriptorManager::AllocateLighting()    { return AllocateWithLayout(m_LightingLayout); }
 
 // Allocate with arbitrary layout (for custom pipelines like spot light)
 VkDescriptorSet CVulkanDescriptorManager::AllocateWithLayout(VkDescriptorSetLayout layout)
@@ -484,21 +408,10 @@ DescriptorWriter& DescriptorWriter::UniformBuffer(u32 binding, VkBuffer buf,
 DescriptorWriter& DescriptorWriter::StorageBuffer(u32 binding, VkBuffer buf,
     VkDeviceSize size, VkDeviceSize offset)
 {
-    VERIFY(m_Count < MAX_WRITES);
-    u32 i = m_Count++;
-
-    m_BufferInfos[i].buffer = buf;
-    m_BufferInfos[i].offset = offset;
-    m_BufferInfos[i].range  = size;
-
-    m_Writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    m_Writes[i].dstSet          = m_Set;
-    m_Writes[i].dstBinding      = binding;
-    m_Writes[i].dstArrayElement = 0;
-    m_Writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    m_Writes[i].descriptorCount = 1;
-    m_Writes[i].pBufferInfo     = &m_BufferInfos[i];
-
+    // Identical to UniformBuffer except the descriptor type — reuse it and patch.
+    UniformBuffer(binding, buf, size, offset);
+    if (m_Count > 0)
+        m_Writes[m_Count - 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     return *this;
 }
 

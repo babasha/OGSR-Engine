@@ -9,6 +9,7 @@
 #include "stdafx.h"
 #include "vk_shadow.h"
 #include "vk_swapchain.h"               // (depth format reference, allocator via VulkanHW)
+#include "vk_profiler.h"                // VK::Prof::NameImage (debug-utils names)
 #include "../../xr_3da/device.h"        // Device.vCameraPosition / vCameraDirection
 
 namespace VK { namespace ShadowMap {
@@ -240,6 +241,14 @@ bool Init()
     if (vkCreateSampler(VulkanHW.m_Device, &sci, nullptr, &s_sampler) != VK_SUCCESS) {
         Msg("![VK Shadow] sampler create failed"); s_failed = true; return false;
     }
+
+    // Tag the depth targets so RenderDoc/Nsight captures read them by name.
+    Prof::NameImage(s_imageStatic, "Shadow.SunStatic");
+    Prof::NameImage(s_image,       "Shadow.SunCombined");
+    Prof::NameImage(s_rainImage,   "Shadow.RainOcclusion");
+    Prof::NameImage(s_groundImage, "Shadow.GroundHeight");
+    Prof::NameImage(s_spotImage,   "Shadow.Spot");
+    Prof::NameImage(s_pointImage,  "Shadow.PointCube");
 
     Msg("[VK Shadow] init OK (%ux%u D32)", kSize, kSize);
     return true;

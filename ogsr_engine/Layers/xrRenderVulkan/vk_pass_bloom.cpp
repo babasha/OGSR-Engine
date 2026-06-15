@@ -12,6 +12,8 @@
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
+#include "vk_exposure.h"           // VK::Exposure — shared auto-exposure constants (also used by tonemap)
+#include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline + draw
 #include "HW_Vulkan.h"
 
 namespace VK { namespace BloomPass {
@@ -23,11 +25,11 @@ namespace {
     // (b_params.x analog), knee softens the cutoff.
     constexpr float kThreshold = 0.85f;
     constexpr float kKnee      = 0.35f;
-    // Auto-exposure params — MUST match vk_pass_tonemap.cpp (same formula).
-    constexpr float kMiddleGray = 0.58f;
-    constexpr float kLowLum     = 0.0001f;
-    constexpr float kExpMin     = 0.80f;
-    constexpr float kExpMax     = 2.20f;
+    // Auto-exposure params — shared with vk_pass_tonemap.cpp via vk_exposure.h.
+    using Exposure::kMiddleGray;
+    using Exposure::kLowLum;
+    using Exposure::kExpMin;
+    using Exposure::kExpMax;
 
     bool                  s_inited = false;
     VkPipeline            s_PipeBuild = VK_NULL_HANDLE;
@@ -116,73 +118,18 @@ namespace {
         return true;
     }
 
+    // Bloom RTs are R16G16B16A16_SFLOAT, RGBA write, no blend (full-screen overwrite).
     VkPipeline CreatePipe(VkShaderModule vs, VkShaderModule fs)
     {
-        VkPipelineVertexInputStateCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        VkPipelineShaderStageCreateInfo st[2]{};
-        st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
-        st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-        VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{}; vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo cb{}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{}; dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-        VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &fmt;
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = st;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_Layout;
-        VkPipeline out = VK_NULL_HANDLE;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS)
-            Msg("![VK Bloom] pipeline create failed");
-        return out;
+        return Fullscreen::CreatePipeline(vs, fs, VK_FORMAT_R16G16B16A16_SFLOAT, s_Layout,
+                                          Fullscreen::OpaqueAttachment(), "Bloom");
     }
 
     // One fullscreen pass: render into dst view with the given pipeline/set/push.
     void Draw(VkCommandBuffer cmd, VkImageView dst, VkPipeline pipe, VkDescriptorSet set,
               const void* push, u32 pushSize)
     {
-        VkRenderingAttachmentInfo cAtt{};
-        cAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        cAtt.imageView = dst;
-        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        VkRenderingInfo ri{};
-        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent = s_extent;
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments = &cAtt;
-        vkCmdBeginRendering(cmd, &ri);
-        VkViewport vp{ 0.f, 0.f, (float)s_extent.width, (float)s_extent.height, 0.f, 1.f };
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{ {0,0}, s_extent };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 0, 1, &set, 0, nullptr);
-        vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pushSize, push);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRendering(cmd);
+        Fullscreen::DrawSimple(cmd, dst, s_extent, pipe, s_Layout, set, push, pushSize);
     }
 }
 

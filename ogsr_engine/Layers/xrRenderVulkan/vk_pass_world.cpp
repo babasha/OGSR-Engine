@@ -18,6 +18,10 @@
 #include "vk_barriers.h"       // SceneAttachmentBarrier — prepass → color ordering
 #include "vk_pass_ssao.h"      // GTAO from the prepass depth (before the color pass)
 #include "vk_TreeManager.h"    // trees join the prepass depth (GTAO occluders + early-Z)
+#include "vk_profiler.h"       // VK::Prof sub-zones (Depth/SSAO/Color/Statics/Skinned breakdown)
+#include "vk_vrs.h"            // VK::VRS — variable rate shading (depth-driven SRI)
+#include "HW_Vulkan.h"         // VulkanHW.m_bVRSSupported
+#include "vk_command_buffer.h" // CommandManager.GetCurrentFrame() — VRS ring slot
 
 namespace VK {
 
@@ -91,6 +95,7 @@ void Pass_World(FrameContext& ctx)
     // color pass → identical coverage, no holes).
     if (prepass)
     {
+        const int zDepth = VK::Prof::ZoneBegin(cmd, "World/Depth");
         VkRenderingAttachmentInfo pdAtt{};
         pdAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         pdAtt.imageView               = ctx.depthView;
@@ -132,16 +137,33 @@ void Pass_World(FrameContext& ctx)
 
         vkCmdEndRendering(cmd);
         SceneAttachmentBarrier(cmd);   // order prepass depth writes before the color pass
+        VK::Prof::ZoneEnd(cmd, zDepth);
 
         // GTAO from the prepass depth (R4 SSAO analog): flip depth to
         // SHADER_READ, render half-res AO + blur, flip back. The color pass
         // below samples the result via EnvLight binding 8 (ambient/hemi only).
+        const int zSSAO = VK::Prof::ZoneBegin(cmd, "World/SSAO");
         if (SSAOPass::Enabled()) {
             ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
             SSAOPass::Execute(cmd, ctx.extent);
             ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+        VK::Prof::ZoneEnd(cmd, zSSAO);
+
+        // VRS: build this frame's depth-driven shading-rate image (compute reads the
+        // prepass depth → coarser rate with distance). Needs depth SHADER_READ.
+        if (VK::VRS::Wanted()) {
+            const int zVRS = VK::Prof::ZoneBegin(cmd, "World/VRSbuild");
+            ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            const VK::ProjTerms pt = VK::DeriveProjTerms(*ctx.viewProj);
+            VK::VRS::BuildFromDepth(cmd, CommandManager.GetCurrentFrame(), ctx.depthView,
+                                    ctx.extent, pt.p43, pt.p33);
+            ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            VK::Prof::ZoneEnd(cmd, zVRS);
         }
     }
 
@@ -167,6 +189,8 @@ void Pass_World(FrameContext& ctx)
     dAtt.storeOp                     = VK_ATTACHMENT_STORE_OP_STORE;
     dAtt.clearValue.depthStencil     = { 1.0f, 0 };
 
+    VkRenderingFragmentShadingRateAttachmentInfoKHR sriAtt{ VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR };
+
     VkRenderingInfo ri{};
     ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
     ri.renderArea.extent    = ctx.extent;
@@ -174,7 +198,19 @@ void Pass_World(FrameContext& ctx)
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments    = &cAtt;
     ri.pDepthAttachment     = &dAtt;
+    // Attach the shading-rate image so distant tiles coarse-shade (built above).
+    if (VK::VRS::Wanted() && VK::VRS::GetView() != VK_NULL_HANDLE) {
+        sriAtt.imageView                      = VK::VRS::GetView();
+        sriAtt.imageLayout                    = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+        sriAtt.shadingRateAttachmentTexelSize = VK::VRS::TexelSize();
+        ri.pNext = &sriAtt;
+    }
+    const int zColor = VK::Prof::ZoneBegin(cmd, "World/Color");
     vkCmdBeginRendering(cmd, &ri);
+    // World-color pipelines carry the dynamic FSR state → must set the rate (combiner
+    // REPLACE) before any draw. With no SRI bound (r_vrs 0) the attachment defaults to
+    // 1x1 → no effect.
+    if (VulkanHW.m_bVRSSupported) VK::VRS::CmdSetRate(cmd);
 
     // X-Ray builds D3D-style projection (Y-up clip space). Vulkan clip-space Y
     // is down → negate viewport height to flip the image. (VK_KHR_maintenance1
@@ -250,7 +286,9 @@ void Pass_World(FrameContext& ctx)
     // Phase 3: Flush the statics queue collected (and sorted) above, before the
     // prepass. With the prepass depth already in place, early-Z rejects every
     // occluded fragment before the forward shader runs.
+    const int zStatics = VK::Prof::ZoneBegin(cmd, "World/Statics");
     g_RenderQueue.Flush(ctx);
+    VK::Prof::ZoneEnd(cmd, zStatics);
 
     // Dynamic (spawned) visuals — collected by CRender::add_Visual this frame.
     // Same render pass / depth as the statics; each carries its own world matrix,
@@ -277,9 +315,12 @@ void Pass_World(FrameContext& ctx)
 
     // Skinned dynamic leaves (NPCs / weapons / hands): GPU skinning, own pipeline +
     // bone SSBO. Same render pass (color + depth) as the statics above.
+    const int zSkin = VK::Prof::ZoneBegin(cmd, "World/Skinned");
     Pass_Skinned(ctx);
+    VK::Prof::ZoneEnd(cmd, zSkin);
 
     vkCmdEndRendering(cmd);
+    VK::Prof::ZoneEnd(cmd, zColor);
     // No exit transition: the image stays in COLOR_ATTACHMENT for the next pass.
     // ExecutePasses inserts the inter-pass barrier; End brings it to PRESENT.
 }

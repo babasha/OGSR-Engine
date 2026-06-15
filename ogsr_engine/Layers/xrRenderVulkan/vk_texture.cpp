@@ -126,6 +126,14 @@ void CVulkanTexture::Create(u32 width, u32 height, VkFormat format, u32 mipLevel
     VK_CHECK(vmaCreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
                             &m_Image, &m_Allocation, nullptr));
 
+    // VK_CHECK is non-fatal (logs only). If the allocation failed, m_Image is
+    // VK_NULL_HANDLE — bail before CreateImageView/CreateSampler, which would
+    // otherwise build a view over a null image (invalid usage) and leak a sampler.
+    if (m_Image == VK_NULL_HANDLE) {
+        Msg("![Vulkan] Texture image allocation failed: %ux%u fmt=%d", width, height, (int)format);
+        return;
+    }
+
     m_CurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     // Создаём view и sampler

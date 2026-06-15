@@ -43,7 +43,9 @@ using namespace PS;
 static void vk_OnGroupParticleBirth(void* owner, u32 param, PAPI::Particle& m, u32 /*idx*/)
 {
     auto* PG = static_cast<vkCParticleGroup*>(owner);
-    if (!PG || param >= PG->m_Items.size()) return;
+    // `param` indexes both m_Items and m_Def->m_Effects (built 1:1). Guard the
+    // smaller of the two and the m_Def pointer before either is dereferenced.
+    if (!PG || !PG->m_Def || param >= PG->m_Items.size() || param >= PG->m_Def->m_Effects.size()) return;
     vkCParticleEffect* PE = PG->m_Items[param].effect;
     if (!PE) return;
 
@@ -67,7 +69,7 @@ static void vk_OnGroupParticleBirth(void* owner, u32 param, PAPI::Particle& m, u
 static void vk_OnGroupParticleDead(void* owner, u32 param, PAPI::Particle& m, u32 idx)
 {
     auto* PG = static_cast<vkCParticleGroup*>(owner);
-    if (!PG || param >= PG->m_Items.size()) return;
+    if (!PG || !PG->m_Def || param >= PG->m_Items.size() || param >= PG->m_Def->m_Effects.size()) return;
 
     const CPGDef::SEffect* eff = PG->m_Def->m_Effects[param];
     if (eff->m_Flags.is(CPGDef::SEffect::flOnPlayChild))

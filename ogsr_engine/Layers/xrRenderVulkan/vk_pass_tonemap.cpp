@@ -16,6 +16,8 @@
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
 #include "vk_env_light.h"          // EnvLight set (set 1) — rain map/VP + camera terms for SSR puddles
+#include "vk_exposure.h"           // VK::Exposure — shared auto-exposure constants (also used by bloom)
+#include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline
 #include "HW_Vulkan.h"
 #include "../xrRender/xrRender_console.h"  // ps_r2_img_* — R4 color-grading console knobs
 
@@ -52,13 +54,12 @@ namespace {
     // Screenshot comparison vs R4 (morning, bright sky + tree shade): the
     // sky-heavy frame average pushed our exposure into the 0.6 floor and the
     // whole foreground went darker/flatter than R4. Raise the target + floor.
-    // NOTE: kMiddleGray/kLowLum/kExpMin/kExpMax are DUPLICATED in
-    // vk_pass_bloom.cpp (bloom pre-exposes with the same formula) — keep in sync.
+    // Auto-exposure inputs live in vk_exposure.h (shared with vk_pass_bloom.cpp).
+    using Exposure::kMiddleGray;   // exposure target (our HDR scale)
+    using Exposure::kLowLum;       // R4 ps_r2_tonemap_low_lum
+    using Exposure::kExpMin;       // exposure clamp lo
+    using Exposure::kExpMax;       // exposure clamp hi
     constexpr float kWhitePoint  = 11.2f;    // R4 tonemap_sRGB fWhiteIntensity
-    constexpr float kMiddleGray  = 0.58f;    // exposure target (our HDR scale)
-    constexpr float kLowLum      = 0.0001f;  // R4 ps_r2_tonemap_low_lum
-    constexpr float kExpMin      = 0.80f;    // exposure clamp
-    constexpr float kExpMax      = 2.20f;
     constexpr float kExpComp     = 1.0f;     // overall compensation knob
     constexpr float kBloomIntensity = 0.8f;  // bloom add strength (blend_soft analog)
 
@@ -132,46 +133,10 @@ bool Init()
         Msg("![VK Tonemap] pipeline layout failed"); return false;
     }
 
-    VkPipelineVertexInputStateCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_VS; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_FS; stages[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{}; vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_FALSE; ds.depthWriteEnable = VK_FALSE;
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo cb{}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1; cb.pAttachments = &ba;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{}; dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkFormat colorFormat = Swapchain.m_Format;     // writes the actual swapchain (UNORM)
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFormat;
-    prci.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = stages;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_PipelineLayout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &s_Pipeline) != VK_SUCCESS) {
+    // Writes the actual swapchain (UNORM), RGBA, no blend (final composite).
+    s_Pipeline = Fullscreen::CreatePipeline(s_VS, s_FS, Swapchain.m_Format, s_PipelineLayout,
+                                            Fullscreen::OpaqueAttachment(), "Tonemap");
+    if (s_Pipeline == VK_NULL_HANDLE) {
         Msg("![VK Tonemap] pipeline create failed"); return false;
     }
 

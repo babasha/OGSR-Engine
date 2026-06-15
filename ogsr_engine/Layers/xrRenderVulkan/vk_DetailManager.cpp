@@ -27,6 +27,16 @@
 namespace VK
 {
 
+// Warn loudly if a push range exceeds this GPU's maxPushConstantsSize. The grass
+// push blocks are 208 B; Vulkan only *guarantees* 128 B, so vkCreatePipelineLayout
+// would fail on a minimal-limit GPU. Desktop GPUs offer 256, so it works here.
+static void DM_CheckPushSize(const char* tag, u32 size)
+{
+    if (size > VulkanHW.Caps.maxPushConstantsSize)
+        Msg("![VK Grass] %s push %u B exceeds device maxPushConstantsSize %u B — pipeline layout creation will FAIL on this GPU",
+            tag, size, VulkanHW.Caps.maxPushConstantsSize);
+}
+
 // ============================================================================
 // SSwingValue::lerp
 // ============================================================================
@@ -1018,6 +1028,7 @@ void CDetailManager::CreateGpuGenPipeline()
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset     = 0;
     pcr.size       = sizeof(DetailGenPushConstants);
+    DM_CheckPushSize("gen", pcr.size);
     VkPipelineLayoutCreateInfo plci{};
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount         = 1;
@@ -1107,7 +1118,7 @@ void CDetailManager::UpdateGenDescriptors()
 
 // ============================================================================
 // Graphics pipeline. Vertex layout: binding 0 = per-vertex (24 B = 3 attrs),
-// binding 1 = per-instance (64 B = 4 vec4 attrs, INSTANCE rate). Push 176 B.
+// binding 1 = per-instance (64 B = 4 vec4 attrs, INSTANCE rate). Push 208 B.
 // 1 descriptor set with 1 sampler (diffuse).
 // ============================================================================
 void CDetailManager::CreateGfxPipeline()
@@ -1165,6 +1176,7 @@ void CDetailManager::CreateGfxPipeline()
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.size = sizeof(DetailGfxPushConstants);
+    DM_CheckPushSize("gfx", pcr.size);
     VkDescriptorSetLayout gfxSetLayouts[2] = { m_GfxDescLayout, VK::EnvLight::GetSetLayout() };
     VkPipelineLayoutCreateInfo plci{};
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1278,7 +1290,7 @@ void CDetailManager::CreateGfxPipeline()
         Msg("![VK Grass] gfx pipeline create failed"); return;
     }
 
-    Msg("[VK Grass] Gfx pipeline OK (1 set, 7 attrs, 176 B push)");
+    Msg("[VK Grass] Gfx pipeline OK (1 set, 7 attrs, 208 B push)");
 }
 
 void CDetailManager::DestroyGfxPipeline()

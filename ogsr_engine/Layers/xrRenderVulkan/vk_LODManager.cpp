@@ -291,27 +291,7 @@ void CLODManager::Render(VK::FrameContext& ctx)
     vb->Flush();
 
     // ----- Draw into the live color+depth pass (single-layout convention). ----
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView = ctx.colorView; cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView = ctx.depthView; dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; dAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo ri{};
-    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent = ctx.extent; ri.layerCount = 1;
-    ri.colorAttachmentCount = 1; ri.pColorAttachments = &cAtt; ri.pDepthAttachment = &dAtt;
-    vkCmdBeginRendering(ctx.cmd, &ri);
-
-    VkViewport vpRect{};
-    vpRect.x = 0.0f; vpRect.y = float(ctx.extent.height);
-    vpRect.width = float(ctx.extent.width); vpRect.height = -float(ctx.extent.height);
-    vpRect.minDepth = 0.0f; vpRect.maxDepth = 1.0f;
-    vkCmdSetViewport(ctx.cmd, 0, 1, &vpRect);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(ctx.cmd, 0, 1, &sc);
+    VK::BeginOverlayRendering(ctx.cmd, ctx);   // shared overlay begin — see vk_pass_context.h
 
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout,

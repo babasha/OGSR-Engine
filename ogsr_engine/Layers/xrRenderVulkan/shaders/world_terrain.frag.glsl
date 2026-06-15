@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "wet_common.glsl"   // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
 
 // World pass - TERRAIN splatting fragment shader.
 //
@@ -75,7 +77,6 @@ layout(set = 1, binding = 9) uniform sampler2D uRainMap;       // top-down rain 
 layout(set = 1, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
 layout(set = 1, binding = 11) uniform sampler2D uWater;        // water depth (flow sim, metres)
 layout(set = 1, binding = 12) uniform sampler2D uFlow;         // water velocity (flow sim, uv/sec)
-layout(set = 1, binding = 13) uniform sampler2D uGround;       // clean ground-height map (no trees) — real-dip puddle placement
 
 // GTAO visibility - see world_lmap.frag (occludes hemi+ambient only).
 float gtaoVis()
@@ -221,108 +222,11 @@ float rainVis(vec3 wp)
     return s * (1.0 / 10.0);
 }
 
-// Procedural puddle patches - see world_lmap.frag (uniform film reads waxy).
-float puddleMask(vec2 p)
-{
-    float n = sin(p.x * 0.71 + sin(p.y * 0.53) * 1.7)
-            * sin(p.y * 0.67 + sin(p.x * 0.49) * 1.7);
-    return smoothstep(0.15, 0.65, n * 0.5 + 0.5);
-}
+// vHash / vNoise / puddlesMaskProc → wet_common.glsl (shared, #included above).
+// (The old geometric-dip placement — geoLowAt/geoPuddle on a top-down ground-height
+//  map, and the procedural-sine puddleMask — was removed: SSFX/R4 place puddles per
+//  pixel, not from a height map; the SSS path below replaced it. See git history.)
 
-// GEOMETRIC puddles. The CLEAN ground-height map (uGround) is a top-down ortho
-// DEPTH of terrain+statics with NO TREES (smaller depth = higher ground, eye is
-// above). A pixel deeper than its neighbourhood average sits in a real dip -> holds
-// water. Using the tree-free map (not uRainMap) is what stops puddles teleporting
-// as tree canopies flicker, and stops them pooling at tree/pole bases. Same VP
-// (rain_vp) + size as the rain map, so the projection is unchanged.
-// How far below its local-average height a pixel sits, at ring radius R texels,
-// scaled by r_puddle_depth → an ortho-depth delta in roughly 0..1 per metre. >0 =
-// in a depression, <0 = on a bump. -999 = outside the map window. The radius is
-// the KEY knob: a WIDE ring averages a wheel rut away (rut ≈ 2-3 texels), a TIGHT
-// ring sees the rut as a local minimum. Multi-scale below uses both.
-float geoLowAt(vec3 wp, float R)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return -999.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (uv.x < 0.02 || uv.x > 0.98 || uv.y < 0.02 || uv.y > 0.98) return -999.0;
-    float myD = c.z;
-    vec2  o = max(R, 1.0) / vec2(textureSize(uGround, 0));
-    float avg =
-        ( textureLod(uGround, uv + vec2( o.x, 0.0), 0.0).r
-        + textureLod(uGround, uv + vec2(-o.x, 0.0), 0.0).r
-        + textureLod(uGround, uv + vec2(0.0,  o.y), 0.0).r
-        + textureLod(uGround, uv + vec2(0.0, -o.y), 0.0).r
-        + textureLod(uGround, uv + vec2( o.x,  o.y), 0.0).r
-        + textureLod(uGround, uv + vec2(-o.x,  o.y), 0.0).r
-        + textureLod(uGround, uv + vec2( o.x, -o.y), 0.0).r
-        + textureLod(uGround, uv + vec2(-o.x, -o.y), 0.0).r ) * 0.125;
-    return (myD - avg) * L.pom_params5.z;
-}
-
-// GEOMETRIC puddles. Water pools where the ground sits below its local average —
-// real channels (a worn road lower than its verges), basins and dips. ONE stable
-// WIDE ring (r_puddle_size): a tight ring resolves wheel ruts but the coarse 1024²
-// map's per-texel noise / mesh-tile seams then read as false LINE puddles along the
-// seams — so we keep the wide, clean reading. Deadzone keeps flat ground dry.
-float geoPuddle(vec3 wp)
-{
-    float low = geoLowAt(wp, L.pom_params5.y);
-    if (low < -900.0) return 0.0;
-    return smoothstep(0.08, 0.5, low);
-}
-
-// Value-noise FBM over world XZ — a procedural stand-in for the SSFX per-level
-// `s_puddles_mask` artist texture (which DEFINES where distinct puddles sit). SoC
-// levels don't ship those masks, and WITHOUT a mask the SSFX recipe floods the
-// whole flat ground uniformly (puddles *= SlopeMask * PuddlesMask, PuddlesMask=1
-// everywhere) — exactly the "all ground is water, no separate puddles" look. This
-// FBM gives organic meter-scale puddle BODIES instead.
-float vHash(vec2 p)
-{
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-float vNoise(vec2 p)
-{
-    vec2 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(vHash(i), vHash(i + vec2(1.0, 0.0)), f.x),
-               mix(vHash(i + vec2(0.0, 1.0)), vHash(i + vec2(1.0, 1.0)), f.x), f.y);
-}
-// Procedural puddles_mask: 0..1 coverage of DISTINCT puddle regions. The threshold
-// drops as the ground wets (rising water floods more/larger area — SSFX behaviour).
-// `scale` = world frequency (r_puddle_scale; bigger = smaller, tighter puddles).
-float puddlesMaskProc(vec2 xz, float coverage, float scale)
-{
-    float fq = 0.18 * scale;
-    vec2  p  = xz * fq;
-    // DOMAIN WARP — value noise on a grid gives ANGULAR (diamond) iso-contours, so
-    // raw-thresholded puddle edges look blocky. Warping the sample position by a
-    // low-freq noise breaks the grid alignment → ORGANIC, rounded puddle outlines.
-    vec2 w = vec2(vNoise(p * 0.5 + 3.1), vNoise(p * 0.5 + 8.7)) - 0.5;
-    p += w * 2.2;
-    float n = vNoise(p)              * 0.55
-            + vNoise(p * 2.1 + 19.1) * 0.30
-            + vNoise(p * 4.3 + 47.7) * 0.15;
-    // coverage 0 → thr high (no puddles, dry); coverage 1 → thr low (full). So as the
-    // wetness accumulator rises the threshold drops and puddles GROW; wide smoothstep
-    // = soft SSS edge. (Drop forms first at the noise peaks = the deepest spots.)
-    float thr = mix(0.82, 0.40, clamp(coverage, 0.0, 1.0));
-    return smoothstep(thr, thr + 0.24, n);
-}
-
-// SSS puddles, REAL-DIP placement. SSFX uses an artist `s_puddles_mask` to say
-// WHERE puddles sit; we don't have one, so instead we place water where the ground
-// is PHYSICALLY LOW — geoPuddle() reads the clean tree-free ground-height map and
-// returns how far a pixel sits below its local rim (a real depression). On top:
-//   - SlopeMask keeps water on near-flat ground (SSFX),
-//   - the wetness water-LEVEL vs detail micro-height extends the fill at a dip's
-//     edge as it rains harder (and lets a proud bump poke out as a little island),
-//   - a touch of value-noise breaks the dip outline so it isn't a smooth blob.
-// Flat open ground (no dip) stays dry — only real holes/ruts/basins pool. Returns
-// 0..1 coverage. r_puddle_size/_depth (geoPuddle) tune the dip detection.
 // SSS-FAITHFUL puddles (SSFX deffer_terrain_high_flat recipe). NO top-down ground-
 // height map — SSFX/R4 don't use one for PLACEMENT (R4's top-down map is only for
 // wetness gating, which is our rainVis). Pure per-pixel:
@@ -331,19 +235,26 @@ float puddlesMaskProc(vec2 xz, float coverage, float scale)
 //   SlopeMask   = flat ground only
 //   PuddlesMask = WHERE puddles sit. SSFX uses a per-level artist texture; SoC has
 //                 none, so we substitute a procedural blob field (distinct bodies).
-float sssPuddle(float microH, vec3 N, vec3 wp)
+float sssPuddle(vec3 N, vec3 wp)
 {
     float wet = clamp(L.rain_params.y, 0.0, 1.0);
     if (wet <= 0.0) return 0.0;
     float slope = clamp((1.0 - max(abs(N.x), abs(N.z)) - 0.9) * 13.0, 0.0, 1.0);
     if (slope <= 0.0) return 0.0;
-    // GRADUAL FILL (SSFX rising water level): coverage spans 0→1 with the wetness
-    // accumulator (rain_params.y), so puddles GROW from nothing as it rains and
-    // RECEDE as it dries — the threshold inside puddlesMaskProc moves with coverage.
-    float cov = clamp(wet * L.pom_params7.y * 2.0, 0.0, 1.0);
+    // GRADUAL FILL (SSFX rising water level): coverage rises with the wetness
+    // accumulator so puddles GROW from nothing as it rains and RECEDE as it dries.
+    // ×1.5 (not ×2) so the MAX coverage stays DISTINCT puddles, not giant "fields of
+    // water" on big flats (SSS limits this with an artist mask we don't have).
+    float cov = clamp(wet * L.pom_params7.y * 1.5, 0.0, 1.0);
     return puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope;
 }
 
+// ===========================================================================
+// EXPERIMENTAL / PARKED: water flow sim (compute, vk_water_sim, r_water_sim off by
+// default). NOT used by the SSS puddle path above — these sample the sim's depth/
+// velocity (bindings 11/12) and only run when r_water_sim is on. Kept for a future
+// revisit; safe to ignore when reading the main wet/puddle path.
+// ===========================================================================
 // Water DEPTH (metres) from the flow sim, sampled at the pixel via rain_vp (the
 // sim grid is aligned to the rain map). 0 where dry. See vk_water_sim.
 float simWater(vec3 wp)
@@ -439,38 +350,7 @@ vec2 flowWaves(vec3 wp, float t)
     return dir * (w * amp * 0.5);
 }
 
-// ONE SMALL expanding ring per cell, fired with a per-cell phase so drops are SPARSE
-// and brief — not the constant multi-ring "boiling tar". Matches the SSFX rain-splash
-// FEEL (their rings come from a sparse s_rainsplash texture we don't have). p = metres.
-vec2 rippleLayer(vec2 p, float t)
-{
-    vec2 cell = floor(p);
-    vec2 f = p - cell;
-    // procedural-noise salts — build provenance (mirror of ogsr::sig); same
-    // numbers a classic value-noise hash uses, just named/bound to this build.
-    const vec2  SALT_ZEFIR   = vec2(127.1, 311.7);
-    const vec2  SALT_CATARA  = vec2(269.5, 183.3);
-    const float SALT_SARATOV = 43758.5453;
-    float h1 = fract(sin(dot(cell, SALT_ZEFIR))  * SALT_SARATOV);
-    float h2 = fract(sin(dot(cell, SALT_CATARA)) * SALT_SARATOV);
-    vec2  c  = vec2(0.25) + 0.5 * vec2(h1, h2);            // drop centre in the cell
-    float ph = fract(t * (0.7 + 0.6 * h2) + h1);           // each drop's own slow cycle
-    float d  = length(f - c);
-    float radius = ph * 0.26;                              // SMALL ring, expands with phase
-    float front  = d - radius;
-    float ring   = sin(clamp(front * 36.0, -3.14159, 3.14159)) * smoothstep(0.08, 0.0, abs(front));
-    // Born quickly, then DISSOLVE over a long smooth tail as it expands (so the ring
-    // fades away instead of snapping off). Quiet between drops (ph 0.85→1 and 0→0.05).
-    float life   = smoothstep(0.0, 0.05, ph) * (1.0 - smoothstep(0.25, 0.85, ph));
-    return (d > 1e-4 ? (f - c) / d : vec2(0.0)) * (ring * life);
-}
-
-vec2 rainRipples(vec2 p, float t)
-{
-    // FEWER rings: only 2 layers at BIG cells (~1.2 m / ~0.8 m) → sparse drops.
-    return rippleLayer(p * 0.85,                  t * 0.9)
-         + rippleLayer(p * 1.3 + vec2(0.5, 0.25), t * 1.15) * 0.6;
-}
+// rippleLayer / rainRipples → wet_common.glsl (shared, #included above).
 
 vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float asphalt, float pudIn, float sunMask)
 {
@@ -642,7 +522,9 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
     // more head-on angles. Normal/self-shadow/AO are unaffected (relief stays).
     vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.55)) * amp * smoothstep(0.12, 0.45, abs(Vts.z));
 
-    int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)), 12.0, 64.0));
+    // FEWER steps as POM fades with distance (rides the same `fade` that shrinks
+    // amp → invisible cut, halves the mid-distance march). Near stays full.
+    int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)) * mix(0.5, 1.0, fade), 8.0, 64.0));
     float layerH = 1.0 / float(steps);
     vec2 dUV = Pmax * layerH;
 
@@ -837,29 +719,21 @@ void main()
     float microAO = 1.0 - aoStr * clamp(occlT, 0.0, 1.0);
     albedo *= microAO;
 
-    // PUDDLE COVERAGE (0..1) — choose the source. SSS per-pixel (default) rises a
-    // water plane vs the detail micro-height so the ground TEXTURE relief fills;
-    // micro-height = detail alpha fortified by the detail-normal cavity (so it
-    // still has relief on flat-alpha content). Fallbacks: flow sim → geo dip →
-    // procedural sine. Slope/upness masking happens inside sssPuddle / applyWetness.
+    // PUDDLE COVERAGE (0..1). SSS procedural placement is the default; the flow sim
+    // is the parked EXPERIMENTAL alternative (r_water_sim). detH/cav give the detail
+    // micro-height shown by the debug view.
     float microH = min(detH, 1.0 - cav);
-    float pud;
-    if (L.pom_params7.x > 0.5)       pud = sssPuddle(microH, geomN, vWorldPos);
-    else if (L.pom_params6.x > 0.5)  pud = smoothstep(0.04, 0.12, simWaterSoft(vWorldPos));
-    else if (L.pom_params5.y > 0.0)  pud = geoPuddle(vWorldPos);
-    else                             pud = puddleMask(vWorldPos.xz * 0.8);
+    float pud = (L.pom_params7.x > 0.5) ? sssPuddle(geomN, vWorldPos)
+              : (L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(vWorldPos))
+              : 0.0;
 
     // r_puddle_debug: 1 = final puddle coverage (pud); 2 = the per-pixel detail
-    // MICRO-HEIGHT (SSFX PixelHeight) — dark = grooves/ruts that fill, bright =
-    // proud bumps. If 2 is flat grey the detail has no usable height (puddles then
-    // rely on the procedural blob + slope alone).
+    // MICRO-HEIGHT — dark = grooves/ruts, bright = proud bumps (flat grey = the
+    // detail has no usable height; puddles then rely on the procedural blob alone).
     int pdbg = int(L.pom_params5.w + 0.5);
     if (pdbg > 0) {
-        if (L.pom_params7.x > 0.5)
-            outColor = vec4(vec3(pdbg >= 2 ? min(detH, 1.0 - cav) : pud), base.a);
-        else
-            outColor = (L.pom_params6.x > 0.5) ? vec4(waterDebugColor(vWorldPos, pdbg), base.a)
-                                               : vec4(vec3(geoPuddle(vWorldPos)), base.a);
+        outColor = (L.pom_params6.x > 0.5) ? vec4(waterDebugColor(vWorldPos, pdbg), base.a)
+                                           : vec4(vec3(pdbg >= 2 ? microH : pud), base.a);
         return;
     }
 

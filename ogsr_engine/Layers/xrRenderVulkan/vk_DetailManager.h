@@ -116,7 +116,7 @@ struct DetailGenUBO
 };
 static_assert(sizeof(DetailGenUBO) == 64, "Gen UBO must be 64 B");
 
-// Graphics push (176 B) — wind/lighting/interactors.
+// Graphics push (208 B) — wind/lighting/interactors.
 struct DetailGfxPushConstants
 {
     Fmatrix  mViewProj;                            // 64

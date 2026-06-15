@@ -22,6 +22,8 @@
 #include "vk_pass_bloom.h"     // VK::BloomPass — bright-pass + blur for the composite
 #include "vk_pass_ssao.h"      // VK::SSAOPass — GTAO (depth prepass → EnvLight binding 8)
 #include "vk_pass_registry.h"  // VK::PassTimingDestroy() — GPU timing query pool teardown
+#include "vk_imgui.h"          // VK::ImGuiVK::Shutdown() — profiler overlay teardown
+#include "vk_vrs.h"            // VK::VRS::Destroy() — shading-rate image teardown
 #include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
 #include "vk_pass_particles.h" // VK::ParticlePass_Init/Destroy — billboard particle pass
@@ -162,6 +164,8 @@ void vkRenderDeviceRender::Destroy()
     VK::Skinned_Destroy();              Msg("[VK] DevRender::Destroy: SkinnedPass done");
     VK::EnvLight::Destroy();            Msg("[VK] DevRender::Destroy: EnvLight done");
     VK::ShadowMap::Destroy();          Msg("[VK] DevRender::Destroy: ShadowMap done");
+    VK::VRS::Destroy();                 Msg("[VK] DevRender::Destroy: VRS done");
+    VK::ImGuiVK::Shutdown();            Msg("[VK] DevRender::Destroy: ImGui overlay done");
     VK::PassTimingDestroy();            Msg("[VK] DevRender::Destroy: PassTiming done");
     VK::PipelineCache::Destroy();       Msg("[VK] DevRender::Destroy: PipelineCache done");
     VK::WorldMaterialCache::Destroy();  Msg("[VK] DevRender::Destroy: WorldMaterial done");

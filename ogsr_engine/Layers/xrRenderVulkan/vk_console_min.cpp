@@ -13,6 +13,7 @@
 #include "stdafx.h"
 
 #include "../xrRender/xrRender_console.h"
+#include "vk_profiler.h"   // VK::Prof::RequestMark — the `vk_perf` MARK command
 
 // DLSS preset enum values used in default initializers; pull them in directly
 // rather than depending on the Vulkan-side DLSS wrapper.
@@ -143,6 +144,18 @@ int   ps_r_rain_debug = 0;
 // NOT change the weather — just suppresses the rain effect for testing.
 int   ps_r_rain_enable = 1;
 
+// Global render profiler (vk_profiler). 0 = no [VK Perf] logging, 1 = periodic
+// (~5s) GPU/CPU/VRAM log, 2 = + the live ImGui overlay (Phase 2). `vk_perf`
+// forces an immediate MARK snapshot regardless of this value.
+int   ps_r_profiler = 1;
+
+// Variable Rate Shading (vk_vrs, depth-driven). 0 = off, 1 = mild, 2 = aggressive.
+// near/far = distance (m) thresholds: below near stays 1x1, above far goes coarsest.
+// (Live — tune without restart. Level 2 pulls them ~closer.)
+int   ps_r_vrs      = 0;
+float ps_r_vrs_near = 40.0f;
+float ps_r_vrs_far  = 75.0f;
+
 // World heightmap tessellation (R4 TESS_HM port, live): bump-mapped statics
 // displace along the normal by the `<bump>#` alpha height near the camera.
 // r_tess 0 routes everything back to the flat pipelines. max = subdivision
@@ -217,38 +230,28 @@ int   ps_r_terrain_debug = 0;
 // channel (R4 gloss). Asphalt/gravel catch the sun even when dry; grass stays
 // matte. Fades out as the ground wets (the wet reflection takes over). 0 = off.
 float ps_r_terrain_gloss = 0.5f;
-// GEOMETRIC PUDDLES: water pools in REAL terrain depressions instead of the
-// procedural sine mask. The rain occlusion map is a top-down ortho depth of the
-// scene (terrain is in it) = a height field; a pixel deeper than its neighbours
-// sits in a dip and holds water. r_puddle_size = neighbourhood ring radius in
-// rain-map texels (puddle blob size); 0 = geometric OFF (procedural fallback).
-// r_puddle_depth = depth→fill scale (how shallow a dip already reads as water).
-float ps_r_puddle_size   = 16.0f;   // WIDE dip ring (texels ≈ basin size); a tight 0.25x ring also runs to catch ruts. Smaller = finer ruts
-float ps_r_puddle_depth  = 600.0f;  // dip sensitivity (ortho-depth delta → fill); higher = shallower dips/ruts pool
-int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = depth (colour ramp), 2 = flow direction
+int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = coverage, 2 = micro-height / sim flow
 
-// SSS PER-PIXEL PUDDLES (SSFX deffer_terrain_high_flat.ps port): the DEFAULT
-// terrain puddle source. Water is a rising LEVEL vs the per-pixel detail micro-
-// height — grooves/ruts of the ground TEXTURE fill first, raised bumps stay dry,
-// so puddles follow the texture (not a coarse grid → no stripes/teleport, no
-// compute sim). Slope-masked to flat ground. r_puddle_sss = master; r_puddle_level
-// = how high the water plane rises with wetness (bigger = more/larger puddles);
-// r_puddle_micro = micro-height contrast (bigger = only the deepest grooves fill).
+// SSS PUDDLES (SSFX deffer_terrain_high_flat port): the puddle look. Distinct
+// procedural puddle bodies (stand-in for SSFX's per-level artist puddles_mask) that
+// GROW with the wetness accumulator and RECEDE as it dries; slope-masked to flat
+// ground; reflection / drop-ripples / sun glint applied per pixel. r_puddle_sss =
+// master; r_puddle_level = coverage (more/larger puddles); r_puddle_scale = size.
 int   ps_r_puddle_sss    = 1;
 float ps_r_puddle_level  = 0.5f;    // puddle coverage (higher = more/larger puddles, lower = fewer)
-float ps_r_puddle_micro  = 1.0f;
 // Macro placement scale (procedural stand-in for SSFX's per-level puddles_mask).
 // World frequency of the puddle-body noise: bigger = smaller/tighter puddles,
 // smaller = broader pools. ~1.0 ≈ 5-6 m puddles. This is what gives DISTINCT
 // puddles instead of a uniform wet sheet on levels without an artist mask.
 float ps_r_puddle_scale  = 1.0f;
 
-// WATER FLOW SIMULATION (compute, vk_water_sim): a shallow-water field on the
-// rain ortho box. Rain feeds it, water flows downhill (surface relaxation) and
-// pools in basins, evaporation drains it. Drives puddles + the volumetric water
-// render. r_water_sim = master enable; r_water_rain = input rate (depth/s at full
-// rain); r_water_evap = drain rate (depth/s); r_water_flow = relaxation per step
-// (<0.25 stable); r_water_iters = steps/frame (more = faster fill, costs compute).
+// =========================================================================
+// EXPERIMENTAL / PARKED: WATER FLOW SIMULATION (compute, vk_water_sim).
+// Off by default — NOT part of the shipped SSS puddle look. A shallow-water field
+// on the rain ortho box: rain feeds it, water flows downhill and pools, evaporation
+// drains it; when r_water_sim is on it becomes the puddle source + a volumetric
+// water render. Kept for a future revisit (SSS+RDR2 water). All r_water_* below.
+// =========================================================================
 int   ps_r_water_sim    = 0;   // water flow sim OFF by default (experimental; revisit for SSS+RDR2 water)
 float ps_r_water_rain   = 0.4f;
 // Leak RATE (exponential drain ∝ water amount). Flat ground settles at depth
@@ -607,6 +610,16 @@ public:
     virtual void Execute(LPCSTR /*args*/) { Msg("[VK] video_memory_stats — not implemented"); }
 };
 
+// `vk_perf` — force the global profiler to print an immediate [VK Perf] MARK
+// snapshot (per-pass GPU/CPU ms + VRAM + rain/wet state) the instant it's typed.
+// Type it the moment FPS sits to capture exactly that frame's breakdown.
+class CCC_VkPerf : public IConsole_Command
+{
+public:
+    CCC_VkPerf(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; }
+    virtual void Execute(LPCSTR /*args*/) { VK::Prof::RequestMark(); }
+};
+
 // Vulkan stub — R4 dumps Models + Resources. Vulkan models/resources are
 // elsewhere; not wired here yet.
 class CCC_DumpResources : public IConsole_Command
@@ -714,6 +727,13 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r2_ssa_discard", &ps_r__ssaDISCARD, 0.5f, 10);
 
     CMD3(CCC_Mask64, "r2_tonemap", &ps_r2_ls_flags, R2FLAG_TONEMAP);
+    // NOTE: the four r2_tonemap_* knobs below are INERT in the Vulkan renderer.
+    // The VK tonemap (vk_pass_tonemap.cpp) uses fixed exposure constants
+    // (kMiddleGray/kLowLum/kExpMin/kExpMax) and is instantaneous (no temporal
+    // eye-adaptation), so middlegray/lowlum/adaptation/amount have no effect.
+    // They are kept registered only so the options menu (ui_mm_opt.xml) and DX-R4
+    // parity don't error when setting them. The LIVE image controls are
+    // r2_img_exposure / r2_img_saturation / r2_img_gamma / r2_img_cg_*.
     CMD4(CCC_Float, "r2_tonemap_middlegray", &ps_r2_tonemap_middlegray, 0.0f, 2.0f);
     CMD4(CCC_Float, "r2_tonemap_adaptation", &ps_r2_tonemap_adaptation, 0.01f, 10.0f);
     CMD4(CCC_Float, "r2_tonemap_lowlum", &ps_r2_tonemap_low_lum, 0.0001f, 1.0f);
@@ -842,6 +862,15 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_rain_debug", &ps_r_rain_debug, 0, 1);
     CMD4(CCC_Integer, "r_rain", &ps_r_rain_enable, 0, 1);   // master rain on/off (effect only, not weather)
 
+    // Global render profiler (vk_profiler): r_profiler 0/1/2, vk_perf = MARK dump.
+    CMD4(CCC_Integer, "r_profiler", &ps_r_profiler, 0, 2);
+    CMD1(CCC_VkPerf,  "vk_perf");
+
+    // Variable Rate Shading (vk_vrs): 0 off / 1 mild / 2 aggressive + distance thresholds.
+    CMD4(CCC_Integer, "r_vrs", &ps_r_vrs, 0, 2);
+    CMD4(CCC_Float, "r_vrs_near", &ps_r_vrs_near, 0.f, 300.f);
+    CMD4(CCC_Float, "r_vrs_far",  &ps_r_vrs_far,  0.f, 500.f);
+
     // World heightmap tessellation (live, no restart) — see vk_render_queue.cpp.
     CMD4(CCC_Float, "r_tess", &ps_r_tess, 0.f, 1.f);
     CMD4(CCC_Float, "r_tess_max", &ps_r_tess_max, 1.f, 64.f);
@@ -866,13 +895,10 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_terrain_ao", &ps_r_terrain_ao, 0.f, 1.f);         // terrain micro contact AO strength
     CMD4(CCC_Integer, "r_terrain_debug", &ps_r_terrain_debug, 0, 3);     // 0 off,1 normal,2 AO,3 height
     CMD4(CCC_Float, "r_terrain_gloss", &ps_r_terrain_gloss, 0.f, 2.f);   // terrain dry sun-gloss strength
-    CMD4(CCC_Float, "r_puddle_size", &ps_r_puddle_size, 0.f, 64.f);      // geometric puddle ring radius (0=off)
-    CMD4(CCC_Float, "r_puddle_depth", &ps_r_puddle_depth, 0.f, 5000.f);  // geometric puddle depth→fill scale
-    CMD4(CCC_Integer, "r_puddle_debug", &ps_r_puddle_debug, 0, 2);       // 0 off,1 depth colour,2 flow direction
-    CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS per-pixel puddles (default source)
-    CMD4(CCC_Float, "r_puddle_level", &ps_r_puddle_level, 0.f, 1.f);     // water plane rise vs micro-height
-    CMD4(CCC_Float, "r_puddle_micro", &ps_r_puddle_micro, 0.f, 4.f);     // micro-height contrast
-    CMD4(CCC_Float, "r_puddle_scale", &ps_r_puddle_scale, 0.1f, 6.f);    // macro puddle size (freq; bigger=smaller pools)
+    CMD4(CCC_Integer, "r_puddle_debug", &ps_r_puddle_debug, 0, 2);       // 0 off, 1 coverage, 2 micro-height/flow
+    CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS puddles (default puddle source)
+    CMD4(CCC_Float, "r_puddle_level", &ps_r_puddle_level, 0.f, 1.f);     // puddle coverage (more/larger puddles)
+    CMD4(CCC_Float, "r_puddle_scale", &ps_r_puddle_scale, 0.1f, 6.f);    // puddle size (bigger = smaller pools)
     CMD4(CCC_Integer, "r_water_sim", &ps_r_water_sim, 0, 1);             // water flow sim master enable
     CMD4(CCC_Float, "r_water_rain", &ps_r_water_rain, 0.f, 5.f);         // sim rain input rate (depth/s)
     CMD4(CCC_Float, "r_water_evap", &ps_r_water_evap, 0.f, 20.f);        // sim leak rate (exp drain ∝ amount)

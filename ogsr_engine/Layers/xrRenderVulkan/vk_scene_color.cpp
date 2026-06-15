@@ -8,6 +8,7 @@
 // xrRenderVulkan — HDR scene colour target. See vk_scene_color.h.
 #include "stdafx.h"
 #include "vk_scene_color.h"
+#include "vk_profiler.h"   // VK::Prof::NameImage (debug-utils names)
 
 namespace VK { namespace SceneColor {
 
@@ -105,6 +106,7 @@ void EnsureSize(VkExtent2D extent, u32 count)
             Msg("![VK SceneColor] sample view %u create failed", i);
             s_count = i; return;
         }
+        Prof::NameImage(s_image[i], "SceneColor.HDR");
     }
     s_count = count;
     ++s_generation;

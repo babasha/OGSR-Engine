@@ -53,6 +53,12 @@ public:
     // tessellationShader device feature (world heightmap tessellation, R4 TESS_HM)
     bool m_bTessellationSupported = false;
 
+    // Variable Rate Shading — VK_KHR_fragment_shading_rate (attachment-based):
+    // coarse-shade distant/peripheral pixels via a shading-rate image. m_VRSTexelSize
+    // is the SRI tile size queried from the device (NVIDIA = 16x16).
+    bool       m_bVRSSupported = false;
+    VkExtent2D m_VRSTexelSize  = { 16, 16 };
+
     // Window handle (аналог m_hWnd из DX11)
     HWND m_hWnd = nullptr;
 

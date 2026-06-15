@@ -34,6 +34,7 @@
 #include "vk_pipeline_cache.h"   // PipelineCache::GetCacheObject
 #include "vk_env_light.h"        // VK::EnvLight — set 2 (sun_vp + sun shadow map)
 #include "vk_shadow.h"           // ShadowMap::SphereVisible — caster culling (RenderDepth)
+#include "vk_cull.h"             // VK::ExtractFrustumPlanes (shared with DetailManager)
 #include "HW_Vulkan.h"
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_color/hemi_color)
@@ -456,17 +457,7 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     if (m_FrustumUBO && m_FrustumUBO->IsMapped())
     {
         TreeFrustumUBO* fu = (TreeFrustumUBO*)m_FrustumUBO->m_Mapped;
-        Fvector4* p = fu->planes;
-        p[0].set(vp._14 + vp._11, vp._24 + vp._21, vp._34 + vp._31, vp._44 + vp._41); // left
-        p[1].set(vp._14 - vp._11, vp._24 - vp._21, vp._34 - vp._31, vp._44 - vp._41); // right
-        p[2].set(vp._14 + vp._12, vp._24 + vp._22, vp._34 + vp._32, vp._44 + vp._42); // bottom
-        p[3].set(vp._14 - vp._12, vp._24 - vp._22, vp._34 - vp._32, vp._44 - vp._42); // top
-        p[4].set(vp._14 + vp._13, vp._24 + vp._23, vp._34 + vp._33, vp._44 + vp._43); // near
-        p[5].set(vp._14 - vp._13, vp._24 - vp._23, vp._34 - vp._33, vp._44 - vp._43); // far
-        for (int i = 0; i < 6; ++i) {
-            const float L = _sqrt(p[i].x * p[i].x + p[i].y * p[i].y + p[i].z * p[i].z);
-            if (L > 0.0001f) { const float inv = 1.0f / L; p[i].x *= inv; p[i].y *= inv; p[i].z *= inv; p[i].w *= inv; }
-        }
+        VK::ExtractFrustumPlanes(vp, fu->planes);   // shared Gribb/Hartmann (vk_cull.h)
         m_FrustumUBO->Flush();
     }
 
@@ -521,30 +512,7 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     }
 
     // ----- 5) Begin dynamic-rendering pass (LOAD color + depth from world). ----
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView = ctx.colorView; cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView = ctx.depthView; dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; dAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingInfo ri{};
-    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent = ctx.extent; ri.layerCount = 1;
-    ri.colorAttachmentCount = 1; ri.pColorAttachments = &cAtt;
-    ri.pDepthAttachment = &dAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vpRect{};
-    vpRect.x = 0.0f; vpRect.y = float(ctx.extent.height);
-    vpRect.width = float(ctx.extent.width); vpRect.height = -float(ctx.extent.height);
-    vpRect.minDepth = 0.0f; vpRect.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vpRect);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    VK::BeginOverlayRendering(cmd, ctx);   // shared overlay begin — see vk_pass_context.h
 
     // Push constants + transforms (set 0) once — shared across both variants.
     TreeGfxPush pc{};

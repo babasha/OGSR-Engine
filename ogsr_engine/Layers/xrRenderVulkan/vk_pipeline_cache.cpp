@@ -513,10 +513,12 @@ VkPipeline GetTerrainPipeline()
     cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cb.attachmentCount = 1; cb.pAttachments = &ba;
 
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    // VRS: world-color pipelines accept a dynamic fragment shading rate so the
+    // World pass can bind the shading-rate image (vkCmdSetFragmentShadingRateKHR).
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR };
     VkPipelineDynamicStateCreateInfo dynState{};
     dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
+    dynState.dynamicStateCount = VulkanHW.m_bVRSSupported ? 3u : 2u; dynState.pDynamicStates = dyn;
 
     VkFormat colorFormat = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
@@ -756,10 +758,11 @@ static VkPipeline CreatePipeline(const Key& k)
     cb.attachmentCount = 1;
     cb.pAttachments    = &ba;
 
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    // VRS: world-color pipelines accept a dynamic fragment shading rate (see GetTerrainPipeline).
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR };
     VkPipelineDynamicStateCreateInfo dynState{};
     dynState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2;
+    dynState.dynamicStateCount = VulkanHW.m_bVRSSupported ? 3u : 2u;
     dynState.pDynamicStates    = dyn;
 
     VkFormat colorFormat = VK::SceneColor::Format();

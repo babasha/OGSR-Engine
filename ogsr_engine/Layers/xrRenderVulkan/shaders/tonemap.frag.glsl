@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "wet_common.glsl"   // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
 // Tonemap / auto-exposure / bloom / color-grading composite — the final step
 // mapping the HDR scene to the display. Ports the R4 (Enhanced Shaders) chain:
 //   1. auto-exposure (bloom_luminance_3.ps): exposure = middlegray/(avgLum+low),
@@ -60,7 +62,6 @@ layout(set = 1, binding = 0) uniform Lighting {
 } L;
 layout(set = 1, binding = 9)  uniform sampler2D uRainMap; // top-down rain occlusion
 layout(set = 1, binding = 11) uniform sampler2D uWater;   // water depth (flow sim, metres)
-layout(set = 1, binding = 13) uniform sampler2D uGround;  // clean ground-height map (no trees) — real-dip puddles
 
 layout(push_constant) uniform PC {
     vec4 p0;   // x=whitePoint, y=topMipLOD, z=middleGray, w=lowLum
@@ -73,42 +74,8 @@ layout(location = 0) out vec4 outColor;
 
 const vec3 LUM = vec3(0.2126, 0.7152, 0.0722);
 
-// Procedural-noise domain salts for the rain-ripple hash. These are fixed
-// build-provenance constants (mirror of ogsr::sig in vk_authorship.h) — the same
-// numbers a classic value-noise hash would use, just named after and bound to
-// this build's identity. Retuning them only reshuffles the ripple pattern.
-const vec2  SALT_ZEFIR   = vec2(127.1, 311.7);
-const vec2  SALT_CATARA  = vec2(269.5, 183.3);
-const float SALT_SARATOV = 43758.5453;
-
-// ---- SSR puddle helpers (mirror the world shaders' procedural masks) -----
-float puddleMask(vec2 p)
-{
-    float n = sin(p.x * 0.71 + sin(p.y * 0.53) * 1.7)
-            * sin(p.y * 0.67 + sin(p.x * 0.49) * 1.7);
-    return smoothstep(0.15, 0.65, n * 0.5 + 0.5);
-}
-
-vec2 rippleLayer(vec2 p, float t)
-{
-    vec2 cell = floor(p);
-    vec2 f = p - cell;
-    float h1 = fract(sin(dot(cell, SALT_ZEFIR))  * SALT_SARATOV);
-    float h2 = fract(sin(dot(cell, SALT_CATARA)) * SALT_SARATOV);
-    vec2  cc = vec2(0.3) + 0.4 * vec2(h1, h2);
-    float ph = fract(t + h1);
-    float d  = length(f - cc);
-    float ring = sin(clamp((d - ph * 0.5) * 30.0, -3.1416, 3.1416));
-    float fade = (1.0 - ph) * smoothstep(0.5, 0.25, d);
-    return (d > 1e-4 ? (f - cc) / d : vec2(0.0)) * (ring * fade);
-}
-
-vec2 rainRipples(vec2 p, float t)
-{
-    return rippleLayer(p * 2.2,                     t * 1.05)
-         + rippleLayer(p * 1.34 + vec2(0.50, 0.25), t * 1.31)
-         + rippleLayer(p * 1.91 + vec2(0.31, 0.50), t * 1.58);
-}
+// puddleMask/rippleLayer/rainRipples → wet_common.glsl (shared; the SSR ripples
+// now match the world-pass ripples exactly — they used to be a separate old copy).
 
 // Water depth (metres) from the flow sim, sampled at the column via rain_vp.
 float waterDepthAt(vec3 wp)
@@ -126,67 +93,15 @@ float waterDepthAt(vec3 wp)
           + textureLod(uWater, uvr - vec2(0.0, px.y), 0.0).r) * 0.15;
 }
 
-// REAL-DIP puddle placement from the clean ground-height map (no trees) — same
-// recipe as world_terrain.frag::geoPuddle. A pixel deeper than its wide local
-// average sits in a real terrain depression → holds water. This replaces the
-// procedural sine mask so the SSR mirror appears ONLY in actual dips, not over the
-// whole wet ground (which read as a lake). pom_params5.y = ring radius, .z = scale.
-float geoLowAt(vec3 wp, float R)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return -999.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (uv.x < 0.02 || uv.x > 0.98 || uv.y < 0.02 || uv.y > 0.98) return -999.0;
-    float myD = c.z;
-    vec2  o = max(R, 1.0) / vec2(textureSize(uGround, 0));
-    float avg =
-        ( textureLod(uGround, uv + vec2( o.x, 0.0), 0.0).r
-        + textureLod(uGround, uv + vec2(-o.x, 0.0), 0.0).r
-        + textureLod(uGround, uv + vec2(0.0,  o.y), 0.0).r
-        + textureLod(uGround, uv + vec2(0.0, -o.y), 0.0).r
-        + textureLod(uGround, uv + vec2( o.x,  o.y), 0.0).r
-        + textureLod(uGround, uv + vec2(-o.x,  o.y), 0.0).r
-        + textureLod(uGround, uv + vec2( o.x, -o.y), 0.0).r
-        + textureLod(uGround, uv + vec2(-o.x, -o.y), 0.0).r ) * 0.125;
-    return (myD - avg) * max(L.pom_params5.z, 1.0);
-}
-// Procedural puddle-body mask (matches world_terrain): distinct organic blobs.
-float vHash(vec2 p)
-{
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-float vNoise(vec2 p)
-{
-    vec2 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(vHash(i), vHash(i + vec2(1.0, 0.0)), f.x),
-               mix(vHash(i + vec2(0.0, 1.0)), vHash(i + vec2(1.0, 1.0)), f.x), f.y);
-}
-float puddlesMaskProc(vec2 xz, float coverage, float scale)
-{
-    float fq = 0.18 * scale;
-    vec2  p  = xz * fq;
-    // Domain warp + softer edge — MUST match world_terrain so the SSR puddle and the
-    // world-pass puddle have the same organic (non-blocky) outline.
-    vec2 w = vec2(vNoise(p * 0.5 + 3.1), vNoise(p * 0.5 + 8.7)) - 0.5;
-    p += w * 2.2;
-    float n = vNoise(p)              * 0.55
-            + vNoise(p * 2.1 + 19.1) * 0.30
-            + vNoise(p * 4.3 + 47.7) * 0.15;
-    float thr = mix(0.82, 0.40, clamp(coverage, 0.0, 1.0));
-    return smoothstep(thr, thr + 0.24, n);
-}
+// vHash/vNoise/puddlesMaskProc → wet_common.glsl (shared, #included above).
 
-// Puddle coverage — SAME procedural blob as world_terrain::sssPuddle so the SSR
-// scene-mirror appears exactly where the world pass paints puddles. No ground-
-// height map (SSFX/R4 don't use one for placement). Slope/upface handled by the
-// caller's `upface` gate.
-float geoPuddle(vec3 wp)
+// Puddle coverage — SAME procedural blob (+ wetness-driven coverage) as the world
+// pass (sssPuddle), so the SSR scene-mirror appears exactly where the world pass
+// paints puddles. Slope/upface gating is done by the caller's `upface`.
+float puddleCoverage(vec3 wp)
 {
     float wet = clamp(L.rain_params.y, 0.0, 1.0);
-    return puddlesMaskProc(wp.xz, clamp(wet * L.pom_params7.y * 2.0, 0.0, 1.0), L.pom_params7.w);
+    return puddlesMaskProc(wp.xz, clamp(wet * L.pom_params7.y * 1.5, 0.0, 1.0), L.pom_params7.w);
 }
 
 // Binary rain-map visibility (single tap — only gates the puddle mirror).
@@ -245,7 +160,7 @@ void main()
             float wd  = simOn ? waterDepthAt(wp) : 0.0;
             // Real-dip placement (not the old procedural sine mask) → the SSR mirror
             // only fires in actual depressions, so flat wet ground is NOT a lake.
-            float pud = simOn ? smoothstep(0.04, 0.12, wd) : geoPuddle(wp);
+            float pud = simOn ? smoothstep(0.04, 0.12, wd) : puddleCoverage(wp);
 
             float ripFade = smoothstep(18.0, 8.0, zview)
                           * clamp(L.rain_params.x * 1.5 + 0.1, 0.0, 1.0);
