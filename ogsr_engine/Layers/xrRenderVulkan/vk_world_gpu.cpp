@@ -188,8 +188,22 @@ void Build()
         GpuMeshMeta& m = meta[i];
         m.sphere_P     = fv->vis.sphere.P;
         m.sphere_R     = fv->vis.sphere.R;
-        m.index_count  = fv->m_mesh.iCount;
-        m.ib_first     = fv->m_mesh.iBase;
+        // Draw range = what the CPU path draws. PROGRESSIVE meshes (incl. terrain)
+        // must draw their finest sliding-window slice (iBase + sw_offsets[0]/
+        // sw_counts[0], = vkFProgressive::Submit), NOT the whole IB span — the full
+        // span contains ALL LOD slices, and the coarse ones (different/decimated
+        // heights) poke through the fine mesh → a "step" on terrain in the color
+        // pass. (Same over-draw fix already applied to vk_shadow_gpu.)
+        u32 fullFirst = fv->m_mesh.iBase, fullCount = fv->m_mesh.iCount;
+        if (fv->Type == MT_PROGRESSIVE) {
+            auto* pg = static_cast<vkFProgressive*>(fv);
+            if (pg->sw_count > 0 && pg->sw_offsets && pg->sw_counts) {
+                fullFirst = fv->m_mesh.iBase + pg->sw_offsets[0];
+                fullCount = pg->sw_counts[0];
+            }
+        }
+        m.index_count  = fullCount;
+        m.ib_first     = fullFirst;
         m.first_vertex = fv->m_mesh.vBase;
         m.group        = 0;   // assigned after grouping
     }
