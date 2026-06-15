@@ -26,6 +26,7 @@
 #include "vk_TreeManager.h"     // VK::CTreeManager (trees)
 #include "vk_LODManager.h"      // VK::CLODManager (LOD imposters)
 #include "vk_shadow_gpu.h"      // VK::ShadowGPU (GPU-driven sun shadow casters)
+#include "vk_world_gpu.h"       // VK::WorldGPU (GPU-driven world forward pass)
 #include "HW_Vulkan.h"          // VulkanHW (vkDeviceWaitIdle in level_Unload)
 #include "vk_command_buffer.h"  // CommandManager.FlushUploadsAndWait (drain async uploads)
 
@@ -145,6 +146,12 @@ void CRender::level_Load(IReader* fs)
     // CPU FlushDepth path. See vk_pass_shadow / vk_shadow_gpu.
     VK::ShadowGPU::Build();
 
+    // ----- GPU-driven world forward pass -----------------------------------
+    // Extract opaque/AT static world meshes grouped by material for compute-cull
+    // + indirect draw (moves per-object CPU submission off the CPU so detail-rich
+    // levels stop hitting the draw-call wall). See vk_pass_world / vk_world_gpu.
+    VK::WorldGPU::Build();
+
     // ----- LOD imposters ----------------------------------------------------
     // FLOD billboard facets (MT_LOD) for distant foliage density. Must run after
     // LoadVisuals so the vkFLOD objects exist.
@@ -218,6 +225,7 @@ void CRender::level_Unload()
     // GPU-driven shadow casters borrow the shared VB/IB pool handles — release
     // before those pools (below). Device is already idle (vkDeviceWaitIdle above).
     VK::ShadowGPU::Destroy();
+    VK::WorldGPU::Destroy();
 
     if (LODs) {
         LODs->Destroy();

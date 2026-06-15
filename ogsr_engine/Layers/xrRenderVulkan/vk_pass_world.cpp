@@ -9,6 +9,8 @@
 #include "vk_pass_world.h"
 #include "vk_pipeline_cache.h"
 #include "vk_render_queue.h"   // g_RenderQueue (phase 3)
+#include "vk_world_gpu.h"      // VK::WorldGPU (GPU-driven static forward path)
+#include <algorithm>
 #include "vk_swapchain.h"      // Swapchain.m_Images / m_ImageViews
 #include "CRender_Vulkan.h"    // RImplementation, vkRender_Visual ref
 #include "vk_Visual.h"         // vkRender_Visual::Submit
@@ -25,6 +27,7 @@
 
 // Global scope (not in namespace VK → avoid VK::ps_r_cull mangling), like the rain externs.
 extern int ps_r_cull;
+extern int ps_r_gpu_world;   // GPU-driven static world forward path (A/B with 0)
 
 namespace VK {
 
@@ -80,32 +83,68 @@ void Pass_World(FrameContext& ctx)
     // reuses the same set (at set 2). Fence-guarded slot → no in-flight write hazard.
     EnvLight::Update(CommandManager.GetCurrentFrame());
 
-    // Collect + sort the static queue up front — the depth prepass and the
-    // color pass below both consume it.
+    // Collect the static queue up front — the depth prepass and the color pass
+    // below both consume it. With r_gpu_world the GPU draws the eligible static set
+    // (Cull below) and the CPU touches ONLY the pre-built non-GPU static leaves
+    // (wmark/tess/no-diffuse) — no per-frame walk over all level visuals, no
+    // hierarchy double-submit. This DECOUPLES per-frame static CPU from total
+    // object count (the thing that walls detail-heavy levels). Without it (A/B),
+    // the old full walk runs.
+    const bool gpuWorld = ps_r_gpu_world && WorldGPU::Built();
+
+    // CPU-cost diag: time the static collect vs the whole-frame cpu — shows how
+    // much CPU the collection costs (and that gpuWorld decouples it from objects).
+    static double s_qpcToMs = []{ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return 1000.0 / double(f.QuadPart); }();
+    LARGE_INTEGER t_collA; QueryPerformanceCounter(&t_collA);
+
     Fmatrix identity;
     identity.identity();
     g_RenderQueue.Clear();
-    // FRUSTUM CULLING: skip statics outside the camera frustum. We used to submit
-    // the ENTIRE level every frame (the big gap vs R4) — this drops everything
-    // behind/beside the camera. Bounding spheres are world-space (identity xform).
-    // Lossless (off-frustum geometry produces no pixels). Toggle: r_cull.
-    CFrustum camFrustum;
     const bool doCull = (ps_r_cull != 0);
-    if (doCull) { Fmatrix vp = *ctx.viewProj; camFrustum.CreateFromMatrix(vp, FRUSTUM_P_LRTB | FRUSTUM_P_FAR); }
     u32 cullTotal = 0, cullSkipped = 0;
-    for (IRenderVisual* iv : RImplementation.Visuals) {
-        if (!iv) continue;
-        auto* rv = static_cast<vkRender_Visual*>(iv);
-        ++cullTotal;
-        if (doCull) {
-            const Fsphere& bs = rv->vis.sphere;
-            if (bs.R > 0.f && !camFrustum.testSphere_dirty(bs.P, bs.R)) { ++cullSkipped; continue; }
+    if (gpuWorld) {
+        // Only the small pre-built non-GPU static set (frustum-culled). The GPU set
+        // is compute-culled + drawn by WorldGPU::Draw* (no CPU walk for it at all).
+        cullTotal = WorldGPU::SubmitCpuMeshes(g_RenderQueue, *ctx.viewProj, doCull);
+    } else {
+        // FRUSTUM CULLING (old path): walk ALL level visuals, frustum-test, Submit.
+        // Lossless (off-frustum geometry produces no pixels). Toggle: r_cull.
+        CFrustum camFrustum;
+        if (doCull) { Fmatrix vp = *ctx.viewProj; camFrustum.CreateFromMatrix(vp, FRUSTUM_P_LRTB | FRUSTUM_P_FAR); }
+        for (IRenderVisual* iv : RImplementation.Visuals) {
+            if (!iv) continue;
+            auto* rv = static_cast<vkRender_Visual*>(iv);
+            ++cullTotal;
+            if (doCull) {
+                const Fsphere& bs = rv->vis.sphere;
+                if (bs.R > 0.f && !camFrustum.testSphere_dirty(bs.P, bs.R)) { ++cullSkipped; continue; }
+            }
+            rv->Submit(g_RenderQueue, identity, 0.0f);
         }
-        rv->Submit(g_RenderQueue, identity, 0.0f);
     }
     g_RenderQueue.SortByKey();
+    LARGE_INTEGER t_collB; QueryPerformanceCounter(&t_collB);
+    const double cpuCollectMs = double(t_collB.QuadPart - t_collA.QuadPart) * s_qpcToMs;
     { static u32 s_log = 0; if (Device.dwTimeGlobal > s_log + 3000) { s_log = Device.dwTimeGlobal;
-        Msg("[VK Cull] world statics: %u/%u drawn (%u culled)", cullTotal - cullSkipped, cullTotal, cullSkipped); } }
+        if (gpuWorld) Msg("[VK WorldGPU] CPU set drawn=%u (GPU set %u on GPU)", cullTotal, WorldGPU::SetSize());
+        else          Msg("[VK Cull] world statics: %u/%u drawn (%u culled)", cullTotal - cullSkipped, cullTotal, cullSkipped); } }
+
+    // GPU-driven static world: compute-cull the GPU static set (outside any render
+    // pass); DrawDepth/DrawColor below consume its indirect buffer in both passes.
+    if (gpuWorld)
+        WorldGPU::Cull(cmd, *ctx.viewProj);
+
+    // Throttled average: static-collect CPU vs the whole-frame cpu — confirms the
+    // collect cost (now decoupled from object count when gpuWorld).
+    {
+        static double s_accColl = 0; static u32 s_accN = 0, s_accLast = 0;
+        s_accColl += cpuCollectMs; ++s_accN;
+        if (Device.dwTimeGlobal > s_accLast + 3000 && s_accN) {
+            Msg("[VK WorldGPU] CPU diag: collect=%.2fms (avg/%u fr, gpuWorld=%d) | frame cpu=%.2fms",
+                s_accColl / s_accN, s_accN, gpuWorld ? 1 : 0, Device.fTimeDeltaRealMS);
+            s_accColl = 0; s_accN = 0; s_accLast = Device.dwTimeGlobal;
+        }
+    }
 
     // --- DEPTH PREPASS: statics into the scene depth (CLEAR). The color pass
     // then LOADs depth and early-Z rejects every occluded pixel BEFORE the
@@ -137,6 +176,7 @@ void Pass_World(FrameContext& ctx)
         vkCmdSetDepthBias(cmd, 0.f, 0.f, 0.f);   // depth pipelines have dynamic bias — none here
 
         g_RenderQueue.FlushDepth(cmd, *ctx.viewProj, false /*include alpha-tested via AT variant*/);
+        if (gpuWorld) WorldGPU::DrawDepth(cmd, *ctx.viewProj);   // GPU static set into the prepass depth
 
         // Trees into the prepass depth too: GTAO sees trunks/canopies (R4's
         // gbuffer includes trees — most wilderness SSAO comes from them) and
@@ -307,6 +347,9 @@ void Pass_World(FrameContext& ctx)
     // occluded fragment before the forward shader runs.
     const int zStatics = VK::Prof::ZoneBegin(cmd, "World/Statics");
     g_RenderQueue.Flush(ctx);
+    // GPU static set (drawn after the CPU flush so DrawColor's self-contained
+    // pushes don't disturb Flush's push state). EnvLight set = set 1.
+    if (gpuWorld) WorldGPU::DrawColor(cmd, *ctx.viewProj, EnvLight::GetCurrentSet());
     VK::Prof::ZoneEnd(cmd, zStatics);
 
     // Dynamic (spawned) visuals — collected by CRender::add_Visual this frame.

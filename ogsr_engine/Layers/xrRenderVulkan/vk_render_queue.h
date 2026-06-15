@@ -75,6 +75,16 @@ public:
 
     size_t Size() const { return m_Items.size(); }
 
+    // Read-only view of the queued items (diagnostics / GPU-driven overlap analysis).
+    const xr_vector<DrawItem>& Items() const { return m_Items; }
+
+    // GPU-driven world split: drop items whose visual is in the GPU set
+    // (inGpuSet(vis) → drawn by WorldGPU::Draw*) AND dedup the rest by visual.
+    // The CPU world walk double-submits hierarchy children (parent recursion +
+    // own top-level entry) → ~3.7× redundant draws; this keeps one DrawItem per
+    // unique non-GPU visual. Call after SortByKey, before the prepass/color flush.
+    void DedupExclude(bool (*inGpuSet)(vkRender_Visual*));
+
 private:
     xr_vector<DrawItem> m_Items;
     float               m_SubmitHemi = 1.0f;

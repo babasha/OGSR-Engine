@@ -16,6 +16,7 @@
 #include "../../xr_3da/device.h"   // Device.vCameraPosition (tess distance factors)
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace VK {
 
@@ -46,6 +47,21 @@ void RenderQueue::Push(const DrawItem& item)
 void RenderQueue::Clear()
 {
     m_Items.clear();
+}
+
+void RenderQueue::DedupExclude(bool (*inGpuSet)(vkRender_Visual*))
+{
+    if (m_Items.empty()) return;
+    std::unordered_set<const void*> seen;
+    seen.reserve(m_Items.size());
+    xr_vector<DrawItem> out;
+    out.reserve(m_Items.size());
+    for (const DrawItem& it : m_Items) {
+        if (inGpuSet && inGpuSet(it.vis)) continue;     // drawn by WorldGPU
+        if (!seen.insert(it.vis).second) continue;      // duplicate visual (hierarchy double-submit)
+        out.push_back(it);
+    }
+    m_Items.swap(out);
 }
 
 void RenderQueue::SortByKey()

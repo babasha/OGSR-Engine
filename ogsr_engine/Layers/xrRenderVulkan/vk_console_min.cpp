@@ -173,6 +173,14 @@ int   ps_r_gpu_shadows = 1;
 int   ps_r_shadow_lod      = 1;
 float ps_r_shadow_lod_dist = 30.0f;
 
+// GPU-driven world forward pass (vk_world_gpu): static opaque/AT meshes are
+// compute-culled + drawn via indirect (1 draw/material group) instead of the
+// per-object CPU queue, which also dedups the hierarchy double-submit. Cuts CPU
+// draw-call count massively → fps win on CPU-bound / detail-heavy levels.
+// r_gpu_world 0 = old CPU path (A/B). Default ON: measured ~2× fps in the village
+// (CPU ~halved, World/Statics ~5× lower) + user-verified visually identical.
+int   ps_r_gpu_world = 1;
+
 // World heightmap tessellation (R4 TESS_HM port, live): bump-mapped statics
 // displace along the normal by the `<bump>#` alpha height near the camera.
 // r_tess 0 routes everything back to the flat pipelines. max = subdivision
@@ -897,6 +905,9 @@ void xrRender_initconsole()
     // caster-LOD for GPU shadows: coarse geometry for distant casters (A/B with r_shadow_lod 0).
     CMD4(CCC_Integer, "r_shadow_lod", &ps_r_shadow_lod, 0, 1);
     CMD4(CCC_Float, "r_shadow_lod_dist", &ps_r_shadow_lod_dist, 5.0f, 200.0f);
+
+    // GPU-driven world forward pass (vk_world_gpu) — A/B with r_gpu_world 0.
+    CMD4(CCC_Integer, "r_gpu_world", &ps_r_gpu_world, 0, 1);
 
     // World heightmap tessellation (live, no restart) — see vk_render_queue.cpp.
     CMD4(CCC_Float, "r_tess", &ps_r_tess, 0.f, 1.f);
