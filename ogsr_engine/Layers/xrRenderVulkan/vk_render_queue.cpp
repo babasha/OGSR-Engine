@@ -258,7 +258,8 @@ void RenderQueue::Flush(FrameContext& ctx)
     }
 }
 
-void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool skipAlphaTested)
+void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool skipAlphaTested,
+                            bool alphaTestedOnly)
 {
     if (m_Items.empty() || cmd == VK_NULL_HANDLE) return;
     VkPipelineLayout layoutSolid = PipelineCache::GetDepthLayout();
@@ -290,6 +291,7 @@ void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool s
         if (mat && mat->isWmark) continue;   // baked decals never write depth (prepass/shadows)
         const float aref = mat ? mat->alphaRef : -1.f;
         const bool  at   = aref >= 0.f;
+        if (!at && alphaTestedOnly) continue;   // opaque handled by GPU-driven shadow path
         if (at && (skipAlphaTested || layoutAT == VK_NULL_HANDLE
                    || mat->set == VK_NULL_HANDLE)) continue;
 

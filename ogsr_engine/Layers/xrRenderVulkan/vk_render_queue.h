@@ -67,7 +67,11 @@ public:
     // only. Used by the sun/spot shadow casters AND the camera depth prepass;
     // the prepass passes skipAlphaTested=true (a position-only shader can't
     // discard, so punch-out materials would poke opaque holes in the depth).
-    void FlushDepth(VkCommandBuffer cmd, const Fmatrix& vp, bool skipAlphaTested = false);
+    // alphaTestedOnly=true skips OPAQUE casters (they're rendered by the
+    // GPU-driven compute-cull + indirect path, vk_shadow_gpu) — the CPU queue
+    // then draws only the alpha-tested cutout casters the GPU path can't.
+    void FlushDepth(VkCommandBuffer cmd, const Fmatrix& vp, bool skipAlphaTested = false,
+                    bool alphaTestedOnly = false);
 
     size_t Size() const { return m_Items.size(); }
 

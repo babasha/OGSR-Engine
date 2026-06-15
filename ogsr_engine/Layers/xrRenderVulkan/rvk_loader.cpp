@@ -25,6 +25,7 @@
 #include "vk_DetailManager.h"   // VK::CDetailManager (grass)
 #include "vk_TreeManager.h"     // VK::CTreeManager (trees)
 #include "vk_LODManager.h"      // VK::CLODManager (LOD imposters)
+#include "vk_shadow_gpu.h"      // VK::ShadowGPU (GPU-driven sun shadow casters)
 #include "HW_Vulkan.h"          // VulkanHW (vkDeviceWaitIdle in level_Unload)
 #include "vk_command_buffer.h"  // CommandManager.FlushUploadsAndWait (drain async uploads)
 
@@ -137,6 +138,13 @@ void CRender::level_Load(IReader* fs)
     if (!Trees) Trees = xr_new<VK::CTreeManager>();
     Trees->Build();
 
+    // ----- GPU-driven sun shadow casters -----------------------------------
+    // Extract opaque static casters (shared VB/IB pools, world-space) into a
+    // meta SSBO + indirect/count buffers for per-cascade compute cull. Must run
+    // AFTER LoadVisuals (Visuals[] populated). Alpha-tested casters stay on the
+    // CPU FlushDepth path. See vk_pass_shadow / vk_shadow_gpu.
+    VK::ShadowGPU::Build();
+
     // ----- LOD imposters ----------------------------------------------------
     // FLOD billboard facets (MT_LOD) for distant foliage density. Must run after
     // LoadVisuals so the vkFLOD objects exist.
@@ -206,6 +214,10 @@ void CRender::level_Unload()
         Trees->Destroy();
         xr_delete(Trees);
     }
+
+    // GPU-driven shadow casters borrow the shared VB/IB pool handles — release
+    // before those pools (below). Device is already idle (vkDeviceWaitIdle above).
+    VK::ShadowGPU::Destroy();
 
     if (LODs) {
         LODs->Destroy();

@@ -16,6 +16,8 @@
 #include "vk_pass_skinned.h"               // Skinned_UploadBones / Skinned_RenderShadow
 #include "vk_light.h"                      // Lights::CollectFrame (shadowed spot/point picks)
 #include "vk_TreeManager.h"                // Trees->RenderDepth (leafy crown casters)
+#include "vk_shadow_gpu.h"                 // ShadowGPU::Cull/Draw (GPU-driven opaque casters)
+#include "vk_cull.h"                       // VK::ExtractFrustumPlanes (light frustum → cull planes)
 #include "CRender_Vulkan.h"                // RImplementation.Visuals / b_loaded
 #include "vk_Visual.h"                     // vkRender_Visual::Submit
 #include "HW_Vulkan.h"
@@ -28,6 +30,9 @@
 extern int ps_r_rain_enable;
 extern int ps_r_water_sim;   // gate the ground-height map render (sim)
 extern int ps_r_puddle_sss;  // gate the ground-height map render (SSS puddle real-dip placement)
+extern int ps_r_gpu_shadows; // GPU-driven opaque sun shadow casters (A/B with 0)
+extern int   ps_r_shadow_lod;      // caster-LOD: distant casters draw coarse geometry (A/B with 0)
+extern float ps_r_shadow_lod_dist; // metres from camera beyond which casters go coarse
 
 namespace VK {
 
@@ -172,6 +177,17 @@ void Pass_SunShadow(FrameContext& ctx)
     const bool   loaded = RImplementation.b_loaded && !RImplementation.Visuals.empty();
     const size_t nVis   = loaded ? RImplementation.Visuals.size() : 0;
 
+    // GPU-driven opaque sun casters: compute-cull + indirect draw replaces the
+    // per-object CPU FlushDepth of OPAQUE statics in the three sun targets (far
+    // map + 2 near cascades). The CPU queues then draw only the alpha-tested
+    // cutout casters (atOnly). Falls back to the full CPU path when disabled or
+    // when the GPU system has no casters / failed to build (so opaque shadows
+    // never silently vanish).
+    const bool gpuShadows = ps_r_gpu_shadows && ShadowGPU::Built();
+    // caster-LOD distance (0 disables → full detail everywhere). Distant casters
+    // (esp. progressive terrain/big meshes) emit their coarse slice in the cull.
+    const float shadowLodDist = ps_r_shadow_lod ? ps_r_shadow_lod_dist : 0.0f;
+
     // Bones for the skinned casters below (Pass_Skinned reuses the same upload).
     Skinned_UploadBones();
 
@@ -211,6 +227,14 @@ void Pass_SunShadow(FrameContext& ctx)
             s_ShadowQueue.SortByKey();
         }
 
+        // GPU-driven opaque caster cull (compute) — MUST run before BeginRendering.
+        if (gpuShadows) {
+            Fvector4 planes[6];
+            VK::ExtractFrustumPlanes(ShadowMap::GetLightVP(), planes);
+            ShadowGPU::Target tgt = ShadowGPU::TGT_FAR;
+            ShadowGPU::Cull(cmd, &tgt, planes, 1, Device.vCameraPosition, shadowLodDist);
+        }
+
         // TRANSFER_SRC (or UNDEFINED on first use) → DEPTH_ATTACHMENT for writing.
         const VkImageLayout oldLayout = s_firstUse ? VK_IMAGE_LAYOUT_UNDEFINED
                                                    : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -240,7 +264,11 @@ void Pass_SunShadow(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &scShadow);
         vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
-        s_ShadowQueue.FlushDepth(cmd, ShadowMap::GetLightVP());
+        // Opaque statics via the GPU indirect path; the CPU queue draws only the
+        // alpha-tested cutout casters (atOnly). Without the GPU path, full CPU flush.
+        s_ShadowQueue.FlushDepth(cmd, ShadowMap::GetLightVP(), false, gpuShadows);
+        if (gpuShadows)
+            ShadowGPU::Draw(cmd, ShadowGPU::TGT_FAR, ShadowMap::GetLightVP());
 
         // Trees (GPU-driven elsewhere — not in the queue): alpha-tested leafy
         // crowns into the sun map, CPU-culled by the light box. Redraw-only cost.
@@ -443,6 +471,15 @@ void Pass_SunShadow(FrameContext& ctx)
             else                                  s_cascSunDir = sunDir;
         }
 
+        // Phase A: choose which cascades render this frame, compute their VPs +
+        // rebuild their cached caster queues, and GPU-cull ALL of them in ONE
+        // compute batch BEFORE any cascade render pass — so the depth raster never
+        // interleaves with compute (one compute↔graphics transition for the whole
+        // cascade stage instead of one per cascade).
+        bool              doCasc[ShadowMap::kNumSunCascades] = {};
+        ShadowGPU::Target cullTgts[ShadowMap::kNumSunCascades];
+        Fvector4          cullPlanes[ShadowMap::kNumSunCascades * 6];
+        u32 nCull = 0;
         for (u32 ci = 0; ci < ShadowMap::kNumSunCascades; ++ci)
         {
             // Cascade 1 re-renders every OTHER frame (30 Hz shadow update is
@@ -451,6 +488,7 @@ void Pass_SunShadow(FrameContext& ctx)
             // the cached contents. Cascade 0 stays per-frame.
             if (ci == 1 && !s_cascFirst && (Device.dwFrame & 1))
                 continue;
+            doCasc[ci] = true;
 
             ShadowMap::ComputeCascadeVP(ci, s_cascSunDir);
 
@@ -480,6 +518,21 @@ void Pass_SunShadow(FrameContext& ctx)
                 }
             }
 
+            if (gpuShadows) {
+                VK::ExtractFrustumPlanes(ShadowMap::GetCascadeVP(ci), &cullPlanes[nCull * 6]);
+                cullTgts[nCull] = (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci);
+                ++nCull;
+            }
+        }
+        if (gpuShadows && nCull)
+            ShadowGPU::Cull(cmd, cullTgts, cullPlanes, nCull, Device.vCameraPosition, shadowLodDist);
+
+        // Phase B: render the chosen cascades — graphics only, no compute between
+        // (the indirect buffers were filled by the single batched cull above).
+        for (u32 ci = 0; ci < ShadowMap::kNumSunCascades; ++ci)
+        {
+            if (!doCasc[ci]) continue;
+
             ImageBarrier(cmd, ShadowMap::GetCascadeImage(ci),
                          s_cascFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -507,7 +560,9 @@ void Pass_SunShadow(FrameContext& ctx)
             vkCmdSetScissor(cmd, 0, 1, &scC);
             vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
-            s_CascQueue[ci].FlushDepth(cmd, ShadowMap::GetCascadeVP(ci));
+            s_CascQueue[ci].FlushDepth(cmd, ShadowMap::GetCascadeVP(ci), false, gpuShadows);
+            if (gpuShadows)
+                ShadowGPU::Draw(cmd, (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
             if (RImplementation.Trees && RImplementation.Trees->IsBuilt())
                 RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci);
             Skinned_RenderShadow(cmd, ShadowMap::GetCascadeVP(ci));

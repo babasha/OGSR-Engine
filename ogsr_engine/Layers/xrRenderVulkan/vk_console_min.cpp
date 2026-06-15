@@ -160,6 +160,19 @@ float ps_r_vrs_far  = 75.0f;
 // submit the entire level every frame. r_cull 0 = brute-force all (A/B).
 int   ps_r_cull = 1;
 
+// GPU-driven sun shadow casters (vk_shadow_gpu): opaque statics are compute-culled
+// per cascade and drawn via vkCmdDrawIndexedIndirectCount; the CPU queue then draws
+// only the alpha-tested cutout casters. Default ON. r_gpu_shadows 0 = old CPU
+// FlushDepth-all path (A/B for the SunShadow profiler zone).
+int   ps_r_gpu_shadows = 1;
+
+// caster-LOD for GPU-driven sun shadows: casters farther than r_shadow_lod_dist
+// metres from the camera draw their COARSE sliding-window slice (progressive
+// terrain/big meshes → far fewer triangles in the shadow map). r_shadow_lod 0 =
+// full detail everywhere (A/B). Only affects the GPU shadow path.
+int   ps_r_shadow_lod      = 1;
+float ps_r_shadow_lod_dist = 30.0f;
+
 // World heightmap tessellation (R4 TESS_HM port, live): bump-mapped statics
 // displace along the normal by the `<bump>#` alpha height near the camera.
 // r_tess 0 routes everything back to the flat pipelines. max = subdivision
@@ -877,6 +890,13 @@ void xrRender_initconsole()
 
     // Frustum culling of world statics (A/B with r_cull 0).
     CMD4(CCC_Integer, "r_cull", &ps_r_cull, 0, 1);
+
+    // GPU-driven sun shadow casters (vk_shadow_gpu) — A/B with r_gpu_shadows 0.
+    CMD4(CCC_Integer, "r_gpu_shadows", &ps_r_gpu_shadows, 0, 1);
+
+    // caster-LOD for GPU shadows: coarse geometry for distant casters (A/B with r_shadow_lod 0).
+    CMD4(CCC_Integer, "r_shadow_lod", &ps_r_shadow_lod, 0, 1);
+    CMD4(CCC_Float, "r_shadow_lod_dist", &ps_r_shadow_lod_dist, 5.0f, 200.0f);
 
     // World heightmap tessellation (live, no restart) — see vk_render_queue.cpp.
     CMD4(CCC_Float, "r_tess", &ps_r_tess, 0.f, 1.f);
