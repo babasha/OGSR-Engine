@@ -156,6 +156,10 @@ int   ps_r_vrs      = 0;
 float ps_r_vrs_near = 40.0f;
 float ps_r_vrs_far  = 75.0f;
 
+// Frustum culling of world statics (default ON). The big win vs R4 — we used to
+// submit the entire level every frame. r_cull 0 = brute-force all (A/B).
+int   ps_r_cull = 1;
+
 // World heightmap tessellation (R4 TESS_HM port, live): bump-mapped statics
 // displace along the normal by the `<bump>#` alpha height near the camera.
 // r_tess 0 routes everything back to the flat pipelines. max = subdivision
@@ -870,6 +874,9 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_vrs", &ps_r_vrs, 0, 2);
     CMD4(CCC_Float, "r_vrs_near", &ps_r_vrs_near, 0.f, 300.f);
     CMD4(CCC_Float, "r_vrs_far",  &ps_r_vrs_far,  0.f, 500.f);
+
+    // Frustum culling of world statics (A/B with r_cull 0).
+    CMD4(CCC_Integer, "r_cull", &ps_r_cull, 0, 1);
 
     // World heightmap tessellation (live, no restart) — see vk_render_queue.cpp.
     CMD4(CCC_Float, "r_tess", &ps_r_tess, 0.f, 1.f);

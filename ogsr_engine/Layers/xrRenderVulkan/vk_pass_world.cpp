@@ -21,7 +21,10 @@
 #include "vk_profiler.h"       // VK::Prof sub-zones (Depth/SSAO/Color/Statics/Skinned breakdown)
 #include "vk_vrs.h"            // VK::VRS — variable rate shading (depth-driven SRI)
 #include "HW_Vulkan.h"         // VulkanHW.m_bVRSSupported
-#include "vk_command_buffer.h" // CommandManager.GetCurrentFrame() — VRS ring slot
+#include "../../xr_3da/device.h" // Device.dwTimeGlobal (cull diag throttle)
+
+// Global scope (not in namespace VK → avoid VK::ps_r_cull mangling), like the rain externs.
+extern int ps_r_cull;
 
 namespace VK {
 
@@ -82,11 +85,27 @@ void Pass_World(FrameContext& ctx)
     Fmatrix identity;
     identity.identity();
     g_RenderQueue.Clear();
+    // FRUSTUM CULLING: skip statics outside the camera frustum. We used to submit
+    // the ENTIRE level every frame (the big gap vs R4) — this drops everything
+    // behind/beside the camera. Bounding spheres are world-space (identity xform).
+    // Lossless (off-frustum geometry produces no pixels). Toggle: r_cull.
+    CFrustum camFrustum;
+    const bool doCull = (ps_r_cull != 0);
+    if (doCull) { Fmatrix vp = *ctx.viewProj; camFrustum.CreateFromMatrix(vp, FRUSTUM_P_LRTB | FRUSTUM_P_FAR); }
+    u32 cullTotal = 0, cullSkipped = 0;
     for (IRenderVisual* iv : RImplementation.Visuals) {
         if (!iv) continue;
-        static_cast<vkRender_Visual*>(iv)->Submit(g_RenderQueue, identity, 0.0f);
+        auto* rv = static_cast<vkRender_Visual*>(iv);
+        ++cullTotal;
+        if (doCull) {
+            const Fsphere& bs = rv->vis.sphere;
+            if (bs.R > 0.f && !camFrustum.testSphere_dirty(bs.P, bs.R)) { ++cullSkipped; continue; }
+        }
+        rv->Submit(g_RenderQueue, identity, 0.0f);
     }
     g_RenderQueue.SortByKey();
+    { static u32 s_log = 0; if (Device.dwTimeGlobal > s_log + 3000) { s_log = Device.dwTimeGlobal;
+        Msg("[VK Cull] world statics: %u/%u drawn (%u culled)", cullTotal - cullSkipped, cullTotal, cullSkipped); } }
 
     // --- DEPTH PREPASS: statics into the scene depth (CLEAR). The color pass
     // then LOADs depth and early-Z rejects every occluded pixel BEFORE the
