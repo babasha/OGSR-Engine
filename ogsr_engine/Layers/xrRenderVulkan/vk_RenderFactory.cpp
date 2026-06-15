@@ -338,9 +338,15 @@ private:
 
         // .ogm beats .dds (R4 ordering — SH_Texture.cpp:181).
         if (!tryLoadOgmSlot(m_TexName, *slot)) {
+            // Probe for a static .dds by existence first — R4 resolves
+            // .ogm/.avi/.seq/.dds via FS.exist and never blind-opens. Without this
+            // guard LoadDDS logs a scary "Failed to open" for every animated /
+            // seq-only UI texture (e.g. ui_noise) that legitimately has no static
+            // .dds, then loads fine through the .seq fallback right below.
             string_path full;
-            FS.update_path(full, "$game_textures$", (m_TexName + ".dds").c_str());
-            bool loaded = slot->texture.LoadDDS(full);
+            bool loaded = false;
+            if (FS.exist(full, "$game_textures$", m_TexName.c_str(), ".dds"))
+                loaded = slot->texture.LoadDDS(full);
             if (!loaded) loaded = loadFirstSeqFrame(m_TexName, *slot);
             if (loaded) {
                 slot->hasTex = true;
@@ -481,6 +487,12 @@ struct vkFontRender_Real final : IFontRender
                     }
 
                     X += scw * owner.vInterval.x;
+
+                    // Multibyte (Cyrillic) fonts encode the space as a zero/near-zero
+                    // width glyph; the actual gap comes from fXStep. Without this the
+                    // DX path applies, words run together — "шрифты без пробелов".
+                    if (owner.IsMultibyte() && IsSpaceCharacter(wsStr[1 + j]))
+                        X += owner.GetfXStep() * owner.vInterval.x * owner.GetWidthScale();
                 }
             }
 

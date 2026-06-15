@@ -43,12 +43,32 @@ VkSurfaceFormatKHR CVulkanSwapchain::ChooseSurfaceFormat(const std::vector<VkSur
 // Выбор present mode
 VkPresentModeKHR CVulkanSwapchain::ChoosePresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes)
 {
-    // Предпочитаем MAILBOX (triple buffering, low latency)
-    for (const auto& mode : availablePresentModes) {
-        if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-            Msg("[Vulkan] Using MAILBOX present mode (triple buffering)");
-            return mode;
-        }
+    auto has = [&](VkPresentModeKHR m) {
+        return std::find(availablePresentModes.begin(), availablePresentModes.end(), m)
+               != availablePresentModes.end();
+    };
+
+    // Launch-param overrides. FIFO (steady, every-frame vsync) is the most
+    // compatible present mode for screen-recording / capture software — MAILBOX
+    // lets the driver silently DROP already-queued frames, which OBS & co. see
+    // as stutter/instability. Give the user a lever to force it (or to go fully
+    // uncapped) without a rebuild.
+    const bool forceVsync = Core.Params && strstr(Core.Params, "-vsync");
+    const bool noVsync    = Core.Params && strstr(Core.Params, "-no_vsync");
+
+    if (forceVsync) {
+        Msg("[Vulkan] Using FIFO present mode (vsync — forced by -vsync, recorder-friendly)");
+        return VK_PRESENT_MODE_FIFO_KHR;  // guaranteed available by the spec
+    }
+    if (noVsync && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+        Msg("[Vulkan] Using IMMEDIATE present mode (-no_vsync — uncapped, may tear)");
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+
+    // Default: MAILBOX (triple buffering, low latency) when available.
+    if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        Msg("[Vulkan] Using MAILBOX present mode (triple buffering)");
+        return VK_PRESENT_MODE_MAILBOX_KHR;
     }
 
     // Fallback: FIFO (vsync, always available)

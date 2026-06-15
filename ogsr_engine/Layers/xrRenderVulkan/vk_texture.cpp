@@ -46,6 +46,18 @@ struct DDS_HEADER {
 const u32 FOURCC_DXT1 = 0x31545844; // "DXT1"
 const u32 FOURCC_DXT3 = 0x33545844; // "DXT3"
 const u32 FOURCC_DXT5 = 0x35545844; // "DXT5"
+const u32 FOURCC_DX10 = 0x30315844; // "DX10" — extended header (DDS_HEADER_DXT10) follows
+
+// Present immediately after DDS_HEADER when ddspf.dwFourCC == "DX10". Modern
+// compressors (BC7/BC6H, and BC1-5 re-saved by texconv) emit this instead of the
+// legacy FourCC, carrying an explicit DXGI format.
+struct DDS_HEADER_DXT10 {
+    u32 dxgiFormat;
+    u32 resourceDimension;
+    u32 miscFlag;
+    u32 arraySize;
+    u32 miscFlags2;
+};
 
 // Flags
 const u32 DDPF_ALPHAPIXELS = 0x1;
@@ -396,6 +408,38 @@ void CVulkanTexture::Destroy()
     m_ArrayLayers = 1;
 }
 
+// Map a DXGI_FORMAT (from a DX10 extended DDS header) to the VkFormat we load it
+// as. The engine runs an UNORM pipeline (UNORM swapchain, no gamma hardware), so
+// sRGB DXGI variants are loaded as their UNORM equivalents — same convention the
+// legacy BC1/2/3 path already uses. Returns VK_FORMAT_UNDEFINED for formats we
+// don't handle so the caller can bail with a clear message.
+static VkFormat DXGIFormatToVk(u32 dxgi)
+{
+    switch (dxgi) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R8_UNORM:            return VK_FORMAT_R8_UNORM;
+        case DXGI_FORMAT_R8G8_UNORM:          return VK_FORMAT_R8G8_UNORM;
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:      return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:      return VK_FORMAT_BC2_UNORM_BLOCK;
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:      return VK_FORMAT_BC3_UNORM_BLOCK;
+        case DXGI_FORMAT_BC4_UNORM:           return VK_FORMAT_BC4_UNORM_BLOCK;
+        case DXGI_FORMAT_BC4_SNORM:           return VK_FORMAT_BC4_SNORM_BLOCK;
+        case DXGI_FORMAT_BC5_UNORM:           return VK_FORMAT_BC5_UNORM_BLOCK;
+        case DXGI_FORMAT_BC5_SNORM:           return VK_FORMAT_BC5_SNORM_BLOCK;
+        case DXGI_FORMAT_BC6H_UF16:           return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+        case DXGI_FORMAT_BC6H_SF16:           return VK_FORMAT_BC6H_SFLOAT_BLOCK;
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB:      return VK_FORMAT_BC7_UNORM_BLOCK;
+        default:                              return VK_FORMAT_UNDEFINED;
+    }
+}
+
 // Загрузка DDS
 bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
 {
@@ -420,30 +464,49 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
 
     // Determine format
     VkFormat format = VK_FORMAT_UNDEFINED;
-    
+    bool expand24to32 = false;   // set for 24-bit RGB → upconverted to 32-bit on load
+
     if (header.ddspf.dwFlags & DDPF_FOURCC) {
-        switch (header.ddspf.dwFourCC) {
-            case FOURCC_DXT1:
-                // DXT1 always has 1-bit punch-through alpha in X-Ray engine.
-                // Many DDS files omit DDPF_ALPHAPIXELS flag but still use alpha.
-                // D3D11 always treats DXT1 as having alpha, so we do the same.
-                format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-                break;
-            case FOURCC_DXT3:
-                format = VK_FORMAT_BC2_UNORM_BLOCK;
-                break;
-            case FOURCC_DXT5:
-                format = VK_FORMAT_BC3_UNORM_BLOCK;
-                break;
-            default:
-                Msg("![Vulkan] Unsupported FourCC: %X in %s", header.ddspf.dwFourCC, filename);
+        if (header.ddspf.dwFourCC == FOURCC_DX10) {
+            // Extended DX10 header carries an explicit DXGI format (BC7/BC6H etc.).
+            // Reading it also advances past the 20 extra bytes so the pixel data
+            // that follows is at the correct file offset.
+            DDS_HEADER_DXT10 h10{};
+            F->r(&h10, sizeof(h10));
+            format = DXGIFormatToVk(h10.dxgiFormat);
+            if (format == VK_FORMAT_UNDEFINED) {
+                Msg("![Vulkan] Unsupported DXGI format %u (DX10 header) in %s", h10.dxgiFormat, filename);
                 FS.r_close(F);
                 return false;
+            }
+            // The legacy R↔B swap only applies to BGR-ordered DXT UI atlases;
+            // DX10 textures encode their true channel order in dxgiFormat, so swap
+            // only when the caller asked AND the format is a (BC) compressed one.
+            m_bBCSwizzle = applyBCSwizzle && IsCompressedFormat(format);
+        } else {
+            switch (header.ddspf.dwFourCC) {
+                case FOURCC_DXT1:
+                    // DXT1 always has 1-bit punch-through alpha in X-Ray engine.
+                    // Many DDS files omit DDPF_ALPHAPIXELS flag but still use alpha.
+                    // D3D11 always treats DXT1 as having alpha, so we do the same.
+                    format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+                    break;
+                case FOURCC_DXT3:
+                    format = VK_FORMAT_BC2_UNORM_BLOCK;
+                    break;
+                case FOURCC_DXT5:
+                    format = VK_FORMAT_BC3_UNORM_BLOCK;
+                    break;
+                default:
+                    Msg("![Vulkan] Unsupported FourCC: %X in %s", header.ddspf.dwFourCC, filename);
+                    FS.r_close(F);
+                    return false;
+            }
+            // X-Ray UI atlases ship with BGR-ordered BC endpoints (yellow indicators
+            // come out blue without R↔B swap). Level statics are stock BC1/3 with
+            // RGB endpoints — `applyBCSwizzle=false` keeps them correct.
+            m_bBCSwizzle = applyBCSwizzle;
         }
-        // X-Ray UI atlases ship with BGR-ordered BC endpoints (yellow indicators
-        // come out blue without R↔B swap). Level statics are stock BC1/3 with
-        // RGB endpoints — `applyBCSwizzle=false` keeps them correct.
-        m_bBCSwizzle = applyBCSwizzle;
     } else if (header.ddspf.dwFlags & DDPF_RGB) {
         if (header.ddspf.dwRGBBitCount == 32) {
             // Choose format based on channel masks. D3DFMT_A8R8G8B8 (BGRA-in-
@@ -455,6 +518,16 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
             } else {
                 format = VK_FORMAT_B8G8R8A8_UNORM;
             }
+        } else if (header.ddspf.dwRGBBitCount == 24) {
+            // Vulkan optimal-tiling sampled images don't support 3-byte R8G8B8, so
+            // we upconvert to 32-bit (opaque alpha) on load. The blue mask tells us
+            // the in-memory byte order (B first → D3DFMT_R8G8B8 / BGR, the common
+            // case), so we tag the matching 32-bit format and copy bytes straight
+            // through in the expansion pass below — no channel shuffle needed.
+            format = (header.ddspf.dwBBitMask == 0x000000FF)
+                       ? VK_FORMAT_B8G8R8A8_UNORM
+                       : VK_FORMAT_R8G8B8A8_UNORM;
+            expand24to32 = true;
         } else {
             Msg("![Vulkan] Unsupported RGB bit count: %d in %s", header.ddspf.dwRGBBitCount, filename);
             FS.r_close(F);
@@ -523,6 +596,33 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
     void* data = xr_malloc(dataSize);
     F->r(data, dataSize);
     FS.r_close(F);
+
+    // 24-bit RGB → 32-bit RGBA expansion. Walk the mip chain exactly as
+    // UploadData does (halve per level, floor at 1) so the rebuilt buffer is
+    // tightly packed at 4 bpp and the copy regions line up.
+    if (expand24to32) {
+        u32 dstSize = 0;
+        for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
+            dstSize += w * h * 4;
+            if (w > 1) w >>= 1;
+            if (h > 1) h >>= 1;
+        }
+        u8* dst = (u8*)xr_malloc(dstSize);
+        const u8* src = (const u8*)data;
+        u8* d = dst;
+        for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
+            const u32 px = w * h;
+            for (u32 p = 0; p < px; ++p) {
+                d[0] = src[0]; d[1] = src[1]; d[2] = src[2]; d[3] = 0xFF;
+                d += 4; src += 3;
+            }
+            if (w > 1) w >>= 1;
+            if (h > 1) h >>= 1;
+        }
+        xr_free(data);
+        data     = dst;
+        dataSize = dstSize;
+    }
 
     // Upload
     UploadData(data, dataSize);

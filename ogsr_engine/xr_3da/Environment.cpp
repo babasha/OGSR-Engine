@@ -530,6 +530,11 @@ void CEnvironment::OnFrame()
     m_pRender->OnFrame(*this);
 }
 
+bool CEnvironment::IsThunderboltActive() const
+{
+    return eff_Thunderbolt && eff_Thunderbolt->IsActive();
+}
+
 void CEnvironment::calculate_config_sun_dir() const
 {
     float current_time = fGameTime / (DAY_LENGTH / 24);

@@ -126,6 +126,11 @@ public:
     void OnFrame(shared_str id, float period, float duration);
     void Render(CBackend& cmd_list);
 
+    // True while a bolt is flashing. During this window OnFrame() overwrites
+    // CurrentEnv->sun_dir with the bolt direction, so shadow code must hold its
+    // last real sun direction instead of following it (see vk_pass_shadow).
+    bool IsActive() const { return state == stWorking; }
+
     shared_str AppendDef(CEnvironment& environment, CInifile* pIni, CInifile* thunderbolts, LPCSTR sect);
     shared_str AppendDef_shoc(CEnvironment& environment, CInifile* pIni, LPCSTR sect);
 };

@@ -345,6 +345,9 @@ public:
     bool SetWeatherFX(shared_str name);
     bool SetWeatherFXFromTime(shared_str name, float time);
     bool IsWeatherFXPlaying() const { return b_wfx; }
+    // True while a thunderbolt is flashing (it transiently overwrites the env
+    // sun_dir — shadow cascades must freeze their sun while this is set).
+    bool IsThunderboltActive() const;
     void StopWeatherFX();
 
     void SetWeather(shared_str name, bool forced = false);

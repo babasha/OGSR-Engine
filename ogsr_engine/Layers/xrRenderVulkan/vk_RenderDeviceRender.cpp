@@ -59,12 +59,46 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     // (i.e. the resolution the user sees) regardless of the tiny default
     // window. Resize the window itself too, otherwise UI ends up squished.
     extern u32 psCurrentVidMode[2];
+
+    // Fullscreen handling. The engine's rs_fullscreen toggle is commented out
+    // engine-wide; the DX11/R4 path just runs as a BORDERLESS window covering
+    // the whole monitor (CHW::UpdateWindowProps — style 0, sized to the desktop
+    // resolution). The Vulkan path previously only resized a *bordered* window,
+    // so it was stuck "in a little window" and behaved badly with screen
+    // recorders (no proper fullscreen presentation surface). Mirror R4:
+    // borderless fullscreen by default, a normal bordered window only with
+    // -draw_borders (same launch param R4 honors).
+    const bool bDrawBorders = Core.Params && strstr(Core.Params, "-draw_borders");
+
+    if (hWnd && !bDrawBorders) {
+        // Cover the monitor the window currently lives on (multi-monitor safe).
+        HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi{ sizeof(MONITORINFO) };
+        if (GetMonitorInfo(mon, &mi)) {
+            const LONG mw = mi.rcMonitor.right  - mi.rcMonitor.left;
+            const LONG mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+            dwWidth  = (u32)mw;
+            dwHeight = (u32)mh;
+            // Keep the engine's notion of the screen size in sync, exactly like
+            // R4's CHW ctor forces psCurrentVidMode to the desktop resolution —
+            // UI layout & aspect ratio read from here.
+            psCurrentVidMode[0] = dwWidth;
+            psCurrentVidMode[1] = dwHeight;
+
+            SetWindowLongPtr(hWnd, GWL_STYLE, WS_VISIBLE | WS_POPUP);
+            SetWindowPos(hWnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            Msg("[VK] DevRender::Create — borderless fullscreen %ux%u", dwWidth, dwHeight);
+        }
+    }
+
     if (dwWidth == 0 || dwHeight == 0) {
         dwWidth  = psCurrentVidMode[0];
         dwHeight = psCurrentVidMode[1];
         Msg("[VK] DevRender::Create — engine passed 0×0, using cfg %ux%u", dwWidth, dwHeight);
 
-        if (hWnd) {
+        if (hWnd && bDrawBorders) {
             RECT rc{ 0, 0, (LONG)dwWidth, (LONG)dwHeight };
             const DWORD style   = (DWORD)GetWindowLongPtr(hWnd, GWL_STYLE);
             const DWORD exStyle = (DWORD)GetWindowLongPtr(hWnd, GWL_EXSTYLE);

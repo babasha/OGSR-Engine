@@ -94,21 +94,23 @@ namespace {
     // showed frame-to-frame wobble earlier in this port — a 1 s exponential
     // filter eats it for free and lags the real motion imperceptibly.
     constexpr float kCascSunTau = 1.0f;
+    // A one-frame change bigger than this (with no bolt corrupting sunDir — see
+    // below) is a discontinuity (level/save load, scripted time-skip): the
+    // cascade low-pass SNAPS to it instead of slewing, so shadows don't visibly
+    // rotate into place over ~1 s after a load.
+    constexpr float kCascSnapDot = 0.99939f;     // cos(2°)
     Fvector s_cascSunDir{};
     bool    s_cascSunInit = false;
 
-    // Transient sun-direction rejection. A lightning flash (thunderbolt.cpp)
-    // OVERWRITES CurrentEnv->sun_dir with the bolt direction for ~1 s, so the
-    // shadow sun would swing to the bolt and (via the low-pass) slowly rotate
-    // back — the "shadows open up and rotate back" bug. The real sun moves
-    // <0.01°/frame, so a jump > ~2° in one frame is a transient: hold the last
-    // stable direction through it. A jump that PERSISTS (level load / scripted
-    // time skip) is accepted after kSunAcceptHold frames so we don't get stuck.
-    constexpr float kSunJumpDot    = 0.99939f;   // cos(2°): below → treat as a jump
-    constexpr u32   kSunAcceptHold = 90;         // ~1.5 s — longer than a lightning flash
+    // Lightning rejection. A flash (thunderbolt.cpp OnFrame) OVERWRITES
+    // CurrentEnv->sun_dir with the bolt direction for the WHOLE strike, so the
+    // shadow sun would swing to the bolt and back — the "cascades shift then roll
+    // back" bug. We hold the last real direction while a bolt is active (queried
+    // directly via CEnvironment::IsThunderboltActive — robust at any framerate /
+    // strike length, unlike the old frame-counter hold which released mid-strike
+    // on high-refresh displays).
     Fvector s_stableSunDir{};
     bool    s_stableSunInit = false;
-    u32     s_sunHoldFrames = 0;
 
     // Rain occlusion map cache: statics + trees from straight above, redrawn
     // when the camera moved far enough or the level changed. Rendered only
@@ -157,22 +159,21 @@ void Pass_SunShadow(FrameContext& ctx)
         if (nowLoaded && !s_wasLoaded) {
             s_stableSunInit = false;
             s_cascSunInit   = false;
-            s_sunHoldFrames = 0;
         }
         s_wasLoaded = nowLoaded;
     }
 
-    // Reject lightning-flash transients (see kSunJumpDot): hold the last stable
-    // direction through a brief big jump; accept it only if it persists. Used by
-    // BOTH the far map cache check and the cascades below, so neither swings.
+    // Hold the last real sun direction while a thunderbolt is flashing (it
+    // transiently overwrites CurrentEnv->sun_dir — see s_stableSunDir notes).
+    // Used by BOTH the far map cache check and the cascades below, so neither
+    // swings during a strike.
+    const bool boltActive = g_pGamePersistent && g_pGamePersistent->Environment().IsThunderboltActive();
     if (!s_stableSunInit) {
         s_stableSunDir = sunDir; s_stableSunInit = true;
-    } else if (s_stableSunDir.dotproduct(sunDir) > kSunJumpDot) {
-        s_stableSunDir = sunDir; s_sunHoldFrames = 0;     // small delta → real sun motion
-    } else if (++s_sunHoldFrames > kSunAcceptHold) {
-        s_stableSunDir = sunDir; s_sunHoldFrames = 0;     // persisted → real change (level/skip)
+    } else if (!boltActive) {
+        s_stableSunDir = sunDir;                          // no bolt → track the real sun exactly
     }
-    sunDir = s_stableSunDir;
+    sunDir = s_stableSunDir;                              // bolt → hold last real direction
 
     const bool   loaded = RImplementation.b_loaded && !RImplementation.Visuals.empty();
     const size_t nVis   = loaded ? RImplementation.Visuals.size() : 0;
@@ -464,6 +465,8 @@ void Pass_SunShadow(FrameContext& ctx)
         if (!s_cascSunInit) {
             s_cascSunDir  = sunDir;
             s_cascSunInit = true;
+        } else if (s_cascSunDir.dotproduct(sunDir) < kCascSnapDot) {
+            s_cascSunDir = sunDir;                         // load / time-skip discontinuity → snap, don't slew
         } else {
             const float k = 1.f - expf(-Device.fTimeDelta / kCascSunTau);
             s_cascSunDir.lerp(s_cascSunDir, sunDir, k);
