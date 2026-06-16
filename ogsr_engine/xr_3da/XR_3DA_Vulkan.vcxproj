@@ -71,7 +71,7 @@
       <StringPooling>true</StringPooling>
       <ExceptionHandling>
       </ExceptionHandling>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <FloatingPointModel>Fast</FloatingPointModel>
       <ForceConformanceInForLoopScope>true</ForceConformanceInForLoopScope>
@@ -111,8 +111,6 @@
     <PostBuildEvent>
       <Command>
         copy /Y "$(SolutionDir)\3rd_party\Src\OpenAL_Soft\bin\$(PlatformShortName)\soft_oal.dll" "$(OutDir)OpenAL32.dll"
-        copy /Y "$(SolutionDir)\Game\dlls\dbghelp_$(PlatformShortName).dll" "$(OutDir)dbghelp.dll"
-        copy /Y "$(SolutionDir)\Game\dlls\discord-rpc_$(PlatformShortName).dll" "$(OutDir)discord-rpc.dll"
       </Command>
     </PostBuildEvent>
     <Manifest>
@@ -185,8 +183,6 @@
     <PostBuildEvent>
       <Command>
         copy /Y "$(SolutionDir)\3rd_party\Src\OpenAL_Soft\bin\$(PlatformShortName)\soft_oal.dll" "$(OutDir)OpenAL32.dll"
-        copy /Y "$(SolutionDir)\Game\dlls\dbghelp_$(PlatformShortName).dll" "$(OutDir)dbghelp.dll"
-        copy /Y "$(SolutionDir)\Game\dlls\discord-rpc_$(PlatformShortName).dll" "$(OutDir)discord-rpc.dll"
       </Command>
     </PostBuildEvent>
     <Manifest>
@@ -406,6 +402,9 @@
     <Image Include="stalker.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="PostBuildStep1" AfterTargets="Build">
+    <Exec Command='copy /Y "$(WindowsSDKDir)Debuggers\$(PlatformShortName)\dbghelp.dll" "$(OutDir)dbghelp.dll"' />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <ProjectExtensions>

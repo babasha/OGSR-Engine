@@ -75,7 +75,7 @@ void CLODManager::Build()
     CreateAtlasDescriptor();
     CreatePipeline();
 
-    Msg("[VK LOD] Built: %u FLOD imposters (VB %u KB ×%u)",
+    Msg("[VK LOD] Built: %u FLOD imposters (VB %u KB x%u)",
         (u32)m_Lods.size(), (u32)(vbSize / 1024), LOD_FRAMES);
 }
 

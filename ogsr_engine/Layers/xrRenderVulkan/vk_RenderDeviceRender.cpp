@@ -96,7 +96,7 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     if (dwWidth == 0 || dwHeight == 0) {
         dwWidth  = psCurrentVidMode[0];
         dwHeight = psCurrentVidMode[1];
-        Msg("[VK] DevRender::Create — engine passed 0×0, using cfg %ux%u", dwWidth, dwHeight);
+        Msg("[VK] DevRender::Create — engine passed 0x0, using cfg %ux%u", dwWidth, dwHeight);
 
         if (hWnd && bDrawBorders) {
             RECT rc{ 0, 0, (LONG)dwWidth, (LONG)dwHeight };

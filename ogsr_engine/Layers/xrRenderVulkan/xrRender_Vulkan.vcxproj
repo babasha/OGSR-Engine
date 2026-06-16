@@ -45,7 +45,9 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;XRENGINE_STATIC;XRCORE_STATIC;XRCDB_STATIC;XR_PARTICLES_STATIC;LUABIND_STATIC;XRRENDER_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <BasicRuntimeChecks Condition="$(Configuration.Contains('Debug')) And '$(EnableASAN)'=='true'">
+      </BasicRuntimeChecks>
+      <BasicRuntimeChecks Condition="$(Configuration.Contains('Debug')) And '$(EnableASAN)'!='true'">EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <FloatingPointModel>Fast</FloatingPointModel>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
@@ -54,6 +56,7 @@
       <DisableSpecificWarnings>4456;4457;4458;4459;4315;4267;</DisableSpecificWarnings>
       <AdditionalIncludeDirectories>./;..\..\xrCore;..\..\Luabind;..\..\LuaJIT\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <OmitFramePointers>false</OmitFramePointers>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
   </ItemDefinitionGroup>
@@ -62,11 +65,12 @@
       <Optimization>MaxSpeed</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <OmitFramePointers>false</OmitFramePointers>
       <WholeProgramOptimization>true</WholeProgramOptimization>
       <AdditionalIncludeDirectories>./;..\..\xrCore;..\..\Luabind;..\..\LuaJIT\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;XRENGINE_STATIC;XRCORE_STATIC;XRCDB_STATIC;XR_PARTICLES_STATIC;LUABIND_STATIC;XRRENDER_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <FloatingPointModel>Fast</FloatingPointModel>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
