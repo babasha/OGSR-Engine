@@ -69,8 +69,8 @@ u32 ps_r_sun_shafts = 3;
 
 float ps_r_ss_sunshafts_length = 0.9f; // 1.0f;
 float ps_r_ss_sunshafts_radius = 2.f; // 1.0f;
-float ps_r_prop_ss_radius = 1.56f;
-float ps_r_prop_ss_blend = 0.25f; // 0.066f;
+float ps_r_prop_ss_radius = 2.0f;
+float ps_r_prop_ss_blend = 0.01f;
 float ps_r_prop_ss_sample_step_phase0 = 0.09f;
 float ps_r_prop_ss_sample_step_phase1 = 0.07f;
 
@@ -118,7 +118,7 @@ float ps_r__WallmarkSHIFT_V = 0.0001f;
 float ps_r__GLOD_ssa_start = 256.f;
 float ps_r__GLOD_ssa_end = 64.f;
 
-float ps_r__LOD = 0.5f;
+float ps_r__LOD = 1.0f;
 float ps_r__LOD_k = 1.f;
 
 float ps_r__ssaDISCARD = 3.5f; // RO
@@ -175,6 +175,7 @@ Flags64 ps_r2_ls_flags = {
 //    | R2FLAGEXT_SSFX_SSS
     | R2FLAGEXT_SMAP_LOW_LOD
     | R2FLAGEXT_DISABLE_SMAPVIS
+    | R2FLAG_SMAP_2SIDE
 };
 
 BOOL ps_no_scale_on_fade = 0; // Alundaio
@@ -653,7 +654,7 @@ void xrRender_initconsole()
 
     CMD4(CCC_Float, "r__wallmark_ttl", &ps_r__WallmarkTTL, 1.0f, 10.f * 60.f);
 
-    CMD4(CCC_Float, "r__geometry_lod", &ps_r__LOD, 0.1f, 1.0f);
+    CMD4(CCC_Float, "r__geometry_lod", &ps_r__LOD, 0.5f, 2.f);
     CMD4(CCC_Float, "r__lod_k", &ps_r__LOD_k, 0.1f, 10.f);
 
     CMD4(CCC_detail_radius, "r__detail_radius", &ps_r__detail_radius, 70, 300);
@@ -740,6 +741,8 @@ void xrRender_initconsole()
     CMD3(CCC_Token, "r__smap_lights_size", &r2_SmapLightsSize, LightsSmapSizeToken);
     CMD3(CCC_Token, "r__smap_rain_size", &r2_SmapRainSize, RainSmapSizeToken);
 
+    CMD3(CCC_Mask64, "r_smap_2side", &ps_r2_ls_flags, R2FLAG_SMAP_2SIDE);
+
     CMD4(CCC_Float, "r2_sun_depth_far_scale", &ps_r2_sun_depth_far_scale, 0.5, 1.5);
     CMD4(CCC_Float, "r2_sun_depth_near_scale", &ps_r2_sun_depth_near_scale, 0.5, 1.5);
     CMD4(CCC_Float, "r2_sun_lumscale", &ps_r2_sun_lumscale, -1.0, +3.0);
@@ -789,7 +792,7 @@ void xrRender_initconsole()
 
     // CMD4(CCC_Float, "r_SunShafts_SampleStep_Phase1", &ps_r_prop_ss_sample_step_phase0, 0.01f, 0.2f);
     // CMD4(CCC_Float, "r_SunShafts_SampleStep_Phase2", &ps_r_prop_ss_sample_step_phase1, 0.01f, 0.2f);
-    CMD4(CCC_Float, "r_SunShafts_Radius", &ps_r_prop_ss_radius, 0.5f, 2.0f);
+    CMD4(CCC_Float, "r_SunShafts_Radius", &ps_r_prop_ss_radius, 0.5f, 5.0f);
     CMD4(CCC_Float, "r_SunShafts_Blend", &ps_r_prop_ss_blend, 0.01f, 1.0f);
 
     CMD3(CCC_Token, "r_ao_mode", &ps_r_ao_mode, ao_mode_token);

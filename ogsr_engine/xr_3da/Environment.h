@@ -171,8 +171,6 @@ public:
     Fvector3 sun_dir;
 
     float m_fSunShaftsIntensity;
-    float m_fWaterIntensity;
-    float m_fTreeAmplitudeIntensity{}, m_fTreeAmplitudeIntensity_old{};
 
     float bloom_threshold{};
     float bloom_exposure{};
@@ -342,18 +340,18 @@ public:
     void RenderFlares(CBackend& cmd_list);
     void RenderLast(CBackend& cmd_list);
 
-    bool SetWeatherFX(shared_str name);
-    bool SetWeatherFXFromTime(shared_str name, float time);
+    bool SetWeatherFX(const shared_str& name);
+    bool SetWeatherFXFromTime(const shared_str& name, const float time);
     bool IsWeatherFXPlaying() const { return b_wfx; }
     // True while a thunderbolt is flashing (it transiently overwrites the env
     // sun_dir — shadow cascades must freeze their sun while this is set).
     bool IsThunderboltActive() const;
     void StopWeatherFX();
 
-    void SetWeather(shared_str name, bool forced = false);
-    shared_str& GetWeather() { return CurrentWeatherName; }
-    shared_str& GetPrevWeather() { return PrevWeatherName; }
-    void SetWeatherNext(shared_str name);
+    void SetWeather(const shared_str& name, const bool forced = false);
+    const shared_str& GetWeather() const { return CurrentWeatherName; }
+    const shared_str& GetPrevWeather() const { return PrevWeatherName; }
+    void SetWeatherNext(const shared_str& name);
     void ChangeGameTime(float game_time);
     void SetGameTime(float game_time, float time_factor);
 

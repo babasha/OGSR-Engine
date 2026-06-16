@@ -10,6 +10,8 @@
 #include "UITextureMaster.h"
 #include "UIScrollView.h"
 #include "UIIconParams.h"
+#include "MMSound.h"
+#include "UIOptionsItem.h"
 
 CFontManager& mngr() { return *(UI()->Font()); }
 
@@ -53,10 +55,17 @@ T* wnd_object_cast(CUIWindow* wnd)
     return smart_cast<T*>(wnd);
 }
 
+LPCSTR OptionItemEntry_script(CUIWindow* self)
+{
+    if (auto* optionItem = smart_cast<CUIOptionsItem*>(self))
+    {
+        return optionItem->GetEntry();
+    }
+    return nullptr;
+}
+
 #include "UIButton.h"
 using namespace luabind;
-
-
 
 void CUIWindow::create_ui_snd(ref_sound& S, LPCSTR fName)
 {
@@ -68,7 +77,7 @@ void CUIWindow::create_ui_snd(ref_sound& S, LPCSTR fName)
 
 void CUIWindow::script_register(lua_State* L)
 {
-    module(L)[def("GetARGB", &GetARGB),
+    module(L)[(def("GetARGB", &GetARGB),
 
               def("GetFontSmall", &GetFontSmall), def("GetFontMedium", &GetFontMedium), def("GetFontDI", &GetFontDI), def("GetFontGraffiti19Russian", &GetFontGraffiti19Russian),
               def("GetFontGraffiti22Russian", &GetFontGraffiti22Russian), def("GetFontLetterica16Russian", &GetFontLetterica16Russian),
@@ -128,9 +137,8 @@ void CUIWindow::script_register(lua_State* L)
                   .def("GetAbsoluteRect", (void(CUIWindow::*)(Frect&)) & CUIWindow::GetAbsoluteRect)
                   .def("SetPriority", &CUIWindow::SetPriority)
                   .def("GetPriority", &CUIWindow::GetPriority)
-                  .def("SortByPriority", &CUIWindow::SortByPriority),
-
-              //		.def("",						&CUIWindow::)
+                  .def("SortByPriority", &CUIWindow::SortByPriority)
+                  .def("GetOptionItemEntry", &OptionItemEntry_script),
 
               class_<CDialogHolder>("CDialogHolder")
                   .def("MainInputReceiver", &CDialogHolder::MainInputReceiver)
@@ -159,7 +167,9 @@ void CUIWindow::script_register(lua_State* L)
 
               class_<CUILabel, CUIFrameLineWnd>("CUILabel").def(constructor<>()).def("SetText", &CUILabel::SetText).def("GetText", &CUILabel::GetText),
 
-              class_<CUIMMShniaga, CUIWindow>("CUIMMShniaga").def("SetVisibleMagnifier", &CUIMMShniaga::SetVisibleMagnifier),
+              class_<CUIMMShniaga, CUIWindow>("CUIMMShniaga")
+                  .def("SetVisibleMagnifier", &CUIMMShniaga::SetVisibleMagnifier)
+                  .def("SetMusic", [](CUIMMShniaga* self, const char* filename) { self->m_sound->SetMusic(filename); }),
 
               class_<CUIScrollView, CUIWindow>("CUIScrollView")
                   .def(constructor<>())
@@ -190,7 +200,7 @@ void CUIWindow::script_register(lua_State* L)
               //		.def("",						&CUIFrameLineWnd::)
 
               class_<enum_exporter<EUIMessages>>("ui_events")
-                  .enum_("events")[
+                  .enum_("events")[(
                       // CUIWindow
                       value("WINDOW_LBUTTON_DOWN", int(WINDOW_LBUTTON_DOWN)), value("WINDOW_RBUTTON_DOWN", int(WINDOW_RBUTTON_DOWN)),
                       value("WINDOW_LBUTTON_UP", int(WINDOW_LBUTTON_UP)), value("WINDOW_RBUTTON_UP", int(WINDOW_RBUTTON_UP)), value("WINDOW_MOUSE_MOVE", int(WINDOW_MOUSE_MOVE)),
@@ -257,5 +267,5 @@ void CUIWindow::script_register(lua_State* L)
                       value("INVENTORY_TO_BELT_ACTION", int(INVENTORY_TO_BELT_ACTION)), value("INVENTORY_TO_SLOT_ACTION", int(INVENTORY_TO_SLOT_ACTION)),
                       value("INVENTORY_TO_BAG_ACTION", int(INVENTORY_TO_BAG_ACTION)), value("INVENTORY_ATTACH_ADDON", int(INVENTORY_ATTACH_ADDON)),
                       value("INVENTORY_DETACH_SCOPE_ADDON", int(INVENTORY_DETACH_SCOPE_ADDON)), value("INVENTORY_DETACH_SILENCER_ADDON", int(INVENTORY_DETACH_SILENCER_ADDON)),
-                      value("INVENTORY_DETACH_GRENADE_LAUNCHER_ADDON", int(INVENTORY_DETACH_GRENADE_LAUNCHER_ADDON))]];
+                      value("INVENTORY_DETACH_GRENADE_LAUNCHER_ADDON", int(INVENTORY_DETACH_GRENADE_LAUNCHER_ADDON)))])];
 }

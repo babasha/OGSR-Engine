@@ -34,6 +34,13 @@ static void iterate_sections(CInifile* self, const luabind::functor<void>& funct
         functor(it.first.c_str());
 }
 
+static void iterate_lines(CInifile* self, const char* S, const luabind::functor<void>& functor)
+{
+    auto& SS = self->r_section(S);
+    for (const auto& it : SS.Ordered_Data)
+        functor(it.first.c_str(), it.second.c_str());
+}
+
 static CInifile* reload_system_ini()
 {
     CInifile::Destroy(pSettings);
@@ -130,7 +137,7 @@ using namespace luabind;
 
 void CScriptIniFile::script_register(lua_State* L)
 {
-    module(L)[def("ini_file", &initialize_ini_file, adopt<result>()), def("ini_file", &initialize_ini_file_full, adopt<result>()),
+    module(L)[(def("ini_file", &initialize_ini_file, adopt<result>()), def("ini_file", &initialize_ini_file_full, adopt<result>()),
 
               class_<CInifile>("__ini_file")
                   .def(constructor<LPCSTR>())
@@ -145,6 +152,7 @@ void CScriptIniFile::script_register(lua_State* L)
                   .def("save", &CInifile::save_as)
                   .def("name", &CInifile::fname)
                   .def("iterate_sections", &iterate_sections)
+                  .def("iterate_lines", &iterate_lines)
 
                   .def_readwrite("readonly", &CInifile::bReadOnly)
 
@@ -200,5 +208,5 @@ void CScriptIniFile::script_register(lua_State* L)
                       return xr_new<CInifile>(&reader, FS.get_path(fsgame::game_configs)->m_Path);
                   },
                   adopt<result>()),
-              def("reload_system_ini", &reload_system_ini)];
+              def("reload_system_ini", &reload_system_ini))];
 }

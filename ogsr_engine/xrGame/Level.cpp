@@ -391,9 +391,9 @@ void CLevel::OnFrame()
     // Inherited update
     inherited::OnFrame();
 
-    extern bool s_ScriptTime;
+    extern bool editor_override_time;
 
-    if (!s_ScriptTime)
+    if (!editor_override_time)
     {
         g_pGamePersistent->Environment().SetGameTime(GetEnvironmentGameDayTimeSec(), game->GetEnvironmentGameTimeFactor());
     }
@@ -418,7 +418,8 @@ void CLevel::OnFrame()
     if (ps_lua_gc_method != gc_timeout)
         Device.add_to_seq_parallel(fastdelegate::MakeDelegate(this, &CLevel::script_gc));
 
-    ShowEditor();
+    CImGuiEditor& editor = CImGuiEditor::Get();
+    editor.ShowEditor();
 }
 
 extern Flags32 dbg_net_Draw_Flags;

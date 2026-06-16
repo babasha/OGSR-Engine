@@ -17,12 +17,18 @@ void SStaticSound::Load(IReader& F)
     F.r_fvector3(m_Position);
     m_Volume = F.r_float();
     m_Freq = F.r_float();
-    m_ActiveTime.x = F.r_u32();
-    m_ActiveTime.y = F.r_u32();
-    m_PlayTime.x = F.r_u32();
-    m_PlayTime.y = F.r_u32();
-    m_PauseTime.x = F.r_u32();
-    m_PauseTime.y = F.r_u32();
+    m_ActiveTime.x = F.r_s32();
+    m_ActiveTime.y = F.r_s32();
+    m_PlayTime.x = F.r_s32();
+    m_PlayTime.y = F.r_s32();
+    m_PauseTime.x = F.r_s32();
+    m_PauseTime.y = F.r_s32();
+    if (m_PauseTime.y < m_PauseTime.x)
+    {
+        Msg("!![%s] Invalid m_PauseTime detected in [level.snd_static]! wav_name: [%s]", __FUNCTION__, wav_name.c_str());
+        m_PauseTime.y = m_PauseTime.x;
+    }
+
     m_NextTime = 0;
     m_StopTime = 0;
 }
@@ -203,7 +209,7 @@ void CLevelSoundManager::Load()
 
     CInifile& gameLtx = *pGameIni;
 
-    if (gameLtx.section_exist(Level().name()) && psActorFlags.test(AF_MUSIC_TRACKS))
+    if (gameLtx.section_exist(Level().name()))
     {
         if (gameLtx.line_exist(Level().name(), "music_tracks"))
         {
@@ -249,6 +255,23 @@ void CLevelSoundManager::Update()
     // music track
     if (!m_MusicTracks.empty())
     {
+        if (!psActorFlags.test(AF_MUSIC_TRACKS))
+        {
+            if (m_CurrentTrack >= 0)
+            {
+                SMusicTrack& T = m_MusicTracks[m_CurrentTrack];
+                if (T.IsPlaying())
+                {
+                    T.Stop();
+                }
+
+                m_CurrentTrack = -1;
+                m_NextTrackTime = 0;
+            }
+
+            return;
+        }
+
         if (m_CurrentTrack < 0 && engine_time > m_NextTrackTime)
         {
             U32Vec indices;

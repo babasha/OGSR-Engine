@@ -19,24 +19,6 @@ public:
     bool HudElement() const { return m_pC->HudElement; }
 };
 
-// wrapper
-class adopt_dx10sampler
-{
-    CBlender_Compile* m_pC;
-    u32 m_SI; //	Sampler index
-public:
-    adopt_dx10sampler(CBlender_Compile* C, u32 SamplerIndex) : m_pC(C), m_SI(SamplerIndex)
-    {
-        if (u32(-1) == m_SI)
-            m_pC = nullptr;
-    }
-    adopt_dx10sampler(const adopt_dx10sampler& _C) : m_pC(_C.m_pC), m_SI(_C.m_SI)
-    {
-        if (u32(-1) == m_SI)
-            m_pC = nullptr;
-    }
-};
-
 #pragma warning(push)
 #pragma warning(disable : 4512)
 // wrapper
@@ -112,7 +94,12 @@ public:
         C->PassSET_LightFog(FALSE, _fog);
         return *this;
     }
-    adopt_compiler& _zb(bool _test, bool _write, bool _invert = false)
+    adopt_compiler& _ZB(bool _test, bool _write)
+    {
+        C->PassSET_ZB(_test, _write);
+        return *this;
+    }
+    adopt_compiler& _ZBinvert(bool _test, bool _write, bool _invert)
     {
         C->PassSET_ZB(_test, _write, _invert);
         return *this;
@@ -132,10 +119,10 @@ public:
         C->r_dx10Texture(_resname, _texname);
         return *this;
     }
-    adopt_dx10sampler _dx10sampler(LPCSTR _name) const
+    u32 _dx10sampler(const char* _name) const
     {
         const u32 s = C->r_dx10Sampler(_name);
-        return adopt_dx10sampler(C, s);
+        return s;
     }
 
     //	DX10 specific
@@ -496,34 +483,11 @@ void CResourceManager::LS_Load()
 
     using namespace luabind;
 
-    module(LSVM)[def("log", &ScriptLuaLog),
+    module(LSVM)[(def("log", &ScriptLuaLog),
 
                  class_<adopt_dx10options>("_dx10options")
                      .def("getLevel", [](adopt_dx10options*) { return g_pGameLevel->name().c_str(); })
                      .def("hudElement", [](adopt_dx10options* O) { return O->HudElement(); }),
-
-                 class_<adopt_dx10sampler>("_dx10sampler")
-                 //.def("texture",						&adopt_sampler::_texture		,return_reference_to(_1))
-                 //.def("project",						&adopt_sampler::_projective		,return_reference_to(_1))
-                 //.def("clamp",						&adopt_sampler::_clamp			,return_reference_to(_1))
-                 //.def("wrap",						    &adopt_sampler::_wrap			,return_reference_to(_1))
-                 //.def("mirror",						&adopt_sampler::_mirror			,return_reference_to(_1))
-                 //.def("f_anisotropic",				&adopt_sampler::_f_anisotropic	,return_reference_to(_1))
-                 //.def("f_trilinear",					&adopt_sampler::_f_trilinear	,return_reference_to(_1))
-                 //.def("f_bilinear",					&adopt_sampler::_f_bilinear		,return_reference_to(_1))
-                 //.def("f_linear",					    &adopt_sampler::_f_linear		,return_reference_to(_1))
-                 //.def("f_none",						&adopt_sampler::_f_none			,return_reference_to(_1))
-                 //.def("fmin_none",					&adopt_sampler::_fmin_none		,return_reference_to(_1))
-                 //.def("fmin_point",					&adopt_sampler::_fmin_point		,return_reference_to(_1))
-                 //.def("fmin_linear",					&adopt_sampler::_fmin_linear	,return_reference_to(_1))
-                 //.def("fmin_aniso",					&adopt_sampler::_fmin_aniso		,return_reference_to(_1))
-                 //.def("fmip_none",					&adopt_sampler::_fmip_none		,return_reference_to(_1))
-                 //.def("fmip_point",					&adopt_sampler::_fmip_point		,return_reference_to(_1))
-                 //.def("fmip_linear",					&adopt_sampler::_fmip_linear	,return_reference_to(_1))
-                 //.def("fmag_none",					&adopt_sampler::_fmag_none		,return_reference_to(_1))
-                 //.def("fmag_point",					&adopt_sampler::_fmag_point		,return_reference_to(_1))
-                 //.def("fmag_linear",					&adopt_sampler::_fmag_linear	,return_reference_to(_1))
-                 ,
 
                  class_<adopt_compiler>("_compiler")
                      //.def(constructor<const adopt_compiler&>())
@@ -536,7 +500,8 @@ void CResourceManager::LS_Load()
                      .def("distort", &adopt_compiler::_o_distort, return_reference_to<1>())
                      .def("wmark", &adopt_compiler::_o_wmark, return_reference_to<1>())
                      .def("fog", &adopt_compiler::_fog, return_reference_to<1>())
-                     .def("zb", &adopt_compiler::_zb, return_reference_to<1>())
+                     .def("zb", &adopt_compiler::_ZB, return_reference_to<1>())
+                     .def("zb", &adopt_compiler::_ZBinvert, return_reference_to<1>())
                      .def("blend", &adopt_compiler::_blend, return_reference_to<1>())
                      .def("aref", &adopt_compiler::_aref, return_reference_to<1>())
                      .def("scopelense", &adopt_compiler::_o_scopelense, return_reference_to<1>())
@@ -554,10 +519,10 @@ void CResourceManager::LS_Load()
                      .def("dx10adress", &adopt_compiler::_dx10Adress, return_reference_to<1>())
                      .def("dx10bordercolor", &adopt_compiler::_dx10BorderColor, return_reference_to<1>())
 
-                     .def("dx10sampler", &adopt_compiler::_dx10sampler) // returns sampler-object
+                     .def("dx10sampler", &adopt_compiler::_dx10sampler)
                      .def("dx10Options", &adopt_compiler::_dx10Options), // returns options-object
 
-                 class_<adopt_blend>("blend").enum_("blend")[
+                 class_<adopt_blend>("blend").enum_("blend")[(
                         value("zero", int(D3DBLEND_ZERO)), 
                         value("one", int(D3DBLEND_ONE)), 
                         value("srccolor", int(D3DBLEND_SRCCOLOR)),
@@ -568,9 +533,9 @@ void CResourceManager::LS_Load()
                         value("invdestalpha", int(D3DBLEND_INVDESTALPHA)), 
                         value("destcolor", int(D3DBLEND_DESTCOLOR)),
                         value("invdestcolor", int(D3DBLEND_INVDESTCOLOR)), 
-                        value("srcalphasat", int(D3DBLEND_SRCALPHASAT))],
+                        value("srcalphasat", int(D3DBLEND_SRCALPHASAT)))],
 
-                 class_<adopt_cmp_func>("cmp_func").enum_("cmp_func")[
+                 class_<adopt_cmp_func>("cmp_func").enum_("cmp_func")[(
                         value("never", int(D3DCMP_NEVER)), 
                         value("less", int(D3DCMP_LESS)), 
                         value("equal", int(D3DCMP_EQUAL)),
@@ -578,9 +543,9 @@ void CResourceManager::LS_Load()
                         value("greater", int(D3DCMP_GREATER)), 
                         value("notequal", int(D3DCMP_NOTEQUAL)),
                         value("greaterequal", int(D3DCMP_GREATEREQUAL)), 
-                        value("always", int(D3DCMP_ALWAYS))],
+                        value("always", int(D3DCMP_ALWAYS)))],
 
-                 class_<adopt_stencil_op>("stencil_op").enum_("stencil_op")[
+                 class_<adopt_stencil_op>("stencil_op").enum_("stencil_op")[(
                         value("keep", int(D3DSTENCILOP_KEEP)), 
                         value("zero", int(D3DSTENCILOP_ZERO)), 
                         value("replace", int(D3DSTENCILOP_REPLACE)),
@@ -588,14 +553,14 @@ void CResourceManager::LS_Load()
                         value("decrsat", int(D3DSTENCILOP_DECRSAT)), 
                         value("invert", int(D3DSTENCILOP_INVERT)),
                         value("incr", int(D3DSTENCILOP_INCR)), 
-                        value("decr", int(D3DSTENCILOP_DECR))],
+                        value("decr", int(D3DSTENCILOP_DECR)))],
     
-                 class_<adopt_adress>("adress").enum_("adress")[
+                 class_<adopt_adress>("adress").enum_("adress")[(
                         value("wrap", int(D3DTADDRESS_WRAP)), 
                         value("mirror", int(D3DTADDRESS_MIRROR)), 
                         value("clamp", int(D3DTADDRESS_CLAMP)),
                         value("border", int(D3DTADDRESS_BORDER)), 
-                        value("mirroronce", int(D3DTADDRESS_MIRRORONCE))]];
+                        value("mirroronce", int(D3DTADDRESS_MIRRORONCE)))])];
 
     // load shaders
     xr_vector<char*>* folder = FS.file_list_open(fsgame::game_shaders, RImplementation.getShaderPath(), FS_ListFiles | FS_RootOnly);
