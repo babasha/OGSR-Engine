@@ -252,7 +252,8 @@ void CRenderDevice::on_idle()
         if (is_editor_active)
         {
             ImGui_ImplDX11_NewFrame(); // должно быть перед FrameMove
-            ImGui_ImplWin32_NewFrame();
+            // TODO: 
+            //ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
         }
 

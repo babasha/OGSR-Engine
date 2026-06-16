@@ -176,9 +176,9 @@ bool CreatePipeline()
 
     VkVertexInputBindingDescription bind{ 0, sizeof(ImDrawVert), VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription attr[3]{
-        { 0, 0, VK_FORMAT_R32G32_SFLOAT,  (u32)IM_OFFSETOF(ImDrawVert, pos) },
-        { 1, 0, VK_FORMAT_R32G32_SFLOAT,  (u32)IM_OFFSETOF(ImDrawVert, uv)  },
-        { 2, 0, VK_FORMAT_R8G8B8A8_UNORM, (u32)IM_OFFSETOF(ImDrawVert, col) },
+        { 0, 0, VK_FORMAT_R32G32_SFLOAT,  (u32)offsetof(ImDrawVert, pos) },
+        { 1, 0, VK_FORMAT_R32G32_SFLOAT,  (u32)offsetof(ImDrawVert, uv)  },
+        { 2, 0, VK_FORMAT_R8G8B8A8_UNORM, (u32)offsetof(ImDrawVert, col) },
     };
     VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;

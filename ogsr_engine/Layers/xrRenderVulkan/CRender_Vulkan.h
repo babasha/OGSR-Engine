@@ -177,6 +177,11 @@ public:
     // ----- pureFrame --------------------------------------------------------
     void OnFrame() override;
 
+    // TODO: Реализовать это когда будет рабочий имгуй
+    void CaptureMainRTTexture() override {};
+    void DrawMainRTTexture(float width, float height) override {};
+    void DrawRTTextures() override {};
+
 protected:
     void ScreenshotImpl(ScreenshotMode mode, LPCSTR name) override;
 };
