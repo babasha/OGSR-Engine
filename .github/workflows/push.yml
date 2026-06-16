@@ -9,20 +9,21 @@ on:
 
 jobs:
   build:
-    if: "contains(github.event.head_commit.message, '[ci build]') || github.event_name == 'release'"
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
-        Configuration: [Debug, Release, ReleaseTracyProfiler]
+#        Configuration: [Debug, Release, ReleaseTracyProfiler]
+        Configuration: [Debug, Release]
         Platform: [x64]
         include:
           - Configuration: Debug
             ConfigurationReal: Debug
           - Configuration: Release
             ConfigurationReal: Release
-          - Configuration: ReleaseTracyProfiler
-            ConfigurationReal: Release
+#          - Configuration: ReleaseTracyProfiler
+#            ConfigurationReal: Release
     steps:
     - uses: actions/checkout@v6.0.1
       with:
@@ -32,12 +33,19 @@ jobs:
       run: |
         ${{ github.workspace }}/Update_Components.cmd
 
+    - name: Prepare Vulkan SDK
+      uses: humbletim/setup-vulkan-sdk@v1.2.1
+      with:
+        vulkan-query-version: 1.4.350.0
+        vulkan-components: Vulkan-Headers, Vulkan-Loader
+        vulkan-use-cache: true
+
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v3
     - name: MSBuild
       shell: cmd
       run: |
-        set APPVEYOR_BUILD_VERSION=3.${{ github.run_number }}
+        set APPVEYOR_BUILD_VERSION=VULKAN_TEST.${{ github.run_number }}
         set APPVEYOR_REPO_NAME=${{ github.repository }}
         set CONFIGURATION_GA=${{ matrix.Configuration }}
         
@@ -45,7 +53,7 @@ jobs:
     - name: Prepare artifacts
       shell: cmd
       run: |
-        set APPVEYOR_BUILD_VERSION=3.${{ github.run_number }}
+        set APPVEYOR_BUILD_VERSION=VULKAN_TEST.${{ github.run_number }}
         set CONFIGURATION=${{ matrix.Configuration }}
         set PLATFORM=${{ matrix.Platform }}
         set OGSR_ARTIFACT_NAME=OGSR_Engine_SHOC_EDITION_%PLATFORM%_%APPVEYOR_BUILD_VERSION%_%CONFIGURATION%.7z
@@ -57,12 +65,22 @@ jobs:
         
         cd ..\Game\Resources_SoC_1.0006
         
+        RD /s /q gamedata\shaders\
+        
+        md gamedata\shaders
+        
+        cd ..\..\ogsr_engine\Layers\xrRenderVulkan\shaders
+        
+        copy *.* ..\..\..\..\Game\Resources_SoC_1.0006\gamedata\shaders
+        
+        cd ..\..\..\..\Game\Resources_SoC_1.0006
+        
         7z a -t7z -m0=LZMA2:d=96m:fb=273 -mx=9 -mmt=2 ..\..\%OGSR_ARTIFACT_NAME% .\
     - name: Upload OGSR artifact
       uses: actions/upload-artifact@v7.0.1
       with:
-        name: OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_3.${{ github.run_number }}_${{ matrix.Configuration }}.7z
-        path: .\OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_3.${{ github.run_number }}_${{ matrix.Configuration }}.7z
+        name: OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_VULKAN_TEST.${{ github.run_number }}_${{ matrix.Configuration }}.7z
+        path: .\OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_VULKAN_TEST.${{ github.run_number }}_${{ matrix.Configuration }}.7z
 
     - name: Upload release asset
       if: github.event_name == 'release'
@@ -71,6 +89,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ github.event.release.upload_url }}
-        asset_path: .\OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_3.${{ github.run_number }}_${{ matrix.Configuration }}.7z
-        asset_name: OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_3.${{ github.run_number }}_${{ matrix.Configuration }}.7z
+        asset_path: .\OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_VULKAN_TEST.${{ github.run_number }}_${{ matrix.Configuration }}.7z
+        asset_name: OGSR_Engine_SHOC_EDITION_${{ matrix.Platform }}_VULKAN_TEST.${{ github.run_number }}_${{ matrix.Configuration }}.7z
         asset_content_type: application/x-7z-compressed
