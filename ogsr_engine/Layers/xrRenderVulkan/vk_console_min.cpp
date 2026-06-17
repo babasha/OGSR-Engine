@@ -275,6 +275,7 @@ float ps_r_vol_indoor    = 6.0f;    // indoor density boost: fog ×(1+this) unde
 float ps_r_vol_sun       = 3.0f;    // sun-beam in-scatter boost: directional shaft brightness (pops the god-ray through the ambient haze)
 float ps_r_vol_lights    = 2.5f;    // P2: local light (flashlight/lamp/campfire) in-scatter in fog — glow/cone strength; 0 = off
 float ps_r_vol_smoke     = 1.0f;    // Stage-0: light smoke billboards with the froxel in-scatter (sun shaft/flashlight/campfire catch the smoke); 0 = off (old flat look)
+float ps_r_vol_smoke_clamp = 6.0f;  // Stage-0: upper bound on the per-froxel radiance added to smoke (keeps it from blowing to white next to a campfire/sun beam)
 float ps_r_vol_noise     = 0.55f;   // P3: animated 3D noise on the fog density → drifting dust/mist ("living air"); 0 = off
 float ps_r_vol_noise_scale = 0.40f; // P3 noise frequency (world units; higher = finer motes)
 float ps_r_vol_noise_speed = 0.10f; // P3 drift speed of the dust
@@ -1064,6 +1065,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vol_sun",       &ps_r_vol_sun,       0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_lights",    &ps_r_vol_lights,    0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_smoke",     &ps_r_vol_smoke,     0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_clamp", &ps_r_vol_smoke_clamp, 0.0f, 64.0f);
     CMD4(CCC_Float,   "r_vol_noise",       &ps_r_vol_noise,       0.0f, 1.0f);
     CMD4(CCC_Float,   "r_vol_noise_scale", &ps_r_vol_noise_scale, 0.02f, 2.0f);
     CMD4(CCC_Float,   "r_vol_noise_speed", &ps_r_vol_noise_speed, 0.0f, 1.0f);

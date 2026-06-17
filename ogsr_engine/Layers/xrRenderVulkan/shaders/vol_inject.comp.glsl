@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "vsm_common.glsl"   // VSM clipmap math (vsmSelect/vsmPageIndex) for the smooth atlas occlusion
+#include "froxel.glsl"        // exp-Z slice <-> view-Z mapping (shared with tonemap + particle probe)
 // xrRenderVulkan — froxel volumetric INJECTION (vk_volumetrics, P1).
 //
 // One thread per froxel. Reconstruct the froxel's world position from the camera
@@ -288,7 +289,7 @@ void main()
     // frame) → supersamples the shadow/density. cur (below) uses THIS.
     vec2 uv  = (vec2(id.xy) + 0.5 + V.temporal.xy) / vec2(dimX, dimY);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y);
-    float viewZ = nearZ * exp2(logFN * (float(id.z) + 0.5 + V.temporal.z) / float(dimZ));
+    float viewZ = Froxel_ViewZFromSlice((float(id.z) + 0.5 + V.temporal.z) / float(dimZ), nearZ, logFN);
     vec3 ray   = V.camDir.xyz + V.camRightT.xyz * ndc.x + V.camTopT.xyz * ndc.y;
     vec3 world = V.camPos.xyz + ray * viewZ;
 
@@ -298,7 +299,7 @@ void main()
     // Reprojecting the stable centre lets the jittered samples accumulate cleanly.
     vec2 uvC  = (vec2(id.xy) + 0.5) / vec2(dimX, dimY);
     vec2 ndcC = vec2(uvC.x * 2.0 - 1.0, 1.0 - 2.0 * uvC.y);
-    float viewZC = nearZ * exp2(logFN * (float(id.z) + 0.5) / float(dimZ));
+    float viewZC = Froxel_ViewZFromSlice((float(id.z) + 0.5) / float(dimZ), nearZ, logFN);
     vec3 worldCenter = V.camPos.xyz + (V.camDir.xyz + V.camRightT.xyz * ndcC.x + V.camTopT.xyz * ndcC.y) * viewZC;
 
     // Sky visibility (0 under a roof, 1 open) drives BOTH the indoor density boost
@@ -362,7 +363,7 @@ void main()
             vec2 puv = (pc.xy / pc.w) * 0.5 + 0.5;
             puv.y = 1.0 - puv.y;
             float pvz = dot(worldCenter - V.prevCamPos.xyz, V.prevCamDir.xyz);   // prev view-space depth
-            float pw  = log2(max(pvz, 1e-3) / V.prevCamPos.w) / V.prevCamDir.w;
+            float pw  = Froxel_SliceFromViewZ(max(pvz, 1e-3), V.prevCamPos.w, V.prevCamDir.w);
             if (all(greaterThanEqual(vec3(puv, pw), vec3(0.0))) &&
                 all(lessThanEqual   (vec3(puv, pw), vec3(1.0)))) {
                 // Full EMA blend (no rejection): the moving-sun shadow crawl through

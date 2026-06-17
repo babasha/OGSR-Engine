@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "wet_common.glsl"   // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
+#include "froxel.glsl"        // exp-Z slice <-> view-Z mapping (shared with vol_inject + particle probe)
 // Tonemap / auto-exposure / bloom / color-grading composite — the final step
 // mapping the HDR scene to the display. Ports the R4 (Enhanced Shaders) chain:
 //   1. auto-exposure (bloom_luminance_3.ps): exposure = middlegray/(avgLum+low),
@@ -266,7 +267,7 @@ void main()
         float near_ = pc.p4.y, far_ = pc.p4.z, logFN = pc.p4.w;
         float zview = (zndc >= 0.9999) ? far_
                     : clamp(L.cam_rightT.w / (zndc - L.cam_dir.w), near_, far_);
-        float vw  = clamp(log2(zview / near_) / logFN, 0.0, 1.0);
+        float vw  = clamp(Froxel_SliceFromViewZ(zview, near_, logFN), 0.0, 1.0);
         // Sub-froxel dither (interleaved-gradient noise) breaks the residual grid
         // banding into fine grain. Kept SUBTLE (±0.25 froxel) — the higher-res grid
         // already smooths most of it, so a light dither avoids visible noise. (Full

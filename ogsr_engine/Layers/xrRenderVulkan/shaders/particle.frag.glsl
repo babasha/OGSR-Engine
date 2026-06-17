@@ -26,7 +26,7 @@ layout(push_constant) uniform PushConstants {
     mat4 viewProj;
     vec4 camPosNear;
     vec4 camDirLogFN;
-    vec4 volParams;     // x = light-probe strength, yz = 1/extent
+    vec4 volParams;     // x = light-probe strength, yz = 1/extent, w = radiance clamp
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -45,7 +45,7 @@ void main()
         vec2 uv  = gl_FragCoord.xy * pc.volParams.yz;          // screen UV (matches the tonemap composite)
         vec4 s   = texture(uScatter, vec3(uv, clamp(fragVolW, 0.0, 1.0)));
         vec3 rad = s.rgb / max(s.a, 1e-3);                     // density-independent local radiance
-        rad = min(rad, vec3(6.0));                             // bound it so smoke doesn't blow to white next to a campfire / sun beam
+        rad = min(rad, vec3(pc.volParams.w));                  // bound it (r_vol_smoke_clamp) so smoke doesn't blow to white next to a campfire / sun beam
         outColor.rgb += rad * (pc.volParams.x * outColor.a);   // additive, coverage-weighted
     }
 }

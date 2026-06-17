@@ -27,9 +27,11 @@
 #include <unordered_map>
 #include <string>
 
-// Stage-0 volumetric lighting strength for smoke billboards (global scope — matches
-// the C-linkage console symbol the other r_vol_* knobs use). 0 = off / old look.
+// Stage-0 volumetric lighting knobs for smoke billboards (global scope — matches
+// the C-linkage console symbols the other r_vol_* knobs use). strength 0 = off /
+// old look; clamp bounds the per-froxel radiance added so smoke can't blow to white.
 extern float ps_r_vol_smoke;
+extern float ps_r_vol_smoke_clamp;
 
 namespace VK {
 
@@ -67,9 +69,13 @@ namespace {
     // set pointed at Vol's scatter view (eager-created, so valid from init); rebound
     // if Vol ever regenerates. Bound for every particle draw because particle.frag
     // statically references it (the sample itself is gated on volParams.x).
+    // Sentinel "no Vol generation bound yet" — != any real Vol::Generation() so the
+    // first EnsureVolSet() always writes the descriptor.
+    constexpr u32 kVolGenUnbound = 0xFFFFFFFFu;
+
     VkDescriptorSetLayout s_VolSetLayout = VK_NULL_HANDLE;
     VkDescriptorSet       s_VolSet       = VK_NULL_HANDLE;
-    u32                   s_VolBoundGen  = 0xFFFFFFFFu;   // != any real Generation() → write on first use
+    u32                   s_VolBoundGen  = kVolGenUnbound;
 
     CVulkanBuffer    s_Ring[kFramesInFlight];
 
@@ -463,7 +469,7 @@ void ParticlePass_Destroy()
     DestroyDistortRT();
     if (s_Layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_Layout, nullptr); s_Layout = VK_NULL_HANDLE; }
     if (s_Pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr); s_Pool = VK_NULL_HANDLE; }  // frees s_VolSet too
-    s_VolSet = VK_NULL_HANDLE; s_VolBoundGen = 0xFFFFFFFFu;
+    s_VolSet = VK_NULL_HANDLE; s_VolBoundGen = kVolGenUnbound;
     if (s_Sampler)   { vkDestroySampler(VulkanHW.m_Device, s_Sampler, nullptr); s_Sampler = VK_NULL_HANDLE; }
     if (s_SetLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_SetLayout, nullptr); s_SetLayout = VK_NULL_HANDLE; }
     if (s_VolSetLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_VolSetLayout, nullptr); s_VolSetLayout = VK_NULL_HANDLE; }
@@ -674,41 +680,12 @@ void Pass_Particles(FrameContext& ctx)
     u32 vtxUsed = 0;
     u32 nDraw = 0, nHud = 0, nDistort = 0;
 
-    // Shared draw loop: builds billboards into the ring at the running offset
-    // and issues one draw per effect. `forcedPipe` overrides the per-blend
-    // pipeline (distort phase renders every effect with the distort pipeline).
-    auto drawList = [&](xr_vector<vkCParticleEffect*>& list, VkPipeline forcedPipe, u32& counter) {
-        for (vkCParticleEffect* e : list) {
-            VkPipeline pipe = forcedPipe ? forcedPipe : ParticlePass::GetPipeline(e->GetBlendMode());
-            if (pipe == VK_NULL_HANDLE) continue;          // build failure
-
-            VkDescriptorSet set = e->ResolveTextureSet();
-            if (set == VK_NULL_HANDLE) continue;           // missing texture
-
-            if (vtxUsed >= kRingVerts) break;              // ring full
-            const u32 avail = kRingVerts - vtxUsed;
-            FVF::LIT* dst = (FVF::LIT*)(base + (size_t)vtxUsed * kVtxStride);
-            const u32 vcount = e->BuildVertices(dst, avail);
-            if (vcount == 0) continue;
-
-            if (pipe != lastPipe) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); lastPipe = pipe; }
-            if (set  != lastSet)  { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 0, 1, &set, 0, nullptr); lastSet = set; }
-
-            vkCmdDraw(cmd, vcount, 1, vtxUsed, 0);
-            vtxUsed += vcount;
-            ++counter;
-        }
-    };
-
-    VkBuffer vbuf = ring.GetHandle();
-    VkDeviceSize voff = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voff);
-
     // ---- Stage-0 volumetric smoke lighting setup -----------------------------
-    // Bind the froxel scatter volume (set 1) and build the froxel camera basis the
-    // VS uses to map each vertex to its froxel. The probe is enabled (volParams.x)
-    // only for the WORLD phase and only when r_vol actually ran this frame (scatter
-    // is valid + SHADER_READ). HUD / distort push strength 0 → byte-identical output.
+    // Build the froxel camera basis the VS uses to map each vertex to its froxel.
+    // The probe (drawList's per-effect volParams.x) is enabled only for the WORLD
+    // phase, only when r_vol actually ran this frame (scatter is valid + SHADER_READ),
+    // and only on alpha-blended smoke — see drawList. The basis is built from the
+    // scene camera even for the HUD phase (which pushes strength 0, so it's unused).
     EnsureVolSet();
     const float smokeStrength = (Vol::Ready() && Vol::Wanted()) ? ps_r_vol_smoke : 0.0f;
 
@@ -722,15 +699,55 @@ void Pass_Particles(FrameContext& ctx)
         push.camDirLogFN[0] = dir.x; push.camDirLogFN[1] = dir.y; push.camDirLogFN[2] = dir.z; push.camDirLogFN[3] = gz.logFarNear;
         push.volParams[1]   = ctx.extent.width  ? 1.0f / float(ctx.extent.width)  : 0.0f;
         push.volParams[2]   = ctx.extent.height ? 1.0f / float(ctx.extent.height) : 0.0f;
+        push.volParams[3]   = ps_r_vol_smoke_clamp;
     }
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 1, 1, &s_VolSet, 0, nullptr);
 
-    auto pushParticle = [&](const Fmatrix& vpMat, float strength) {
-        push.viewProj     = vpMat;
-        push.volParams[0] = strength;
-        vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(ParticlePush), &push);
+    // Shared draw loop: builds billboards into the ring at the running offset and
+    // issues one draw per effect. `vpMat` is the phase's view-projection; `probe`
+    // is the Stage-0 light-probe strength, applied ONLY to alpha-blended smoke
+    // (PBM_BLEND) — additive fire/sparks/muzzle are self-emissive and would
+    // over-glow, so everything else pushes strength 0. The push carries viewProj,
+    // so it's re-issued whenever the strength changes (and always on the first
+    // drawable effect). `forcedPipe` overrides the per-blend pipeline (the distort
+    // phase renders every effect with one pipeline).
+    auto drawList = [&](xr_vector<vkCParticleEffect*>& list, VkPipeline forcedPipe,
+                        u32& counter, const Fmatrix& vpMat, float probe) {
+        push.viewProj = vpMat;
+        float lastStrength = -1.0f;   // != any real strength → push on first drawable effect
+        for (vkCParticleEffect* e : list) {
+            VkPipeline pipe = forcedPipe ? forcedPipe : ParticlePass::GetPipeline(e->GetBlendMode());
+            if (pipe == VK_NULL_HANDLE) continue;          // build failure
+
+            VkDescriptorSet set = e->ResolveTextureSet();
+            if (set == VK_NULL_HANDLE) continue;           // missing texture
+
+            if (vtxUsed >= kRingVerts) break;              // ring full
+            const u32 avail = kRingVerts - vtxUsed;
+            FVF::LIT* dst = (FVF::LIT*)(base + (size_t)vtxUsed * kVtxStride);
+            const u32 vcount = e->BuildVertices(dst, avail);
+            if (vcount == 0) continue;
+
+            const float strength = (e->GetBlendMode() == PBM_BLEND) ? probe : 0.0f;
+            if (strength != lastStrength) {
+                push.volParams[0] = strength;
+                vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(ParticlePush), &push);
+                lastStrength = strength;
+            }
+
+            if (pipe != lastPipe) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); lastPipe = pipe; }
+            if (set  != lastSet)  { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 0, 1, &set, 0, nullptr); lastSet = set; }
+
+            vkCmdDraw(cmd, vcount, 1, vtxUsed, 0);
+            vtxUsed += vcount;
+            ++counter;
+        }
     };
+
+    VkBuffer vbuf = ring.GetHandle();
+    VkDeviceSize voff = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voff);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 1, 1, &s_VolSet, 0, nullptr);
 
     VkRect2D sc{ {}, ctx.extent };
 
@@ -767,8 +784,7 @@ void Pass_Particles(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
         if (!s_world.empty() && ctx.viewProj) {
-            pushParticle(*ctx.viewProj, smokeStrength);   // smoke catches the froxel light
-            drawList(s_world, VK_NULL_HANDLE, nDraw);
+            drawList(s_world, VK_NULL_HANDLE, nDraw, *ctx.viewProj, smokeStrength);   // alpha smoke catches the froxel light
         }
 
         if (!s_hud.empty()) {
@@ -779,8 +795,8 @@ void Pass_Particles(FrameContext& ctx)
             // against the HUD weapon itself.
             vp.minDepth = 0.0f; vp.maxDepth = 0.02f;
             vkCmdSetViewport(cmd, 0, 1, &vp);
-            pushParticle(Device.mFullTransform_hud2, 0.0f);   // HUD smoke: no froxel probe (different projection/depth)
-            drawList(s_hud, VK_NULL_HANDLE, nHud);
+            // HUD smoke: no froxel probe (different projection/depth) → strength 0.
+            drawList(s_hud, VK_NULL_HANDLE, nHud, Device.mFullTransform_hud2, 0.0f);
         }
 
         vkCmdEndRendering(cmd);
@@ -830,8 +846,8 @@ void Pass_Particles(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
         if (!s_distort.empty() && ctx.viewProj) {
-            pushParticle(*ctx.viewProj, 0.0f);   // distort writes UV offsets, not colour — no probe
-            drawList(s_distort, s_DistortPipe, nDistort);
+            // distort writes UV offsets, not colour — no probe → strength 0.
+            drawList(s_distort, s_DistortPipe, nDistort, *ctx.viewProj, 0.0f);
         }
 
         vkCmdEndRendering(cmd);

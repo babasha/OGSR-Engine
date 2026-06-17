@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "froxel.glsl"   // exp-Z slice <-> view-Z mapping (shared with vol_inject + tonemap)
 
 // Particle billboard vertex shader (OGSR Vulkan).
 // Vertices are FVF::LIT {vec3 pos; D3DCOLOR color; vec2 uv} built CPU-side in
@@ -25,7 +27,7 @@ layout(push_constant) uniform PushConstants {
     mat4 viewProj;
     vec4 camPosNear;    // xyz = camera world pos, w = froxel near Z
     vec4 camDirLogFN;   // xyz = camera forward (unit), w = log2(far/near)
-    vec4 volParams;     // x = light-probe strength, yz = 1/extent (fragment)
+    vec4 volParams;     // x = light-probe strength, yz = 1/extent, w = radiance clamp (fragment)
 } pc;
 
 void main()
@@ -40,5 +42,5 @@ void main()
     // only needs the linear view depth here.
     float near  = max(pc.camPosNear.w, 1e-4);
     float viewZ = dot(inPosition - pc.camPosNear.xyz, pc.camDirLogFN.xyz);
-    fragVolW    = log2(max(viewZ, near) / near) / max(pc.camDirLogFN.w, 1e-4);
+    fragVolW    = Froxel_SliceFromViewZ(max(viewZ, near), near, max(pc.camDirLogFN.w, 1e-4));
 }
