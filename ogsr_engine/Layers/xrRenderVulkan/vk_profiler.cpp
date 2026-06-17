@@ -40,6 +40,7 @@ float         s_periodNs   = 0.f;                       // timestampPeriod (ns/t
 // ---- per-slot bookkeeping ----
 u32  s_curSlot   = 0;
 u32  s_curZoneN  = 0;                 // zones opened this frame
+u32  s_zoneDepth = 0;                 // current open-zone nesting depth (0 while between top-level passes)
 bool s_slotWritten[kSlots] = {};
 u32  s_slotZoneN [kSlots]  = {};
 
@@ -180,6 +181,7 @@ void FrameBegin(VkCommandBuffer cmd, u32 frameIndex)
     Init();
     s_curSlot  = frameIndex % kSlots;
     s_curZoneN = 0;
+    s_zoneDepth = 0;   // defensive: rebalance in case a zone span was left open last frame
 
     // snapshot + reset CPU-side counters for getters
     s_frameLast.draws     = s_cDraws;     s_cDraws = 0;
@@ -218,6 +220,7 @@ int ZoneBegin(VkCommandBuffer cmd, const char* name)
 
     // stable name for this slot index
     xr_strcpy(s_zone[z].name, name);
+    s_zone[z].depth = s_zoneDepth++;   // 0 = top-level pass; nested children are excluded from gpu_total
     QueryPerformanceCounter(&s_cpuStart[z]);
 
     if (s_pool)
@@ -232,7 +235,8 @@ int ZoneBegin(VkCommandBuffer cmd, const char* name)
 
 void ZoneEnd(VkCommandBuffer cmd, int zone)
 {
-    if (zone < 0) { CmdEndLabel(cmd); return; }   // overflow zone (label only)
+    if (zone < 0) { CmdEndLabel(cmd); return; }   // overflow zone (label only; never bumped s_zoneDepth)
+    if (s_zoneDepth) s_zoneDepth--;
     CmdEndLabel(cmd);
     if (s_pool)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_pool,
@@ -262,10 +266,13 @@ void MaybeLog()
     s_lastLogMs = nowMs;
     s_markReq   = false;
 
-    char line[1024]; int off = 0;
+    char line[2048]; int off = 0;
     float gpuTotal = 0.f;
     for (u32 z = 0; z < s_zoneCount; ++z) {
-        gpuTotal += s_zone[z].gpuLast;
+        // gpu_total = wall-clock frame GPU time ≈ sum of TOP-LEVEL passes only.
+        // Nested zones (World/*, Shadow/*) are a breakdown of their parent, so
+        // adding them would double-count; they're still printed individually.
+        if (s_zone[z].depth == 0) gpuTotal += s_zone[z].gpuLast;
         off += _snprintf(line + off, sizeof(line) - off - 1, "%s=%.2f(%.2f/%.2f) ",
                          s_zone[z].name, s_zone[z].gpuLast, s_zone[z].gpuMin, s_zone[z].gpuMax);
         if (off > (int)sizeof(line) - 64) break;
@@ -302,7 +309,7 @@ MemSnap GetMem() { return s_mem; }
 FrameInfo GetFrame()
 {
     float gpu = 0.f;
-    for (u32 z = 0; z < s_zoneCount; ++z) gpu += s_zone[z].gpuLast;
+    for (u32 z = 0; z < s_zoneCount; ++z) if (s_zone[z].depth == 0) gpu += s_zone[z].gpuLast;   // top-level only (see MaybeLog)
     s_frameLast.gpuMs = gpu;
     s_frameLast.cpuMs = Device.fTimeDeltaRealMS;
     s_frameLast.fps   = s_frameLast.cpuMs > 0.01f ? 1000.f / s_frameLast.cpuMs : 0.f;

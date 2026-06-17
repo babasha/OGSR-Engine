@@ -22,12 +22,18 @@
 #include "vk_TreeManager.h"    // trees join the prepass depth (GTAO occluders + early-Z)
 #include "vk_profiler.h"       // VK::Prof sub-zones (Depth/SSAO/Color/Statics/Skinned breakdown)
 #include "vk_vrs.h"            // VK::VRS — variable rate shading (depth-driven SRI)
+#include "vk_vsm.h"            // VK::VSM — virtual shadow maps page marking (WIP, r_vsm)
+#include "vk_clustered.h"      // VK::Clustered — clustered forward light cull (r_clustered)
+#include "vk_volumetrics.h"    // VK::Vol — froxel volumetric inject/integrate (r_vol)
 #include "HW_Vulkan.h"         // VulkanHW.m_bVRSSupported
 #include "../../xr_3da/device.h" // Device.dwTimeGlobal (cull diag throttle)
 
 // Global scope (not in namespace VK → avoid VK::ps_r_cull mangling), like the rain externs.
 extern int ps_r_cull;
 extern int ps_r_gpu_world;   // GPU-driven static world forward path (A/B with 0)
+extern int ps_r_clustered;   // clustered forward light cull (A/B with 0)
+extern int ps_r_clustered_debug; // clustered froxel light-count heatmap (also activates the cull)
+extern int ps_r_ssao_npc_normals;   // NPC normal G-buffer for GTAO (global scope: block-scope extern in namespace VK would mangle → LNK2001)
 
 namespace VK {
 
@@ -77,6 +83,11 @@ void Pass_World(FrameContext& ctx)
     // fresh image out of UNDEFINED, and binding it would be invalid to sample.
     if (prepass)
         SSAOPass::EnsureTargets(ctx.extent);
+
+    // VSM (r_vsm): compute this frame's clipmap params + ensure the screen-space mask
+    // target BEFORE EnvLight binds it on the receiver set (the actual mark/alloc/render/
+    // resolve happen in the prepass below; this only sets up params + the mask image).
+    if (VK::VSM::Wanted()) VK::VSM::BeginFrame(Device.vCameraPosition, ctx.extent);
 
     // Refresh this frame's env-lighting UBO (sun/hemi/ambient) once, before any
     // draw. RenderQueue::Flush binds the resulting set at set 1; Pass_Skinned
@@ -133,6 +144,27 @@ void Pass_World(FrameContext& ctx)
     // pass); DrawDepth/DrawColor below consume its indirect buffer in both passes.
     if (gpuWorld)
         WorldGPU::Cull(cmd, *ctx.viewProj);
+
+    // Clustered forward: bin this frame's dynamic lights into the froxel grid
+    // (compute, outside the render pass). EnvLight::Update above already uploaded
+    // the light list to this slot's SSBO; the world/skinned color fragments read
+    // the resulting per-cluster lists. (Init is lazy via EnvLight::Update.)
+    if ((ps_r_clustered || ps_r_clustered_debug) && VK::Clustered::Ready()) {
+        const VK::ProjTerms cpt = VK::DeriveProjTerms(*ctx.viewProj);
+        VK::Clustered::Cull(cmd, cpt, Device.vCameraPosition, ctx.extent,
+                            CommandManager.GetCurrentFrame(),
+                            VK::Lights::CollectFrame(Device.vCameraPosition).count);
+    }
+
+    // Froxel volumetrics (r_vol): inject + integrate the view-frustum volume
+    // (compute, OUTSIDE the render pass). Needs NO scene depth — the froxel world
+    // pos is analytic — so it runs here, before the prepass. EnvLight::Update +
+    // the earlier Pass_SunShadow already produced the sun cascade maps it samples.
+    // The composite is folded into the tonemap pass (gated on r_vol).
+    if (VK::Vol::Wanted() && VK::Vol::Ready()) {
+        const VK::ProjTerms vpt = VK::DeriveProjTerms(*ctx.viewProj);
+        VK::Vol::Execute(cmd, vpt, CommandManager.GetCurrentFrame());
+    }
 
     // Throttled average: static-collect CPU vs the whole-frame cpu — confirms the
     // collect cost (now decoupled from object count when gpuWorld).
@@ -198,6 +230,56 @@ void Pass_World(FrameContext& ctx)
         SceneAttachmentBarrier(cmd);   // order prepass depth writes before the color pass
         VK::Prof::ZoneEnd(cmd, zDepth);
 
+        // NPC NORMAL G-buffer for GTAO: render the near-camera skinned casters into
+        // the SSAO normal RT, depth-tested against the prepass depth (no depth write).
+        // Gives GTAO real per-pixel normals where NPCs are visible → no depth-
+        // derivative speckle on characters; statics/trees fall back to depth recon.
+        // The RT is always CLEARed (defined for the GTAO sample) even if the draw is
+        // gated off. ps_r_ssao_npc_normals (vk_console_min) — A/B toggle.
+        if (SSAOPass::Enabled() && SSAOPass::GetNormalView() != VK_NULL_HANDLE)
+        {
+            const int zNrm = VK::Prof::ZoneBegin(cmd, "World/AOnormal");
+            ImageBarrier(cmd, SSAOPass::GetNormalImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+            VkRenderingAttachmentInfo nAtt{};
+            nAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            nAtt.imageView   = SSAOPass::GetNormalView();
+            nAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            nAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;       // a=0 everywhere → GTAO fallback
+            nAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+            nAtt.clearValue.color = { { 0.f, 0.f, 0.f, 0.f } };
+
+            VkRenderingAttachmentInfo nDepth{};
+            nDepth.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            nDepth.imageView   = ctx.depthView;
+            nDepth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            nDepth.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;       // test the prepass depth
+            nDepth.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE; // pipeline has depthWrite off
+
+            VkRenderingInfo nri{};
+            nri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            nri.renderArea.extent    = ctx.extent;
+            nri.layerCount           = 1;
+            nri.colorAttachmentCount = 1;
+            nri.pColorAttachments    = &nAtt;
+            nri.pDepthAttachment     = &nDepth;
+            vkCmdBeginRendering(cmd, &nri);
+
+            VkViewport nvp{ 0.f, (float)ctx.extent.height, (float)ctx.extent.width, -(float)ctx.extent.height, 0.f, 1.f };
+            vkCmdSetViewport(cmd, 0, 1, &nvp);
+            VkRect2D nsc{ {}, ctx.extent };
+            vkCmdSetScissor(cmd, 0, 1, &nsc);
+
+            if (ps_r_ssao_npc_normals)
+                Skinned_RenderNormalPrepass(cmd, *ctx.viewProj);
+
+            vkCmdEndRendering(cmd);
+            ImageBarrier(cmd, SSAOPass::GetNormalImage(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            VK::Prof::ZoneEnd(cmd, zNrm);
+        }
+
         // GTAO from the prepass depth (R4 SSAO analog): flip depth to
         // SHADER_READ, render half-res AO + blur, flip back. The color pass
         // below samples the result via EnvLight binding 8 (ambient/hemi only).
@@ -223,6 +305,67 @@ void Pass_World(FrameContext& ctx)
             ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
             VK::Prof::ZoneEnd(cmd, zVRS);
+        }
+
+        // VSM page marking (WIP, r_vsm): which sun-clipmap pages do visible pixels
+        // need? Reads the prepass depth in SHADER_READ. Gated on Wanted() (the cvar,
+        // no Init dependency); MarkPages lazily Inits + no-ops if not yet Ready.
+        if (VK::VSM::Wanted()) {
+            // Scene depth is sampled by the VSM mark/resolve COMPUTE dispatches. The auto
+            // ImageBarrier derives SHADER_READ as FRAGMENT-only (vk_barriers DeriveStageAccess),
+            // so the compute read is left unordered vs the prepass depth write — a latent sync
+            // hole (works today only because the prepass finished long before; breaks under async
+            // compute / strict drivers). Use explicit barriers that include COMPUTE (mirrors VSM's
+            // own atlasToRead). [#3]
+            auto depthToRead = [&]() {
+                VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                b.srcStageMask  = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+                b.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                b.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                b.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = Swapchain.m_DepthImage;
+                b.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+                VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &b;
+                vkCmdPipelineBarrier2(cmd, &di);
+            };
+            auto depthToAttach = [&]() {
+                VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                b.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                b.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                b.dstStageMask  = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+                b.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+                b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                b.image = Swapchain.m_DepthImage;
+                b.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+                VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &b;
+                vkCmdPipelineBarrier2(cmd, &di);
+            };
+
+            const int zVSM = VK::Prof::ZoneBegin(cmd, "World/VSMmark");
+            depthToRead();
+            VK::VSM::MarkPages(cmd, ctx.depthView, ctx.extent, *ctx.viewProj);
+            depthToAttach();
+            VK::Prof::ZoneEnd(cmd, zVSM);
+            // Rasterize the casters into the VSM atlas (own render pass; the scene
+            // depth is already restored above).
+            const int zVSMr = VK::Prof::ZoneBegin(cmd, "World/VSMrender");
+            VK::VSM::RenderAtlas(cmd);
+            VK::Prof::ZoneEnd(cmd, zVSMr);
+            // Temporal resolve: sample the atlas per screen pixel + reproject history →
+            // the screen-space sun-shadow mask the receivers read. Needs the prepass
+            // depth in SHADER_READ (same transition pattern as the mark pass above).
+            const int zVSMres = VK::Prof::ZoneBegin(cmd, "World/VSMresolve");
+            depthToRead();
+            VK::VSM::ResolveMask(cmd, ctx.depthView, ctx.extent, *ctx.viewProj);
+            depthToAttach();
+            VK::Prof::ZoneEnd(cmd, zVSMres);
         }
     }
 

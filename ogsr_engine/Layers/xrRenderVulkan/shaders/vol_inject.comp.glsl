@@ -1,0 +1,380 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "vsm_common.glsl"   // VSM clipmap math (vsmSelect/vsmPageIndex) for the smooth atlas occlusion
+// xrRenderVulkan — froxel volumetric INJECTION (vk_volumetrics, P1).
+//
+// One thread per froxel. Reconstruct the froxel's world position from the camera
+// basis (DeriveProjTerms scheme — camDir + right*tanX*ndc.x + top*tanY*ndc.y,
+// scaled by the exponential view-Z), evaluate height/base fog density, then the
+// sun in-scatter = Henyey-Greenstein phase * cascade sun-shadow * sun colour
+// (+ a flat sky-ambient fill), all * density. Output: rgb = in-scatter,
+// a = extinction (= density). vol_integrate then marches Z over this.
+//
+// Occlusion = the sun CASCADE maps (cascSample/cascTap ported from
+// world_lmap.frag) — the r_vsm-OFF path + the permanent fallback. VSM-atlas
+// sampling is the P4 upgrade.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+struct VolLight { vec4 pos; vec4 color; vec4 dir; };  // pos.w=range, color.w=1 spot/0 point, dir.w=cos(cone/2)
+
+layout(set = 0, binding = 0) uniform Vol {
+    vec4 camPos;       // xyz world camera pos
+    vec4 camDir;       // xyz camera forward (unit)
+    vec4 camRightT;    // xyz right * tan(fovX/2)
+    vec4 camTopT;      // xyz top   * tan(fovY/2)
+    vec4 sun_dir;      // xyz sun TRAVEL dir (down); to-sun = -sun_dir
+    vec4 sun_color;    // rgb
+    vec4 sky_ambient;  // rgb flat fill
+    mat4 sun_vp;       // far cascade VP
+    mat4 sun_near_vp;  // cascade 0 VP
+    mat4 sun_c1_vp;    // cascade 1 VP
+    vec4 gridParams;   // x=dimX y=dimY z=dimZ
+    vec4 zParams;      // x=near y=far z=log2(far/near)
+    vec4 fog;          // x=baseDensity y=heightBase z=heightFalloff w=HG_g
+    vec4 fog2;         // x=intensity y=ambient floor z=indoor density boost w=sun-beam boost
+    mat4 rain_vp;      // top-down ortho VP for the sky-visibility (ambient) occlusion
+    mat4 prevViewProj; // temporal reprojection (prev frame world→clip)
+    vec4 prevCamPos;   // xyz prev cam pos, w = prev near
+    vec4 prevCamDir;   // xyz prev cam forward, w = prev log2(far/near)
+    vec4 temporal;     // xyz = froxel jitter (−0.5..0.5), w = history blend (0 = off)
+    mat4 fog_shadow_vp; // r_vol_shadow: dedicated per-frame fog sun-shadow VP
+    vec4 lightParams;  // P2: x = count, y = boost, z = spot-shadowed idx (-1), w = point-shadowed idx (-1)
+    VolLight lights[8];
+    vec4 noiseParams;  // P3: x = amount, y = scale, z = speed, w = time
+    mat4 spot_vp;      // spot (flashlight) shadow VP
+} V;
+
+layout(set = 0, binding = 1) uniform sampler2D uShadowNear; // cascade 0
+layout(set = 0, binding = 2) uniform sampler2D uShadowC1;   // cascade 1
+layout(set = 0, binding = 3) uniform sampler2D uShadow;     // far cached map
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D uScatter;
+layout(set = 0, binding = 5) uniform sampler2D uRainMap;    // top-down statics depth (sky visibility)
+layout(set = 0, binding = 6) uniform sampler3D uHistory;    // prev frame's blended scatter (temporal)
+// VSM static atlas occlusion (smooth, no cache tick) — gated by gridParams.w.
+layout(set = 0, binding = 7) uniform sampler2D uVsmAtlas;   // static VSM atlas (opaque + trees)
+layout(set = 0, binding = 8) readonly buffer VsmPageTable { uint vsmPageTable[]; }; // virtual page → atlas slot
+layout(set = 0, binding = 9) uniform VsmClipmap {
+    mat4 view;                 // world → sun light space
+    vec4 level[VSM_LEVELS];    // xy = level origin (light XY of texel 0,0), z = extent (m)
+    vec4 zparams;              // x = zNear, y = 1/(zFar-zNear), z = depth bias
+} vsmC;
+layout(set = 0, binding = 10) uniform sampler2D uFogShadow;  // dedicated per-frame fog sun-shadow
+layout(set = 0, binding = 11) uniform sampler2D   uSpotShadow;  // spot (flashlight) shadow — occlude the fog cone
+layout(set = 0, binding = 12) uniform samplerCube uPointShadow; // point (campfire) shadow cube
+
+const float PI = 3.14159265;
+
+// --- P3: cheap animated 3D value noise (drifting dust / "living air") -----------
+float hash13(vec3 p)
+{
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+float vnoise3(vec3 x)
+{
+    vec3 i = floor(x), f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash13(i + vec3(0,0,0)), hash13(i + vec3(1,0,0)), f.x),
+                   mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x),
+                   mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm3(vec3 p) { return 0.62 * vnoise3(p) + 0.38 * vnoise3(p * 2.3 + 11.7); }
+
+// --- Sun shadow, R4 cascade scheme (ported from world_lmap.frag) -------------
+float cascTap(sampler2D smap, vec2 uv, float ref)
+{
+    vec2 sz = vec2(textureSize(smap, 0));
+    vec2 t  = uv * sz - 0.5;
+    vec2 f  = fract(t);
+    vec4 d  = textureGather(smap, (floor(t) + 1.0) / sz, 0);
+    vec4 c  = step(vec4(ref), d);
+    return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
+}
+float cascSample(sampler2D smap, mat4 vp, vec3 wp, float bias_)
+{
+    vec3 n = (vp * vec4(wp, 1.0)).xyz;          // ortho → already NDC
+    vec2 uv = n.xy * 0.5 + 0.5;
+    uv.y = 1.0 - uv.y;
+    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99 || n.z <= 0.0 || n.z >= 1.0)
+        return -1.0;
+    float ref = n.z - bias_;
+    // WIDE 3x3 PCF (spacing = r_vol_soft texels): a SOFT penumbra. The fog doesn't
+    // need crisp shadows — a soft shadow makes the foliage dapple a gentle gradient
+    // instead of sharp speckles, so the cascade cache TICK (sun creep) barely shows.
+    vec2  tx  = (1.0 / vec2(textureSize(smap, 0))) * max(V.zParams.w, 0.5);
+    float s = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+        s += cascTap(smap, uv + vec2(float(dx), float(dy)) * tx, ref);
+    return s * (1.0 / 9.0);
+}
+// VSM static-atlas occlusion (port of vsm_resolve sampleVSM, static atlas only):
+// world → light → clipmap level → page → atlas slot → 3x3 PCF depth compare. The
+// VSM updates SMOOTHLY per frame (no cascade cache TICK) → stable shafts. Returns
+// lit 1..0, or -1.0 when this point has NO resident VSM page → caller falls back to
+// the cascade (covers off-screen gaps in the view-dependent VSM).
+float sampleVSMStatic(vec3 wp)
+{
+    vec3 lp = (vsmC.view * vec4(wp, 1.0)).xyz;
+    vec2 luv; ivec2 page;
+    int  L = vsmSelect(lp.xy, vsmC.level, luv, page);
+    if (L < 0) return -1.0;                       // outside the clipmap → cascade fallback
+    uint slot = vsmPageTable[vsmPageIndex(L, page)];
+    if (slot >= uint(VSM_MAX_PHYS_S)) return -1.0; // page not resident → cascade fallback
+
+    vec2  pageLocal = luv * float(VSM_PAGES_AXIS) - vec2(page);
+    vec2  base  = vec2(float(slot % uint(VSM_ATLAS_W_S)), float(slot / uint(VSM_ATLAS_W_S)));
+    float zHere = (lp.z - vsmC.zparams.x) * vsmC.zparams.y;
+    float bias  = vsmC.zparams.z;
+    const vec2  dim   = vec2(float(VSM_ATLAS_W_S), float(VSM_ATLAS_H_S));
+    const float tp    = 1.0 / float(VSM_PAGE_SIZE);
+    const float inset = 0.5 * tp;
+    float lit = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        vec2 pl = clamp(pageLocal + vec2(float(dx), float(dy)) * tp, vec2(inset), vec2(1.0 - inset));
+        float occ = texture(uVsmAtlas, (base + pl) / dim).r;
+        lit += (zHere - bias > occ) ? 0.0 : 1.0;
+    }
+    return lit * (1.0 / 9.0);
+}
+
+// Dedicated per-frame fog sun-shadow (r_vol_shadow): re-rendered EVERY frame with a
+// fresh anchor-snapped VP → CONTINUOUS occlusion (no cache tick). Soft 3x3 PCF (the
+// r_vol_soft radius). Ortho. Returns lit 1..0, or -1.0 outside the box → cascade.
+float sampleFogShadow(vec3 wp)
+{
+    vec3 n = (V.fog_shadow_vp * vec4(wp, 1.0)).xyz;   // ortho → already NDC
+    vec2 uv = n.xy * 0.5 + 0.5;
+    uv.y = 1.0 - uv.y;
+    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99 || n.z <= 0.0 || n.z >= 1.0)
+        return -1.0;
+    float ref = n.z - 0.0006;
+    vec2  tx  = (1.0 / vec2(textureSize(uFogShadow, 0))) * max(V.zParams.w, 0.5);
+    float s = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+        s += cascTap(uFogShadow, uv + vec2(float(dx), float(dy)) * tx, ref);
+    return s * (1.0 / 9.0);
+}
+
+float sunShadow(vec3 worldPos)
+{
+    // Occlusion source (gridParams.w): 2 = dedicated per-frame fog shadow (continuous,
+    // no tick), 1 = VSM atlas, 0 = cascade. Each falls through to the cascade where it
+    // has no coverage (outside the box / no VSM page / r_vsm off).
+    float mode = V.gridParams.w;
+    if (mode > 1.5) {
+        float f = sampleFogShadow(worldPos);
+        if (f >= 0.0) return f;
+    } else if (mode > 0.5) {
+        float v = sampleVSMStatic(worldPos);
+        if (v >= 0.0) return v;
+    }
+    // Smaller bias than the surface receivers: a froxel is in AIR (no self-shadow
+    // acne to hide), so a tight bias just reduces light leaking THROUGH walls.
+    float s = cascSample(uShadowNear, V.sun_near_vp, worldPos, 0.00015);
+    if (s >= 0.0) return s;
+    s = cascSample(uShadowC1, V.sun_c1_vp, worldPos, 0.00025);
+    if (s >= 0.0) return s;
+
+    vec4 c = V.sun_vp * vec4(worldPos, 1.0);
+    if (c.w <= 0.0) return 1.0;
+    vec3 ndc = c.xyz / c.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    uv.y = 1.0 - uv.y;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
+    float ref = ndc.z - 0.0008;
+    return cascTap(uShadow, uv, ref);
+}
+
+// Sky visibility (top-down statics depth): 1 = open to the sky, 0 = under a roof.
+// Occludes the unconditional ambient term so the air inside a building doesn't glow
+// with outdoor haze (the sun beam through the window still lights via the cascade).
+float skyVis(vec3 wp)
+{
+    vec3 n = (V.rain_vp * vec4(wp, 1.0)).xyz;   // ortho → already NDC
+    vec2 uv = n.xy * 0.5 + 0.5;
+    uv.y = 1.0 - uv.y;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || n.z <= 0.0 || n.z >= 1.0)
+        return 1.0;                              // outside the map = open sky
+    float ref = n.z - 0.002;
+    vec2  px  = 1.0 / vec2(textureSize(uRainMap, 0));
+    return 0.25 * (cascTap(uRainMap, uv + vec2(-0.5, -0.5) * px, ref)
+                 + cascTap(uRainMap, uv + vec2( 0.5, -0.5) * px, ref)
+                 + cascTap(uRainMap, uv + vec2(-0.5,  0.5) * px, ref)
+                 + cascTap(uRainMap, uv + vec2( 0.5,  0.5) * px, ref));
+}
+
+// Henyey-Greenstein phase: peaks at cosT=+1 for g>0 (forward scatter = the bright
+// halo when looking toward the sun).
+float hgPhase(float cosT, float g)
+{
+    float g2 = g * g;
+    float d  = 1.0 + g2 - 2.0 * g * cosT;
+    return (1.0 - g2) / (4.0 * PI * pow(max(d, 1e-4), 1.5));
+}
+
+// Spot (flashlight) shadow — 3x3 PCF, ported from world_lmap.frag. Occludes the fog
+// cone so it stops at walls instead of leaking through.
+float spotShadowF(vec3 wp)
+{
+    vec4 c = V.spot_vp * vec4(wp, 1.0);
+    if (c.w <= 0.0) return 1.0;
+    vec3 ndc = c.xyz / c.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
+    float ref   = ndc.z - 0.002;
+    vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x)
+        sum += (ref <= texture(uSpotShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
+    return sum * (1.0 / 9.0);
+}
+// Point (campfire) cube shadow — 1 tap (ported).
+float pointShadowF(vec3 wp, vec3 lp, float range)
+{
+    vec3 d = wp - lp;
+    float z = max(max(abs(d.x), abs(d.y)), abs(d.z));
+    const float n = 0.1;
+    float refD = range * (z - n) / (max(z, n) * max(range - n, 1e-3));
+    return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
+}
+
+// P2 — local lights (flashlight CONE, lamp/campfire/anomaly HALO) scattering in the
+// fog. Distance falloff × HG phase × (spot) cone gate × the budget shadow (so the
+// cone stops at walls).
+vec3 localLights(vec3 world, vec3 viewDir)
+{
+    int n = int(V.lightParams.x);
+    int spotIdx = int(V.lightParams.z);
+    int pointIdx = int(V.lightParams.w);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < n; ++i) {
+        vec3  toL   = V.lights[i].pos.xyz - world;
+        float dist  = length(toL);
+        float range = V.lights[i].pos.w;
+        if (range <= 0.0 || dist >= range) continue;
+        vec3  Ld    = toL / max(dist, 1e-3);
+        float atten = 1.0 - dist / range;
+        atten *= atten;                                   // smooth falloff
+        if (V.lights[i].color.w > 0.5) {                  // spot (flashlight) cone
+            float cosCone = V.lights[i].dir.w;
+            float d = dot(-Ld, V.lights[i].dir.xyz);
+            if (d < cosCone) continue;
+            atten *= smoothstep(cosCone, mix(cosCone, 1.0, 0.5), d);
+        }
+        if (i == spotIdx)        atten *= spotShadowF(world);
+        else if (i == pointIdx)  atten *= pointShadowF(world, V.lights[i].pos.xyz, range);
+        float ph = hgPhase(dot(viewDir, Ld), V.fog.w);    // scatter toward the camera
+        acc += V.lights[i].color.rgb * (atten * ph);
+    }
+    return acc * V.lightParams.y;                          // r_vol_lights boost
+}
+
+void main()
+{
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    int dimX = int(V.gridParams.x), dimY = int(V.gridParams.y), dimZ = int(V.gridParams.z);
+    if (id.x >= dimX || id.y >= dimY || id.z >= dimZ) return;
+
+    float nearZ = V.zParams.x, logFN = V.zParams.z;
+
+    // Froxel sample world pos with the sub-froxel JITTER (temporal.xyz, Halton per
+    // frame) → supersamples the shadow/density. cur (below) uses THIS.
+    vec2 uv  = (vec2(id.xy) + 0.5 + V.temporal.xy) / vec2(dimX, dimY);
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y);
+    float viewZ = nearZ * exp2(logFN * (float(id.z) + 0.5 + V.temporal.z) / float(dimZ));
+    vec3 ray   = V.camDir.xyz + V.camRightT.xyz * ndc.x + V.camTopT.xyz * ndc.y;
+    vec3 world = V.camPos.xyz + ray * viewZ;
+
+    // UNJITTERED froxel CENTRE — used ONLY for the history reprojection. The history
+    // is indexed at integer froxel centres, so reprojecting the JITTERED world made
+    // the lookup wobble by the jitter every frame → it never settled = "trembling".
+    // Reprojecting the stable centre lets the jittered samples accumulate cleanly.
+    vec2 uvC  = (vec2(id.xy) + 0.5) / vec2(dimX, dimY);
+    vec2 ndcC = vec2(uvC.x * 2.0 - 1.0, 1.0 - 2.0 * uvC.y);
+    float viewZC = nearZ * exp2(logFN * (float(id.z) + 0.5) / float(dimZ));
+    vec3 worldCenter = V.camPos.xyz + (V.camDir.xyz + V.camRightT.xyz * ndcC.x + V.camTopT.xyz * ndcC.y) * viewZC;
+
+    // Sky visibility (0 under a roof, 1 open) drives BOTH the indoor density boost
+    // and the ambient occlusion — sampled once.
+    float skyv = skyVis(world);
+
+    // Base extinction: base × exponential height falloff above the anchor.
+    // This drives the TRANSMITTANCE (scene dimming) — kept at base so small rooms
+    // aren't over-darkened (over-darkening is why the fog read as "just darker").
+    float extinction = V.fog.x * exp(-max(0.0, world.y - V.fog.y) * V.fog.z);
+    // P3 — animated dust/mist: mottle the DENSITY (both the extinction below AND the
+    // scatter inherit it) with slowly-drifting 3D noise → visible wisps/pockets in the
+    // lit fog, the "living air" feel. Applied to density (not scatter-only) so it
+    // survives the Z-integration + temporal averaging that washed the subtle version out.
+    if (V.noiseParams.x > 0.001) {
+        float t  = V.noiseParams.z * V.noiseParams.w;
+        vec3  np = world * V.noiseParams.y + vec3(t, t * 0.4, t * 0.8);
+        extinction *= max(1.0 + V.noiseParams.x * (fbm3(np) - 0.5) * 2.0, 0.0);
+    }
+    // Indoor density boost (fog2.z, ×(1+indoor) under a roof) makes the thin diffuse
+    // AMBIENT haze visible across a short interior sightline. It is applied ONLY to
+    // the ambient term: the SUN BEAM and LOCAL LIGHTS are strong DIRECTIONAL sources,
+    // and boosting THEM ×(1+indoor) indoors accumulated over the Z-march into a WHITE
+    // BLOWOUT (the campfire column / a god-ray through a doorway). Those use the BASE
+    // extinction so bright sources stay bounded; the ambient haze keeps the interior
+    // atmosphere. NOTE outdoors skyv=1 → boost=0 → ambDens==extinction → this is
+    // byte-identical to the old outdoor look (only interiors change).
+    float ambDens = extinction * (1.0 + V.fog2.z * (1.0 - skyv));
+
+    // Sun in-scatter (cascade-occluded → the beam stops at walls/roof, passing
+    // only through openings like windows) + sky ambient (occluded by sky visibility
+    // → interiors don't glow uniformly, so the sun beam stands out).
+    vec3  viewDir = normalize(ray);
+    vec3  toSun   = normalize(-V.sun_dir.xyz);
+    float phase   = hgPhase(dot(viewDir, toSun), V.fog.w);
+    float occ     = sunShadow(world);
+    // Ambient: FULL outdoors (skyv 1), but only a FLOOR fraction (fog2.y) under a
+    // roof — interiors keep visible haze (real rooms aren't pitch black) while the
+    // sun beam from a window still stands out against the dimmer indoor fill.
+    float ambK    = V.fog2.y + (1.0 - V.fog2.y) * skyv;
+    vec3  ambient = V.sky_ambient.rgb * ambK;
+    // The SUN term gets its own boost (fog2.w) so the directional shaft pops THROUGH
+    // the ambient haze. Transmittance (a) uses the base extinction.
+    vec3  sunScatter = V.sun_color.rgb * (phase * occ * V.fog2.w);
+    // Sun beam + local lights at BASE extinction (no indoor ×boost → no blowout);
+    // the ambient haze at the indoor-boosted density (the visible interior glow).
+    // Local lights carry their OWN boost (r_vol_lights) so lamps can be dialed.
+    vec3  inscatter  = sunScatter * V.fog2.x * extinction
+                     + ambient    * V.fog2.x * ambDens
+                     + localLights(world, viewDir) * extinction;
+
+    vec4 cur = vec4(inscatter, extinction);
+
+    // ---- Temporal accumulation: reproject this froxel's world pos into the PREV
+    // frame's volume and EMA-blend (alpha = temporal.w). Converges the jittered
+    // samples into a clean, dense volume; rejected (off-screen / behind cam) → cur.
+    float alpha = V.temporal.w;
+    if (alpha > 0.0) {
+        vec4 pc = V.prevViewProj * vec4(worldCenter, 1.0);
+        if (pc.w > 0.0) {
+            vec2 puv = (pc.xy / pc.w) * 0.5 + 0.5;
+            puv.y = 1.0 - puv.y;
+            float pvz = dot(worldCenter - V.prevCamPos.xyz, V.prevCamDir.xyz);   // prev view-space depth
+            float pw  = log2(max(pvz, 1e-3) / V.prevCamPos.w) / V.prevCamDir.w;
+            if (all(greaterThanEqual(vec3(puv, pw), vec3(0.0))) &&
+                all(lessThanEqual   (vec3(puv, pw), vec3(1.0)))) {
+                // Full EMA blend (no rejection): the moving-sun shadow crawl through
+                // foliage is exactly the noise temporal accumulation is meant to
+                // average into a stable shaft. Rejecting it (drop history on change)
+                // re-exposed the crawl = "trembling". Off-screen → reprojection bounds
+                // above already fall back to `cur`, so disocclusion can't ghost badly.
+                vec4 hist = textureLod(uHistory, vec3(puv, pw), 0.0);
+                cur = mix(cur, hist, alpha);
+            }
+        }
+    }
+
+    imageStore(uScatter, id, cur);
+}

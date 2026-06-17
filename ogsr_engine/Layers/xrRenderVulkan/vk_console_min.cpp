@@ -115,6 +115,10 @@ int   ps_r_ssao_debug    = 0;     // 1 = draw the raw AO map instead of the scen
 // zero GPU cost, binding 8 falls back to white. For A/B perf measurement and a
 // real off switch (r2_ssao 0 is treated as "medium", not off).
 int   ps_r_ssao_enable   = 1;
+// NPC normal G-buffer for GTAO (r_ssao_npc_normals): 1 = NPCs feed real per-pixel
+// normals into GTAO (no depth-derivative speckle on characters); 0 = NPCs fall
+// back to depth-reconstructed normals like statics. A/B toggle, no restart.
+int   ps_r_ssao_npc_normals = 1;
 // Strength is an exponent on the AO value (0 = off, 1 = raw GTAO). Default 2:
 // our AO input is the depth prepass (statics+trees, no grass/NPCs), and the
 // forward path applies AO to a smaller ambient share than R4's deferred
@@ -173,6 +177,69 @@ int   ps_r_gpu_shadows = 1;
 int   ps_r_shadow_lod      = 1;
 float ps_r_shadow_lod_dist = 30.0f;
 
+// Cascade shadow-map STATIC cache (vk_pass_shadow): the statics-only cascade depth
+// is re-rastered only when the camera moves past kCascRedrawDist OR the sun rotates
+// past r_shadow_casc_sun degrees; otherwise it's reused and only the skinned dynamics
+// are overlaid (kills the ~3 ms/frame Shadow/Casc0 raster while standing). 0 = old
+// per-frame raster (smoothest sun creep, full cost). r_shadow_casc_sun is the sun
+// step that forces a redraw — SMALLER = smoother shadow motion as the sun moves, at
+// the cost of more frequent (but cheaply amortized) redraws.
+int   ps_r_shadow_casc_cache = 1;
+float ps_r_shadow_casc_sun   = 0.05f;
+
+// Virtual Shadow Maps (vk_vsm) — sun directional clipmap with sparse physical pages:
+// only pages sampled by visible pixels are rendered, and they're cached across
+// frames in world space. Smooth moving-sun shadows (only visible pages re-render)
+// + standing ≈ 0. WIP, default OFF; the cascade path above stays the shipped default
+// until VSM proves out. r_vsm_debug logs per-frame page mark/alloc counts.
+int   ps_r_vsm       = 0;
+int   ps_r_vsm_debug = 0;
+// VSM receiver depth-compare bias (normalized clipmap Z, range ~2000 m). Larger =
+// less acne but more light-leak (small/thin caster shadows fade). Live-tunable.
+float ps_r_vsm_bias  = 0.0003f;
+// VSM clipmap detail: base extent (m) of clipmap level 0 → finest texel = base/4096.
+// 24 m ≈ the old 4096² cascade (5.9 mm), balanced. Smaller = sharper but more pages
+// (the 2048-page atlas can overflow on wide vistas → distant pages drop, graceful).
+// Live-tunable; meant to back a future "VSM detail Low/Med/High" graphics slider.
+float ps_r_vsm_base  = 24.0f;   // finest texel 5.9mm ≈ old cascade; temporal accumulation makes this coarse base look as clean as 12 did (user-verified) → cheap default. Future graphics slider Low/Med/High = 32/24/16.
+// VSM temporal accumulation (TAA-for-shadows): sub-texel jitter the clipmap origin each
+// frame + EMA-blend a reprojected history → kills the moving-sun "crawling snake" along
+// shadow edges. The proper crawl fix (lets base go back to a cheap coarse value). Live.
+int   ps_r_vsm_temporal = 1;
+// History weight (EMA alpha): higher = smoother/stabler but more ghosting under motion;
+// lower = crisper but more residual crawl. 0.9 ≈ ~10-frame convergence. Live-tunable.
+float ps_r_vsm_ta_blend = 0.9f;
+// Grass casts VSM shadows (near + L0 only; reads the GPU-driven detail instance buffer
+// 1 frame stale). DEFAULT OFF: grass blades are thinner than the shadow texel (blobby) and
+// the static-caster temporal filter ghosts the near-static grass ("see-through"). Kept,
+// gated, for experimentation — see [[vulkan-vsm]]. Live-tunable.
+int   ps_r_vsm_grass      = 0;
+float ps_r_vsm_grass_dist = 12.0f;   // max grass cast distance from camera (m)
+float ps_r_vsm_npc_dist   = 50.0f;   // max NPC shadow-cast distance into the VSM atlas (m); 0 = no cull (NPC shadows tiny past ~50m)
+float ps_r_vsm_lod_dist   = 0.0f;    // VSM caster-LOD: opaque casters draw coarse slice past this (m); 0 = off (measured marginal in village, like the cascade; kept for open maps)
+int   ps_r_vsm_mark_half  = 1;       // page-mark at half-res (4x fewer threads/atomics); 0 = full-res
+// VSM static-atlas CACHE (Phase 2): the static (opaque + tree) atlas is persistent; when
+// the sun hasn't moved (> r_vsm_cache_sun) AND the camera is still within the current page
+// cell, the whole static atlas pass is SKIPPED and last frame's atlas is reused (the dynamic
+// NPC/grass atlas still re-renders). Standing/aiming on a vista: VSMrender ~10ms -> ~0. Also
+// page-snaps the static clipmap window (vs texel) so sub-page camera moves don't invalidate.
+// DEFAULT OFF (0 = exactly the Step-0 per-frame path) — A/B knob. Live.
+int   ps_r_vsm_cache     = 0;
+// Sun-rotation tolerance (deg) before the cached static atlas re-renders. Larger = holds the
+// cache longer (cheaper) but a bigger one-shot shadow jump when it ticks (temporal resolve is
+// meant to smooth it). 0.05 ~ the old cascade-cache threshold. Live-tunable.
+float ps_r_vsm_cache_sun = 0.05f;
+// Camera-TURN tolerance (deg) before the cached static atlas re-renders. A frozen atlas only
+// holds the pages visible at freeze-time, so turning past this reveals un-rendered pages →
+// re-render. Smaller = no missing-shadow wedge while turning but more re-render (turning costs
+// like moving anyway); larger = holds the freeze through bigger turns but a thin wedge may show
+// at the screen edge. Live-tunable. (The proper fix for smooth turning is per-page residency.)
+float ps_r_vsm_cache_rot = 8.0f;
+// Round-robin refresh period (frames) for the moving-sun case (Phase 1b toroidal cache): each
+// frame ~1/N of the resident static pages re-render to track the creeping sun smoothly (no
+// jump). Smaller = fresher but costlier; only active while the sun moves (paused sun → 0). Live.
+int   ps_r_vsm_cache_refresh = 8;
+
 // GPU-driven world forward pass (vk_world_gpu): static opaque/AT meshes are
 // compute-culled + drawn via indirect (1 draw/material group) instead of the
 // per-object CPU queue, which also dedups the hierarchy double-submit. Cuts CPU
@@ -180,6 +247,55 @@ float ps_r_shadow_lod_dist = 30.0f;
 // r_gpu_world 0 = old CPU path (A/B). Default ON: measured ~2× fps in the village
 // (CPU ~halved, World/Statics ~5× lower) + user-verified visually identical.
 int   ps_r_gpu_world = 1;
+
+// Clustered forward (Forward+, vk_clustered): a compute pass bins the active
+// dynamic lights into a 16x9x24 froxel grid; each fragment iterates only the
+// few lights touching its cluster instead of all 16 with zero culling. Raises
+// the light cap 16 -> 256 AND makes shaded pixels cheaper (the structural gap
+// vs R4 deferred). Default OFF for A/B + safety: r_clustered 0 keeps the exact
+// old per-fragment 16-light loop. v1 covers world (lmap/vlit/terrain) + skinned;
+// foliage stays on the 16-light path. r_clustered_debug draws a per-cluster
+// light-count heatmap (validates the cull).
+int   ps_r_clustered       = 0;
+int   ps_r_clustered_debug = 0;
+
+// Froxel volumetric lighting (vk_volumetrics, r_vol) — P1. A 3D froxel grid over
+// the frustum: compute injects sun in-scatter (Henyey-Greenstein phase × cascade
+// sun-shadow) + height/base fog, integrates it front-to-back, and the tonemap
+// composites scene*transmittance + in-scatter (HDR, pre-tonemap). = god rays
+// through geometry + depth fog (the Metro base look). Default OFF. r_vol_height 0
+// = uniform fog; r_vol_debug shows the raw integrated in-scatter pattern.
+int   ps_r_vol           = 1;       // ON by default — shipped feature (god-rays + depth fog + indoor haze), ~1.5ms
+float ps_r_vol_density   = 0.02f;   // base extinction / scatter density
+float ps_r_vol_height    = 0.10f;   // height-fog falloff above eye level (0 = uniform)
+float ps_r_vol_g         = 0.80f;   // Henyey-Greenstein anisotropy (forward scatter)
+float ps_r_vol_intensity = 3.0f;    // in-scatter brightness multiplier (raised: fog must GLOW more than it dims to read as haze)
+float ps_r_vol_amb       = 0.60f;   // indoor ambient floor: fraction of sky ambient kept under a roof (0=pitch-dark interior, 1=no occlusion)
+float ps_r_vol_indoor    = 6.0f;    // indoor density boost: fog ×(1+this) under a roof — short interior sightlines need denser air to show
+float ps_r_vol_sun       = 3.0f;    // sun-beam in-scatter boost: directional shaft brightness (pops the god-ray through the ambient haze)
+float ps_r_vol_lights    = 2.5f;    // P2: local light (flashlight/lamp/campfire) in-scatter in fog — glow/cone strength; 0 = off
+float ps_r_vol_smoke     = 1.0f;    // Stage-0: light smoke billboards with the froxel in-scatter (sun shaft/flashlight/campfire catch the smoke); 0 = off (old flat look)
+float ps_r_vol_noise     = 0.55f;   // P3: animated 3D noise on the fog density → drifting dust/mist ("living air"); 0 = off
+float ps_r_vol_noise_scale = 0.40f; // P3 noise frequency (world units; higher = finer motes)
+float ps_r_vol_noise_speed = 0.10f; // P3 drift speed of the dust
+float ps_r_vol_soft      = 2.5f;    // cascade shadow PCF blur radius (texels): soft penumbra in fog so the cache TICK (sun creep through foliage) barely shows; 0.5 = crisp
+int   ps_r_vol_ta        = 1;       // temporal accumulation (jitter + reproject prev frame): smooths the froxel grid → clean dense fog
+float ps_r_vol_ta_blend  = 0.92f;   // history weight (EMA): higher = smoother but more ghosting on motion
+// TODO REMOVE (dead detour): the dedicated per-frame fog sun-shadow. Built to fix
+// the "trembling shafts", but the real bug was the temporal reprojection (now fixed),
+// so this is NOT needed. Kept OFF as an A/B toggle; safe to delete later along with
+// vk_shadow GetFogShadow*/ComputeFogShadowVP, the vk_pass_shadow fog render block,
+// vk_volumetrics binding 10 + sampleFogShadow, and gridParams.w mode 2.
+int   ps_r_vol_shadow    = 0;       // [deprecated] 0 = cascade/VSM path (the live one)
+int   ps_r_vol_debug     = 0;       // view the raw integrated in-scatter
+
+// Dynamic-light terrain/static occlusion (vk_shadow ground-height map + a per-light
+// height-march in the forward shaders). Stops un-shadowed point lights from
+// lighting through the ground/walls — a basement lamp no longer lights the earth +
+// fence overhead. Scales O(1) per light to ANY light count (unlike per-light shadow
+// maps). Needs the top-down ground map rendered every frame (cached on camera move).
+// Default ON; r_light_occ 0 = off (A/B / if the map redraw is too costly).
+int   ps_r_light_occ       = 1;
 
 // World heightmap tessellation (R4 TESS_HM port, live): bump-mapped statics
 // displace along the normal by the `<bump>#` alpha height near the camera.
@@ -877,6 +993,7 @@ void xrRender_initconsole()
     CMD3(CCC_Token, "r_ao_mode", &ps_r_ao_mode, ao_mode_token);
     CMD3(CCC_Token, "r2_ssao", &ps_r_ao_quality, qssao_token);
     CMD4(CCC_Integer, "r_ssao", &ps_r_ssao_enable, 0, 1);        // global GTAO on/off (perf A/B + real off)
+    CMD4(CCC_Integer, "r_ssao_npc_normals", &ps_r_ssao_npc_normals, 0, 1); // NPC normal G-buffer for GTAO (A/B)
     CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 3);   // 1=AO map, 2=depth view, 3=normal view
     CMD4(CCC_Float, "r_ssao_strength", &ps_r_ssao_strength, 0.f, 4.f);
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
@@ -906,8 +1023,58 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_shadow_lod", &ps_r_shadow_lod, 0, 1);
     CMD4(CCC_Float, "r_shadow_lod_dist", &ps_r_shadow_lod_dist, 5.0f, 200.0f);
 
+    // Cascade static-map cache (A/B with r_shadow_casc_cache 0 = old per-frame raster);
+    // r_shadow_casc_sun = sun-rotation degrees that forces a redraw (smaller = smoother).
+    CMD4(CCC_Integer, "r_shadow_casc_cache", &ps_r_shadow_casc_cache, 0, 1);
+    CMD4(CCC_Float,   "r_shadow_casc_sun",   &ps_r_shadow_casc_sun,   0.005f, 1.0f);
+
+    // Virtual Shadow Maps (WIP, default OFF). r_vsm_base = clipmap detail (m, smaller=sharper).
+    CMD4(CCC_Integer, "r_vsm",          &ps_r_vsm,          0, 1);
+    CMD4(CCC_Integer, "r_vsm_debug",    &ps_r_vsm_debug,    0, 1);
+    CMD4(CCC_Float,   "r_vsm_base",     &ps_r_vsm_base,     8.0f, 64.0f);
+    CMD4(CCC_Float,   "r_vsm_bias",     &ps_r_vsm_bias,     0.0f, 0.02f);
+    CMD4(CCC_Integer, "r_vsm_temporal", &ps_r_vsm_temporal, 0, 1);
+    CMD4(CCC_Float,   "r_vsm_ta_blend", &ps_r_vsm_ta_blend, 0.0f, 0.98f);
+    CMD4(CCC_Integer, "r_vsm_grass",      &ps_r_vsm_grass,      0, 1);
+    CMD4(CCC_Float,   "r_vsm_grass_dist", &ps_r_vsm_grass_dist, 4.0f, 48.0f);
+    CMD4(CCC_Float,   "r_vsm_npc_dist",   &ps_r_vsm_npc_dist,   0.0f, 500.0f);
+    CMD4(CCC_Float,   "r_vsm_lod_dist",   &ps_r_vsm_lod_dist,   0.0f, 500.0f);
+    CMD4(CCC_Integer, "r_vsm_mark_half",  &ps_r_vsm_mark_half,  0, 1);
+    CMD4(CCC_Integer, "r_vsm_cache",      &ps_r_vsm_cache,      0, 1);
+    CMD4(CCC_Float,   "r_vsm_cache_sun",  &ps_r_vsm_cache_sun,  0.0f, 5.0f);
+    CMD4(CCC_Float,   "r_vsm_cache_rot",  &ps_r_vsm_cache_rot,  0.0f, 90.0f);
+    CMD4(CCC_Integer, "r_vsm_cache_refresh", &ps_r_vsm_cache_refresh, 1, 64);
+
     // GPU-driven world forward pass (vk_world_gpu) — A/B with r_gpu_world 0.
     CMD4(CCC_Integer, "r_gpu_world", &ps_r_gpu_world, 0, 1);
+
+    // Clustered forward / Forward+ (vk_clustered) — A/B with r_clustered 0.
+    // r_clustered_debug 1 = per-cluster light-count heatmap on the world.
+    CMD4(CCC_Integer, "r_clustered",       &ps_r_clustered,       0, 1);
+    CMD4(CCC_Integer, "r_clustered_debug", &ps_r_clustered_debug, 0, 1);
+
+    // Froxel volumetric lighting (vk_volumetrics) — P1: sun god rays + depth fog.
+    CMD4(CCC_Integer, "r_vol",           &ps_r_vol,           0, 1);
+    CMD4(CCC_Float,   "r_vol_density",   &ps_r_vol_density,   0.0f, 1.0f);
+    CMD4(CCC_Float,   "r_vol_height",    &ps_r_vol_height,    0.0f, 2.0f);
+    CMD4(CCC_Float,   "r_vol_g",         &ps_r_vol_g,         0.0f, 0.95f);
+    CMD4(CCC_Float,   "r_vol_intensity", &ps_r_vol_intensity, 0.0f, 8.0f);
+    CMD4(CCC_Float,   "r_vol_amb",       &ps_r_vol_amb,       0.0f, 1.0f);
+    CMD4(CCC_Float,   "r_vol_indoor",    &ps_r_vol_indoor,    0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_sun",       &ps_r_vol_sun,       0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_lights",    &ps_r_vol_lights,    0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_smoke",     &ps_r_vol_smoke,     0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_noise",       &ps_r_vol_noise,       0.0f, 1.0f);
+    CMD4(CCC_Float,   "r_vol_noise_scale", &ps_r_vol_noise_scale, 0.02f, 2.0f);
+    CMD4(CCC_Float,   "r_vol_noise_speed", &ps_r_vol_noise_speed, 0.0f, 1.0f);
+    CMD4(CCC_Float,   "r_vol_soft",      &ps_r_vol_soft,      0.5f, 8.0f);
+    CMD4(CCC_Integer, "r_vol_ta",        &ps_r_vol_ta,        0, 1);
+    CMD4(CCC_Float,   "r_vol_ta_blend",  &ps_r_vol_ta_blend,  0.0f, 0.98f);
+    CMD4(CCC_Integer, "r_vol_shadow",    &ps_r_vol_shadow,    0, 1);
+    CMD4(CCC_Integer, "r_vol_debug",     &ps_r_vol_debug,     0, 1);
+
+    // Dynamic-light terrain/static occlusion (ground-height map + per-light march).
+    CMD4(CCC_Integer, "r_light_occ", &ps_r_light_occ, 0, 1);
 
     // World heightmap tessellation (live, no restart) — see vk_render_queue.cpp.
     CMD4(CCC_Float, "r_tess", &ps_r_tess, 0.f, 1.f);

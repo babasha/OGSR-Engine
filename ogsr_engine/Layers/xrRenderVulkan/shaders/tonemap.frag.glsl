@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform sampler2D uHDR;     // scene, full mip chai
 layout(set = 0, binding = 1) uniform sampler2D uBloom;   // blurred bright-pass (quarter res)
 layout(set = 0, binding = 2) uniform sampler2D uDistort; // particle heat-haze offsets (rg, neutral 0.5)
 layout(set = 0, binding = 3) uniform sampler2D uDepth;   // scene depth (SSR puddles)
+layout(set = 0, binding = 4) uniform sampler3D uVolume;  // integrated volumetrics (rgb=in-scatter, a=transmittance)
 
 // Shared per-frame environment set (same UBO/set the world shaders read at
 // set 1) — the SSR puddles need the rain mask/VP, the wetness factor and the
@@ -68,6 +69,7 @@ layout(push_constant) uniform PC {
     vec4 p1;   // x=expMin, y=expMax, z=expComp, w=bloomIntensity
     vec4 p2;   // x=cdlSlope, y=cdlSaturation, z=invGamma, w=distortAmount (0 = off)
     vec4 p3;   // xyz=cdlPower (2*(1-cg)), w=unused
+    vec4 p4;   // x=vol mode (0 off / 1 composite / 2 debug), y=near, z=far, w=log2(far/near)
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -252,6 +254,34 @@ void main()
             c = mix(c, drop, inside);
             c += vec3(0.025) * smoothstep(r * 0.7, r, d) * inside;  // faint rim
         }
+    }
+
+    // ---- Volumetric fog / god-rays (r_vol) ----
+    // Sample the integrated froxel volume at this pixel's depth (inverse exp-Z,
+    // EXACT inverse of vol_inject's forward map) and composite in HDR before the
+    // tonemap: scene*transmittance + in-scatter. Sky/no-geo → far slice (aerial
+    // perspective). In-scatter is exposure-scaled to match the lit scene.
+    if (pc.p4.x > 0.5) {
+        float zndc  = textureLod(uDepth, uv, 0.0).r;
+        float near_ = pc.p4.y, far_ = pc.p4.z, logFN = pc.p4.w;
+        float zview = (zndc >= 0.9999) ? far_
+                    : clamp(L.cam_rightT.w / (zndc - L.cam_dir.w), near_, far_);
+        float vw  = clamp(log2(zview / near_) / logFN, 0.0, 1.0);
+        // Sub-froxel dither (interleaved-gradient noise) breaks the residual grid
+        // banding into fine grain. Kept SUBTLE (±0.25 froxel) — the higher-res grid
+        // already smooths most of it, so a light dither avoids visible noise. (Full
+        // convergence is the P4 temporal-accumulation job.)
+        vec2 ign = vec2(
+            fract(52.9829189 * fract(dot(gl_FragCoord.xy,             vec2(0.06711056, 0.00583715)))),
+            fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238,  vec2(0.06711056, 0.00583715))))) - 0.5;
+        ign *= 0.5;   // ±0.25 froxel
+        vec3 vtex = vec3(textureSize(uVolume, 0));
+        vec3 vuvw = vec3(uv + ign * (1.0 / vtex.xy), vw + (ign.x + ign.y) * 0.5 / vtex.z);
+        vec4 vol  = textureLod(uVolume, vuvw, 0.0);
+        if (pc.p4.x > 1.5)
+            c = vol.rgb * exposure * 8.0;             // r_vol_debug: raw in-scatter pattern
+        else
+            c = c * vol.a + vol.rgb * exposure;
     }
 
     // 2. Bloom (built exposure-scaled at quarter res, gaussian-blurred) added in

@@ -11,6 +11,8 @@
 #include "vk_buffer.h"                     // CVulkanBuffer
 #include "vk_command_buffer.h"             // CVulkanCommandManager::FRAMES_IN_FLIGHT
 #include "vk_shadow.h"                     // ShadowMap (binding 1 = shadow map, sun_vp)
+#include "vk_vsm.h"                        // VSM receivers (bindings 14-16: atlas, page table, clipmap UBO)
+#include "vk_clustered.h"                  // Clustered forward (bindings 17-19: lights, grid, indices)
 #include "vk_water_sim.h"                  // WaterSim (binding 11 = water depth)
 #include "vk_texture.h"                    // CVulkanTexture (fallback ambient cube)
 #include "vk_pass_sky.h"                   // SkyPass::AcquireAmbientCubes (hemisphere sky ambient)
@@ -50,6 +52,9 @@ extern int   ps_r_puddle_debug;   // r_puddle_debug — draw the geometric puddl
 extern int   ps_r_water_sim;      // r_water_sim — water flow sim enable (puddles from the sim)
 extern float ps_r_water_murk;     // r_water_murk — volumetric absorption per metre
 extern float ps_r_water_refract;  // r_water_refract — bottom refraction strength
+extern int   ps_r_clustered;      // r_clustered — clustered forward light culling (vk_clustered)
+extern int   ps_r_clustered_debug; // r_clustered_debug — per-cluster light-count heatmap
+extern int   ps_r_light_occ;      // r_light_occ — dynamic-light terrain/static occlusion (ground map march)
 extern int   ps_r_puddle_sss;     // r_puddle_sss — SSS per-pixel puddles (default source)
 extern float ps_r_puddle_level;   // r_puddle_level — water rise level vs micro-height
 extern float ps_r_puddle_scale;   // r_puddle_scale — macro puddle-body size (procedural mask freq)
@@ -71,6 +76,7 @@ namespace {
     VkDescriptorPool      s_pool       = VK_NULL_HANDLE;
     VkDescriptorSet       s_set[kFramesInFlight] = {};
     CVulkanBuffer         s_ubo;
+    CVulkanBuffer         s_dummyBuf;   // valid SSBO/UBO placeholder for VSM bindings 15/16 before VSM inits
     u8*                   s_mapped     = nullptr;
     VkDescriptorSet       s_current    = VK_NULL_HANDLE;
 
@@ -101,6 +107,11 @@ namespace {
     VkImageView           s_boundFlow[kFramesInFlight]  = {};
     // Ground-height map (binding 13, SSS puddle real-dip placement): lazy-bind.
     VkImageView           s_boundGround[kFramesInFlight] = {};
+
+    // Clustered forward (bindings 17/18/19 = lights/grid/indices SSBOs). Start on
+    // the dummy buffer; Update() swaps in the real vk_clustered buffers once that
+    // module has inited (lazy, one-shot per slot). False = still on the dummy.
+    bool                  s_boundCluster[kFramesInFlight] = {};
 
     // Load-once cookie lookup: "$game_textures$\<name>.dds". Negative results
     // cached too (null) so a missing texture logs once, not per frame.
@@ -152,27 +163,39 @@ bool Init()
     // water-sim (r_water_sim, off by default); the SSS puddle path doesn't use them
     // but they stay bound (harmless) so the sim can be switched on without relayout.
     // All FRAGMENT.
-    VkDescriptorSetLayoutBinding b[14]{};
+    VkDescriptorSetLayoutBinding b[20]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     for (u32 i = 1; i < 14; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    // VSM receivers (Phase 1C): 14 = atlas sampler, 15 = page table SSBO, 16 = clipmap UBO.
+    b[14].binding = 14; b[14].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[14].descriptorCount = 1; b[14].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[15].binding = 15; b[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         b[15].descriptorCount = 1; b[15].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[16].binding = 16; b[16].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         b[16].descriptorCount = 1; b[16].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Clustered forward (vk_clustered): 17 = light list SSBO, 18 = cluster grid
+    // SSBO (per-cluster count), 19 = light index list SSBO. Read only when
+    // cluster_params.w (r_clustered) is set; bound to the dummy buffer otherwise.
+    for (u32 i = 17; i < 20; ++i) {
+        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 14; slci.pBindings = b;
+    slci.bindingCount = 20; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
-    VkDescriptorPoolSize ps[2]{
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 13 },
+    VkDescriptorPoolSize ps[3]{
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight * 2 },    // LightUBO + VSM clipmap UBO
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 14 },   // 13 shadow/sky/ao + VSM atlas
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kFramesInFlight * 4 },    // VSM page table + 3 cluster SSBOs
     };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = kFramesInFlight; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+    pci.maxSets = kFramesInFlight; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
     if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) {
         Msg("![VK EnvLight] pool create failed"); s_failed = true; return false;
     }
@@ -192,6 +215,11 @@ bool Init()
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
     s_mapped = static_cast<u8*>(s_ubo.Map());
     if (!s_mapped) { Msg("![VK EnvLight] UBO map failed"); s_failed = true; return false; }
+
+    // Tiny valid SSBO/UBO bound to VSM bindings 15/16 until VSM initialises (lazy on
+    // first r_vsm). Receivers gate VSM sampling on shadow_params.w, so it's never read.
+    s_dummyBuf.Create(256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                      VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // Trilinear cube sampler (mips → blurred sky = diffuse irradiance) + a
     // neutral 1×1×6 fallback so bindings 6/7 are valid before SkyPass loads the
@@ -272,7 +300,16 @@ bool Init()
         VkDescriptorImageInfo gdI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundGround[i] = fbWhite;
 
-        VkWriteDescriptorSet w[14]{};
+        // Clustered forward (bindings 17/18/19): valid SSBO placeholder until the
+        // vk_clustered module inits; Update() swaps in the real buffers (gated by
+        // cluster_params.w so the dummy is never actually read).
+        VkDescriptorBufferInfo clI[3]{
+            { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
+            { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
+            { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
+        };
+
+        VkWriteDescriptorSet w[17]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
@@ -318,6 +355,12 @@ bool Init()
         w[count].dstSet = s_set[i]; w[count].dstBinding = 13; w[count].descriptorCount = 1;
         w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &gdI;
         ++count;
+        for (u32 k = 0; k < 3; ++k) {
+            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[count].dstSet = s_set[i]; w[count].dstBinding = 17 + k; w[count].descriptorCount = 1;
+            w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &clI[k];
+            ++count;
+        }
         vkUpdateDescriptorSets(VulkanHW.m_Device, count, w, 0, nullptr);
     }
 
@@ -383,8 +426,36 @@ void Update(u32 slot)
     // Same per-frame result Pass_SunShadow used to render the dynamic shadow maps,
     // so the shadowed indices match the array the shaders iterate.
     const auto& FL = Lights::CollectFrame(Device.vCameraPosition);
-    memcpy(ub.lights, FL.gpu, sizeof(ub.lights));
-    ub.counts[0] = float(FL.count);
+    memcpy(ub.lights, FL.gpu, sizeof(ub.lights));   // first kMaxGpuLights → UBO (foliage + non-clustered fallback)
+    // counts.x drives the UBO lights[16] loop — clamp it so a >16-light frame
+    // never reads past the UBO array (the clustered path reads the SSBO instead).
+    ub.counts[0] = float(_min(FL.count, kMaxGpuLights));
+    // Clustered forward: upload ALL collected lights to this slot's SSBO so the
+    // compute cull (Pass_World) can bin them. r_clustered_debug also activates the
+    // machinery (so the heatmap works without also typing r_clustered 1). This
+    // also lazily inits the module on the first frame it's switched on.
+    const bool clusterActive = (ps_r_clustered || ps_r_clustered_debug);
+    if (clusterActive) {
+        Clustered::UploadLights(FL, slot);
+        // Diag (throttled ~3 s, only with r_clustered_debug): the shadowed picks'
+        // range + distance-to-eye — to see why a near light might not bin.
+        if (ps_r_clustered_debug) {
+            static u32 s_clDiagCd = 0;
+            if (s_clDiagCd == 0) {
+                s_clDiagCd = 180;
+                const Fvector& e = Device.vCameraPosition;
+                auto logL = [&](const char* tag, int idx) {
+                    if (idx < 0 || idx >= int(FL.count)) { Msg("[VK Clustered] %s: none", tag); return; }
+                    const auto& g = FL.gpu[idx];
+                    const float dx = g.pos[0]-e.x, dy = g.pos[1]-e.y, dz = g.pos[2]-e.z;
+                    Msg("[VK Clustered] %s idx=%d range=%.1f dist=%.2f spotFlag=%.0f", tag, idx, g.pos[3], _sqrt(dx*dx+dy*dy+dz*dz), g.color[3]);
+                };
+                logL("SPOT(flashlight)", FL.spotIdx);
+                logL("POINT(campfire)",  FL.pointIdx);
+                Msg("[VK Clustered] collected=%u eye=(%.1f,%.1f,%.1f)", FL.count, e.x, e.y, e.z);
+            } else --s_clDiagCd;
+        }
+    }
     memcpy(ub.spot_vp, &ShadowMap::GetSpotVP(), sizeof(ub.spot_vp));
     ub.shadow_params[0] = float(FL.spotIdx);
     ub.shadow_params[1] = float(FL.pointIdx);
@@ -409,7 +480,7 @@ void Update(u32 slot)
             s_boundCookie[slot] = want;
         }
     }
-    ub.shadow_params[3] = 0.f;
+    ub.shadow_params[3] = VK::VSM::MaskReady() ? 1.f : 0.f;  // VSM receiver gate (screen-space mask resolved)
     // Sun cascade VPs — recomputed every frame in Pass_SunShadow (earlier this
     // frame), so receivers always sample the freshly rendered cascade maps.
     memcpy(ub.sun_near_vp, &ShadowMap::GetCascadeVP(0), sizeof(ub.sun_near_vp));
@@ -586,7 +657,30 @@ void Update(u32 slot)
         ub.cam_rightT[2] = pt.right.z * pt.tanX; ub.cam_rightT[3] = pt.p43;
         ub.cam_topT[0] = pt.top.x * pt.tanY; ub.cam_topT[1] = pt.top.y * pt.tanY;
         ub.cam_topT[2] = pt.top.z * pt.tanY; ub.cam_topT[3] = 0.f;
+
+        // Clustered forward: the froxel-grid params the fragments use to find
+        // their cluster (same near/far + slice formula the compute cull uses).
+        // cluster_params.w gates the whole clustered path in the receivers.
+        const Clustered::GridZ gz = Clustered::DeriveGridZ(pt);
+        const bool clusterOn = (ps_r_clustered || ps_r_clustered_debug) && Clustered::Ready();
+        ub.cluster_params[0]  = gz.sliceScale;
+        ub.cluster_params[1]  = gz.sliceBias;
+        ub.cluster_params[2]  = gz.nearZ;
+        // 0 = off, 1 = on, 2 = on + debug heatmap (receivers branch on >0.5 / >1.5).
+        ub.cluster_params[3]  = clusterOn ? (ps_r_clustered_debug ? 2.f : 1.f) : 0.f;
+        ub.cluster_params2[0] = float(Clustered::kGridX);
+        ub.cluster_params2[1] = float(Clustered::kGridY);
+        ub.cluster_params2[2] = float(Clustered::kGridZ);
+        ub.cluster_params2[3] = float(Clustered::kMaxPerCluster);
     }
+
+    // Dynamic-light terrain/static occlusion (r_light_occ): the forward shaders
+    // march the ground-height map (rain_vp) between the fragment and each light.
+    // Biases are in the rain ortho's NDC-z (~rainVis uses 0.0015); tune if needed.
+    ub.light_occ[0] = ps_r_light_occ ? 1.f : 0.f;
+    ub.light_occ[1] = 0.001f;   // bury bias (NDC-z; ~0.35 m the light must be below the surface to count as buried)
+    ub.light_occ[2] = 0.006f;   // frag-below band (~2 m): a fragment deeper than this under the surface = fully lit (basement)
+    ub.light_occ[3] = 1.0f;     // strength (1 = full cut where occluded)
 
     // POM params (world lmap/vlit fragment parallax).
     ub.pom_params[0] = ps_r_pom ? ps_r_pom_height : 0.f;
@@ -629,6 +723,51 @@ void Update(u32 slot)
     }
 
     memcpy(s_mapped + size_t(slot) * kSlotStride, &ub, sizeof(LightUBO));
+
+    // VSM receiver bindings. As of the temporal-resolve phase, binding 14 is the
+    // SCREEN-SPACE sun-shadow mask (resolved each frame in Pass_World) — receivers
+    // sample it by screen UV instead of doing the atlas/page-table lookup themselves.
+    // Bindings 15/16 (page table / clipmap UBO) stay in the layout but are unused by
+    // receivers now (the resolve compute owns them). Mask is in GENERAL layout; the
+    // placeholder = white (lit) when not yet resolved (also gated off by shadow_params.w).
+    {
+        const bool maskOk = VK::VSM::MaskReady();
+        VkDescriptorImageInfo  atI{
+            maskOk ? VK::VSM::GetMaskSampler() : s_cubeSampler,
+            maskOk ? VK::VSM::GetMaskView()    : s_fallbackWhite->GetView(),
+            maskOk ? VK_IMAGE_LAYOUT_GENERAL   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        const VkBuffer ptBuf = VK::VSM::GetPageTableHandle();
+        const VkBuffer ubBuf = VK::VSM::GetUBOHandle();
+        VkDescriptorBufferInfo ptI{ ptBuf ? ptBuf : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo vuI{ ubBuf ? ubBuf : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet wv[3]{};
+        for (u32 k = 0; k < 3; ++k) { wv[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wv[k].dstSet = s_set[slot]; wv[k].dstBinding = 14 + k; wv[k].descriptorCount = 1; }
+        wv[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[0].pImageInfo  = &atI;
+        wv[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         wv[1].pBufferInfo = &ptI;
+        wv[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         wv[2].pBufferInfo = &vuI;
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 3, wv, 0, nullptr);
+    }
+
+    // Clustered forward SSBOs (bindings 17/18/19): swap the dummy for the real
+    // vk_clustered buffers once it inited (lazy, one-shot per slot — handles are
+    // stable; the light buffer binds to THIS slot's region). Fence-safe (Begin
+    // waited this slot's fence). Receivers gate on cluster_params.w regardless.
+    if ((ps_r_clustered || ps_r_clustered_debug) && Clustered::Ready() && !s_boundCluster[slot]) {
+        VkDescriptorBufferInfo cb[3] = {
+            { Clustered::GetLightsHandle(slot), Clustered::GetLightsOffset(slot), Clustered::GetLightsRange() },
+            { Clustered::GetGridHandle(),    0, VK_WHOLE_SIZE },
+            { Clustered::GetIndicesHandle(), 0, VK_WHOLE_SIZE },
+        };
+        VkWriteDescriptorSet wc[3]{};
+        for (u32 k = 0; k < 3; ++k) {
+            wc[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wc[k].dstSet = s_set[slot];
+            wc[k].dstBinding = 17 + k; wc[k].descriptorCount = 1;
+            wc[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wc[k].pBufferInfo = &cb[k];
+        }
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 3, wc, 0, nullptr);
+        s_boundCluster[slot] = true;
+    }
+
     s_current = s_set[slot];
 }
 
@@ -645,9 +784,10 @@ void Destroy()
     if (s_pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_setLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }
     s_ubo.Destroy();
+    s_dummyBuf.Destroy();
     s_mapped = nullptr;
     s_current = VK_NULL_HANDLE;
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; }
     s_inited = false; s_failed = false;
 }
 

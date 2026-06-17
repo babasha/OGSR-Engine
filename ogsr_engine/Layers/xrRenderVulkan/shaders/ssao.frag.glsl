@@ -16,9 +16,10 @@
 // Output: R8 visibility (1 = open, 0 = fully occluded). Pairs with
 // ssao_blur.frag (depth-aware 3×3) before receivers sample it.
 
-layout(location = 0) out float outAO;
+layout(location = 0) out vec4 outAO;   // r = AO visibility, gba = world-space bent normal *0.5+0.5
 
-layout(set = 0, binding = 0) uniform sampler2D uDepth;   // full-res scene depth (D32, prepass)
+layout(set = 0, binding = 0) uniform sampler2D uDepth;    // full-res scene depth (D32, prepass)
+layout(set = 0, binding = 2) uniform sampler2D uNormal;   // NPC normal G-buffer (rgb=worldN*0.5+0.5, a=valid); a=0 elsewhere
 
 layout(push_constant) uniform PC {
     vec4 camDir;     // xyz = camera forward (unit)
@@ -62,11 +63,11 @@ void main()
     // so a cleared (all-1.0) depth shows as solid white here.
     if (pc.dbg.x > 1.5 && pc.dbg.x < 2.5) {
         float zv = clamp(pc.zp.y / (zndc - pc.zp.x), 0.0, 10000.0);
-        outAO = clamp(zv * 0.01, 0.0, 1.0);
+        outAO = vec4(clamp(zv * 0.01, 0.0, 1.0), 0.5, 0.5, 0.5);
         return;
     }
 
-    if (zndc >= 0.9999) { outAO = 1.0; return; }   // sky / no prepass coverage
+    if (zndc >= 0.9999) { outAO = vec4(1.0, 0.5, 0.5, 0.5); return; }   // sky / no prepass coverage (bentN encodes ~0 → receiver uses geomN)
 
     vec4 C    = fetchPos(uv);
     vec3 cPos = C.xyz;
@@ -83,9 +84,30 @@ void main()
     vec3 N = normalize(cross(ddy, ddx));
     if (dot(N, viewV) < 0.0) N = -N;               // face the camera regardless of winding
 
+    // HYBRID: where the NPC normal G-buffer has a real normal (a=1), use it
+    // instead of the noisy depth-derivative one — kills the speckle/"dirt" on
+    // small curvy skinned geometry. Everywhere else (statics/trees/ground) a=0
+    // and we keep the depth-reconstructed N above.
+    vec4 gbN = texture(uNormal, uv);
+    if (gbN.a > 0.5) {
+        vec3 rn = gbN.xyz * 2.0 - 1.0;
+        // Skip degenerate (zero/near-zero) normals — normalize(0)=NaN stamped
+        // black patches; keep the depth-reconstructed N there instead.
+        if (dot(rn, rn) > 0.05) {
+            rn = normalize(rn);
+            // Do NOT flip outward normals (flip negated side/silhouette normals →
+            // hard black patches). Instead BEND grazing normals toward the viewer
+            // so the half-res depth horizons don't collapse the GTAO integral to 0.
+            const float kMinNdV = 0.15;
+            float ndv = dot(rn, viewV);
+            if (ndv < kMinNdV) rn = normalize(rn + viewV * (kMinNdV - ndv));
+            N = rn;
+        }
+    }
+
     // r_ssao_debug 3: reconstructed world normal "up-ness" — flat ground ≈ 1,
     // walls ≈ 0.5, noise here means the depth-derivative normals are broken.
-    if (pc.dbg.x > 2.5) { outAO = N.y * 0.5 + 0.5; return; }
+    if (pc.dbg.x > 2.5 && pc.dbg.x < 3.5) { outAO = vec4(N.y * 0.5 + 0.5, 0.5, 0.5, 0.5); return; }
 
     // Screen axes as world directions — the original's view-space (x,y).
     vec3 rightU = normalize(pc.camRightT.xyz);
@@ -116,6 +138,7 @@ void main()
     float pi_by_slices  = PI / float(SLICES);
 
     float visibility = 0.0;
+    vec3  bentNormal = vec3(0.0);
 
     for (int slice = 0; slice < SLICES; ++slice)
     {
@@ -133,6 +156,7 @@ void main()
         float n     = sgnN * fast_acos(cosN);
         float sinN2 = 2.0 * sin(n);
 
+        float hSide[2];
         for (int side = 0; side < 2; ++side)
         {
             float sideSign = -1.0 + 2.0 * float(side);
@@ -154,9 +178,23 @@ void main()
             }
 
             float h = n + clamp(sideSign * fast_acos(cHorizonCos) - n, -PI * 0.5, PI * 0.5);
+            hSide[side] = h;
             visibility += projNormalLength * (cosN + h * sinN2 - cos(2.0 * h - n)) * 0.25;
+        }
+
+        // Bent normal (Jimenez 2016): the unoccluded-arc bisector in this slice's
+        // plane (view dir + in-slice tangent), weighted like the visibility term.
+        // Fully open → bentAngle = n → reconstructs the projected normal; occluded
+        // on one side → tilts toward the open side. Summed over slices = world bentN.
+        float bentAngle = (hSide[0] + hSide[1]) * 0.5;
+        float tl = length(orthoDirectionV);
+        if (tl > 1e-4) {
+            vec3 sliceTan = orthoDirectionV / tl;
+            bentNormal += (cos(bentAngle) * viewV + sin(bentAngle) * sliceTan) * projNormalLength;
         }
     }
 
-    outAO = clamp(visibility / float(SLICES), 0.0, 1.0);
+    float aoOut = clamp(visibility / float(SLICES), 0.0, 1.0);
+    vec3  bn    = (dot(bentNormal, bentNormal) > 1e-6) ? normalize(bentNormal) : N;
+    outAO = vec4(aoOut, bn * 0.5 + 0.5);
 }

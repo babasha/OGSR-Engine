@@ -72,6 +72,14 @@ namespace {
     VkImage       s_img[2]   = {};
     VmaAllocation s_alloc[2] = {};
     VkImageView   s_view[2]  = {};
+
+    // FULL-res NPC normal G-buffer (skinned pass writes worldN*0.5+0.5, a=valid;
+    // GTAO uses it where a=1, else falls back to depth-derived normals). RGBA8.
+    constexpr VkFormat kNormalFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    VkImage       s_normImg   = VK_NULL_HANDLE;
+    VmaAllocation s_normAlloc  = VK_NULL_HANDLE;
+    VkImageView   s_normView   = VK_NULL_HANDLE;
+    VkExtent2D    s_normExtent  = {};
     VkExtent2D    s_extent   = {};
     u32           s_generation = 0;
     bool          s_first[2] = { true, true };
@@ -80,9 +88,24 @@ namespace {
     // final AO image is copied to this host buffer and min/max/avg logged —
     // verifies the GTAO output end-to-end without a GPU capture tool.
     CVulkanBuffer s_dbgBuf;
-    u8*           s_dbgMap = nullptr;
+    u16*          s_dbgMap = nullptr;     // R16_SFLOAT texels (half-float)
     int           s_dbgCountdown = -1;   // frames until the mapped copy is safely written
     u32           s_dbgCooldown  = 0;
+
+    // Decode an IEEE-754 half (one R16_SFLOAT AO texel) onto the legacy 0..255
+    // scale so the debug log reads the same as it did under R8_UNORM.
+    u8 AoHalfToU8(u16 h)
+    {
+        const u32 exp = (h >> 10) & 0x1F;
+        const u32 man = h & 0x3FF;
+        float v;
+        if (exp == 0)         v = man * (1.0f / 16777216.0f);             // subnormal ~0
+        else if (exp == 0x1F) v = 1.0f;                                   // inf/nan → clamp
+        else                  v = ldexpf(1.0f + man / 1024.0f, int(exp) - 15);
+        if (h & 0x8000) v = 0.0f;                                         // AO is never negative
+        if (v < 0.0f) v = 0.0f; else if (v > 1.0f) v = 1.0f;
+        return u8(v * 255.0f + 0.5f);
+    }
 
     struct SSAOPush {
         float camDir[4];
@@ -113,6 +136,9 @@ namespace {
             if (s_img[i])  { vmaDestroyImage(VulkanHW.m_Allocator, s_img[i], s_alloc[i]); s_img[i] = VK_NULL_HANDLE; s_alloc[i] = VK_NULL_HANDLE; }
             s_first[i] = true;
         }
+        if (s_normView) { vkDestroyImageView(VulkanHW.m_Device, s_normView, nullptr); s_normView = VK_NULL_HANDLE; }
+        if (s_normImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_normImg, s_normAlloc); s_normImg = VK_NULL_HANDLE; s_normAlloc = VK_NULL_HANDLE; }
+        s_normExtent = {};
         s_extent = {};
     }
 
@@ -128,7 +154,7 @@ namespace {
             VkImageCreateInfo ici{};
             ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = VK_FORMAT_R8_UNORM;
+            ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;   // r=AO (R16F kills contouring) + gba=world bent normal
             ici.extent = { want.width, want.height, 1 };
             ici.mipLevels = 1; ici.arrayLayers = 1;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -145,7 +171,7 @@ namespace {
             vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             vci.image = s_img[i];
             vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_R8_UNORM;
+            vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
             vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             vci.subresourceRange.levelCount = 1;
             vci.subresourceRange.layerCount = 1;
@@ -153,13 +179,44 @@ namespace {
                 Msg("![VK SSAO] view %u create failed", i); return false;
             }
         }
-        // Host buffer for the debug readback (one byte per AO texel).
+        // FULL-res NPC normal G-buffer (skinned pass renders into it, GTAO samples it).
+        s_normExtent = sceneExtent;
+        {
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = kNormalFormat;
+            ici.extent = { sceneExtent.width, sceneExtent.height, 1 };
+            ici.mipLevels = 1; ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_normImg, &s_normAlloc, nullptr) != VK_SUCCESS) {
+                Msg("![VK SSAO] normal RT create failed"); return false;
+            }
+            VkImageViewCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = s_normImg;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = kNormalFormat;
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_normView) != VK_SUCCESS) {
+                Msg("![VK SSAO] normal view create failed"); return false;
+            }
+        }
+
+        // Host buffer for the debug readback (RGBA16F = 4 halfs = 8 bytes per AO texel; R = AO).
         s_dbgBuf.Destroy();
         s_dbgMap = nullptr;
         s_dbgCountdown = -1;
-        s_dbgBuf.Create(VkDeviceSize(want.width) * want.height,
+        s_dbgBuf.Create(VkDeviceSize(want.width) * want.height * 4 * sizeof(u16),
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
-        s_dbgMap = static_cast<u8*>(s_dbgBuf.Map());
+        s_dbgMap = static_cast<u16*>(s_dbgBuf.Map());
 
         ++s_generation;
         Msg("[VK SSAO] RTs ready (%ux%u half-res, gen %u, samples %u)",
@@ -167,11 +224,12 @@ namespace {
         return true;
     }
 
-    // SSAO RT is R8_UNORM, single-channel (R) write, no blend.
+    // SSAO RT is RGBA16F (r=AO, gba=bent normal), all channels written, no blend.
     VkPipeline CreatePipe(VkShaderModule vs, VkShaderModule fs)
     {
-        return Fullscreen::CreatePipeline(vs, fs, VK_FORMAT_R8_UNORM, s_layout,
-                                          Fullscreen::OpaqueAttachment(VK_COLOR_COMPONENT_R_BIT), "SSAO");
+        return Fullscreen::CreatePipeline(vs, fs, VK_FORMAT_R16G16B16A16_SFLOAT, s_layout,
+                                          Fullscreen::OpaqueAttachment(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                                                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT), "SSAO");
     }
 
     // One fullscreen draw into dst at the half-res extent.
@@ -191,6 +249,13 @@ VkImageView GetResultView() { return Enabled() ? s_view[0] : VK_NULL_HANDLE; }  
 VkSampler   GetSampler()    { return s_sampLin; }
 u32         Generation()    { return s_generation; }
 float       Strength()      { return (Enabled() && s_hasResult && s_view[0]) ? kStrength : 0.f; }
+
+// NPC normal G-buffer: the skinned pass renders into it (after the prepass,
+// before Execute); GTAO samples it (binding 2). VK_NULL_HANDLE until EnsureRTs.
+VkImage     GetNormalImage()  { return s_normImg; }
+VkImageView GetNormalView()   { return s_normView; }
+VkFormat    GetNormalFormat() { return kNormalFormat; }
+VkExtent2D  GetNormalExtent() { return s_normExtent; }
 
 bool EnsureTargets(VkExtent2D sceneExtent)
 {
@@ -212,23 +277,23 @@ bool Init()
         s_failed = true; return false;
     }
 
-    // Set: 0 = scene depth, 1 = raw AO (only the blur pipeline reads it; the
-    // GTAO pipeline doesn't statically use binding 1, so its stale layout
-    // during the GTAO draw is legal).
-    VkDescriptorSetLayoutBinding b[2]{};
-    for (u32 i = 0; i < 2; ++i) {
+    // Set: 0 = scene depth, 1 = raw AO (blur only), 2 = NPC normal G-buffer
+    // (GTAO only). Each pipeline statically uses a subset; the others' stale
+    // layout during a draw is legal (all bindings are written each frame).
+    VkDescriptorSetLayoutBinding b[3]{};
+    for (u32 i = 0; i < 3; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 2; slci.pBindings = b;
+    slci.bindingCount = 3; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         s_failed = true; return false;
     }
 
     const u32 nSets = kFramesInFlight * 2;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 2 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 3 };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -292,15 +357,19 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     {
         VkDescriptorImageInfo depthI{ s_sampNear, Swapchain.m_DepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo rawI  { s_sampNear, s_view[1],             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkWriteDescriptorSet w[4]{};
-        VkDescriptorSet dst[4] = { s_setGtao[slot], s_setGtao[slot], s_setBlur[slot], s_setBlur[slot] };
-        const VkDescriptorImageInfo* ii[4] = { &depthI, &rawI, &depthI, &rawI };
-        for (u32 i = 0; i < 4; ++i) {
+        VkDescriptorImageInfo normI { s_sampNear, s_normView,            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        // Write all 3 bindings to both sets (gtao + blur) so none is ever stale-undefined.
+        VkWriteDescriptorSet w[6]{};
+        VkDescriptorSet dst[6] = { s_setGtao[slot], s_setGtao[slot], s_setGtao[slot],
+                                   s_setBlur[slot], s_setBlur[slot], s_setBlur[slot] };
+        const u32 bind[6] = { 0, 1, 2, 0, 1, 2 };
+        const VkDescriptorImageInfo* ii[6] = { &depthI, &rawI, &normI, &depthI, &rawI, &normI };
+        for (u32 i = 0; i < 6; ++i) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = dst[i]; w[i].dstBinding = i & 1; w[i].descriptorCount = 1;
+            w[i].dstSet = dst[i]; w[i].dstBinding = bind[i]; w[i].descriptorCount = 1;
             w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = ii[i];
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
     }
 
     auto toColor = [&](u32 i) {
@@ -360,7 +429,7 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
             const u32 n = s_extent.width * s_extent.height;
             u32 mn = 255, mx = 0; u64 sum = 0; u32 below200 = 0;
             for (u32 i = 0; i < n; ++i) {
-                const u8 v = s_dbgMap[i];
+                const u8 v = AoHalfToU8(s_dbgMap[i * 4]);   // R = AO (4 halfs/texel, gba = bent normal)
                 mn = std::min(mn, (u32)v); mx = std::max(mx, (u32)v);
                 sum += v; below200 += (v < 200);
             }
@@ -370,11 +439,11 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
             for (u32 r = 1; r <= 3; ++r) {   // rows at 25/50/75% height, 5 taps each
                 const u32 cy = s_extent.height * r / 4;
                 Msg("[VK SSAO]   row %u%%: %u %u %u %u %u", r * 25,
-                    s_dbgMap[cy * s_extent.width + s_extent.width / 6],
-                    s_dbgMap[cy * s_extent.width + s_extent.width / 3],
-                    s_dbgMap[cy * s_extent.width + s_extent.width / 2],
-                    s_dbgMap[cy * s_extent.width + s_extent.width * 2 / 3],
-                    s_dbgMap[cy * s_extent.width + s_extent.width * 5 / 6]);
+                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width / 6)     * 4]),
+                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width / 3)     * 4]),
+                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width / 2)     * 4]),
+                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width * 2 / 3) * 4]),
+                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width * 5 / 6) * 4]));
             }
         }
         if (s_dbgCooldown == 0 && s_dbgCountdown <= 0) {

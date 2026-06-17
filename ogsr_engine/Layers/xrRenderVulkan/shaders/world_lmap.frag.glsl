@@ -1,6 +1,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "wet_common.glsl"   // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
+#include "vsm_sample.glsl"   // vsmSunShadow (Phase 1C receiver: set 1 bindings 14-16)
+#include "cluster_lights.glsl"  // clustered forward (set 1 bindings 17-19, r_clustered)
 
 // World pass — lmap variant. Final colour = albedo × baked lightmap.
 //
@@ -55,6 +57,9 @@ layout(set = 1, binding = 0) uniform Lighting {
     vec4 pom_params5;    // x=terrain gloss, y=geo-puddle radius (0=off), z=geo-puddle depth scale, w=puddle debug
     vec4 pom_params6;    // x=water-sim enable (puddles from the flow sim)
     vec4 pom_params7;    // SSS puddles: x=enable, y=level (coverage), z=micro, w=macro scale
+    vec4 cluster_params;  // x=sliceScale, y=sliceBias, z=near, w=enable (0 off, 1 on, 2 debug)
+    vec4 cluster_params2; // x=gridX, y=gridY, z=gridZ, w=maxLightsPerCluster
+    vec4 light_occ;       // x=enable, y=bury bias, z=march bias, w=strength (terrain/static light occlusion)
 } L;
 layout(set = 1, binding = 1) uniform sampler2D uShadow;        // far sun map (320 m, cached)
 layout(set = 1, binding = 2) uniform sampler2D uSpotShadow;    // spot (flashlight) shadow map
@@ -68,6 +73,31 @@ layout(set = 1, binding = 9) uniform sampler2D uRainMap;       // top-down rain 
 layout(set = 1, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
 layout(set = 1, binding = 11) uniform sampler2D uWater;        // water depth (flow sim, metres)
 layout(set = 1, binding = 12) uniform sampler2D uFlow;         // water velocity (flow sim, uv/sec)
+layout(set = 1, binding = 13) uniform sampler2D uGround;       // top-down ground-height (statics+terrain, no trees)
+
+// Terrain/static occlusion for a dynamic light (r_light_occ): if the light is
+// BURIED (below the ground surface at its own XZ), march the ground-height map
+// between fragment and light — where the surface rises above the segment, the
+// light is blocked. Stops a basement lamp lighting the earth + fence overhead.
+// Above-ground lights early-out after one tap (not buried → full light).
+float lightTerrainOcc(vec3 wp, vec3 lpos)
+{
+    if (L.light_occ.x < 0.5) return 1.0;
+    vec4 lc = L.rain_vp * vec4(lpos, 1.0);
+    if (lc.w <= 0.0) return 1.0;
+    vec2 luv = lc.xy * 0.5 + 0.5; luv.y = 1.0 - luv.y;
+    if (any(lessThan(luv, vec2(0.0))) || any(greaterThan(luv, vec2(1.0)))) return 1.0;
+    if (lc.z <= texture(uRainMap, luv).r + L.light_occ.y) return 1.0;   // light at/above the surface → no occlusion
+    // The light is buried. A fragment ALSO below the surface (same underground
+    // pocket — a heightfield can't see the cavity) stays LIT (basement works); a
+    // fragment AT/ABOVE the surface is only reachable THROUGH the ground → occlude.
+    vec4 fc = L.rain_vp * vec4(wp, 1.0);
+    if (fc.w <= 0.0) return 1.0;
+    vec2 fuv = fc.xy * 0.5 + 0.5; fuv.y = 1.0 - fuv.y;
+    if (any(lessThan(fuv, vec2(0.0))) || any(greaterThan(fuv, vec2(1.0)))) return 1.0;
+    float fragBelow = fc.z - texture(uRainMap, fuv).r;                  // >0 = fragment under the surface
+    return 1.0 - L.light_occ.w * (1.0 - smoothstep(0.0, L.light_occ.z, max(fragBelow, 0.0)));
+}
 
 // GTAO visibility at this pixel (R4 combine_1.ps: occludes hemi+ambient only —
 // never the sun or dynamic lights). Strength is an EXPONENT: 0 = off (→1.0),
@@ -76,6 +106,19 @@ float gtaoVis()
 {
     float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
     return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);
+}
+
+// GTAO bent normal: the average UNOCCLUDED direction (gba channels of the AO RT,
+// world-space). Sampling the sky cube along it instead of the geometric normal
+// makes the ambient fill come from where the hemisphere is actually open
+// (recesses pull their fill from the opening). Falls back to the geometric
+// normal when AO is off/not-ready (ao_params.z==0) or the bent normal is
+// degenerate (sky / unwritten texels encode ~0).
+vec3 gtaoBentN(vec3 fallbackN)
+{
+    if (L.ao_params.z <= 0.0) return fallbackN;
+    vec3 b = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).gba * 2.0 - 1.0;
+    return (dot(b, b) > 0.25) ? normalize(b) : fallbackN;
 }
 
 // Colored AO (R4 common_functions.h / Activision SIGGRAPH'16): mid-range
@@ -131,43 +174,61 @@ float pointShadowF(vec3 wp, vec3 lp, float range)
     return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
 }
 
-// Dynamic point/spot light accumulation (STEP 3): linear-squared falloff,
-// N·L diffuse, smooth spot cone. Range check first — most pixels exit early.
-// The two shadow-budget lights additionally sample their shadow maps.
-vec3 dynLights(vec3 wp, vec3 N)
+// Shade ONE dynamic point/spot light: linear-squared falloff, N·L diffuse,
+// smooth spot cone, + the two shadow-budget lights' shadow maps & cookie. The
+// light fields are passed in so this serves BOTH the UBO array (fallback) and
+// the clustered SSBO. `gi` = the light's GLOBAL index (for the shadow picks).
+vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int sIdx, int pIdx)
 {
-    vec3 acc = vec3(0.0);
-    int n = int(L.counts.x + 0.5);
-    int sIdx = int(L.shadow_params.x);
-    int pIdx = int(L.shadow_params.y);
-    for (int i = 0; i < n; ++i) {
-        vec3  dv = L.lights[i].pos.xyz - wp;
-        float r  = L.lights[i].pos.w;
-        float d2 = dot(dv, dv);
-        if (d2 >= r * r) continue;
-        float d   = sqrt(max(d2, 1e-6));
-        vec3  ld  = dv / d;
-        float att = 1.0 - d / r;
-        att *= att;
-        if (L.lights[i].color.w > 0.5)   // spot cone
-            att *= clamp((dot(-ld, L.lights[i].dir.xyz) - L.lights[i].dir.w)
-                         / max(1.0 - L.lights[i].dir.w, 1e-3), 0.0, 1.0);
-        vec3 tint = L.lights[i].color.rgb;
-        if (i == sIdx) {
-            att *= spotShadowF(wp);
-            // Flashlight cookie (R4 projective light texture): the beam pattern
-            // projected through the SAME spot_vp the shadow lookup uses.
-            if (L.shadow_params.z > 0.5) {
-                vec4 cc = L.spot_vp * vec4(wp, 1.0);
-                if (cc.w > 0.0) {
-                    vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
-                    cuv.y = 1.0 - cuv.y;
-                    tint *= textureLod(uSpotCookie, clamp(cuv, 0.0, 1.0), 0.0).rgb;
-                }
+    vec3  dv = lpos.xyz - wp;
+    float r  = lpos.w;
+    float d2 = dot(dv, dv);
+    if (d2 >= r * r) return vec3(0.0);
+    float d   = sqrt(max(d2, 1e-6));
+    vec3  ld  = dv / d;
+    float att = 1.0 - d / r;
+    att *= att;
+    if (lcol.w > 0.5)   // spot cone
+        att *= clamp((dot(-ld, ldir.xyz) - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    vec3 tint = lcol.rgb;
+    if (gi == sIdx) {
+        att *= spotShadowF(wp);
+        // Flashlight cookie (R4 projective light texture): the beam pattern
+        // projected through the SAME spot_vp the shadow lookup uses.
+        if (L.shadow_params.z > 0.5) {
+            vec4 cc = L.spot_vp * vec4(wp, 1.0);
+            if (cc.w > 0.0) {
+                vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
+                cuv.y = 1.0 - cuv.y;
+                tint *= textureLod(uSpotCookie, clamp(cuv, 0.0, 1.0), 0.0).rgb;
             }
         }
-        else if (i == pIdx) att *= pointShadowF(wp, L.lights[i].pos.xyz, r);
-        acc += tint * (att * max(dot(N, ld), 0.0));
+    }
+    else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
+    else att *= lightTerrainOcc(wp, lpos.xyz);   // UNshadowed lamps: heightfield terrain occlusion (shadowed ones use their maps)
+    return tint * (att * max(dot(N, ld), 0.0));
+}
+
+// Dynamic light accumulation (STEP 3). Clustered (r_clustered): iterate only the
+// froxel's lights from the SSBO — the cap is 256, each pixel touches the ~few
+// lights reaching it. Fallback: the old per-fragment loop over the UBO's 16.
+vec3 dynLights(vec3 wp, vec3 N)
+{
+    int sIdx = int(L.shadow_params.x);
+    int pIdx = int(L.shadow_params.y);
+    vec3 acc = vec3(0.0);
+    if (L.cluster_params.w > 0.5) {
+        int ci  = clusterOfFragment(wp, L.eye_pos.xyz, L.cam_dir.xyz, gl_FragCoord.xy, L.ao_params.xy, L.cluster_params, L.cluster_params2);
+        int mxp = int(L.cluster_params2.w);
+        int cnt = int(clusterGrid[ci]);
+        for (int k = 0; k < cnt; ++k) {
+            int gi = int(clusterIndex[ci * mxp + k]);
+            acc += shadeDynLight(clusterLights[gi].pos, clusterLights[gi].color, clusterLights[gi].dir, wp, N, gi, sIdx, pIdx);
+        }
+    } else {
+        int n = int(L.counts.x + 0.5);
+        for (int i = 0; i < n; ++i)
+            acc += shadeDynLight(L.lights[i].pos, L.lights[i].color, L.lights[i].dir, wp, N, i, sIdx, pIdx);
     }
     return acc;
 }
@@ -634,6 +695,13 @@ void main()
         return;
     }
 
+    // r_clustered_debug: per-cluster dynamic-light-count heatmap (blue 0 … red many).
+    if (L.cluster_params.w > 1.5) {
+        int cnt = clusterLightCount(vWorldPos, L.eye_pos.xyz, L.cam_dir.xyz, gl_FragCoord.xy, L.ao_params.xy, L.cluster_params, L.cluster_params2);
+        outColor = vec4(clusterHeat(cnt), base.a);
+        return;
+    }
+
     vec3 detail = texture(uTexDetail, pDetailUV).rgb;
     vec3 albedo = 2.0 * base.rgb * detail;
 
@@ -648,8 +716,14 @@ void main()
     vec3  geomN   = normalize(vNormal);   // flat — for the sky fill (sharp cube → perturbed = mirror)
     vec3  Nw      = pomN;   // POM-perturbed normal → sun + dyn lights catch the relief
     float sunMask = max(dot(Nw, normalize(-L.sun_dir.xyz)), 0.0);
-    if (sunMask > 0.005)
-        sunMask *= sunShadow(vWorldPos) * pomShadow;   // cascade shadow × POM groove self-shadow
+    if (sunMask > 0.005) {
+        // VSM (r_vsm) vs the cascade path — gated per frame by shadow_params.w.
+        // VSM is now a screen-space, temporally-resolved mask → sample by screen UV
+        // (ao_params.xy = 1/screenDims, same scale gtaoVis() uses).
+        float sunSh = (L.shadow_params.w > 0.5) ? vsmSunShadow(gl_FragCoord.xy * L.ao_params.xy)
+                                                : sunShadow(vWorldPos);
+        sunMask *= sunSh * pomShadow;   // sun shadow × POM groove self-shadow
+    }
 
     // Hemisphere sky fill (R4 hmodel) replaces the flat hemi term: real sky
     // colour per normal × lightmap occlusion.
@@ -657,7 +731,7 @@ void main()
     float hemiOccL = hemiOcc;
     float dynHemiL = pc.dynHemi;
     if (L.pom_params3.y > 0.5) { occ = vec3(1.0); hemiOccL = 1.0; dynHemiL = 1.0; }   // r_ao_flat debug
-    vec3 lighting = skyAmbient(geomN) * (hemiOccL * L.sky_params.y * dynHemiL) * occ
+    vec3 lighting = skyAmbient(gtaoBentN(geomN)) * (hemiOccL * L.sky_params.y * dynHemiL) * occ
                   + L.sun_color.rgb  * sunMask
                   + L.ambient.rgb * occ
                   + dynLights(vWorldPos, Nw);

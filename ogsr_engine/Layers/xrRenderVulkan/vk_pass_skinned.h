@@ -42,4 +42,36 @@ namespace VK
     // Alpha-tested with skinned.frag's threshold so cutout coverage matches the
     // color pass. HUD skeletons never enter. Called from Pass_World's prepass.
     void Skinned_RenderDepthPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj);
+
+    // NPCs into the SSAO normal G-buffer (camera VP) — feeds GTAO real per-pixel
+    // normals where an NPC is visible (kills depth-derivative speckle on NPCs).
+    // Depth-tested against the prepass depth (no depth write); alpha-tested like
+    // the depth prepass. Caller owns render begin/end + viewport (Pass_World).
+    void Skinned_RenderNormalPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj);
+
+    // --- VSM skinned casters (vk_vsm consumes these to render NPC shadows into the
+    // virtual shadow atlas). One entry per visible world skinned leaf this frame.
+    struct VsmSkinnedCaster {
+        Fvector      sphere_P;      // world-space bounding sphere (skeleton bound)
+        float        sphere_R;
+        u32          index_count, ib_first;
+        s32          first_vertex;
+        VkBuffer     vb, ib;
+        VkIndexType  iType;
+        u32          stride;        // vertex stride (36/40/44) → pipeline key + vertex input
+        u32          base_bone, bone_count, skin_mode;
+    };
+    // Collect this frame's world skinned leaves as VSM casters (ensures bones are
+    // uploaded first). HUD never casts. Append-only into `out` (not cleared here).
+    void Skinned_CollectCasters(xr_vector<VsmSkinnedCaster>& out);
+
+    // The shared world-space bone SSBO set (set 0, binding 0) + its layout — vk_vsm's
+    // skinned-page pipeline binds the SAME set so baseBone indexes the same matrices.
+    VkDescriptorSet       Skinned_GetBoneSet();
+    VkDescriptorSetLayout Skinned_GetBoneSetLayout();
+
+    // Build the vertHW skinned vertex input for `stride` (6 attrs) — vk_vsm reuses it
+    // for the skinned-page pipeline so the layout matches the mesh buffers exactly.
+    void Skinned_BuildVertexInput(u32 stride, VkVertexInputBindingDescription& binding,
+                                  VkVertexInputAttributeDescription attrs[6]);
 }

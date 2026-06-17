@@ -58,5 +58,13 @@ VkSampler   GetSampler();      // linear/clamp — receivers bilinearly upsample
 u32         Generation();      // bumps when the RTs are (re)created — rebind triggers
 float       Strength();        // ao_params.z for the Lighting UBO (0 disables in-shader)
 
+// NPC normal G-buffer (full-res RGBA8). The skinned normal pass renders into it
+// between the depth prepass and Execute; GTAO samples it (real normals where an
+// NPC is visible, depth-derived fallback elsewhere). Null until EnsureTargets.
+VkImage     GetNormalImage();
+VkImageView GetNormalView();
+VkFormat    GetNormalFormat();
+VkExtent2D  GetNormalExtent();
+
 }  // namespace SSAOPass
 }  // namespace VK

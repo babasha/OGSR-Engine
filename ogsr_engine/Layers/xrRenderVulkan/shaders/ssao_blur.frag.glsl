@@ -7,7 +7,7 @@
 // across silhouette edges (a corner's darkness must not leak onto the wall
 // 10 m behind it).
 
-layout(location = 0) out float outAO;
+layout(location = 0) out vec4 outAO;   // r = AO, gba = world bent normal *0.5+0.5
 
 layout(set = 0, binding = 0) uniform sampler2D uDepth;   // full-res scene depth
 layout(set = 0, binding = 1) uniform sampler2D uAO;      // half-res raw GTAO
@@ -39,13 +39,16 @@ void main()
 
     float sum = 0.0;
     float wsum = 0.0;
+    vec3  bentSum = vec3(0.0);   // accumulate the world bent normal (decoded to [-1,1])
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x) {
             vec2 o  = vec2(x, y) * pc.res.zw;
             float zi = viewDepth(uv + o);
             // Relative depth gate: ~5% depth difference ≈ weight 0.45.
             float w  = exp(-abs(zi - z0) * 16.0 / max(z0, 0.1));
-            sum  += texture(uAO, uv + o).r * w;
+            vec4 t = texture(uAO, uv + o);
+            sum  += t.r * w;
+            bentSum += (t.gba * 2.0 - 1.0) * w;
             wsum += w;
         }
 
@@ -59,5 +62,7 @@ void main()
     const float IGN_MARIA    = 52.9829189;
     const vec2  IGN_BLUMENAU = vec2(0.06711056, 0.00583715);
     float dith = fract(IGN_MARIA * fract(dot(gl_FragCoord.xy, IGN_BLUMENAU)));
-    outAO = sum / max(wsum, 1e-4) + (dith - 0.5) / 255.0;
+    float ao = sum / max(wsum, 1e-4) + (dith - 0.5) / 255.0;
+    vec3  bentN = (dot(bentSum, bentSum) > 1e-6) ? normalize(bentSum) : vec3(0.0);
+    outAO = vec4(ao, bentN * 0.5 + 0.5);
 }

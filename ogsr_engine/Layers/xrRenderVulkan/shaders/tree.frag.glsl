@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#define VSM_SET 2                 // env set is bound at set 2 for trees
+#include "vsm_sample.glsl"        // vsmSunShadow — screen-space VSM mask (set 2, binding 14)
 // xrRenderVulkan — tree forward fragment shader (Session B).
 // set 1/binding 0 = per-group diffuse texture. Trees are alpha-tested
 // (punch-out leaves), not blended; discard below the push-constant cutoff.
@@ -157,8 +160,13 @@ void main()
     }
 
     vec3 sunPart = vSunLit;
-    if (dot(sunPart, sunPart) > 0.0)
-        sunPart *= sunShadow1(vWPos);
+    if (dot(sunPart, sunPart) > 0.0) {
+        // VSM screen-space mask (r_vsm) vs the 1-tap cascade — gated by _pad_shadow_params.w.
+        // (VSM has no tree casters yet → crown-on-trunk self-shadow returns with that work.)
+        float sunSh = (L._pad_shadow_params.w > 0.5) ? vsmSunShadow(gl_FragCoord.xy * L.ao_params.xy)
+                                                     : sunShadow1(vWPos);
+        sunPart *= sunSh;
+    }
 
     // Ambient = sky-cube light × per-tree openness (vLight.x). ×0.75 keeps the
     // old grass:tree ambient ratio (grass 2.0 vs tree 1.5 in the flat model).

@@ -715,6 +715,22 @@ void CGamePersistent::OnRenderPPUI_PP() { MainMenu()->OnRenderPPUI_PP(); }
 
 void CGamePersistent::LoadTitle(const char* str)
 {
+    // TEMP load-phase profiling: log the wall time of the phase that just ENDED
+    // (between consecutive LoadTitle markers) — finds the real load bottleneck
+    // across cform / geometry / alife / ai / spawn / textures. The 4 render
+    // phases (rvk_loader, unnamed) come through as '(render)' in load order:
+    // 1=shaders 2=geometry 3=visuals 4=sectors+foliage+gpu-build. Remove after.
+    {
+        static CTimer    s_phaseTimer;
+        static shared_str s_prevTitle;
+        static bool       s_started = false;
+        if (s_started)
+            Msg("[load phase] '%s' = %u ms", s_prevTitle.c_str(), s_phaseTimer.GetElapsed_ms());
+        s_prevTitle = (str && str[0]) ? str : "(render)";
+        s_started   = true;
+        s_phaseTimer.Start();
+    }
+
     const char* tittle = CStringTable().translate(str).c_str();
     pApp->SetLoadStageTitle(tittle);
     pApp->LoadStage();

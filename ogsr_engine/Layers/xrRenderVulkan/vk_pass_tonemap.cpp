@@ -16,10 +16,15 @@
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
 #include "vk_env_light.h"          // EnvLight set (set 1) — rain map/VP + camera terms for SSR puddles
+#include "vk_volumetrics.h"        // VK::Vol — integrated froxel volume (binding 4) + exp-Z params
 #include "vk_exposure.h"           // VK::Exposure — shared auto-exposure constants (also used by bloom)
 #include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline
 #include "HW_Vulkan.h"
 #include "../xrRender/xrRender_console.h"  // ps_r2_img_* — R4 color-grading console knobs
+
+// r_vol composite knobs (global scope — C-linkage console symbols).
+extern int ps_r_vol;
+extern int ps_r_vol_debug;
 
 namespace VK {
 
@@ -38,6 +43,7 @@ namespace {
     u32                   s_boundBloomGen  = 0;   // BloomPass RT generation (binding 1)
     u32                   s_boundDistortGen = 0;  // distort RT generation (binding 2)
     VkImageView           s_boundDepth     = VK_NULL_HANDLE;  // scene depth (binding 3, SSR puddles)
+    u32                   s_boundVolGen    = 0;   // Vol volume generation (binding 4, volumetrics)
 
     // Heat-haze strength: scene UV offset = (distort.rg - 0.5) * kDistortAmount —
     // R2/R4 combine_2.ps: (distort.xy - 127/255) * def_distort, def_distort 0.05.
@@ -63,7 +69,7 @@ namespace {
     constexpr float kExpComp     = 1.0f;     // overall compensation knob
     constexpr float kBloomIntensity = 0.8f;  // bloom add strength (blend_soft analog)
 
-    struct TonemapPush { float p0[4]; float p1[4]; float p2[4]; float p3[4]; };
+    struct TonemapPush { float p0[4]; float p1[4]; float p2[4]; float p3[4]; float p4[4]; };
 }
 
 namespace TonemapPass {
@@ -81,20 +87,20 @@ bool Init()
     }
 
     // Set 0: binding 0 = HDR scene, 1 = blurred bloom, 2 = distortion,
-    // 3 = scene depth (SSR puddles). All FS.
-    VkDescriptorSetLayoutBinding b[4]{};
-    for (u32 i = 0; i < 4; ++i) {
+    // 3 = scene depth (SSR puddles), 4 = integrated volumetrics (sampler3D). All FS.
+    VkDescriptorSetLayoutBinding b[5]{};
+    for (u32 i = 0; i < 5; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 4; lci.pBindings = b;
+    lci.bindingCount = 5; lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
         Msg("![VK Tonemap] set layout failed"); return false;
     }
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxImages * 4 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxImages * 5 };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = kMaxImages; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -180,24 +186,31 @@ void Pass_TonemapComposite(FrameContext& ctx)
     const u32 gen        = SceneColor::Generation();
     const u32 bloomGen   = BloomPass::Generation();
     const u32 distortGen = ParticlePass::DistortGeneration();
+    const u32 volGen     = Vol::Generation();
     if (gen != s_boundGen || bloomGen != s_boundBloomGen || distortGen != s_boundDistortGen
-        || Swapchain.m_DepthView != s_boundDepth) {
+        || Swapchain.m_DepthView != s_boundDepth || volGen != s_boundVolGen) {
         const u32 n = SceneColor::Count();
         for (u32 i = 0; i < n && i < kMaxImages; ++i) {
-            VkDescriptorImageInfo ii[4]{};
+            VkDescriptorImageInfo ii[5]{};
             ii[0].sampler = s_Sampler; ii[0].imageView = SceneColor::GetSampleView(i);  // full mip chain
             ii[1].sampler = s_Sampler; ii[1].imageView = BloomPass::GetResultView();
             ii[2].sampler = s_Sampler; ii[2].imageView = ParticlePass::GetDistortView();
             ii[3].sampler = s_Sampler; ii[3].imageView = Swapchain.m_DepthView;          // SSR puddles
-            ii[0].imageLayout = ii[1].imageLayout = ii[2].imageLayout = ii[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            ii[4].sampler = Vol::GetSampler(); ii[4].imageView = Vol::GetIntegratedView(); // integrated volumetrics (3D)
+            ii[0].imageLayout = ii[1].imageLayout = ii[2].imageLayout = ii[3].imageLayout = ii[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             if (ii[1].imageView == VK_NULL_HANDLE) ii[1].imageView = SceneColor::GetSampleView(i); // pre-bloom fallback
             if (ii[2].imageView == VK_NULL_HANDLE) ii[2].imageView = SceneColor::GetSampleView(i); // no-distort fallback (never sampled: scale 0)
-            VkWriteDescriptorSet w[4]{};
-            u32 wc = (ii[3].imageView != VK_NULL_HANDLE) ? 4u : 3u;
-            for (u32 k = 0; k < wc; ++k) {
-                w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                w[k].dstSet = s_Set[i]; w[k].dstBinding = k; w[k].descriptorCount = 1;
-                w[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[k].pImageInfo = &ii[k];
+            if (ii[3].imageView == VK_NULL_HANDLE) ii[3].imageView = SceneColor::GetSampleView(i); // no-depth fallback (never sampled: wetness 0)
+            // Write each valid binding by explicit index — binding 4 (3D volume)
+            // exists from Vol::Init (eager); the others can transiently be null.
+            VkWriteDescriptorSet w[5]{};
+            u32 wc = 0;
+            for (u32 k = 0; k < 5; ++k) {
+                if (ii[k].imageView == VK_NULL_HANDLE) continue;
+                w[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[wc].dstSet = s_Set[i]; w[wc].dstBinding = k; w[wc].descriptorCount = 1;
+                w[wc].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[wc].pImageInfo = &ii[k];
+                ++wc;
             }
             vkUpdateDescriptorSets(VulkanHW.m_Device, wc, w, 0, nullptr);
         }
@@ -205,6 +218,7 @@ void Pass_TonemapComposite(FrameContext& ctx)
         s_boundBloomGen   = bloomGen;
         s_boundDistortGen = distortGen;
         s_boundDepth      = Swapchain.m_DepthView;
+        s_boundVolGen     = volGen;
     }
 
     // Scene depth → SHADER_READ for the SSR puddle march (binding 3). NOT
@@ -263,6 +277,14 @@ void Pass_TonemapComposite(FrameContext& ctx)
     push.p3[0] = 2.0f * (1.0f - ps_r2_img_cg.x);
     push.p3[1] = 2.0f * (1.0f - ps_r2_img_cg.y);
     push.p3[2] = 2.0f * (1.0f - ps_r2_img_cg.z);
+    // Volumetric composite (r_vol): mode + the exp-Z grid params from the LAST
+    // Vol::Execute (the EXACT inverse vol_inject used). 0 off / 1 composite / 2 debug.
+    const Vol::GridZParams gz = Vol::GetGridZ();
+    const bool volOn = (ps_r_vol != 0 || ps_r_vol_debug != 0) && Vol::Ready();
+    push.p4[0] = volOn ? (ps_r_vol_debug ? 2.0f : 1.0f) : 0.0f;
+    push.p4[1] = gz.nearZ;
+    push.p4[2] = gz.farZ;
+    push.p4[3] = gz.logFarNear;
     vkCmdPushConstants(cmd, s_PipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
     vkCmdDraw(cmd, 3, 1, 0, 0);

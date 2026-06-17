@@ -136,6 +136,13 @@ public:
     void RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade = -1,
                      const CFrustum* frustum = nullptr);
 
+    // VSM caster path (trees are static → temporal-friendly). vk_vsm provides the page
+    // buffers (its own pageTable/pageList + this frame's clipmap UBO). VsmBin runs the
+    // per-tree page binning (compute, before the atlas pass); VsmRender rasterizes the
+    // trees into the bound atlas pages (call INSIDE vk_vsm's RenderAtlas pass).
+    void VsmBin(VkCommandBuffer cmd, VkBuffer pageTable, VkBuffer slotDirty, VkBuffer clipmapUBO);
+    void VsmRender(VkCommandBuffer cmd, VkBuffer pageList, VkBuffer clipmapUBO);
+
     bool IsBuilt() const { return m_bBuilt; }
     bool IsReady() const;
     u32  GetTotalCount() const { return m_TotalCount; }
@@ -207,6 +214,25 @@ private:
     VkPipeline       m_DepthPipeline24   = VK_NULL_HANDLE;
     VkPipeline       m_DepthPipeline28   = VK_NULL_HANDLE;
     xr_vector<GpuTreeMeta> m_MetaCPU;
+
+    // ----- VSM caster path (lazy; built on first VsmBin once Session B is up) -----
+    void CreateVsmResources();
+    void DestroyVsm();
+    bool                  m_VsmReady      = false;
+    VkPipeline            m_VsmBinPipe    = VK_NULL_HANDLE;   // vsm_tree_bin.comp (skinned-bin + slotDirty cache filter; STATIC atlas)
+    VkPipelineLayout      m_VsmBinLayout  = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_VsmBinSetL    = VK_NULL_HANDLE;
+    VkDescriptorPool      m_VsmDescPool   = VK_NULL_HANDLE;
+    VkDescriptorSet       m_VsmBinSet[VK_FRAMES_IN_FLIGHT]  = {};
+    VkDescriptorSetLayout m_VsmPageSetL   = VK_NULL_HANDLE;   // set 2: pageList + casterPages + clipmap UBO
+    VkDescriptorSet       m_VsmPageSet[VK_FRAMES_IN_FLIGHT] = {};
+    VkPipelineLayout      m_VsmPageLayout = VK_NULL_HANDLE;
+    VkPipeline            m_VsmPagePipe24 = VK_NULL_HANDLE;
+    VkPipeline            m_VsmPagePipe28 = VK_NULL_HANDLE;
+    CVulkanBuffer* m_VsmCasterPages = nullptr;   // m_TotalCount * kVsmTreeCap u32
+    CVulkanBuffer* m_VsmIndirect    = nullptr;   // m_TotalCount VkDrawIndexedIndirectCommand
+    CVulkanBuffer* m_VsmStats       = nullptr;
+    u32            m_VsmSlot        = 0;          // frame-in-flight ring for the descriptor sets
 };
 
 }  // namespace VK

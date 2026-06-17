@@ -189,6 +189,11 @@ static void __stdcall build_callback(Fvector* V, const size_t Vcnt, CDB::TRI* T,
 
 void CObjectSpace::Load()
 {
+    // TEMP measurement (CDB-cache feasibility): split file read+decompress from
+    // the OPCODE tree build and print in Release too (the old MsgDbg is __noop in
+    // Release). Tells us if caching the built tree is worth it. Remove afterwards.
+    CTimer t_read;
+    t_read.Start();
     IReader* F = FS.r_open(fsgame::level, fsgame::level_files::level_cform);
     R_ASSERT(F);
 
@@ -199,15 +204,15 @@ void CObjectSpace::Load()
     CDB::TRI* tris = (CDB::TRI*)(verts + H.vertcount);
 
     R_ASSERT(CFORM_CURRENT_VERSION == H.version);
+    const u32 readMs = t_read.GetElapsed_ms();
 
     CTimer t_total;
 
     t_total.Start();
     Static.build(verts, H.vertcount, tris, H.facecount, build_callback);
-    if (t_total.GetElapsed_ms() > 5)
-    {
-        MsgDbg("Long CObjectSpace::Load() !!! duration [%d]ms!", t_total.GetElapsed_ms());
-    }
+    const u32 buildMs = t_total.GetElapsed_ms();
+    Msg("[CDB measure] cform read+decompress %u ms | OPCODE tree build %u ms | %u verts, %u tris | CDB RAM ~%.1f MB",
+        readMs, buildMs, H.vertcount, H.facecount, Static.memory() / (1024.f * 1024.f));
 
     m_BoundingVolume.set(H.aabb);
     g_SpatialSpace->initialize(H.aabb);
