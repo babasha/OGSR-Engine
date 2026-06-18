@@ -188,7 +188,26 @@ void CTreeManager::Build()
         x.xform        = t->xform;
         x.c_scale_hemi = t->c_scale.hemi;
         x.c_bias_hemi  = t->c_bias.hemi;
-        x._pad0 = x._pad1 = 0;
+        // Wind class by diffuse TEXTURE NAME (tree materials don't expose alphaRef,
+        // and this "tree" path also carries non-foliage statics — vehicles, props,
+        // walls). Only real foliage gets wind:
+        //   2 = foliage (bend + flow-map flutter): under "trees\" and NOT bark/spil
+        //   1 = trunk   (gentle bend only): under "trees\" bark/spil (sways with crown)
+        //   0 = rigid   (no wind): everything else (veh\, prop\, mtl\, wood\, ...)
+        auto hasKw = [](const char* s, std::initializer_list<const char*> kws) {
+            if (!s || !s[0]) return false;
+            xr_string low = s; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+            for (auto* k : kws) if (low.find(k) != xr_string::npos) return true;
+            return false;
+        };
+        const char* nm = "";
+        if (t->m_pWorldMaterial) { const char* n = t->m_pWorldMaterial->name.c_str(); if (n) nm = n; }
+        const bool underTrees = (strncmp(nm, "trees\\", 6) == 0) || (strncmp(nm, "trees/", 6) == 0);
+        const bool isBark     = hasKw(nm, { "bark", "spil" });   // trunk / cut-stump cross-section
+        u32 windClass = 0u;
+        if (underTrees) windClass = isBark ? 1u : 2u;
+        x._pad0 = windClass;
+        x._pad1 = 0;
     }
 
     // ----- Group consecutive trees with same (tcOffset, descSet, vb, ib, stride).

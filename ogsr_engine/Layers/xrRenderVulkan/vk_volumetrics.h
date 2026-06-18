@@ -45,6 +45,12 @@ constexpr u32 kGridX = 256;
 constexpr u32 kGridY = 144;
 constexpr u32 kGridZ = 128;
 
+// Stage-1 VMS: a smoke particle injected as participating media. Filled by the
+// particle pass (ParticlePass::CollectSmokeParticles) and uploaded to the splat
+// SSBO. xyz = world centre, w = radius (world units); rgb = albedo, a = density
+// (the particle's opacity). Layout matches the SmokeParticle in vol_splat.comp.
+struct SmokeParticle { float pos[3]; float radius; float color[4]; };
+
 bool Init();        // eager: creates the 3D volumes + compute pipelines, transitions
                     // the volumes to SHADER_READ so the tonemap binding is always valid.
 void Destroy();
@@ -54,7 +60,10 @@ bool Wanted();      // r_vol != 0
 // Per-frame inject + integrate. Records into `cmd` (compute, OUTSIDE a render
 // pass). pt = DeriveProjTerms(viewProj); slot = in-flight slot. No-op when
 // r_vol is off (the volume keeps its SHADER_READ layout, the composite is gated).
-void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot);
+// `smoke`/`smokeCount` = this frame's smoke particles to inject as media (Stage 1);
+// pass nullptr/0 for none. Internally clamped to the splat capacity.
+void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
+             const SmokeParticle* smoke, u32 smokeCount);
 
 // Composite inputs for the tonemap fold: the integrated volume (rgb = in-scatter,
 // a = transmittance) + a linear/clamp sampler. The view exists from Init on (the

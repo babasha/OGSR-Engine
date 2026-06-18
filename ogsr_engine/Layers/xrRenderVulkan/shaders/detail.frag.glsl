@@ -1,51 +1,16 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-#include "vsm_sample.glsl"        // vsmSunShadow — screen-space VSM mask (set 1, binding 14)
-// xrRenderVulkan — detail (grass) fragment shader.
-// set=0/binding=0 = per-type diffuse texture. Hard alpha-cutoff at 0.5 because
-// grass billboards are punch-out, not blended.
-// set=1 = shared per-frame env lighting (vk_env_light): sun_vp + the sun shadow
-// map. The sun part of the vertex lighting (vSunLit) is attenuated by a single
-// shadow tap — foliage noise hides the hard edge, and 9-tap PCF on the grass
-// overdraw would be wasted.
+#include "vsm_sample.glsl"         // vsmSunShadow (set 1 b14)
+#include "light_ubo.glsl"          // DynLight + Lighting UBO (set 1 b0) + samplers (set 1 b1..13)
+#include "surface_class.glsl"      // SC_* classification + snow (grass)
 
+// xrRenderVulkan - detail (grass) fragment shader. set 0/binding 0 = per-type
+// diffuse (alpha-cutoff 0.5, punch-out). set 1 = the shared EnvLight, now via
+// light_ubo.glsl (was a hand-rolled partial copy). Sun gets a single shadow tap;
+// grass overdraw noise hides the hard edge.
 layout(set = 0, binding = 0) uniform sampler2D uDiffuse;
 
-struct DynLight {
-    vec4 pos;     // xyz = world position, w = range
-    vec4 color;   // rgb = colour,         w = 1 spot / 0 point
-    vec4 dir;     // xyz = spot direction, w = cos(cone/2)
-};
-layout(set = 1, binding = 0) uniform Lighting {
-    vec4 sun_dir;
-    vec4 sun_color;
-    vec4 hemi_color;
-    vec4 ambient;
-    mat4 sun_vp;      // sun light view·proj (shadow lookup)
-    vec4 counts;      // x = dynamic light count
-    DynLight lights[16];
-    // Padding to reach the fog block at the end of the shared LightUBO — grass
-    // doesn't sample the cascade maps, it just needs fog_color/params/eye.
-    mat4 _pad_spot_vp;
-    vec4 _pad_shadow_params;
-    mat4 _pad_sun_near_vp;
-    mat4 _pad_sun_c1_vp;
-    vec4 fog_color;      // rgb haze colour (env)
-    vec4 fog_params;     // x=-near*r, y=near, z=far, w=r; fog = saturate(dist*w + x)
-    vec4 eye_pos;        // xyz camera world pos
-    vec4 sky_params;     // x=cube cross-fade weight, y=ambient scale, z=sample LOD
-    vec4 ao_params;      // x=1/screenW, y=1/screenH, z=AO strength exponent (0=off)
-    mat4 rain_vp;        // straight-down ortho VP for the rain occlusion map (wetness)
-    vec4 rain_params;    // x=rain density, y=wetness, z=darken, w=reflection scale
-} L;
-layout(set = 1, binding = 1) uniform sampler2D uShadow;
-layout(set = 1, binding = 6) uniform samplerCube uSky0;   // sky ambient cube (weather A)
-layout(set = 1, binding = 7) uniform samplerCube uSky1;   // sky ambient cube (weather B)
-layout(set = 1, binding = 8) uniform sampler2D uAO;       // GTAO (half-res)
-layout(set = 1, binding = 9) uniform sampler2D uRainMap;  // top-down rain occlusion (wetness gate)
-
-// Rain visibility — is this blade open to the sky (gets rained on)? Single tap is
-// fine: grass overdraw is noisy, no need for the world ground's blurred PCF.
+// Rain visibility - is this blade open to the sky? Single tap (grass overdraw is noisy).
 float rainVisGrass(vec3 wp)
 {
     vec3 n = (L.rain_vp * vec4(wp, 1.0)).xyz;
@@ -55,18 +20,15 @@ float rainVisGrass(vec3 wp)
     return (n.z - 0.0015 <= texture(uRainMap, uv).r) ? 1.0 : 0.0;
 }
 
-// GTAO at this pixel — grass isn't in the prepass depth, so this is the AO of
-// the GROUND behind the blade: grass in a dark corner sits in the same ambient
-// as the dirt it grows from (full strength, matches world_terrain).
+// GTAO at this pixel - grass isn't in the prepass, so this is the AO of the GROUND
+// behind the blade (grass in a dark corner sits in the same ambient as the dirt).
 float gtaoVis()
 {
     float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
     return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);
 }
 
-// Colored AO — see world_lmap.frag. R4 applies this to grass too (deffer_grass
-// writes the gbuffer, combine_1.ps tints occlusion by the BLADE's albedo), so
-// occluded grass shades toward its own green instead of grey.
+// Colored AO - see world_lmap.frag (R4 tints occlusion toward the blade's albedo).
 vec3 coloredAO(float ao, vec3 albedo)
 {
     vec3 a =  2.0404 * albedo - 0.3324;
@@ -75,9 +37,16 @@ vec3 coloredAO(float ao, vec3 albedo)
     return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
 }
 
-// Hemisphere sky ambient — the SAME light the world ground uses (world_lmap
-// skyAmbient). Grass has no real normal: sample straight up, like the terrain
-// beneath it, so blades sit in the same light as the ground they grow from.
+// SSIL ambient boost - see env_common.glsl (SSFX hdiffuse *= IL). 0/no-op where
+// there's no bounce or r_ssil is off; uIL is binding 21 (light_ubo.glsl).
+vec3 ssilBoost()
+{
+    vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
+    return vec3(1.0) + il / (1.0 + il);
+}
+
+// Hemisphere sky ambient - grass samples straight up (no real normal), same light
+// as the terrain beneath it.
 vec3 skyAmbientUp()
 {
     float lod = L.sky_params.z;
@@ -86,8 +55,7 @@ vec3 skyAmbientUp()
                clamp(L.sky_params.x, 0.0, 1.0));
 }
 
-// Foliage variant: billboards have no meaningful normal → attenuation-only
-// (×0.7 stands in for the average N·L of randomly-oriented blades).
+// Foliage variant: billboards have no meaningful normal -> attenuation-only.
 vec3 dynLightsFoliage(vec3 wp)
 {
     vec3 acc = vec3(0.0);
@@ -110,8 +78,9 @@ vec3 dynLightsFoliage(vec3 wp)
 
 layout(push_constant) uniform DetailConstants {
     mat4 mViewProj;
-    vec4 vWave;
-    vec4 vWind;
+    vec4 wind_params;       // vertex-only (kept for push layout parity)
+    vec4 wsetup_grass;      // vertex-only
+    vec4 wind_anim;         // vertex-only
     vec4 vConsts;
     vec4 vInteractors[4];
     vec4 vSunColor;
@@ -123,10 +92,9 @@ layout(location = 1) in vec4  vColor;
 layout(location = 2) in float vHeight;
 layout(location = 3) in vec3  vSunLit;
 layout(location = 4) in vec3  vWPos;
-
 layout(location = 0) out vec4 outColor;
 
-// 1-tap sun shadow (same projection convention as world_lmap.frag).
+// 1-tap sun shadow - see world_lmap.frag.
 float sunShadow1(vec3 worldPos)
 {
     vec4 c = L.sun_vp * vec4(worldPos, 1.0);
@@ -143,41 +111,46 @@ void main()
     vec4 diff = texture(uDiffuse, vUV);
     if (diff.a < 0.5) discard;
 
-    // r_ssao_debug 1: grass shows the raw AO map too — see world_lmap.frag.
+    // r_ssao_debug 1: grass shows the raw AO map too.
     if (L.ao_params.w > 0.5) {
         outColor = vec4(vec3(textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r), 1.0);
         return;
     }
+    // r_sf_debug 5: surface classification - grass (cyan).
+    if (int(L.sf_params.y + 0.5) == 5) {
+        outColor = vec4(SC_DebugColor(SC_Refine(SC_GRASS, vec3(0.0, 1.0, 0.0))), 1.0);
+        return;
+    }
+
+    // SNOW cover on the grass (Surface Field consumer, r_snow), gated by sky
+    // exposure so grass under cover stays green.
+    float snow = SC_SnowAmount(SC_Refine(SC_GRASS, vec3(0.0, 1.0, 0.0)), vec3(0.0, 1.0, 0.0), rainVisGrass(vWPos)) * clamp(L.sf_params.w, 0.0, 1.0);
+    diff.rgb = mix(diff.rgb, vec3(0.92, 0.94, 0.98), snow);
 
     vec3 sunPart = vSunLit;
     if (dot(sunPart, sunPart) > 0.0) {
-        // VSM screen-space mask (r_vsm) vs the 1-tap cascade — gated by _pad_shadow_params.w.
-        float sunSh = (L._pad_shadow_params.w > 0.5) ? vsmSunShadow(gl_FragCoord.xy * L.ao_params.xy)
-                                                     : sunShadow1(vWPos);
+        // VSM screen-space mask (r_vsm) vs the 1-tap cascade - gated by shadow_params.w.
+        float sunSh = (L.shadow_params.w > 0.5) ? vsmSunShadow(gl_FragCoord.xy * L.ao_params.xy)
+                                                 : sunShadow1(vWPos);
         sunPart *= sunSh;
     }
 
-    // Ambient = sky-cube light × baked per-slot hemi occlusion (vColor.r) —
-    // matches world_lmap's skyAmbient(N)*(hemiOcc*sky_params.y) on the ground.
-    // L.ambient replaces the old literal +0.05 floor: grass now gets the real
-    // env ambient (which carries r_ambient_floor) like every other receiver.
-    // GTAO gates it like every other receiver (sun/dyn lights untouched).
+    // Ambient = sky-cube light x baked per-slot hemi occlusion (vColor.r). L.ambient
+    // = real env ambient (carries r_ambient_floor). GTAO gates it (sun/dyn untouched).
     vec3 ambient = (skyAmbientUp() * (vColor.r * L.sky_params.y) + L.ambient.rgb)
-                 * coloredAO(gtaoVis(), diff.rgb);
+                 * coloredAO(gtaoVis(), diff.rgb) * ssilBoost();   // + SSIL bounce (ambient only)
 
     vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos));
 
-    // Wet grass: blades open to the rain DARKEN (wet foliage is darker + a touch
-    // cooler), so grass doesn't stay bright-dry on a soaked ground. No reflection /
-    // puddle on grass — just the damp tint. Gated by rain visibility (dry under cover).
+    // Wet grass: blades open to the rain darken slightly (+ a touch cooler).
     float wet = clamp(L.rain_params.y, 0.0, 1.0) * max(L.rain_params.z, 0.0);
     if (wet > 0.005) {
         float wv = wet * rainVisGrass(vWPos);
-        col *= 1.0 - 0.5 * wv;                 // darken
-        col = mix(col, col * vec3(0.85, 0.92, 1.0), 0.5 * wv);  // slight cool damp tint
+        col *= 1.0 - 0.5 * wv;
+        col = mix(col, col * vec3(0.85, 0.92, 1.0), 0.5 * wv);
     }
 
-    // Distance fog (R4) — see world_lmap.frag.
+    // Distance fog (R4).
     float fog = clamp(length(vWPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 

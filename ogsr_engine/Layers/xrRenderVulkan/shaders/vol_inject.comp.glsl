@@ -44,6 +44,8 @@ layout(set = 0, binding = 0) uniform Vol {
     VolLight lights[8];
     vec4 noiseParams;  // P3: x = amount, y = scale, z = speed, w = time
     mat4 spot_vp;      // spot (flashlight) shadow VP
+    vec4 smokeParams;  // Stage-1 VMS: x = smoke-inject strength (0 = no injected smoke)
+    vec4 light_occ;    // r_light_occ: x = enable, y = bury bias, z = frag-below band, w = strength
 } V;
 
 layout(set = 0, binding = 1) uniform sampler2D uShadowNear; // cascade 0
@@ -63,6 +65,7 @@ layout(set = 0, binding = 9) uniform VsmClipmap {
 layout(set = 0, binding = 10) uniform sampler2D uFogShadow;  // dedicated per-frame fog sun-shadow
 layout(set = 0, binding = 11) uniform sampler2D   uSpotShadow;  // spot (flashlight) shadow — occlude the fog cone
 layout(set = 0, binding = 12) uniform samplerCube uPointShadow; // point (campfire) shadow cube
+layout(set = 0, binding = 13) uniform sampler3D   uSmokeMedia;  // Stage-1 VMS: splatted+resolved smoke (rgb=albedo, a=density)
 
 const float PI = 3.14159265;
 
@@ -246,9 +249,30 @@ float pointShadowF(vec3 wp, vec3 lp, float range)
     return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
 }
 
+// Terrain/static occlusion for an UN-shadowed lamp (r_light_occ) — ported verbatim
+// from light_shade.glsl so the fog/smoke matches the surfaces: if the light is BURIED
+// below the top-down surface at its XZ (a lamp/campfire under a roof or in a basement),
+// a froxel at/above that surface is only reachable THROUGH the geometry → occlude. This
+// is what stops an indoor caster from lighting the smoke/fog OUTSIDE the house.
+float lightTerrainOcc(vec3 wp, vec3 lpos)
+{
+    if (V.light_occ.x < 0.5) return 1.0;
+    vec4 lc = V.rain_vp * vec4(lpos, 1.0);
+    if (lc.w <= 0.0) return 1.0;
+    vec2 luv = lc.xy * 0.5 + 0.5; luv.y = 1.0 - luv.y;
+    if (any(lessThan(luv, vec2(0.0))) || any(greaterThan(luv, vec2(1.0)))) return 1.0;
+    if (lc.z <= texture(uRainMap, luv).r + V.light_occ.y) return 1.0;   // light at/above the surface → no occlusion
+    vec4 fc = V.rain_vp * vec4(wp, 1.0);
+    if (fc.w <= 0.0) return 1.0;
+    vec2 fuv = fc.xy * 0.5 + 0.5; fuv.y = 1.0 - fuv.y;
+    if (any(lessThan(fuv, vec2(0.0))) || any(greaterThan(fuv, vec2(1.0)))) return 1.0;
+    float fragBelow = fc.z - texture(uRainMap, fuv).r;                  // >0 = froxel under the surface
+    return 1.0 - V.light_occ.w * (1.0 - smoothstep(0.0, V.light_occ.z, max(fragBelow, 0.0)));
+}
+
 // P2 — local lights (flashlight CONE, lamp/campfire/anomaly HALO) scattering in the
-// fog. Distance falloff × HG phase × (spot) cone gate × the budget shadow (so the
-// cone stops at walls).
+// fog. Distance falloff × HG phase × (spot) cone gate × occlusion (budget spot/point
+// shadow, else the r_light_occ heightfield so indoor lamps don't leak through walls).
 vec3 localLights(vec3 world, vec3 viewDir)
 {
     int n = int(V.lightParams.x);
@@ -271,10 +295,27 @@ vec3 localLights(vec3 world, vec3 viewDir)
         }
         if (i == spotIdx)        atten *= spotShadowF(world);
         else if (i == pointIdx)  atten *= pointShadowF(world, V.lights[i].pos.xyz, range);
+        else                     atten *= lightTerrainOcc(world, V.lights[i].pos.xyz);  // un-shadowed lamp → no leak through roof/floor
         float ph = hgPhase(dot(viewDir, Ld), V.fog.w);    // scatter toward the camera
         acc += V.lights[i].color.rgb * (atten * ph);
     }
     return acc * V.lightParams.y;                          // r_vol_lights boost
+}
+
+// Stage-2: smoke media density at an arbitrary WORLD point (inverse of the splat/inject
+// froxel basis — same math as vol_splat). 0 outside the grid frustum. Used to march
+// optical depth toward the sun for smoke self-shadow.
+float smokeDensityAt(vec3 wpos)
+{
+    vec3  rel = wpos - V.camPos.xyz;
+    float vz  = dot(rel, V.camDir.xyz);
+    if (vz <= V.zParams.x || vz >= V.zParams.y) return 0.0;
+    float ndcx = dot(rel, V.camRightT.xyz) / (vz * dot(V.camRightT.xyz, V.camRightT.xyz));
+    float ndcy = dot(rel, V.camTopT.xyz)   / (vz * dot(V.camTopT.xyz,   V.camTopT.xyz));
+    if (abs(ndcx) > 1.0 || abs(ndcy) > 1.0) return 0.0;
+    vec2  smuv = vec2(ndcx * 0.5 + 0.5, (1.0 - ndcy) * 0.5);
+    float smw  = Froxel_SliceFromViewZ(vz, V.zParams.x, V.zParams.z);
+    return texture(uSmokeMedia, vec3(smuv, smw)).a;
 }
 
 void main()
@@ -347,9 +388,60 @@ void main()
     // Sun beam + local lights at BASE extinction (no indoor ×boost → no blowout);
     // the ambient haze at the indoor-boosted density (the visible interior glow).
     // Local lights carry their OWN boost (r_vol_lights) so lamps can be dialed.
+    vec3  localL     = localLights(world, viewDir);
     vec3  inscatter  = sunScatter * V.fog2.x * extinction
                      + ambient    * V.fog2.x * ambDens
-                     + localLights(world, viewDir) * extinction;
+                     + localL * extinction;
+
+    // ---- Stage-1 VMS: smoke as participating media. Sample the splatted+resolved
+    // smoke media at this froxel (same normalized frustum coords as the fog, so it
+    // lines up). Smoke adds its OWN extinction and scatters the SAME light as fog
+    // (sun beam + ambient + local lights), tinted by the particles' own albedo —
+    // so smoke catches god-rays / the flashlight cone and self-occludes via the
+    // extinction the integrate pass marches. v1: scatter uses the lit terms without
+    // the indoor boost (bright sources stay bounded, same reasoning as the sun beam).
+    if (V.smokeParams.x > 0.0) {
+        vec3  smUVW = vec3(uv, (float(id.z) + 0.5 + V.temporal.z) / float(dimZ));
+        vec4  sm    = texture(uSmokeMedia, smUVW);
+        float smokeDens = sm.a * V.smokeParams.x;
+
+        // Stage-2 SELF-SHADOW: march the smoke media from here toward the sun and
+        // accumulate optical depth → the cloud's sun side stays bright, its far/deep
+        // side darkens (gives the cloud real volume/form). Only smoky froxels march
+        // (cheap); gated on r_vol_smoke_shadow (smokeParams.z), step = smokeParams.w.
+        float sunVis = 1.0;
+        if (V.smokeParams.z > 0.0 && sm.a > 1e-5) {
+            float mstep = V.smokeParams.w;
+            // Seed with THIS froxel's own density so even a thin / single-cell cloud
+            // self-attenuates the sun (a smoky cell dims the light passing through it) —
+            // the march on top adds the directional gradient (far/deep side darker) when
+            // the cloud is thick enough to span several cells toward the sun.
+            float tau = sm.a;
+            vec3  sp  = world;
+            for (int s = 0; s < 6; ++s) { sp += toSun * mstep; tau += smokeDensityAt(sp); }
+            sunVis = exp(-tau * mstep * V.smokeParams.z);
+        }
+
+        if (V.smokeParams.y > 0.5) {
+            // DEBUG (r_vol_smoke_debug): isolate the smoke in the composite. 1 = colour
+            // (albedo glow), 2 = density heatmap (grey), 3 = SELF-SHADOW sunVis (blue =
+            // shadowed/deep side, warm = sun-lit side) → shows the Stage-2 gradient
+            // directly. Empty froxels stay 0 → scene shows through clean.
+            float dd      = sm.a;
+            float present = (dd > 1e-4) ? 1.0 : 0.0;
+            vec3  col;
+            if      (V.smokeParams.y > 2.5) col = mix(vec3(0.0, 0.06, 0.5), vec3(1.0, 0.25, 0.0), clamp((1.0 - sunVis) * 4.0, 0.0, 1.0)) * (5.0 * present);  // shadow heatmap: blue=lit, red=self-shadowed (×4 so faint shows)
+            else if (V.smokeParams.y > 1.5) col = vec3(dd) * 25.0;
+            else                            col = (sm.rgb + 0.15) * dd * 25.0;
+            inscatter  = col;
+            extinction = dd;
+        } else if (smokeDens > 1e-5) {
+            // Sun term attenuated by the smoke toward the sun; ambient + local lights full.
+            vec3 lit = (sunScatter * sunVis + ambient) * V.fog2.x + localL;
+            inscatter  += sm.rgb * lit * smokeDens;
+            extinction += smokeDens;
+        }
+    }
 
     vec4 cur = vec4(inscatter, extinction);
 

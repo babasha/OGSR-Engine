@@ -41,6 +41,11 @@
 
 // GLOBAL scope (an extern inside namespace VK would mangle as VK::* → LNK2001).
 extern float ps_r_sun_boost;   // r_sun_boost — global sun multiplier (see vk_env_light)
+extern float ps_r_wind_tree_bend;   // r_wind_tree_bend  — trunk sway intensity
+extern float ps_r_wind_tree_anim;   // r_wind_tree_anim  — branch flutter speed
+extern float ps_r_wind_tree_trunk;  // r_wind_tree_trunk — trunk anim speed
+extern float ps_r_wind_tree_flutter;// r_wind_tree_flutter — crown flutter amplitude
+extern float ps_r_wind_tree_crown;  // r_wind_tree_crown — flutter fade-in height
 
 namespace VK
 {
@@ -154,18 +159,46 @@ void CTreeManager::CreateXformDescriptor()
 {
     if (!m_TreeTransformsBuffer) return;
 
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // SSFX wind flow map (s_waves) — sampled in tree.vert for the crown flutter.
+    // Load it + a linear/repeat sampler here so the wind branch has its texture.
+    if (m_WaveSampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter = VK_FILTER_LINEAR; sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.maxLod = VK_LOD_CLAMP_NONE;
+        vkCreateSampler(VulkanHW.m_Device, &sci, nullptr, &m_WaveSampler);
+    }
+    if (m_WaveTex == nullptr) {
+        string_path full;
+        FS.update_path(full, "$game_textures$", "fx\\wind_wave.dds");
+        if (FS.exist(full)) {
+            auto* tex = xr_new<VK::CVulkanTexture>();
+            if (tex->LoadDDS(full, /*applyBCSwizzle*/ false)) { m_WaveTex = tex; Msg("[VK Tree] SSFX wind flow map loaded"); }
+            else { Msg("![VK Tree] LoadDDS failed for fx\\wind_wave.dds — tree flutter flat"); xr_delete(tex); }
+        } else {
+            Msg("![VK Tree] fx\\wind_wave.dds not found — tree flutter flat");
+        }
+    }
+
+    // Set 0: binding 0 = transforms SSBO (vertex), binding 1 = s_waves (vertex).
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 1; lci.pBindings = &b;
+    lci.bindingCount = 2; lci.pBindings = b;
     vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &m_XformDescLayout);
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+    VkDescriptorPoolSize ps[2] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 } };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
     vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &m_XformDescPool);
 
     VkDescriptorSetAllocateInfo dai{};
@@ -175,11 +208,20 @@ void CTreeManager::CreateXformDescriptor()
     vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_XformDescSet);
 
     VkDescriptorBufferInfo bi{ m_TreeTransformsBuffer->GetHandle(), 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w{};
-    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w.dstSet = m_XformDescSet; w.dstBinding = 0; w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+    // s_waves view — fall back to the SSBO-only case is unsafe (shader samples it),
+    // so bind the flow map; if it failed to load the tree still draws (flat wind).
+    VkDescriptorImageInfo wi{ m_WaveSampler,
+                              m_WaveTex ? m_WaveTex->GetView() : VK_NULL_HANDLE,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet w[2]{};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = m_XformDescSet; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &bi;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = m_XformDescSet; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[1].pImageInfo = &wi;
+    const u32 wc = (wi.imageView != VK_NULL_HANDLE) ? 2u : 1u;   // skip the null-view write
+    vkUpdateDescriptorSets(VulkanHW.m_Device, wc, w, 0, nullptr);
 }
 
 // ============================================================================
@@ -392,6 +434,15 @@ void CTreeManager::RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 
     pc.mViewProj = lightVP;
     pc.uvScale   = 1.0f / 2048.0f;
     pc.alphaRef  = 200.0f / 255.0f;
+    // Same wind as the forward pass — the shadow caster must bend with the trees,
+    // else a swaying trunk self-shadows (black band). See tree_depth.vert.
+    pc.wsetup_trees.set(ps_r_wind_tree_anim, ps_r_wind_tree_trunk, ps_r_wind_tree_bend, 0.1f);
+    if (g_pGamePersistent) {
+        const Fvector3 wa = g_pGamePersistent->Environment().wind_anim;
+        pc.wind_anim.set(wa.x, wa.y, wa.z, ps_r_wind_tree_flutter);
+        if (auto* E = g_pGamePersistent->Environment().CurrentEnv)
+            pc.wind_params.set(E->wind_direction, E->wind_velocity, 0.0f, 0.0f);
+    }
     vkCmdPushConstants(cmd, m_GfxPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
@@ -525,12 +576,21 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     // foliage tracks time-of-day like the world). Neutral fallback if env not up.
     pc.vSunColor.set(0.6f, 0.6f, 0.6f, 0.0f);
     pc.vHemiColor.set(0.45f, 0.45f, 0.45f, 0.0f);
+    // SSFX trunk wind (screenspace_wind.h): direction/velocity drive the sway,
+    // drift from the shared Environment.wind_anim. Defaults match SSFX "10 - Wind"
+    // (branches 11.0, trunk 0.15, bend 0.5, min wind speed 0.1).
+    pc.wsetup_trees.set(ps_r_wind_tree_anim, ps_r_wind_tree_trunk, ps_r_wind_tree_bend, 0.1f);
     if (g_pGamePersistent) {
-        if (auto* E = g_pGamePersistent->Environment().CurrentEnv) {
+        auto& envMgr = g_pGamePersistent->Environment();
+        const Fvector3 wa = envMgr.wind_anim;
+        pc.wind_anim.set(wa.x, wa.y, wa.z, ps_r_wind_tree_flutter);   // w = crown flutter amplitude
+        if (auto* E = envMgr.CurrentEnv) {
             pc.vSunColor.set(E->sun_color.x, E->sun_color.y, E->sun_color.z, 0.0f);
             pc.vHemiColor.set(E->hemi_color.x, E->hemi_color.y, E->hemi_color.z, 0.0f);
+            pc.wind_params.set(E->wind_direction, E->wind_velocity, 0.0f, 0.0f);
         }
     }
+    pc.wind_params.w = ps_r_wind_tree_crown;   // leaf-flutter fade-in height (gate the low trunk)
     // Same global sun boost as the world (vk_env_light premultiplies it into
     // the LightUBO; the tree sun colour travels via push constants).
     pc.vSunColor.mul(ps_r_sun_boost);
@@ -605,6 +665,8 @@ void CTreeManager::DestroySessionB()
 
     if (m_XformDescPool)   { vkDestroyDescriptorPool(dev, m_XformDescPool, nullptr); m_XformDescPool = VK_NULL_HANDLE; m_XformDescSet = VK_NULL_HANDLE; }
     if (m_XformDescLayout) { vkDestroyDescriptorSetLayout(dev, m_XformDescLayout, nullptr); m_XformDescLayout = VK_NULL_HANDLE; }
+    if (m_WaveTex)     { m_WaveTex->Destroy(); xr_delete(m_WaveTex); m_WaveTex = nullptr; }
+    if (m_WaveSampler) { vkDestroySampler(dev, m_WaveSampler, nullptr); m_WaveSampler = VK_NULL_HANDLE; }
 
     if (m_CullPipeline)       { vkDestroyPipeline(dev, m_CullPipeline, nullptr); m_CullPipeline = VK_NULL_HANDLE; }
     if (m_CullPipelineLayout) { vkDestroyPipelineLayout(dev, m_CullPipelineLayout, nullptr); m_CullPipelineLayout = VK_NULL_HANDLE; }

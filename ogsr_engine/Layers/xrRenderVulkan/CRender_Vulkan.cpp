@@ -15,7 +15,9 @@
 #include "vk_UIPipeline.h"
 #include "vk_pass_world.h"
 #include "vk_pass_sky.h"
+#include "vk_pass_snow.h"
 #include "vk_scene_color.h"     // HDR scene target (passes render here, then tonemap)
+#include "vk_motionvec.h"       // screen-space motion vectors + r_mv_debug overlay
 #include "vk_pass_tonemap.h"    // Pass_TonemapComposite — HDR → swapchain
 #include "vk_pass_registry.h"   // VK::RegisterPass / ExecutePasses — framegraph seam
 #include "vk_profiler.h"        // VK::Prof — GPU/CPU zones, debug labels, VRAM
@@ -572,6 +574,10 @@ void CRender::Render()
         // the shadow map (own depth target), leaves it SHADER_READ for the receivers.
         VK::RegisterPass("SunShadow", [](VK::FrameContext& c) { VK::Pass_SunShadow(c); });
         VK::RegisterPass("World", [](VK::FrameContext& c) { VK::Pass_World(c); });
+        // Dense snow surface (VHM-style): drawn on top of the world, owns the near snow
+        // geometry + footprint dents when r_snow_mesh is on. Writes depth (trees/grass
+        // test against it). No-op unless r_snow_mesh + deform texture are active.
+        VK::RegisterPass("SnowMesh", [](VK::FrameContext& c) { VK::Pass_SnowMesh(c); });
         VK::RegisterPass("Trees", [](VK::FrameContext& c) {
             if (RImplementation.Trees && RImplementation.Trees->IsReady())
                 RImplementation.Trees->Render(c);
@@ -584,6 +590,9 @@ void CRender::Render()
             if (RImplementation.LODs && RImplementation.LODs->IsReady())
                 RImplementation.LODs->Render(c);
         });
+        // Dynamic motion vectors: now that the full opaque depth exists, overlay
+        // self-moving geometry (skinned NPCs) onto the camera/static MV field.
+        VK::RegisterPass("MotionVecDyn", [](VK::FrameContext& c) { VK::MotionVec::ExecuteDynamic(c.cmd, c); });
         VK::RegisterPass("Sky",   [](VK::FrameContext& c) { VK::Pass_Sky(c); });
         // Volumetric sun shafts (god rays): fullscreen raymarch vs the sun shadow
         // map, additive over the lit scene. After Sky so rays glow against it too.
@@ -614,6 +623,11 @@ void CRender::Render()
         VK::Pass_TonemapComposite(g_FrameCtx);
         VK::Prof::ZoneEnd(g_FrameCtx.cmd, z);
     }
+
+    // r_mv_debug: paint the motion-vector field over the final image (the
+    // swapchain is COLOR_ATTACHMENT here; the UI pass in End draws on top). No-op
+    // unless r_mv_debug is set. Verifies the MV reconstruction before any DLSS.
+    VK::MotionVec::DrawDebugOverlay(g_FrameCtx.cmd, Swapchain.m_ImageViews[g_FrameCtx.imageIndex], g_FrameCtx.extent);
     VK::Prof::FrameEnd(g_FrameCtx.cmd);
 }
 void CRender::AfterWorldRender() { VK_STUB_ONCE("CRender"); }
@@ -683,6 +697,7 @@ void CRender::Begin()
     // (so highlights exceed 1.0); the Tonemap pass maps it to the swapchain.
     // One per swapchain image index, sized to the swapchain.
     VK::SceneColor::EnsureSize(Swapchain.m_Extent, (u32)Swapchain.m_Images.size());
+    VK::MotionVec::EnsureSize(Swapchain.m_Extent);   // RG16F motion target tracks the render resolution
     VkImage     hdrImage = VK::SceneColor::GetImage(g_FrameInFlight.imageIndex);
     VkImageView hdrView  = VK::SceneColor::GetView(g_FrameInFlight.imageIndex);
 

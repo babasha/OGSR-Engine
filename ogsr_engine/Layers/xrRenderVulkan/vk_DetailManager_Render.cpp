@@ -134,17 +134,23 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     // hundreds, scaled `*0.001` everywhere it's used (Environment.cpp:490).
     // Multiplying that into the shader's displacement amplitude (which is in
     // metres) yanked grass 10+ m per wave → "rubber-band stretching" look.
-    Fvector wind_dir{};      wind_dir.set(0.7f, 0.0f, 0.7f);   // fallback SE
-    Fvector sun_dir{};       sun_dir.set(0.0f, 1.0f, 0.0f);
-    float   wind_strength = 0.0f;                              // 0..1 lerp factor
+    Fvector  wind_dir{};      wind_dir.set(0.7f, 0.0f, 0.7f);   // fallback SE
+    Fvector  sun_dir{};       sun_dir.set(0.0f, 1.0f, 0.0f);
+    float    wind_strength = 0.0f;                             // 0..1 lerp factor
+    float    windDirAngle  = 0.0f;                             // SSFX: raw wind_direction (radians)
+    float    windVel       = 0.0f;                             // SSFX: raw wind_velocity (engine units)
+    Fvector3 windAnim{};                                       // SSFX: accumulated wind drift (Environment.wind_anim)
     // Env lighting for the grass (colorize the baked sun/hemi scalars to match the
     // world ground). Neutral fallback when env isn't up yet.
     m_GfxConstants.vSunColor.set(0.6f, 0.6f, 0.6f, 0.0f);
     m_GfxConstants.vHemiColor.set(0.45f, 0.45f, 0.45f, 0.0f);
     if (g_pGamePersistent) {
         auto& env = g_pGamePersistent->Environment();
+        windAnim = env.wind_anim;   // shared accumulator (R4/SSFX): drifts with wind dir·velocity·dt
         if (env.CurrentEnv) {
             const float a = env.CurrentEnv->wind_direction;
+            windDirAngle = a;
+            windVel      = env.CurrentEnv->wind_velocity;
             wind_dir.set(_cos(a), 0.0f, _sin(a));
             // Map `wind_velocity` (engine units, typically 0..1000) into a
             // 0..1 lerp factor. *0.001 matches Environment.cpp's own scale,
@@ -158,10 +164,14 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     // The same global sun boost the world receives — vk_env_light premultiplies
     // it into the LightUBO; the grass sun colour travels via push constants.
     m_GfxConstants.vSunColor.mul(ps_r_sun_boost);
-    swing_current.lerp(swing_desc[0], swing_desc[1], wind_strength);
 
-    m_GfxConstants.vWave.set(0.5f, 0.5f, swing_current.speed, m_time_pos);
-    m_GfxConstants.vWind.set(wind_dir.x, 0.0f, wind_dir.z, swing_current.amp1);
+    // SSFX flow-map wind (screenspace_wind.h). The shader builds the dir vector +
+    // speed from these; drift comes from the shared Environment.wind_anim
+    // accumulator. Defaults match the SSFX "10 - Wind" MCM (grass animspeed 9.5,
+    // turbulence 1.4, push 1.5, wave 0.4; min wind speed 0.1).
+    m_GfxConstants.wind_params.set(windDirAngle, windVel, 0.0f, 0.0f);
+    m_GfxConstants.wsetup_grass.set(9.5f, 1.4f, 1.5f, 0.4f);
+    m_GfxConstants.wind_anim.set(windAnim.x, windAnim.y, windAnim.z, 0.1f);
     m_GfxConstants.vConsts.set(1.0f, 1.0f, sun_dir.y, 0.2f);   // sun.y feeds shader hemi calc
 
     // Character interaction: vInteractors[0] = player, [1..3] = nearest 3 NPCs

@@ -27,6 +27,14 @@ namespace VK
     // fallback by Pass_Skinned.
     void Skinned_UploadBones();
 
+    // World-space foot-bone positions of this frame's skinned bodies (player + NPCs),
+    // for snow footprint deformation. Valid after Skinned_UploadBones().
+    void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet = 24);
+
+    // World roots of skeleton-less skinned props/items (thrown/dropped bolts, grenades,
+    // debris) — caller gates by ground proximity + prints them SHALLOW.
+    void Skinned_CollectProps(xr_vector<Fvector>& out, u32 maxProps = 8);
+
     // Depth-only render of the world (non-HUD) skinned casters into the currently
     // bound shadow attachment. Caller owns render begin/end, viewport and bias.
     // Default cull = the sun ortho box; pass cullPos+cullRange to cull against a
@@ -48,6 +56,13 @@ namespace VK
     // Depth-tested against the prepass depth (no depth write); alpha-tested like
     // the depth prepass. Caller owns render begin/end + viewport (Pass_World).
     void Skinned_RenderNormalPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj);
+
+    // NPC motion vectors (MV Phase 2a): re-draw world skinned leaves into the
+    // motion target, skinning the current + previous pose so each pixel gets its
+    // true screen motion. Depth-tested (LEQUAL, no write) against the complete
+    // scene depth. Caller owns render begin/end + the negative-height viewport
+    // (VK::MotionVec::ExecuteDynamic). prevVP = previous frame's view-proj.
+    void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP);
 
     // --- VSM skinned casters (vk_vsm consumes these to render NPC shadows into the
     // virtual shadow atlas). One entry per visible world skinned leaf this frame.

@@ -33,12 +33,15 @@ namespace {
     VkShaderModule                         s_WorldLmapTES = VK_NULL_HANDLE;
     VkShaderModule                         s_WorldVlitTCS = VK_NULL_HANDLE;
     VkShaderModule                         s_WorldVlitTES = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldTerrainTCS = VK_NULL_HANDLE;  // snow footprint tessellation
+    VkShaderModule                         s_WorldTerrainTES = VK_NULL_HANDLE;
 
     // Terrain splatting: own layout + single lazily-built pipeline + shaders.
     VkShaderModule                         s_TerrainVS       = VK_NULL_HANDLE;
     VkShaderModule                         s_TerrainFS       = VK_NULL_HANDLE;
     VkPipelineLayout                       s_TerrainLayout   = VK_NULL_HANDLE;
     VkPipeline                             s_TerrainPipeline = VK_NULL_HANDLE;
+    VkPipeline                             s_TerrainDepthPipeline = VK_NULL_HANDLE;   // snow-displaced depth-prepass variant
 
     // Sun shadow caster: depth-only VS (no FS), own layout (push: mat4 lightMVP),
     // per-stride lazily-built pipelines into the shadow map's D32 format.
@@ -191,6 +194,8 @@ bool Init()
         s_WorldLmapTES = g_ShaderManager->Load("world_lmap.tese.spv");
         s_WorldVlitTCS = g_ShaderManager->Load("world_vlit.tesc.spv");
         s_WorldVlitTES = g_ShaderManager->Load("world_vlit.tese.spv");
+        s_WorldTerrainTCS = g_ShaderManager->Load("world_terrain.tesc.spv");   // snow footprint tess
+        s_WorldTerrainTES = g_ShaderManager->Load("world_terrain.tese.spv");
         if (!TessAvailable())
             Msg("![VK PipelineCache] world tess shaders missing (world_*.tesc/.tese.spv) — tessellation disabled");
     }
@@ -472,17 +477,26 @@ VkPipeline GetTerrainPipeline()
     vi.vertexAttributeDescriptionCount = 6;
     vi.pVertexAttributeDescriptions    = attrs;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = s_TerrainVS; stages[0].pName = "main";
-    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = s_TerrainFS; stages[1].pName = "main";
+    // Snow footprint tessellation: VS -> TCS -> TES -> FS over patch lists when the
+    // device supports it + the terrain TCS/TES loaded (the TCS gates tess to snow areas).
+    const bool tess = VulkanHW.m_bTessellationSupported && s_WorldTerrainTCS != VK_NULL_HANDLE && s_WorldTerrainTES != VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo stages[4]{};
+    for (auto& s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
+    u32 nStage = 0;
+    stages[nStage].stage = VK_SHADER_STAGE_VERTEX_BIT;     stages[nStage++].module = s_TerrainVS;
+    if (tess) {
+        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;    stages[nStage++].module = s_WorldTerrainTCS;
+        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; stages[nStage++].module = s_WorldTerrainTES;
+    }
+    stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT;   stages[nStage++].module = s_TerrainFS;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineTessellationStateCreateInfo ts{};
+    ts.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+    ts.patchControlPoints = 3;
 
     VkPipelineViewportStateCreateInfo vp{};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -530,10 +544,11 @@ VkPipeline GetTerrainPipeline()
     VkGraphicsPipelineCreateInfo pi{};
     pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pi.pNext               = &prci;
-    pi.stageCount          = 2;
+    pi.stageCount          = nStage;
     pi.pStages             = stages;
     pi.pVertexInputState   = &vi;
     pi.pInputAssemblyState = &ia;
+    pi.pTessellationState  = tess ? &ts : nullptr;
     pi.pViewportState      = &vp;
     pi.pRasterizationState = &rs;
     pi.pMultisampleState   = &ms;
@@ -549,6 +564,100 @@ VkPipeline GetTerrainPipeline()
     }
     Msg("[VK PipelineCache] Created terrain splat pipeline");
     return s_TerrainPipeline;
+}
+
+// Terrain DEPTH-prepass variant: the SAME world_terrain.vert (so the snow vertex
+// displacement is IDENTICAL to the color pass -> the prepass depth matches, no
+// z-fight / see-through). Vertex-only (depth-only, no FS), terrain layout (set 1 =
+// EnvLight, for sf_params.w in the VS). Depth bias dynamic (the prepass sets 0).
+// Used by FlushDepth / WorldGPU::DrawDepth for terrain in the depth prepass only.
+VkPipeline GetTerrainDepthPipeline()
+{
+    if (s_TerrainDepthPipeline != VK_NULL_HANDLE) return s_TerrainDepthPipeline;
+    if (s_TerrainLayout == VK_NULL_HANDLE || s_TerrainVS == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+    VkVertexInputBindingDescription   binding{};
+    VkVertexInputAttributeDescription attrs[6]{};
+    BuildVertexInputForStride(32, 24, binding, attrs);
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
+    vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
+
+    // Tessellated (snow footprints) when available - MUST match the color terrain
+    // pipeline's displacement so the prepass depth lines up (no z-fight on prints).
+    const bool tess = VulkanHW.m_bTessellationSupported && s_WorldTerrainTCS != VK_NULL_HANDLE && s_WorldTerrainTES != VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo stages[3]{};   // VS (+ TCS/TES); no FS (depth-only)
+    for (auto& s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
+    u32 nStage = 0;
+    stages[nStage].stage = VK_SHADER_STAGE_VERTEX_BIT;     stages[nStage++].module = s_TerrainVS;
+    if (tess) {
+        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;    stages[nStage++].module = s_WorldTerrainTCS;
+        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; stages[nStage++].module = s_WorldTerrainTES;
+    }
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineTessellationStateCreateInfo ts{};
+    ts.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+    ts.patchControlPoints = 3;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType           = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode     = VK_POLYGON_MODE_FILL;
+    rs.cullMode        = VK_CULL_MODE_NONE;
+    rs.frontFace       = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth       = 1.0f;
+    rs.depthBiasEnable = VK_TRUE;                  // dynamic; prepass sets 0 (match color)
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendStateCreateInfo cb{};      // no color attachments
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 0;
+
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+    VkPipelineDynamicStateCreateInfo dynState{};
+    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+
+    VkPipelineRenderingCreateInfo prci{};
+    prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    prci.colorAttachmentCount  = 0;
+    prci.depthAttachmentFormat = Swapchain.m_DepthFormat;   // the scene prepass depth
+
+    VkGraphicsPipelineCreateInfo pi{};
+    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pi.pNext               = &prci;
+    pi.stageCount          = nStage;   pi.pStages = stages;
+    pi.pVertexInputState   = &vi;      pi.pInputAssemblyState = &ia;
+    pi.pTessellationState  = tess ? &ts : nullptr;
+    pi.pViewportState      = &vp;      pi.pRasterizationState = &rs;
+    pi.pMultisampleState   = &ms;      pi.pDepthStencilState  = &ds;
+    pi.pColorBlendState    = &cb;      pi.pDynamicState       = &dynState;
+    pi.layout              = s_TerrainLayout;
+
+    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &s_TerrainDepthPipeline) != VK_SUCCESS) {
+        Msg("![VK PipelineCache] terrain DEPTH pipeline create failed");
+        s_TerrainDepthPipeline = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    Msg("[VK PipelineCache] Created terrain depth (snow-displaced) pipeline");
+    return s_TerrainDepthPipeline;
 }
 
 void Destroy()
@@ -571,6 +680,10 @@ void Destroy()
     if (s_TerrainPipeline) {
         vkDestroyPipeline(VulkanHW.m_Device, s_TerrainPipeline, nullptr);
         s_TerrainPipeline = VK_NULL_HANDLE;
+    }
+    if (s_TerrainDepthPipeline) {
+        vkDestroyPipeline(VulkanHW.m_Device, s_TerrainDepthPipeline, nullptr);
+        s_TerrainDepthPipeline = VK_NULL_HANDLE;
     }
     if (s_TerrainLayout) {
         vkDestroyPipelineLayout(VulkanHW.m_Device, s_TerrainLayout, nullptr);
@@ -606,6 +719,8 @@ void Destroy()
     s_WorldLmapTES = VK_NULL_HANDLE;
     s_WorldVlitTCS = VK_NULL_HANDLE;
     s_WorldVlitTES = VK_NULL_HANDLE;
+    s_WorldTerrainTCS = VK_NULL_HANDLE;
+    s_WorldTerrainTES = VK_NULL_HANDLE;
 }
 
 // Build vertex input for X-Ray level static vertex layouts (stride 32).

@@ -11,6 +11,7 @@
 #include "vk_shadow.h"
 #include "vk_render_queue.h"               // RenderQueue (local caster queue)
 #include "vk_water_sim.h"                  // WaterSim::Dispatch (shallow-water flow sim)
+#include "vk_deform.h"                     // Deform::Dispatch (snow deform press field)
 #include "vk_pipeline_cache.h"             // depth pipelines/layout
 #include "vk_barriers.h"                   // ImageBarrier
 #include "vk_pass_skinned.h"               // Skinned_UploadBones / Skinned_RenderShadow
@@ -30,6 +31,11 @@
 // GLOBAL scope (NOT inside namespace VK — a block-scope extern there would
 // mangle as VK::ps_r_rain_enable → LNK2001). r_rain master off skips the map.
 extern int ps_r_rain_enable;
+extern int   ps_r_snow_deform;        // snow footprint deformation enable
+extern int   ps_r_snow_deform_tex;    // use the dense deform texture (vk_deform)
+extern int   ps_r_snow_mesh;          // dense snow surface mesh (needs the ground-height map)
+extern float ps_r_snow_deform_radius; // print radius (m)
+extern float ps_r_snow;               // TARGET snow coverage (gate the deform dispatch)
 extern int ps_r_water_sim;   // gate the ground-height map render (sim)
 extern int ps_r_puddle_sss;  // gate the ground-height map render (SSS puddle real-dip placement)
 extern int ps_r_light_occ;   // dynamic-light occlusion: render the ground-height map always
@@ -423,8 +429,12 @@ void Pass_SunShadow(FrameContext& ctx)
         }
         const bool wantRain   = rainNeed > 0.001f;
         const bool occWanted  = ps_r_light_occ != 0;   // dynamic-light occlusion samples the RAIN map (binding 9)
-        const bool wantGround = ps_r_water_sim != 0;   // ground map (binding 13) is water-sim only now
-        const bool wantMap    = wantRain || occWanted || wantGround;
+        const bool wantGround = ps_r_water_sim != 0;   // ground map (binding 13) is water-sim only
+        // The snow deform compute samples the RAIN map (binding 9 — the ground map came
+        // out empty) for the snow-mesh base height AND the stamp ground-gate, so force
+        // the rain map to render + stay fresh whenever deform is active.
+        const bool wantDeform = ps_r_snow_deform && ps_r_snow_deform_tex && ps_r_snow > 0.f;
+        const bool wantMap    = wantRain || occWanted || wantGround || wantDeform;
         // Occlusion-only (no rain) tolerates a much larger redraw step: the map covers
         // ±120 m and terrain is static, so redrawing every 48 m (vs 16 m for wetness)
         // cuts the always-on spike frequency 3× — fewer frame hitches that make the
@@ -474,7 +484,7 @@ void Pass_SunShadow(FrameContext& ctx)
             // plumbing; the separate ground map came out empty). Trees only when
             // raining (a canopy must not occlude a lamp). Render when either wants it;
             // first frame clears once for a defined layout.
-            if (wantRain || occWanted || s_rainFirst) {
+            if (wantRain || occWanted || wantDeform || s_rainFirst) {
                 ImageBarrier(cmd, ShadowMap::GetRainImage(),
                              s_rainFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -559,6 +569,31 @@ void Pass_SunShadow(FrameContext& ctx)
                 if (env.CurrentEnv) rd = env.CurrentEnv->rain_density;
             }
             VK::WaterSim::Dispatch(cmd, rd);
+        }
+
+        // ---- Snow deform texture: stamp foot contacts into the dense persistent
+        // player-centred press field (vk_deform). Read by the terrain shaders
+        // (r_snow_deform_tex) for sharp, persistent, non-faceted footprints.
+        if (ps_r_snow_deform && ps_r_snow_deform_tex && ps_r_snow > 0.f) {
+            xr_vector<VK::Deform::Stamp> stamps;
+            const Fvector& camp = Device.vCameraPosition;
+            Fvector fwd = Device.vCameraDirection; fwd.y = 0.f;
+            if (fwd.square_magnitude() > 1e-4f) fwd.normalize(); else fwd.set(0.f, 0.f, 1.f);
+            const Fvector perp = { -fwd.z, 0.f, fwd.x };
+            const float r = ps_r_snow_deform_radius;
+            // Player feet ~at ground (≈1.65 m below the camera) so the compute's terrain
+            // ground-gate passes them (it compares the stamp Y to the real terrain height).
+            const float footY = camp.y - 1.65f;
+            stamps.push_back({ { camp.x - perp.x * 0.13f, footY, camp.z - perp.z * 0.13f }, r, 1.f });
+            stamps.push_back({ { camp.x + perp.x * 0.13f, footY, camp.z + perp.z * 0.13f }, r, 1.f });
+            // Landed items/props: shallow print (~1/3 depth, smaller). The COMPUTE
+            // ground-gates each stamp against the real terrain height, so flying items
+            // don't stamp (no camera heuristic) and it's robust on uneven terrain.
+            xr_vector<Fvector> props; Skinned_CollectProps(props, 16);
+            for (const Fvector& p : props) stamps.push_back({ p, r * 0.6f, 0.34f });
+            xr_vector<Fvector> npc; Skinned_CollectFeet(npc, 48);
+            for (const Fvector& f : npc) stamps.push_back({ f, r, 1.f });
+            VK::Deform::Dispatch(cmd, stamps.data(), (u32)stamps.size());
         }
     }
     VK::Prof::ZoneEnd(cmd, zRain);

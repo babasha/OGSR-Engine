@@ -21,6 +21,8 @@
 extern u32 ps_r_ao_quality;        // r2_ssao token (0 off / 1 low / 2 med / 3 high / 4 ultra)
 extern int ps_r_ssao_enable;       // r_ssao — global GTAO on/off (GLOBAL scope: block-scope extern inside the namespace would mangle as VK::SSAOPass::* → LNK2001)
 extern int ps_r_ssao_debug;        // r_ssao_debug — also enables the readback stats below
+extern int   ps_r_ssil_enable;     // r_ssil — fold-in SSIL on/off (gates the prev-colour taps in the horizon march)
+extern float ps_r_ssil_strength;   // r_ssil_strength — baked into the IL output (forward receivers apply a fixed ssilBoost)
 
 namespace VK {
 
@@ -73,6 +75,20 @@ namespace {
     VmaAllocation s_alloc[2] = {};
     VkImageView   s_view[2]  = {};
 
+    // SSIL (folded into the GTAO horizon march, MRT target 1). Same half-res
+    // ping-pong as AO ([0] = final/blurred IL, [1] = raw IL). RGBA16F (rgb = HDR
+    // indirect radiance). Plus a persistent half-res PREV-frame colour buffer the
+    // horizon gather samples (captured from the composited scene each frame).
+    constexpr VkFormat kILFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    constexpr float    kILFireClamp = 6.0f;   // per-sample radiance clamp → no single specular pixel dominates
+    VkImage       s_ilImg[2]   = {};
+    VmaAllocation s_ilAlloc[2] = {};
+    VkImageView   s_ilView[2]  = {};
+    VkImage       s_prevColor      = VK_NULL_HANDLE;   // half-res linear-HDR history (prev frame's lit scene)
+    VmaAllocation s_prevColorAlloc = VK_NULL_HANDLE;
+    VkImageView   s_prevColorView  = VK_NULL_HANDLE;
+    bool          s_prevColorCleared = false;          // false → first Execute clears it to black (valid SHADER_READ)
+
     // FULL-res NPC normal G-buffer (skinned pass writes worldN*0.5+0.5, a=valid;
     // GTAO uses it where a=1, else falls back to depth-derived normals). RGBA8.
     constexpr VkFormat kNormalFormat = VK_FORMAT_R8G8B8A8_UNORM;
@@ -113,7 +129,7 @@ namespace {
         float camTopT[4];     // xyz = top   * tan(fovY/2), w = tan(fovY/2)
         float zp[4];          // proj _33, proj _43, radius, samples/side
         float res[4];         // AO size xy, 1/AO size zw
-        float dbg[4];         // x = r_ssao_debug mode (2 = depth view, 3 = normal view)
+        float dbg[4];         // x = r_ssao_debug mode (2 = depth, 3 = normal); y = SSIL on; z = SSIL firefly clamp
     };
     static_assert(sizeof(SSAOPush) == 96, "must match ssao.frag / ssao_blur.frag PC blocks");
 
@@ -138,6 +154,13 @@ namespace {
         }
         if (s_normView) { vkDestroyImageView(VulkanHW.m_Device, s_normView, nullptr); s_normView = VK_NULL_HANDLE; }
         if (s_normImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_normImg, s_normAlloc); s_normImg = VK_NULL_HANDLE; s_normAlloc = VK_NULL_HANDLE; }
+        for (u32 i = 0; i < 2; ++i) {
+            if (s_ilView[i]) { vkDestroyImageView(VulkanHW.m_Device, s_ilView[i], nullptr); s_ilView[i] = VK_NULL_HANDLE; }
+            if (s_ilImg[i])  { vmaDestroyImage(VulkanHW.m_Allocator, s_ilImg[i], s_ilAlloc[i]); s_ilImg[i] = VK_NULL_HANDLE; s_ilAlloc[i] = VK_NULL_HANDLE; }
+        }
+        if (s_prevColorView) { vkDestroyImageView(VulkanHW.m_Device, s_prevColorView, nullptr); s_prevColorView = VK_NULL_HANDLE; }
+        if (s_prevColor)     { vmaDestroyImage(VulkanHW.m_Allocator, s_prevColor, s_prevColorAlloc); s_prevColor = VK_NULL_HANDLE; s_prevColorAlloc = VK_NULL_HANDLE; }
+        s_prevColorCleared = false;
         s_normExtent = {};
         s_extent = {};
     }
@@ -178,6 +201,66 @@ namespace {
             if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_view[i]) != VK_SUCCESS) {
                 Msg("![VK SSAO] view %u create failed", i); return false;
             }
+        }
+        // SSIL ping-pong (half-res RGBA16F, MRT target 1 alongside AO). [0]=final, [1]=raw.
+        for (u32 i = 0; i < 2; ++i) {
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = kILFormat;
+            ici.extent = { want.width, want.height, 1 };
+            ici.mipLevels = 1; ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_ilImg[i], &s_ilAlloc[i], nullptr) != VK_SUCCESS) {
+                Msg("![VK SSAO] IL RT %u create failed", i); return false;
+            }
+            VkImageViewCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = s_ilImg[i];
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = kILFormat;
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_ilView[i]) != VK_SUCCESS) {
+                Msg("![VK SSAO] IL view %u create failed", i); return false;
+            }
+        }
+        // Persistent half-res PREV-frame colour (linear HDR) — the IL gather source.
+        // blit dst (capture) + sampled (gather). Cleared to black on first Execute.
+        {
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = kILFormat;
+            ici.extent = { want.width, want.height, 1 };
+            ici.mipLevels = 1; ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_prevColor, &s_prevColorAlloc, nullptr) != VK_SUCCESS) {
+                Msg("![VK SSAO] prevColor create failed"); return false;
+            }
+            VkImageViewCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = s_prevColor;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = kILFormat;
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_prevColorView) != VK_SUCCESS) {
+                Msg("![VK SSAO] prevColor view create failed"); return false;
+            }
+            s_prevColorCleared = false;
         }
         // FULL-res NPC normal G-buffer (skinned pass renders into it, GTAO samples it).
         s_normExtent = sceneExtent;
@@ -224,19 +307,22 @@ namespace {
         return true;
     }
 
-    // SSAO RT is RGBA16F (r=AO, gba=bent normal), all channels written, no blend.
+    // MRT: target 0 = AO+bentN (RGBA16F), target 1 = SSIL (RGBA16F). Both opaque,
+    // all channels, no blend. gtao + blur share this two-attachment layout.
     VkPipeline CreatePipe(VkShaderModule vs, VkShaderModule fs)
     {
-        return Fullscreen::CreatePipeline(vs, fs, VK_FORMAT_R16G16B16A16_SFLOAT, s_layout,
-                                          Fullscreen::OpaqueAttachment(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                                                                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT), "SSAO");
+        const VkFormat fmts[2] = { VK_FORMAT_R16G16B16A16_SFLOAT, kILFormat };
+        const VkPipelineColorBlendAttachmentState blends[2] = {
+            Fullscreen::OpaqueAttachment(), Fullscreen::OpaqueAttachment() };
+        return Fullscreen::CreatePipelineMRT(vs, fs, fmts, 2, s_layout, blends, "SSAO");
     }
 
-    // One fullscreen draw into dst at the half-res extent.
-    void Draw(VkCommandBuffer cmd, VkImageView dst, VkPipeline pipe, VkDescriptorSet set,
-              const SSAOPush& push)
+    // One MRT fullscreen draw into (AO, IL) at the half-res extent.
+    void Draw(VkCommandBuffer cmd, VkImageView aoDst, VkImageView ilDst, VkPipeline pipe,
+              VkDescriptorSet set, const SSAOPush& push)
     {
-        Fullscreen::DrawSimple(cmd, dst, s_extent, pipe, s_layout, set, &push, sizeof(push));
+        const VkImageView views[2] = { aoDst, ilDst };
+        Fullscreen::DrawMRT(cmd, views, 2, s_extent, pipe, s_layout, set, &push, sizeof(push));
     }
 }  // anon namespace
 
@@ -249,6 +335,11 @@ VkImageView GetResultView() { return Enabled() ? s_view[0] : VK_NULL_HANDLE; }  
 VkSampler   GetSampler()    { return s_sampLin; }
 u32         Generation()    { return s_generation; }
 float       Strength()      { return (Enabled() && s_hasResult && s_view[0]) ? kStrength : 0.f; }
+
+// SSIL result (MRT target 1). Folded into the GTAO march, so it requires the
+// GTAO pass to be running (r_ssao on) AND r_ssil on. Null otherwise → tonemap
+// binds its fallback and skips the IL composite.
+VkImageView GetILResultView() { return (Enabled() && s_hasResult && ps_r_ssil_enable != 0 && s_ilView[0]) ? s_ilView[0] : VK_NULL_HANDLE; }
 
 // NPC normal G-buffer: the skinned pass renders into it (after the prepass,
 // before Execute); GTAO samples it (binding 2). VK_NULL_HANDLE until EnsureRTs.
@@ -278,22 +369,23 @@ bool Init()
     }
 
     // Set: 0 = scene depth, 1 = raw AO (blur only), 2 = NPC normal G-buffer
-    // (GTAO only). Each pipeline statically uses a subset; the others' stale
-    // layout during a draw is legal (all bindings are written each frame).
-    VkDescriptorSetLayoutBinding b[3]{};
-    for (u32 i = 0; i < 3; ++i) {
+    // (GTAO only), 3 = prev-frame colour (GTAO+IL gather), 4 = raw IL (blur only).
+    // Each pipeline statically uses a subset; the others' stale layout during a
+    // draw is legal (all bindings are written each frame).
+    VkDescriptorSetLayoutBinding b[5]{};
+    for (u32 i = 0; i < 5; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 3; slci.pBindings = b;
+    slci.bindingCount = 5; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         s_failed = true; return false;
     }
 
     const u32 nSets = kFramesInFlight * 2;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 3 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 5 };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -351,36 +443,51 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     if (!Enabled()) return;
     if (!EnsureRTs(sceneExtent)) return;
 
-    // Refresh this slot's sets (fence-guarded): depth view can change on
-    // swapchain recreate, AO views on RT recreate. 4 trivial writes per frame.
+    // Refresh this slot's sets (fence-guarded): depth view can change on swapchain
+    // recreate, AO/IL/prevColor views on RT recreate. 5 bindings × 2 sets/frame.
     const u32 slot = CommandManager.GetCurrentFrame() % kFramesInFlight;
     {
         VkDescriptorImageInfo depthI{ s_sampNear, Swapchain.m_DepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo rawI  { s_sampNear, s_view[1],             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo normI { s_sampNear, s_normView,            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        // Write all 3 bindings to both sets (gtao + blur) so none is ever stale-undefined.
-        VkWriteDescriptorSet w[6]{};
-        VkDescriptorSet dst[6] = { s_setGtao[slot], s_setGtao[slot], s_setGtao[slot],
-                                   s_setBlur[slot], s_setBlur[slot], s_setBlur[slot] };
-        const u32 bind[6] = { 0, 1, 2, 0, 1, 2 };
-        const VkDescriptorImageInfo* ii[6] = { &depthI, &rawI, &normI, &depthI, &rawI, &normI };
-        for (u32 i = 0; i < 6; ++i) {
+        VkDescriptorImageInfo prevI { s_sampLin,  s_prevColorView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ilrawI{ s_sampNear, s_ilView[1],           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        // gtao uses 0,2,3; blur uses 0,1,4 — write all 5 to both sets so none is stale.
+        VkWriteDescriptorSet w[10]{};
+        VkDescriptorSet dst[10] = { s_setGtao[slot], s_setGtao[slot], s_setGtao[slot], s_setGtao[slot], s_setGtao[slot],
+                                    s_setBlur[slot], s_setBlur[slot], s_setBlur[slot], s_setBlur[slot], s_setBlur[slot] };
+        const u32 bind[10] = { 0, 1, 2, 3, 4, 0, 1, 2, 3, 4 };
+        const VkDescriptorImageInfo* ii[10] = { &depthI, &rawI, &normI, &prevI, &ilrawI,
+                                                &depthI, &rawI, &normI, &prevI, &ilrawI };
+        for (u32 i = 0; i < 10; ++i) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet = dst[i]; w[i].dstBinding = bind[i]; w[i].descriptorCount = 1;
             w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = ii[i];
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 10, w, 0, nullptr);
     }
 
+    // First use after (re)create: clear the prev-colour history to black so the
+    // horizon gather reads valid (zero-IL) data until the first capture lands.
+    if (!s_prevColorCleared) {
+        ImageBarrier(cmd, s_prevColor, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue black{};
+        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cmd, s_prevColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        ImageBarrier(cmd, s_prevColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        s_prevColorCleared = true;
+    }
+
+    // Transition the AO + IL MRT pair for slot i together (one draw writes both).
     auto toColor = [&](u32 i) {
-        ImageBarrier(cmd, s_img[i],
-                     s_first[i] ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const VkImageLayout old = s_first[i] ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ImageBarrier(cmd, s_img[i],   old, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        ImageBarrier(cmd, s_ilImg[i], old, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         s_first[i] = false;
     };
     auto toRead = [&](u32 i) {
-        ImageBarrier(cmd, s_img[i],
-                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        ImageBarrier(cmd, s_img[i],   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        ImageBarrier(cmd, s_ilImg[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     };
 
     // Everything derived from the matrix that RENDERED the prepass depth —
@@ -401,6 +508,9 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     push.res[2] = 1.f / float(s_extent.width);
     push.res[3] = 1.f / float(s_extent.height);
     push.dbg[0] = float(ps_r_ssao_debug);
+    push.dbg[1] = ps_r_ssil_enable ? 1.0f : 0.0f;   // SSIL: gather prev-frame colour in the horizon march
+    push.dbg[2] = kILFireClamp;
+    push.dbg[3] = ps_r_ssil_enable ? ps_r_ssil_strength : 0.0f;   // baked into IL → forward ssilBoost; 0 when off
 
     // One-time dump of the reconstruction inputs — sanity vs the offline test
     // (expect _33 ≈ 1.0006, _43 ≈ -0.2 for zn 0.2 / zf 350, tan ≈ 0.6-1.1).
@@ -410,14 +520,14 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
             pt.p33, pt.p43, pt.tanX, pt.tanY, pt.dir.x, pt.dir.y, pt.dir.z);
     }
 
-    // 1) GTAO: depth → raw [1].
+    // 1) GTAO+IL: depth + prev-colour → raw AO [1] + raw IL [1].
     toColor(1);
-    Draw(cmd, s_view[1], s_pipeGtao, s_setGtao[slot], push);
+    Draw(cmd, s_view[1], s_ilView[1], s_pipeGtao, s_setGtao[slot], push);
     toRead(1);
 
-    // 2) Depth-aware 3×3 blur: raw [1] → final [0].
+    // 2) Depth-aware 3×3 blur: raw [1] → final [0] (both AO and IL).
     toColor(0);
-    Draw(cmd, s_view[0], s_pipeBlur, s_setBlur[slot], push);
+    Draw(cmd, s_view[0], s_ilView[0], s_pipeBlur, s_setBlur[slot], push);
     toRead(0);
 
     s_hasResult = true;
@@ -461,6 +571,36 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
         }
         if (s_dbgCooldown) --s_dbgCooldown;
     }
+}
+
+void CapturePrevColor(VkCommandBuffer cmd, VkImage srcImage, VkExtent2D srcExtent)
+{
+    // Snapshot THIS frame's composited HDR scene (half-res, linear) into the
+    // history the NEXT frame's GTAO+IL gather reads. No-op unless the GTAO pass
+    // runs AND r_ssil is on (else there's no IL to feed). prevColor is SHADER_READ
+    // here (cleared on the first Execute, left SHADER_READ by the previous capture).
+    if (!Enabled() || ps_r_ssil_enable == 0 || s_prevColor == VK_NULL_HANDLE
+        || srcImage == VK_NULL_HANDLE || !s_prevColorCleared)
+        return;
+
+    // src mip0 SHADER_READ → TRANSFER_SRC (ImageBarrier touches mip0 only, leaving
+    // the rest of the HDR mip chain SHADER_READ for the tonemap that follows).
+    ImageBarrier(cmd, srcImage,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    ImageBarrier(cmd, s_prevColor, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkImageBlit blit{};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[1]  = { int32_t(srcExtent.width), int32_t(srcExtent.height), 1 };
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[1]  = { int32_t(s_extent.width), int32_t(s_extent.height), 1 };
+    vkCmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   s_prevColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+    // src back to SHADER_READ (tonemap samples it); dst to SHADER_READ — this
+    // barrier also synchronizes the next frame's gather read (same queue, in
+    // submission order), so the single history buffer needs no ping-pong.
+    ImageBarrier(cmd, srcImage,    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    ImageBarrier(cmd, s_prevColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void Destroy()

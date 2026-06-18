@@ -62,7 +62,7 @@ void Cull(VkCommandBuffer cmd, const Fmatrix& viewProj);
 
 // Depth prepass: indirect depth-only draw of the culled statics (solid + AT
 // variants), reusing the shared depth pipelines. INSIDE the prepass BeginRendering.
-void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj);
+void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrain = false);
 
 // Color pass: indirect forward draw of the culled statics. Binds per group the
 // pipeline (derived like Flush) + material set + env set, pushes mvp(=viewProj)

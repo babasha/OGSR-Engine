@@ -71,7 +71,7 @@ public:
     // GPU-driven compute-cull + indirect path, vk_shadow_gpu) — the CPU queue
     // then draws only the alpha-tested cutout casters the GPU path can't.
     void FlushDepth(VkCommandBuffer cmd, const Fmatrix& vp, bool skipAlphaTested = false,
-                    bool alphaTestedOnly = false);
+                    bool alphaTestedOnly = false, bool displaceTerrain = false);
 
     size_t Size() const { return m_Items.size(); }
 

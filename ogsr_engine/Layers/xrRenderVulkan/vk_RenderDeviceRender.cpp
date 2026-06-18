@@ -20,7 +20,8 @@
 #include "vk_scene_color.h"    // VK::SceneColor — HDR scene target
 #include "vk_pass_tonemap.h"   // VK::TonemapPass — HDR → swapchain composite
 #include "vk_pass_bloom.h"     // VK::BloomPass — bright-pass + blur for the composite
-#include "vk_pass_ssao.h"      // VK::SSAOPass — GTAO (depth prepass → EnvLight binding 8)
+#include "vk_pass_ssao.h"      // VK::SSAOPass — GTAO + folded-in SSIL (one-bounce SSGI in the horizon march)
+#include "vk_motionvec.h"      // VK::MotionVec — screen-space motion vectors (DLSS/FSR/PT foundation)
 #include "vk_pass_registry.h"  // VK::PassTimingDestroy() — GPU timing query pool teardown
 #include "vk_imgui.h"          // VK::ImGuiVK::Shutdown() — profiler overlay teardown
 #include "vk_vrs.h"            // VK::VRS::Destroy() — shading-rate image teardown
@@ -33,6 +34,8 @@
 #include "vk_wallmarks.h"      // VK::Wallmarks::Destroy — static decals teardown
 #include "vk_rain.h"           // VK::RainPass_Destroy — weather effects teardown
 #include "vk_water_sim.h"      // VK::WaterSim::Destroy — water flow sim teardown
+#include "vk_deform.h"         // VK::Deform::Destroy — snow deform texture teardown
+#include "vk_pass_snow.h"      // VK::SnowMesh_Init/Destroy — dense snow surface mesh
 #include "vk_shader.h"   // g_VulkanShaderManager (level-shader table)
 #include "vk_shaders.h"  // g_ShaderManager (SPIRV module loader/cache)
 #include "vk_ModelPool.h"
@@ -138,9 +141,11 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     VK::EnvLight::Init();          // before PipelineCache — its set layout joins the world pipeline layout (set 1)
     VK::PipelineCache::Init();
     VK::SkyPass::Init();
+    VK::SnowMesh_Init();           // dense snow surface mesh (after EnvLight — shares its set layout)
     VK::TonemapPass::Init();       // HDR → swapchain composite (after SkyPass — shares the SPIRV loader)
     VK::BloomPass::Init();         // bright-pass + blur feeding the tonemap composite
-    VK::SSAOPass::Init();          // GTAO from the depth prepass (EnvLight binding 8)
+    VK::SSAOPass::Init();          // GTAO from the depth prepass (EnvLight binding 8) + folded-in SSIL (tonemap binding 5)
+    VK::MotionVec::Init();         // screen-space motion vectors from the prepass depth (DLSS/FSR/PT foundation; needs Swapchain.m_Format)
     VK::Vol::Init();               // froxel volumetrics (3D volume eager so the tonemap binding 4 is valid)
     VK::ParticlePass_Init();
 
@@ -192,9 +197,12 @@ void vkRenderDeviceRender::Destroy()
     VK::Wallmarks::Destroy();           Msg("[VK] DevRender::Destroy: Wallmarks done");
     VK::RainPass_Destroy();             Msg("[VK] DevRender::Destroy: RainPass done");
     VK::WaterSim::Destroy();            Msg("[VK] DevRender::Destroy: WaterSim done");
+    VK::Deform::Destroy();              Msg("[VK] DevRender::Destroy: Deform done");
+    VK::SnowMesh_Destroy();            Msg("[VK] DevRender::Destroy: SnowMesh done");
     VK::ParticlePass_Destroy();         Msg("[VK] DevRender::Destroy: ParticlePass done");
     VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
     VK::SSAOPass::Destroy();            Msg("[VK] DevRender::Destroy: SSAOPass done");
+    VK::MotionVec::Destroy();           Msg("[VK] DevRender::Destroy: MotionVec done");
     VK::BloomPass::Destroy();           Msg("[VK] DevRender::Destroy: BloomPass done");
     VK::TonemapPass::Destroy();         Msg("[VK] DevRender::Destroy: TonemapPass done");
     VK::SceneColor::Destroy();          Msg("[VK] DevRender::Destroy: SceneColor done");

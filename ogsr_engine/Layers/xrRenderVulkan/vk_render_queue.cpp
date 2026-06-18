@@ -275,7 +275,7 @@ void RenderQueue::Flush(FrameContext& ctx)
 }
 
 void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool skipAlphaTested,
-                            bool alphaTestedOnly)
+                            bool alphaTestedOnly, bool displaceTerrain)
 {
     if (m_Items.empty() || cmd == VK_NULL_HANDLE) return;
     VkPipelineLayout layoutSolid = PipelineCache::GetDepthLayout();
@@ -305,6 +305,34 @@ void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool s
         // the depth); without it (shader missing / caller opted out) skip them.
         WorldMaterial* mat = fv->m_pWorldMaterial ? fv->m_pWorldMaterial : WorldMaterialCache::GetDefault();
         if (mat && mat->isWmark) continue;   // baked decals never write depth (prepass/shadows)
+
+        // Terrain in the DEPTH PREPASS: route through the snow-displaced terrain
+        // depth pipeline (the SAME world_terrain.vert as the color pass -> identical
+        // SnowDisplace -> the prepass depth matches the color -> no z-fight/see-
+        // through). Needs the EnvLight set at set 1 (sf_params.w). Only when asked
+        // (prepass); shadows/rain pass displaceTerrain=false (undisplaced is fine).
+        if (displaceTerrain && mat && mat->isTerrain) {
+            VkPipeline       tpipe = PipelineCache::GetTerrainDepthPipeline();
+            VkPipelineLayout tlay  = PipelineCache::GetTerrainLayout();
+            VkDescriptorSet  eset  = EnvLight::GetCurrentSet();
+            if (tpipe == VK_NULL_HANDLE || tlay == VK_NULL_HANDLE || eset == VK_NULL_HANDLE) continue;
+            if (tlay != lastLayout) { lastLayout = tlay; lastMatSet = VK_NULL_HANDLE; lastAref = -999.f; haveXform = false; }
+            if (tpipe != lastPipe)  { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tpipe); lastPipe = tpipe; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE; }
+            if (eset != lastMatSet) { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tlay, 1, 1, &eset, 0, nullptr); lastMatSet = eset; }   // set 1 = EnvLight
+            struct TPush { Fmatrix mvp; float uv[2]; float aref; float ds; } tp{};
+            tp.mvp.mul(lightVP, it.xform);   // terrain xform = identity -> = lightVP (matches color's pc.mvp)
+            vkCmdPushConstants(cmd, tlay, PipelineCache::GetPushStages(), 0, sizeof(TPush), &tp);
+            VkBuffer vbT = fv->m_mesh.p_rm_Vertices->GetHandle();
+            if (vbT != lastVB) { VkDeviceSize o = 0; vkCmdBindVertexBuffers(cmd, 0, 1, &vbT, &o); lastVB = vbT; }
+            VkBuffer ibT = fv->m_mesh.p_rm_Indices->GetHandle();
+            if (ibT != lastIB || fv->m_mesh.iType != lastIType) { vkCmdBindIndexBuffer(cmd, ibT, 0, fv->m_mesh.iType); lastIB = ibT; lastIType = fv->m_mesh.iType; }
+            const u32 fiT = it.iCountOverride ? it.iBaseOverride  : fv->m_mesh.iBase;
+            const u32 icT = it.iCountOverride ? it.iCountOverride : fv->m_mesh.iCount;
+            vkCmdDrawIndexed(cmd, icT, 1, fiT, (s32)fv->m_mesh.vBase, 0);
+            ++nDraw;
+            continue;
+        }
+
         const float aref = mat ? mat->alphaRef : -1.f;
         const bool  at   = aref >= 0.f;
         if (!at && alphaTestedOnly) continue;   // opaque handled by GPU-driven shadow path

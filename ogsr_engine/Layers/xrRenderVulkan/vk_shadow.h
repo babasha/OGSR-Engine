@@ -94,6 +94,7 @@ VkImageView    GetRainView();
 VkImage        GetGroundImage();
 VkImageView    GetGroundView();
 u32            RainSize();                    // 1024 (shared by rain + ground maps)
+float          RainEyeY();                    // ortho eye world-Y at the last redraw (height reconstruction)
 void           ComputeRainVP();               // straight-down ortho box at the camera
 const Fmatrix& GetRainVP();
 bool           RainSphereVisible(const Fvector& center, float radius);

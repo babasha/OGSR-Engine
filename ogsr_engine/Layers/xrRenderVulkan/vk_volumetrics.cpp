@@ -47,12 +47,32 @@ extern float ps_r_vol_ta_blend;   // EMA history weight
 extern int   ps_r_vol_shadow;     // dedicated per-frame fog sun-shadow (continuous) vs cascade/VSM
 extern float ps_r_sun_boost;      // same global sun multiplier the receivers use
 extern float ps_r_ambient_floor;  // same flat ambient lift the receivers use
+extern float ps_r_vol_smoke_inject;  // Stage-1 VMS: inject smoke-particle density into the froxel grid (0 = off)
+extern float ps_r_vol_smoke_density;  // Stage-1 VMS: density mass per particle opacity (splat scale)
+extern int   ps_r_vol_smoke_debug;    // Stage-1 VMS debug: 1 = isolate injected smoke, 2 = density heatmap
+extern float ps_r_vol_smoke_footprint; // Stage-1.1 VMS: max splat footprint (froxel cells; 0 = point)
+extern float ps_r_vol_smoke_shadow;       // Stage-2 VMS: smoke self-shadow strength (0 = off)
+extern float ps_r_vol_smoke_shadow_step;  // Stage-2 VMS: self-shadow sun-march step (world m)
+extern int   ps_r_light_occ;              // dynamic-light terrain/static occlusion (stops indoor lamps leaking into fog/smoke)
 
 namespace VK { namespace Vol {
 
 namespace {
     constexpr u32 kFramesInFlight = CVulkanCommandManager::FRAMES_IN_FLIGHT;
     constexpr VkFormat kVolFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    // Stage-1 VMS smoke media grid. Smoke is low-frequency → a COARSE grid (half-res
+    // of the fog grid) is plenty: ~9 MB accum + 4.7 MB media vs 76 MB at full res,
+    // less atomic contention, cheaper splat. inject samples it trilinearly at the
+    // SAME normalized frustum coords, so the resolution mismatch is invisible.
+    constexpr u32 kSmokeX = 128, kSmokeY = 72, kSmokeZ = 64;
+    constexpr u32 kSmokeCells = kSmokeX * kSmokeY * kSmokeZ;
+    constexpr u32 kMaxSmokeParticles = 32768;   // cap per frame (silently clamped; logged)
+    constexpr float kSmokeFixed = 4096.0f;       // atomic fixed-point scale (uint accum)
+
+    // Splat push (camera basis + grid params; 112 B). Resolve push (32 B).
+    struct SplatPush  { float camPos[4], camDir[4], camRightT[4], camTopT[4], zParams[4], dims[4], params[4]; };
+    struct ResolvePush { s32 dims[4]; float params[4]; };
 
     // Vol UBO (std140 — all vec4/mat4, naturally 16-aligned). MUST match the
     // `Vol` block in vol_inject.comp.glsl / vol_integrate.comp.glsl.
@@ -84,6 +104,8 @@ namespace {
         struct { float pos[4]; float color[4]; float dir[4]; } lights[8];
         float noiseParams[4];  // P3: x = amount, y = scale, z = speed, w = time clock
         float spot_vp[16];     // spot (flashlight) shadow VP — occlude the cone in fog
+        float smokeParams[4];  // Stage-1 VMS: x = smoke-inject strength (0 = no injected smoke)
+        float light_occ[4];    // r_light_occ: x = enable, y = bury bias, z = frag-below band, w = strength
     };
     constexpr u32 kVolMaxLights = 8;
     constexpr VkDeviceSize kUboStride = (sizeof(VolUBO) + 255) & ~VkDeviceSize(255);
@@ -141,6 +163,20 @@ namespace {
     VkPipeline            s_intPipe = VK_NULL_HANDLE;
     VkDescriptorSet       s_intSet[kFramesInFlight] = {};
 
+    // Stage-1 VMS smoke media: a resolved RGBA16F volume (rgb=albedo, a=density) that
+    // inject samples; fed by a per-particle SPLAT (atomic accumulation SSBO) + RESOLVE.
+    VkImage       s_smokeImg = VK_NULL_HANDLE;
+    VmaAllocation s_smokeAlloc = VK_NULL_HANDLE;
+    VkImageView   s_smokeView = VK_NULL_HANDLE;
+    CVulkanBuffer s_smokeAccum;                              // device-local uint[cells*4] (atomic accumulation)
+    CVulkanBuffer s_smokeParts[kFramesInFlight];             // host-visible per-particle upload ring
+    u8*           s_smokePartsMapped[kFramesInFlight] = {};
+    VkDescriptorSetLayout s_splatSetL = VK_NULL_HANDLE, s_resolveSetL = VK_NULL_HANDLE;
+    VkPipelineLayout      s_splatLayout = VK_NULL_HANDLE, s_resolveLayout = VK_NULL_HANDLE;
+    VkPipeline            s_splatPipe = VK_NULL_HANDLE, s_resolvePipe = VK_NULL_HANDLE;
+    VkDescriptorSet       s_splatSet[kFramesInFlight] = {};  // per-slot (particle buffer differs by slot)
+    VkDescriptorSet       s_resolveSet = VK_NULL_HANDLE;     // shared (accum + media)
+
     VkDescriptorPool s_pool = VK_NULL_HANDLE;
 
     // Defensive cascade/rain-view rebind: if ShadowMap ever recreates a view,
@@ -168,12 +204,13 @@ namespace {
         vkCmdPipelineBarrier2(cmd, &di);
     }
 
-    bool CreateVolume(VkImage& img, VmaAllocation& alloc, VkImageView& view, const char* name)
+    bool CreateVolume(VkImage& img, VmaAllocation& alloc, VkImageView& view,
+                      u32 ex, u32 ey, u32 ez, const char* name)
     {
         VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         ici.imageType   = VK_IMAGE_TYPE_3D;
         ici.format      = kVolFormat;
-        ici.extent      = { kGridX, kGridY, kGridZ };
+        ici.extent      = { ex, ey, ez };
         ici.mipLevels   = 1;
         ici.arrayLayers = 1;
         ici.samples     = VK_SAMPLE_COUNT_1_BIT;
@@ -231,9 +268,10 @@ bool Init()
     if (!g_ShaderManager) g_ShaderManager = xr_new<VK::CVulkanSPIRVLoader>();
 
     // --- 3D volumes (eager: keeps the tonemap binding valid even with r_vol off).
-    if (!CreateVolume(s_scatterImg, s_scatterAlloc, s_scatterView, "Vol.Scatter")) { s_failed = true; return false; }
-    if (!CreateVolume(s_integImg,   s_integAlloc,   s_integView,   "Vol.Integrated")) { s_failed = true; return false; }
-    if (!CreateVolume(s_histImg,    s_histAlloc,    s_histView,    "Vol.History")) { s_failed = true; return false; }
+    if (!CreateVolume(s_scatterImg, s_scatterAlloc, s_scatterView, kGridX, kGridY, kGridZ, "Vol.Scatter")) { s_failed = true; return false; }
+    if (!CreateVolume(s_integImg,   s_integAlloc,   s_integView,   kGridX, kGridY, kGridZ, "Vol.Integrated")) { s_failed = true; return false; }
+    if (!CreateVolume(s_histImg,    s_histAlloc,    s_histView,    kGridX, kGridY, kGridZ, "Vol.History")) { s_failed = true; return false; }
+    if (!CreateVolume(s_smokeImg,   s_smokeAlloc,   s_smokeView,   kSmokeX, kSmokeY, kSmokeZ, "Vol.SmokeMedia")) { s_failed = true; return false; }
 
     // Linear/clamp sampler — trilinear composite (NEAREST z = banding).
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -251,9 +289,22 @@ bool Init()
     // Dummy SSBO — keeps the VSM page-table binding valid before VSM is ready.
     s_dummySSBO.Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
+    // Stage-1 smoke: device-local atomic accumulation SSBO (uint[cells*4], cleared +
+    // splatted + resolved each frame on the GPU) + a host-visible per-particle upload
+    // ring (one buffer per in-flight slot, CPU writes off the GPU timeline).
+    s_smokeAccum.Create(VkDeviceSize(kSmokeCells) * 4 * sizeof(u32),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    for (u32 i = 0; i < kFramesInFlight; ++i) {
+        s_smokeParts[i].Create(VkDeviceSize(kMaxSmokeParticles) * sizeof(SmokeParticle),
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+        s_smokePartsMapped[i] = static_cast<u8*>(s_smokeParts[i].Map());
+        if (!s_smokePartsMapped[i]) { Msg("![VK Vol] smoke particle buffer map failed"); s_failed = true; return false; }
+    }
+
     // --- Inject set layout (0=UBO 1-3=cascades 4=scatter storage 5=rain/sky-vis 6=history sampler).
     {
-        VkDescriptorSetLayoutBinding b[13]{};
+        VkDescriptorSetLayoutBinding b[14]{};
         b[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,        1, VK_SHADER_STAGE_COMPUTE_BIT };
         b[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
         b[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
@@ -267,8 +318,9 @@ bool Init()
         b[10] = { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // fog sun-shadow
         b[11] = { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // spot (flashlight) shadow
         b[12] = { 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // point (campfire) shadow cube
+        b[13] = { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // Stage-1 smoke media
         VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 13; lci.pBindings = b;
+        lci.bindingCount = 14; lci.pBindings = b;
         if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_injSetL) != VK_SUCCESS) { Msg("![VK Vol] inject set layout failed"); s_failed = true; return false; }
     }
     // --- Integrate set layout (0=UBO 1=scatter[read] 2=integrated[write]).
@@ -281,17 +333,36 @@ bool Init()
         lci.bindingCount = 3; lci.pBindings = b;
         if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_intSetL) != VK_SUCCESS) { Msg("![VK Vol] integrate set layout failed"); s_failed = true; return false; }
     }
+    // --- Stage-1 splat set layout (0=particles SSBO[read] 1=accum SSBO[read-modify-write]).
+    {
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
+        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
+        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        lci.bindingCount = 2; lci.pBindings = b;
+        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_splatSetL) != VK_SUCCESS) { Msg("![VK Vol] splat set layout failed"); s_failed = true; return false; }
+    }
+    // --- Stage-1 resolve set layout (0=accum SSBO[read] 1=media image[write]).
+    {
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
+        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT };
+        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        lci.bindingCount = 2; lci.pBindings = b;
+        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_resolveSetL) != VK_SUCCESS) { Msg("![VK Vol] resolve set layout failed"); s_failed = true; return false; }
+    }
 
-    // Pool: UBO 3*F (Vol inject+integrate + VSM clipmap), sampler 6*F (3 cascades +
-    // rain + history + VSM atlas), storage image 3*F, storage buffer 1*F (VSM PT); 2*F sets.
+    // Pool: UBO 3*F, sampler 10*F (9 + Stage-1 smoke media on inject), storage image
+    // 3*F+1 (+resolve media write), storage buffer 3*F+1 (VSM PT*F + splat particles+accum
+    // *F + resolve accum). Sets: 2*F (inject+integrate) + F (per-slot splat) + 1 (resolve).
     VkDescriptorPoolSize ps[4] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         3 * kFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9 * kFramesInFlight },  // 3 casc + rain + history + VSM atlas + fog + spot + point
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          3 * kFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1 * kFramesInFlight },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 10 * kFramesInFlight },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          3 * kFramesInFlight + 1 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         3 * kFramesInFlight + 1 },
     };
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 2 * kFramesInFlight; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
+    pci.maxSets = 3 * kFramesInFlight + 1; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
     if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) { Msg("![VK Vol] pool failed"); s_failed = true; return false; }
 
     // Allocate per-slot sets.
@@ -304,6 +375,16 @@ bool Init()
         if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_injSet) != VK_SUCCESS) { Msg("![VK Vol] inject set alloc failed"); s_failed = true; return false; }
         dai.pSetLayouts = tL;
         if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_intSet) != VK_SUCCESS) { Msg("![VK Vol] integrate set alloc failed"); s_failed = true; return false; }
+    }
+    // Stage-1 smoke sets: per-slot splat (its slot's particle buffer) + one resolve.
+    {
+        VkDescriptorSetLayout sL[kFramesInFlight];
+        for (u32 i = 0; i < kFramesInFlight; ++i) sL[i] = s_splatSetL;
+        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = s_pool; dai.descriptorSetCount = kFramesInFlight; dai.pSetLayouts = sL;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_splatSet) != VK_SUCCESS) { Msg("![VK Vol] splat set alloc failed"); s_failed = true; return false; }
+        dai.descriptorSetCount = 1; dai.pSetLayouts = &s_resolveSetL;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_resolveSet) != VK_SUCCESS) { Msg("![VK Vol] resolve set alloc failed"); s_failed = true; return false; }
     }
 
     // Write the stable descriptors (UBO per slot + storage images). Cascade
@@ -320,8 +401,9 @@ bool Init()
         VkDescriptorImageInfo  fogShI{ ShadowMap::GetSampler(), ShadowMap::GetFogShadowView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  spotShI{ ShadowMap::GetSampler(), ShadowMap::GetSpotView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  pointShI{ ShadowMap::GetSampler(), ShadowMap::GetPointCubeView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo  smokeI{ s_sampler, s_smokeView, VK_IMAGE_LAYOUT_GENERAL };   // Stage-1 smoke media (sampled from GENERAL)
 
-        VkWriteDescriptorSet w[12]{};
+        VkWriteDescriptorSet w[13]{};
         // inject: UBO(0) + scatter storage(4) + history sampler(6) + VSM atlas(7)/PT(8)/clipmap(9)
         w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_injSet[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &ubi;
         w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_injSet[i]; w[1].dstBinding = 4; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &scatterI;
@@ -332,11 +414,30 @@ bool Init()
         w[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[9].dstSet = s_injSet[i]; w[9].dstBinding = 10; w[9].descriptorCount = 1; w[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[9].pImageInfo = &fogShI;
         w[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[10].dstSet = s_injSet[i]; w[10].dstBinding = 11; w[10].descriptorCount = 1; w[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[10].pImageInfo = &spotShI;
         w[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[11].dstSet = s_injSet[i]; w[11].dstBinding = 12; w[11].descriptorCount = 1; w[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[11].pImageInfo = &pointShI;
+        w[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[12].dstSet = s_injSet[i]; w[12].dstBinding = 13; w[12].descriptorCount = 1; w[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[12].pImageInfo = &smokeI;
         // integrate: UBO(0) + scatter read(1) + integrated write(2)
         w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[2].dstSet = s_intSet[i]; w[2].dstBinding = 0; w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[2].pBufferInfo = &ubi;
         w[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[3].dstSet = s_intSet[i]; w[3].dstBinding = 1; w[3].descriptorCount = 1; w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[3].pImageInfo = &scatterI;
         w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[4].dstSet = s_intSet[i]; w[4].dstBinding = 2; w[4].descriptorCount = 1; w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[4].pImageInfo = &integI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 12, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 13, w, 0, nullptr);
+    }
+
+    // Stage-1 smoke descriptor writes: per-slot splat (its particle buffer + the
+    // shared accum SSBO) + the resolve set (accum read + media storage write).
+    {
+        VkDescriptorBufferInfo accumI{ s_smokeAccum.GetHandle(), 0, VK_WHOLE_SIZE };
+        for (u32 i = 0; i < kFramesInFlight; ++i) {
+            VkDescriptorBufferInfo partI{ s_smokeParts[i].GetHandle(), 0, VK_WHOLE_SIZE };
+            VkWriteDescriptorSet w[2]{};
+            w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_splatSet[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &partI;
+            w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_splatSet[i]; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &accumI;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+        }
+        VkDescriptorImageInfo mediaStoreI{ VK_NULL_HANDLE, s_smokeView, VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet w[2]{};
+        w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_resolveSet; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &accumI;
+        w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_resolveSet; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &mediaStoreI;
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
     }
 
     // Pipeline layouts + pipelines.
@@ -351,6 +452,21 @@ bool Init()
     s_intPipe = BuildComputePipe("vol_integrate.comp.spv", s_intLayout);
     if (!s_injPipe || !s_intPipe) { s_failed = true; return false; }
 
+    // Stage-1 smoke splat + resolve (push-constant driven, no UBO).
+    {
+        VkPushConstantRange pcS{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SplatPush) };
+        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        plci.setLayoutCount = 1; plci.pSetLayouts = &s_splatSetL;
+        plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcS;
+        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_splatLayout) != VK_SUCCESS) { Msg("![VK Vol] splat layout failed"); s_failed = true; return false; }
+        VkPushConstantRange pcR{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ResolvePush) };
+        plci.pSetLayouts = &s_resolveSetL; plci.pPushConstantRanges = &pcR;
+        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_resolveLayout) != VK_SUCCESS) { Msg("![VK Vol] resolve layout failed"); s_failed = true; return false; }
+    }
+    s_splatPipe   = BuildComputePipe("vol_splat.comp.spv",   s_splatLayout);
+    s_resolvePipe = BuildComputePipe("vol_resolve.comp.spv", s_resolveLayout);
+    if (!s_splatPipe || !s_resolvePipe) { s_failed = true; return false; }
+
     // One-time UNDEFINED -> SHADER_READ so the tonemap binding is valid before the
     // first Execute (and stays valid on the menu / with r_vol off — never sampled).
     if (VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands()) {
@@ -364,6 +480,11 @@ bool Init()
         ImgBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    0, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        // Smoke media stays GENERAL for its life (resolve writes it as a storage image,
+        // inject samples it from GENERAL); never sampled until the first splat (gated).
+        ImgBarrier(cmd, s_smokeImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                   0, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                   VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         VulkanHW.EndSingleTimeCommands(cmd);
     }
 
@@ -374,10 +495,17 @@ bool Init()
     return true;
 }
 
-void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot)
+void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
+             const SmokeParticle* smoke, u32 smokeCount)
 {
     if (!s_ready || !Wanted()) return;
     if (slot >= kFramesInFlight) slot = 0;
+
+    // Stage-1 smoke: clamp the upload to capacity; gate the splat + inject sample on
+    // the knob (or the debug view, which also drives the path). smokeActive false →
+    // no splat/resolve, smokeParams 0 → inject skips it.
+    const u32  smokeN      = (smoke && smokeCount) ? ((smokeCount < kMaxSmokeParticles) ? smokeCount : kMaxSmokeParticles) : 0u;
+    const bool smokeActive = (ps_r_vol_smoke_inject > 0.0f || ps_r_vol_smoke_debug != 0) && (smokeN > 0u);
 
     // exp-Z grid — ONE source of truth shared with the clustered cull, so the
     // froxel Z mapping is identical to the inverse the composite uses.
@@ -458,6 +586,18 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot)
     ub.noiseParams[1] = ps_r_vol_noise_scale;
     ub.noiseParams[2] = ps_r_vol_noise_speed;
     ub.noiseParams[3] = float(Device.dwTimeGlobal) * 0.001f;   // seconds
+    // Stage-1 gate: force a non-zero sample strength when debug-isolating with inject 0.
+    ub.smokeParams[0] = smokeActive ? ((ps_r_vol_smoke_inject > 0.0f) ? ps_r_vol_smoke_inject : 1.0f) : 0.0f;
+    ub.smokeParams[1] = float(ps_r_vol_smoke_debug);   // 0 off / 1 isolate colour / 2 density heatmap
+    ub.smokeParams[2] = ps_r_vol_smoke_shadow;         // Stage-2 self-shadow strength
+    ub.smokeParams[3] = ps_r_vol_smoke_shadow_step;    // Stage-2 self-shadow march step (m)
+    // Dynamic-light terrain occlusion (r_light_occ) — SAME values the forward shaders
+    // use (vk_env_light) so the fog/smoke local lights match the surfaces: indoor lamps
+    // buried under a roof don't leak out and light the smoke through walls.
+    ub.light_occ[0] = ps_r_light_occ ? 1.0f : 0.0f;
+    ub.light_occ[1] = 0.001f;   // bury bias (NDC-z)
+    ub.light_occ[2] = 0.006f;   // frag-below band
+    ub.light_occ[3] = 1.0f;     // strength
 
     // ---- Temporal accumulation (r_vol_ta): sub-froxel Halton jitter + the prev
     // frame's reprojection inputs. alpha 0 until we have a valid history frame.
@@ -533,6 +673,79 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot)
         VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         di.memoryBarrierCount = 1; di.pMemoryBarriers = &mb;
         vkCmdPipelineBarrier2(cmd, &di);
+    }
+
+    // ---- Stage-1 VMS: SPLAT smoke particles → accum SSBO → RESOLVE to the media
+    // volume the inject below samples. Particles were simulated in CollectVisuals
+    // (before any pass), so their data is valid here. Skipped when disabled / no smoke.
+    if (smokeActive) {
+        const int z = Prof::ZoneBegin(cmd, "VolSmoke");
+        if (ps_r_vol_smoke_debug && (s_frame % 120u) == 0u)
+            Msg("[VK Vol] smoke inject: %u particles (debug %d, density %.2f)", smokeN, ps_r_vol_smoke_debug, ps_r_vol_smoke_density);
+        memcpy(s_smokePartsMapped[slot], smoke, size_t(smokeN) * sizeof(SmokeParticle));
+
+        // accum + media are SHARED (not per-slot); with frames in flight, order the
+        // PREVIOUS frame's reads (resolve's accum read, inject's media sample) before
+        // this frame's overwrites (the clear + resolve store). One global barrier
+        // covers both — it spans submissions on the same queue, and media stays GENERAL
+        // (no layout change), so a memory barrier is enough.
+        {
+            VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            mb.dstStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; di.memoryBarrierCount = 1; di.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+
+        // Clear the accumulation SSBO, then make the clear visible to the splat.
+        vkCmdFillBuffer(cmd, s_smokeAccum.GetHandle(), 0, VK_WHOLE_SIZE, 0);
+        {
+            VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;     mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT; mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; di.memoryBarrierCount = 1; di.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+
+        // SPLAT — one thread per particle, atomic-add into the accum SSBO.
+        SplatPush sp{};
+        sp.camPos[0]    = eye.x;             sp.camPos[1]    = eye.y;             sp.camPos[2]    = eye.z;
+        sp.camDir[0]    = pt.dir.x;          sp.camDir[1]    = pt.dir.y;          sp.camDir[2]    = pt.dir.z;
+        sp.camRightT[0] = pt.right.x*pt.tanX; sp.camRightT[1] = pt.right.y*pt.tanX; sp.camRightT[2] = pt.right.z*pt.tanX;
+        sp.camTopT[0]   = pt.top.x*pt.tanY;   sp.camTopT[1]   = pt.top.y*pt.tanY;   sp.camTopT[2]   = pt.top.z*pt.tanY;
+        sp.zParams[0]   = gz.nearZ; sp.zParams[1] = gz.farZ; sp.zParams[2] = gz.logFarNear;
+        sp.dims[0] = float(kSmokeX); sp.dims[1] = float(kSmokeY); sp.dims[2] = float(kSmokeZ); sp.dims[3] = kSmokeFixed;
+        sp.params[0] = float(smokeN); sp.params[1] = ps_r_vol_smoke_density; sp.params[2] = ps_r_vol_smoke_footprint;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_splatPipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_splatLayout, 0, 1, &s_splatSet[slot], 0, nullptr);
+        vkCmdPushConstants(cmd, s_splatLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sp), &sp);
+        vkCmdDispatch(cmd, (smokeN + 63u) / 64u, 1, 1);
+
+        // accum splat-write → resolve read.
+        {
+            VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT; mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT; mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; di.memoryBarrierCount = 1; di.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+
+        // RESOLVE — accum → RGBA16F media (written as a storage image, kept GENERAL).
+        ResolvePush rp{};
+        rp.dims[0] = s32(kSmokeX); rp.dims[1] = s32(kSmokeY); rp.dims[2] = s32(kSmokeZ);
+        rp.params[0] = 1.0f / kSmokeFixed;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolvePipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, 1, &s_resolveSet, 0, nullptr);
+        vkCmdPushConstants(cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rp), &rp);
+        vkCmdDispatch(cmd, (kSmokeX + 3) / 4, (kSmokeY + 3) / 4, (kSmokeZ + 3) / 4);
+
+        // media resolve-write → inject sampled-read (stays GENERAL).
+        ImgBarrier(cmd, s_smokeImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        Prof::ZoneEnd(cmd, z);
     }
 
     // ---- INJECT: per froxel in-scatter + extinction.
@@ -621,21 +834,32 @@ void Destroy()
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     if (s_injPipe)   { vkDestroyPipeline(VulkanHW.m_Device, s_injPipe, nullptr); s_injPipe = VK_NULL_HANDLE; }
     if (s_intPipe)   { vkDestroyPipeline(VulkanHW.m_Device, s_intPipe, nullptr); s_intPipe = VK_NULL_HANDLE; }
+    if (s_splatPipe)   { vkDestroyPipeline(VulkanHW.m_Device, s_splatPipe, nullptr); s_splatPipe = VK_NULL_HANDLE; }
+    if (s_resolvePipe) { vkDestroyPipeline(VulkanHW.m_Device, s_resolvePipe, nullptr); s_resolvePipe = VK_NULL_HANDLE; }
     if (s_injLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_injLayout, nullptr); s_injLayout = VK_NULL_HANDLE; }
     if (s_intLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_intLayout, nullptr); s_intLayout = VK_NULL_HANDLE; }
+    if (s_splatLayout)   { vkDestroyPipelineLayout(VulkanHW.m_Device, s_splatLayout, nullptr); s_splatLayout = VK_NULL_HANDLE; }
+    if (s_resolveLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_resolveLayout, nullptr); s_resolveLayout = VK_NULL_HANDLE; }
     if (s_pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_injSetL)   { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_injSetL, nullptr); s_injSetL = VK_NULL_HANDLE; }
     if (s_intSetL)   { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_intSetL, nullptr); s_intSetL = VK_NULL_HANDLE; }
+    if (s_splatSetL)   { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_splatSetL, nullptr); s_splatSetL = VK_NULL_HANDLE; }
+    if (s_resolveSetL) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_resolveSetL, nullptr); s_resolveSetL = VK_NULL_HANDLE; }
     if (s_sampler)   { vkDestroySampler(VulkanHW.m_Device, s_sampler, nullptr); s_sampler = VK_NULL_HANDLE; }
     if (s_scatterView) { vkDestroyImageView(VulkanHW.m_Device, s_scatterView, nullptr); s_scatterView = VK_NULL_HANDLE; }
     if (s_integView)   { vkDestroyImageView(VulkanHW.m_Device, s_integView, nullptr); s_integView = VK_NULL_HANDLE; }
     if (s_histView)    { vkDestroyImageView(VulkanHW.m_Device, s_histView, nullptr); s_histView = VK_NULL_HANDLE; }
+    if (s_smokeView)   { vkDestroyImageView(VulkanHW.m_Device, s_smokeView, nullptr); s_smokeView = VK_NULL_HANDLE; }
     if (s_scatterImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_scatterImg, s_scatterAlloc); s_scatterImg = VK_NULL_HANDLE; s_scatterAlloc = VK_NULL_HANDLE; }
     if (s_integImg)    { vmaDestroyImage(VulkanHW.m_Allocator, s_integImg, s_integAlloc); s_integImg = VK_NULL_HANDLE; s_integAlloc = VK_NULL_HANDLE; }
     if (s_histImg)     { vmaDestroyImage(VulkanHW.m_Allocator, s_histImg, s_histAlloc); s_histImg = VK_NULL_HANDLE; s_histAlloc = VK_NULL_HANDLE; }
+    if (s_smokeImg)    { vmaDestroyImage(VulkanHW.m_Allocator, s_smokeImg, s_smokeAlloc); s_smokeImg = VK_NULL_HANDLE; s_smokeAlloc = VK_NULL_HANDLE; }
     s_ubo.Destroy(); s_uboMapped = nullptr;
     s_dummySSBO.Destroy();
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_injSet[i] = VK_NULL_HANDLE; s_intSet[i] = VK_NULL_HANDLE; }
+    s_smokeAccum.Destroy();
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_smokeParts[i].Destroy(); s_smokePartsMapped[i] = nullptr; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_injSet[i] = VK_NULL_HANDLE; s_intSet[i] = VK_NULL_HANDLE; s_splatSet[i] = VK_NULL_HANDLE; }
+    s_resolveSet = VK_NULL_HANDLE;
     s_boundCasc[0] = s_boundCasc[1] = s_boundCasc[2] = s_boundCasc[3] = VK_NULL_HANDLE;
     s_boundVsmAtlas = VK_NULL_HANDLE; s_boundVsmPT = VK_NULL_HANDLE; s_boundVsmUBO = VK_NULL_HANDLE;
     s_haveHistory = false; s_prevValid = false; s_frame = 0;

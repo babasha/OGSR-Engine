@@ -16,6 +16,7 @@
 #include "vk_render_queue.h"    // VK::RenderQueue (SubmitCpuMeshes)
 #include "vk_buffer.h"          // CVulkanBuffer
 #include "vk_pipeline_cache.h"  // PipelineCache pipelines/layouts
+#include "vk_env_light.h"       // EnvLight::GetCurrentSet (set 1, terrain snow-depth)
 #include "vk_shaders.h"         // g_ShaderManager
 #include "vk_cull.h"            // VK::ExtractFrustumPlanes
 #include <algorithm>
@@ -313,7 +314,7 @@ void Cull(VkCommandBuffer cmd, const Fmatrix& viewProj)
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 }
 
-void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj)
+void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrain)
 {
     if (!Built()) return;
     VkPipelineLayout layoutSolid = PipelineCache::GetDepthLayout();
@@ -333,6 +334,30 @@ void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj)
     for (u32 g = 0; g < nGroups; ++g) {
         const Group& grp = s_groups[g];
         WorldMaterial* mat = grp.mat;
+
+        // Terrain in the DEPTH PREPASS: snow-displaced terrain depth pipeline (same
+        // world_terrain.vert as color -> matching displacement -> no z-fight). Set 1
+        // = EnvLight (sf_params.w). Only in the prepass (displaceTerrain); shadows
+        // pass false. Terrain groups sort first (group key isTerrain?0:1).
+        if (displaceTerrain && mat->isTerrain) {
+            VkPipeline       tpipe = PipelineCache::GetTerrainDepthPipeline();
+            VkPipelineLayout tlay  = PipelineCache::GetTerrainLayout();
+            VkDescriptorSet  eset  = EnvLight::GetCurrentSet();
+            if (tpipe == VK_NULL_HANDLE || tlay == VK_NULL_HANDLE || eset == VK_NULL_HANDLE) continue;
+            if (tlay != lastLayout) { lastLayout = tlay; lastMatSet = VK_NULL_HANDLE; lastPipe = VK_NULL_HANDLE; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE; }
+            if (tpipe != lastPipe)  { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tpipe); lastPipe = tpipe; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE; }
+            if (eset != lastMatSet) { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tlay, 1, 1, &eset, 0, nullptr); lastMatSet = eset; }   // set 1 = EnvLight
+            struct TPush { Fmatrix mvp; float uv[2]; float aref; float ds; } tp{}; tp.mvp = vp;
+            vkCmdPushConstants(cmd, tlay, PipelineCache::GetPushStages(), 0, sizeof(TPush), &tp);
+            if (grp.vb != lastVB) { VkDeviceSize z = 0; vkCmdBindVertexBuffers(cmd, 0, 1, &grp.vb, &z); lastVB = grp.vb; }
+            if (grp.ib != lastIB || grp.iType != lastIType) { vkCmdBindIndexBuffer(cmd, grp.ib, 0, grp.iType); lastIB = grp.ib; lastIType = grp.iType; }
+            const VkDeviceSize cmdOffT = (VkDeviceSize)g * s_maxGroupMesh * sizeof(VkDrawIndexedIndirectCommand);
+            const VkDeviceSize cntOffT = (VkDeviceSize)g * sizeof(u32);
+            vkCmdDrawIndexedIndirectCount(cmd, s_indirect->GetHandle(), cmdOffT, s_count->GetHandle(), cntOffT,
+                                          s_maxGroupMesh, sizeof(VkDrawIndexedIndirectCommand));
+            continue;
+        }
+
         const bool at = mat->alphaRef >= 0.f;
         if (at && (layoutAT == VK_NULL_HANDLE || mat->set == VK_NULL_HANDLE)) continue;  // mirror FlushDepth skip
 

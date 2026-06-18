@@ -21,6 +21,7 @@
 #pragma once
 #include "HW_Vulkan.h"
 #include "vk_light.h"   // Lights::GpuLight (dynamic point/spot lights, STEP 3)
+#include <cstddef>      // offsetof (LightUBO layout guards)
 
 namespace VK { namespace EnvLight {
 
@@ -70,11 +71,11 @@ struct LightUBO {
     float pom_params2[4];   // x = blur (extra mip LOD), y = normal, z = self-shadow, w = contact AO
     float pom_params3[4];   // x = debug view, y = ao_flat, z = ceil strength, w = floor strength
     float pom_params4[4];   // x = terrain POM enable, y = detail-normal strength, z = micro-AO, w = debug view
-    float pom_params5[4];   // x = terrain dry gloss strength, y = geo-puddle radius, z = geo-puddle depth, w = puddle debug
+    float pom_params5[4];   // x = terrain dry gloss strength, y/z = RESERVED (was geo-puddle radius/depth, removed; zeroed on fill), w = puddle debug
     float pom_params6[4];   // x = water-sim enable (puddles come from the flow sim), y = murk, z = refract, w unused
     // SSS per-pixel puddles (SSFX deffer_terrain_high_flat port): water as a rising
     // LEVEL vs the detail micro-height — terrain texture relief (ruts) pools first.
-    float pom_params7[4];   // x = enable, y = water level, z = micro-height contrast, w = macro mask scale
+    float pom_params7[4];   // x = enable, y = water level, z = RESERVED (was micro-height contrast, removed; zeroed on fill), w = macro mask scale
     // Clustered forward (vk_clustered): the froxel-grid parameters the fragment
     // needs to find its cluster. The light list itself lives in SSBOs bound at
     // set bindings 17 (lights) / 18 (grid) / 19 (indices). Appended last (prefix-safe).
@@ -84,9 +85,32 @@ struct LightUBO {
     // march the ground-height map (binding 13, via rain_vp) between fragment and
     // light, so a buried lamp can't light through the ground. Appended (prefix-safe).
     float light_occ[4];       // x = enable, y = bury bias, z = march bias, w = strength
+    // Surface Field ("smart heightmap"): metre-scale ground height/slope/curvature/
+    // exposure derived from the rain+ground maps (shaders/surface_field.glsl).
+    float sf_params[4];       // x = enable (r_sf), y = debug view (r_sf_debug 0..5), z = derive eps (m, r_sf_eps), w = snow amount (r_snow)
+    // Snow footprint deformation: ring of recent foot contacts (filled from
+    // Skinned_CollectFeet). Read by snow_displace.glsl (VS) to carve footprints.
+    float deform_count[4];     // x = active count, y = press depth (m), z = ridge height (m), w = enable
+    float deform_stamps[256][4];// xy = world XZ, z = radius (m), w = strength 0..1 (256 + time-decay = ~1 min trail)
+    // Texture-based deform (r_snow_deform_tex): a dense persistent press field in a
+    // player-centred ortho box (vk_deform, EnvLight binding 20). Appended last.
+    float deform_vp[16];       // world -> deform-texture NDC (straight-down ortho)
+    float deform_tex[4];       // x = enable, y = 1/size, z = max depth (m), w = world metres per texel
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16,
               "LightUBO must match the GLSL Lighting block");
+// Per-field offset guards. The size-only assert above still passes if two equal-
+// sized fields are swapped; these pin the layout at structural anchors and across
+// the POM/cluster tail (where new params get appended), so a reorder/resize is a
+// build error. Offsets relative to neighbours stay valid if kMaxGpuLights changes.
+static_assert(offsetof(LightUBO, lights)  == 144, "LightUBO layout drift before lights[]");
+static_assert(offsetof(LightUBO, spot_vp) - offsetof(LightUBO, lights) == 48 * kMaxGpuLights, "LightUBO lights[] size drift");
+static_assert(offsetof(LightUBO, pom_params5)    - offsetof(LightUBO, pom_params)     == 64,  "LightUBO POM block drift");
+static_assert(offsetof(LightUBO, cluster_params) - offsetof(LightUBO, pom_params)     == 112, "LightUBO POM->cluster tail drift");
+static_assert(offsetof(LightUBO, light_occ)      - offsetof(LightUBO, cluster_params) == 32,  "LightUBO cluster->light_occ drift");
+static_assert(offsetof(LightUBO, sf_params)      - offsetof(LightUBO, light_occ)      == 16,  "LightUBO light_occ->sf_params drift");
+static_assert(offsetof(LightUBO, deform_count)   - offsetof(LightUBO, sf_params)      == 16,  "LightUBO sf_params->deform_count drift");
+static_assert(offsetof(LightUBO, deform_stamps)  - offsetof(LightUBO, deform_count)   == 16,  "LightUBO deform_count->stamps drift");
 
 bool                  Init();                 // idempotent; safe to call from multiple pass inits
 void                  Destroy();

@@ -93,6 +93,10 @@ VkShaderStageFlags GetPushStages();
 // formats like the world pipelines. Both return VK_NULL_HANDLE before Init().
 VkPipelineLayout GetTerrainLayout();
 VkPipeline       GetTerrainPipeline();
+// Depth-prepass variant of the terrain pipeline: same world_terrain.vert (so snow
+// displacement matches color exactly -> no z-fight), vertex-only, terrain layout.
+// Bind the EnvLight set at set 1 (it reads sf_params.w). VK_NULL_HANDLE before Init().
+VkPipeline       GetTerrainDepthPipeline();
 
 // Sun shadow caster (STEP 2): depth-only pipelines (shadow_depth.vert, no FS),
 // keyed by vertex stride (position is at offset 0 for every level layout). The
