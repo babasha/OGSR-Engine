@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "vsm_sample.glsl"        // vsmSunShadow — screen-space VSM mask (set 1, binding 14)
 // xrRenderVulkan — detail (grass) fragment shader.
 // set=0/binding=0 = per-type diffuse texture. Hard alpha-cutoff at 0.5 because
 // grass billboards are punch-out, not blended.
@@ -148,8 +150,12 @@ void main()
     }
 
     vec3 sunPart = vSunLit;
-    if (dot(sunPart, sunPart) > 0.0)
-        sunPart *= sunShadow1(vWPos);
+    if (dot(sunPart, sunPart) > 0.0) {
+        // VSM screen-space mask (r_vsm) vs the 1-tap cascade — gated by _pad_shadow_params.w.
+        float sunSh = (L._pad_shadow_params.w > 0.5) ? vsmSunShadow(gl_FragCoord.xy * L.ao_params.xy)
+                                                     : sunShadow1(vWPos);
+        sunPart *= sunSh;
+    }
 
     // Ambient = sky-cube light × baked per-slot hemi occlusion (vColor.r) —
     // matches world_lmap's skyAmbient(N)*(hemiOcc*sky_params.y) on the ground.

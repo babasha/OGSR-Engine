@@ -612,6 +612,243 @@ void CTreeManager::DestroySessionB()
     if (m_CullDescLayout)     { vkDestroyDescriptorSetLayout(dev, m_CullDescLayout, nullptr); m_CullDescLayout = VK_NULL_HANDLE; }
 
     if (m_FrustumUBO) { m_FrustumUBO->Destroy(); xr_delete(m_FrustumUBO); }
+
+    DestroyVsm();
+}
+
+// ============================================================================
+// VSM caster path — trees into the virtual shadow atlas (static → temporal-safe).
+// Mirrors RenderDepth, but each tree is instanced over the atlas pages it overlaps
+// (binned by vsm_skinned_bin.comp — GpuTreeMeta shares SkinMeta's 32 B layout) and
+// rasterized with tree_vsm_page.{vert,frag} which routes per page + alpha-tests leaves.
+// ============================================================================
+namespace { constexpr u32 kVsmTreeCap = 512; }   // max atlas pages a tree bins into (big crowns span many)
+
+void CTreeManager::CreateVsmResources()
+{
+    if (m_VsmReady) return;
+    if (m_XformDescLayout == VK_NULL_HANDLE || m_TexDescLayout == VK_NULL_HANDLE) return;   // Session B not up
+    if (m_XformDescSet == VK_NULL_HANDLE) return;
+    if (!m_TreeMetadataBuffer || !m_TreeTransformsBuffer || m_TotalCount == 0) return;
+    if (!g_ShaderManager) return;
+
+    VkShaderModule binCS = g_ShaderManager->Load("vsm_tree_bin.comp.spv");   // skinned-bin + slotDirty cache filter (STATIC atlas)
+    VkShaderModule pvs   = g_ShaderManager->Load("tree_vsm_page.vert.spv");
+    VkShaderModule pfs   = g_ShaderManager->Load("tree_vsm_page.frag.spv");
+    if (!binCS || !pvs || !pfs) { Msg("![VK Trees] VSM caster shaders missing — tree VSM shadows disabled"); return; }
+
+    VkDevice dev = VulkanHW.m_Device;
+    const u32 N = VK_FRAMES_IN_FLIGHT;
+
+    // Buffers.
+    m_VsmCasterPages = xr_new<CVulkanBuffer>();
+    m_VsmCasterPages->Create((VkDeviceSize)m_TotalCount * kVsmTreeCap * sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    m_VsmIndirect = xr_new<CVulkanBuffer>();
+    m_VsmIndirect->Create((VkDeviceSize)m_TotalCount * sizeof(VkDrawIndexedIndirectCommand),
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    m_VsmStats = xr_new<CVulkanBuffer>();
+    m_VsmStats->Create(4 * sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+    // Pool: bin (5 SSBO + 1 UBO) + page (2 SSBO + 1 UBO), ×N.
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 8 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N * 2 } };   // bin 6 SSBO (+slotDirty) + page 2 SSBO
+    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = N * 2; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(dev, &pci, nullptr, &m_VsmDescPool) != VK_SUCCESS) return;
+
+    // Bin set layout (6 bindings) + N sets + pipeline.
+    {
+        VkDescriptorSetLayoutBinding b[7]{};
+        const VkDescriptorType t[7] = {
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,   // 6: slotDirty (Phase 2 cache filter)
+        };
+        for (u32 i = 0; i < 7; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        lci.bindingCount = 7; lci.pBindings = b;
+        if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_VsmBinSetL) != VK_SUCCESS) return;
+        VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_VsmBinSetL;
+        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = m_VsmDescPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
+        if (vkAllocateDescriptorSets(dev, &dai, m_VsmBinSet) != VK_SUCCESS) return;
+        VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(u32) };
+        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        plci.setLayoutCount = 1; plci.pSetLayouts = &m_VsmBinSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_VsmBinLayout) != VK_SUCCESS) return;
+        VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = binCS; cpci.stage.pName = "main"; cpci.layout = m_VsmBinLayout;
+        if (vkCreateComputePipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &cpci, nullptr, &m_VsmBinPipe) != VK_SUCCESS) return;
+    }
+
+    // Page set layout (3 bindings: pageList, casterPages, clipmap UBO) + N sets.
+    {
+        VkDescriptorSetLayoutBinding b[3]{};
+        const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
+        for (u32 i = 0; i < 3; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT; }
+        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        lci.bindingCount = 3; lci.pBindings = b;
+        if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_VsmPageSetL) != VK_SUCCESS) return;
+        VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_VsmPageSetL;
+        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = m_VsmDescPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
+        if (vkAllocateDescriptorSets(dev, &dai, m_VsmPageSet) != VK_SUCCESS) return;
+    }
+
+    // Page pipeline layout: set0 = transforms (reuse), set1 = diffuse (reuse), set2 = page data.
+    {
+        VkDescriptorSetLayout sets[3] = { m_XformDescLayout, m_TexDescLayout, m_VsmPageSetL };
+        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(u32) };   // uvScale, alphaRef, cap, pad
+        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        plci.setLayoutCount = 3; plci.pSetLayouts = sets; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_VsmPageLayout) != VK_SUCCESS) return;
+    }
+
+    // Page pipelines (tcOffset 24 / 28) — depth-only into the D32 atlas, alpha-test FS.
+    auto createPageVariant = [&](u32 tcOffset, VkPipeline& out) {
+        VkPipelineShaderStageCreateInfo ss[2]{};
+        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = pvs; ss[0].pName = "main";
+        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = pfs; ss[1].pName = "main";
+        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
+        VkVertexInputAttributeDescription via[2]{};
+        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
+        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
+        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
+        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        rs.depthBiasEnable = VK_TRUE;
+        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
+        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
+        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
+        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = m_VsmPageLayout;
+        if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS) {
+            Msg("![VK Trees] VSM page pipeline (tcOff=%u) create failed", tcOffset); out = VK_NULL_HANDLE;
+        }
+    };
+    createPageVariant(24, m_VsmPagePipe24);
+    createPageVariant(28, m_VsmPagePipe28);
+
+    m_VsmReady = true;
+    Msg("[VK Trees] VSM caster path ready (%u trees, cap %u pages)", m_TotalCount, kVsmTreeCap);
+}
+
+void CTreeManager::VsmBin(VkCommandBuffer cmd, VkBuffer pageTable, VkBuffer slotDirty, VkBuffer clipmapUBO)
+{
+    if (!m_VsmReady) CreateVsmResources();
+    if (!m_VsmReady || m_TotalCount == 0 || m_VsmBinPipe == VK_NULL_HANDLE) return;
+    if (pageTable == VK_NULL_HANDLE || slotDirty == VK_NULL_HANDLE || clipmapUBO == VK_NULL_HANDLE) return;
+
+    m_VsmSlot = (m_VsmSlot + 1) % VK_FRAMES_IN_FLIGHT;
+    const u32 slot = m_VsmSlot;
+
+    vkCmdFillBuffer(cmd, m_VsmStats->GetHandle(), 0, VK_WHOLE_SIZE, 0u);
+    { VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+      b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr); }
+
+    VkDescriptorBufferInfo bi[7] = {
+        { m_TreeMetadataBuffer->GetHandle(), 0, VK_WHOLE_SIZE }, { clipmapUBO,                     0, VK_WHOLE_SIZE },
+        { pageTable,                         0, VK_WHOLE_SIZE }, { m_VsmCasterPages->GetHandle(),  0, VK_WHOLE_SIZE },
+        { m_VsmIndirect->GetHandle(),        0, VK_WHOLE_SIZE }, { m_VsmStats->GetHandle(),        0, VK_WHOLE_SIZE },
+        { slotDirty,                         0, VK_WHOLE_SIZE },   // 6: STATIC-atlas dirty set (cache filter)
+    };
+    const VkDescriptorType t[7] = {
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+    };
+    VkWriteDescriptorSet w[7]{};
+    for (u32 i = 0; i < 7; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmBinSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 7, w, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VsmBinPipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VsmBinLayout, 0, 1, &m_VsmBinSet[slot], 0, nullptr);
+    const u32 push[2] = { m_TotalCount, kVsmTreeCap };
+    vkCmdPushConstants(cmd, m_VsmBinLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(cmd, (m_TotalCount + 63) / 64, 1, 1);
+}
+
+void CTreeManager::VsmRender(VkCommandBuffer cmd, VkBuffer pageList, VkBuffer clipmapUBO)
+{
+    if (!m_VsmReady || m_TotalCount == 0 || m_XformDescSet == VK_NULL_HANDLE) return;
+    if (m_VsmPagePipe24 == VK_NULL_HANDLE && m_VsmPagePipe28 == VK_NULL_HANDLE) return;
+    if (pageList == VK_NULL_HANDLE || clipmapUBO == VK_NULL_HANDLE) return;
+    const u32 slot = m_VsmSlot;
+
+    VkDescriptorBufferInfo bi[3] = {
+        { pageList,                      0, VK_WHOLE_SIZE },
+        { m_VsmCasterPages->GetHandle(), 0, VK_WHOLE_SIZE },
+        { clipmapUBO,                    0, VK_WHOLE_SIZE },
+    };
+    const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
+    VkWriteDescriptorSet w[3]{};
+    for (u32 i = 0; i < 3; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmPageSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+
+    struct { float uvScale, alphaRef; u32 cap, pad; } pc{ 1.0f / 2048.0f, 200.0f / 255.0f, kVsmTreeCap, 0u };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VsmPageLayout, 0, 1, &m_XformDescSet, 0, nullptr);       // set0 transforms
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VsmPageLayout, 2, 1, &m_VsmPageSet[slot], 0, nullptr);   // set2 page data
+    vkCmdPushConstants(cmd, m_VsmPageLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+    VkPipeline lastPipe = VK_NULL_HANDLE; VkDescriptorSet lastTex = VK_NULL_HANDLE;
+    for (const TreeIndirectGroup& grp : m_Groups) {
+        VkPipeline pipe = (grp.tcOffset == 24) ? m_VsmPagePipe24 : m_VsmPagePipe28;
+        if (pipe == VK_NULL_HANDLE || grp.descSetIdx >= m_TexDescSets.size()) continue;
+        if (pipe != lastPipe) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); lastPipe = pipe; lastTex = VK_NULL_HANDLE; }
+        VkDescriptorSet tex = m_TexDescSets[grp.descSetIdx];
+        if (tex != lastTex) { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VsmPageLayout, 1, 1, &tex, 0, nullptr); lastTex = tex; }
+        VkDeviceSize vbOff = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &grp.vb, &vbOff);
+        vkCmdBindIndexBuffer(cmd, grp.ib, 0, VK_INDEX_TYPE_UINT16);
+        // [#7] ONE multi-draw indirect for the whole group — the group's trees are contiguous
+        // in m_VsmIndirect (tree-index order), so a single call replaces meshCount individual
+        // draws. Cuts ~6288 draw calls/frame to one per group (~tens). Trees with no dirty pages
+        // carry instanceCount=0 from the bin → ~free on the GPU. Needs multiDrawIndirect +
+        // drawIndirectFirstInstance (both enabled in HW_Vulkan).
+        vkCmdDrawIndexedIndirect(cmd, m_VsmIndirect->GetHandle(),
+                                 (VkDeviceSize)grp.meshOffset * sizeof(VkDrawIndexedIndirectCommand),
+                                 grp.meshCount, sizeof(VkDrawIndexedIndirectCommand));
+    }
+}
+
+void CTreeManager::DestroyVsm()
+{
+    if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+    VkDevice dev = VulkanHW.m_Device;
+    if (m_VsmPagePipe24) { vkDestroyPipeline(dev, m_VsmPagePipe24, nullptr); m_VsmPagePipe24 = VK_NULL_HANDLE; }
+    if (m_VsmPagePipe28) { vkDestroyPipeline(dev, m_VsmPagePipe28, nullptr); m_VsmPagePipe28 = VK_NULL_HANDLE; }
+    if (m_VsmPageLayout) { vkDestroyPipelineLayout(dev, m_VsmPageLayout, nullptr); m_VsmPageLayout = VK_NULL_HANDLE; }
+    if (m_VsmBinPipe)    { vkDestroyPipeline(dev, m_VsmBinPipe, nullptr); m_VsmBinPipe = VK_NULL_HANDLE; }
+    if (m_VsmBinLayout)  { vkDestroyPipelineLayout(dev, m_VsmBinLayout, nullptr); m_VsmBinLayout = VK_NULL_HANDLE; }
+    if (m_VsmDescPool)   { vkDestroyDescriptorPool(dev, m_VsmDescPool, nullptr); m_VsmDescPool = VK_NULL_HANDLE;
+                           for (u32 i = 0; i < VK_FRAMES_IN_FLIGHT; ++i) { m_VsmBinSet[i] = VK_NULL_HANDLE; m_VsmPageSet[i] = VK_NULL_HANDLE; } }
+    if (m_VsmBinSetL)    { vkDestroyDescriptorSetLayout(dev, m_VsmBinSetL, nullptr); m_VsmBinSetL = VK_NULL_HANDLE; }
+    if (m_VsmPageSetL)   { vkDestroyDescriptorSetLayout(dev, m_VsmPageSetL, nullptr); m_VsmPageSetL = VK_NULL_HANDLE; }
+    if (m_VsmCasterPages) { m_VsmCasterPages->Destroy(); xr_delete(m_VsmCasterPages); }
+    if (m_VsmIndirect)    { m_VsmIndirect->Destroy(); xr_delete(m_VsmIndirect); }
+    if (m_VsmStats)       { m_VsmStats->Destroy(); xr_delete(m_VsmStats); }
+    m_VsmReady = false; m_VsmSlot = 0;
 }
 
 }  // namespace VK

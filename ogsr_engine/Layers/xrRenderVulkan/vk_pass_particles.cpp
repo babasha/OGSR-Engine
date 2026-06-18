@@ -19,12 +19,19 @@
 #include "vk_barriers.h"          // ImageBarrier — distort RT layout flips
 #include "HW_Vulkan.h"
 
+#include "vk_volumetrics.h"        // VK::Vol — froxel in-scatter probe (Stage-0 smoke lighting) + ProjTerms
 #include "../xrRender/FVF.h"
 #include "../../xr_3da/fmesh.h"   // MT_PARTICLE_EFFECT / MT_PARTICLE_GROUP
 #include "../../xr_3da/device.h"  // Device.mFullTransform_hud2 — HUD-FOV projection
 
 #include <unordered_map>
 #include <string>
+
+// Stage-0 volumetric lighting knobs for smoke billboards (global scope — matches
+// the C-linkage console symbols the other r_vol_* knobs use). strength 0 = off /
+// old look; clamp bounds the per-froxel radiance added so smoke can't blow to white.
+extern float ps_r_vol_smoke;
+extern float ps_r_vol_smoke_clamp;
 
 namespace VK {
 
@@ -33,6 +40,17 @@ namespace {
 
     // Particle vertex = FVF::LIT (24 bytes): vec3 pos, D3DCOLOR, vec2 uv.
     constexpr u32 kVtxStride = sizeof(float) * 3 + sizeof(u32) + sizeof(float) * 2;  // 24
+
+    // Push block shared by the particle VS+FS (and, harmlessly, by the rain/wallmark
+    // passes that reuse this layout — they only push the first 64 bytes). Must match
+    // the PushConstants block in particle.vert/frag.glsl.
+    struct ParticlePush {
+        Fmatrix viewProj;        // 64  VS
+        float   camPosNear[4];   // 16  VS — xyz cam pos, w = froxel near Z
+        float   camDirLogFN[4];  // 16  VS — xyz cam forward, w = log2(far/near)
+        float   volParams[4];    // 16  FS — x = probe strength, yz = 1/extent
+    };
+    static_assert(sizeof(ParticlePush) == 112, "ParticlePush must match the shader push block");
 
     // Per-frame dynamic vertex ring (host-visible). 4 MB ≈ 174k verts ≈ 29k
     // particles per frame — far above any realistic on-screen count.
@@ -46,6 +64,18 @@ namespace {
     VkDescriptorSetLayout s_SetLayout = VK_NULL_HANDLE;
     VkDescriptorPool s_Pool   = VK_NULL_HANDLE;
     VkSampler        s_Sampler = VK_NULL_HANDLE;
+
+    // Set 1 — the froxel in-scatter volume (Stage-0 smoke lighting). One persistent
+    // set pointed at Vol's scatter view (eager-created, so valid from init); rebound
+    // if Vol ever regenerates. Bound for every particle draw because particle.frag
+    // statically references it (the sample itself is gated on volParams.x).
+    // Sentinel "no Vol generation bound yet" — != any real Vol::Generation() so the
+    // first EnsureVolSet() always writes the descriptor.
+    constexpr u32 kVolGenUnbound = 0xFFFFFFFFu;
+
+    VkDescriptorSetLayout s_VolSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet       s_VolSet       = VK_NULL_HANDLE;
+    u32                   s_VolBoundGen  = kVolGenUnbound;
 
     CVulkanBuffer    s_Ring[kFramesInFlight];
 
@@ -259,6 +289,32 @@ namespace {
         }
         return pipe;
     }
+
+    // (Re)point set 1 at Vol's scatter volume. Vol::Init runs before ParticlePass_Init
+    // and creates the volume eagerly, so the view is valid here; this also rebinds if
+    // Vol ever regenerates (Generation() bumps). No-op once bound for the current gen.
+    void EnsureVolSet()
+    {
+        if (!Vol::Ready()) return;
+        const u32 gen = Vol::Generation();
+        if (s_VolBoundGen == gen) return;
+        VkImageView view = Vol::GetScatterView();
+        VkSampler   samp = Vol::GetSampler();
+        if (!view || !samp || s_VolSet == VK_NULL_HANDLE) return;
+        VkDescriptorImageInfo ii{};
+        ii.sampler     = samp;
+        ii.imageView   = view;
+        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w{};
+        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet          = s_VolSet;
+        w.dstBinding      = 0;
+        w.descriptorCount = 1;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo      = &ii;
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        s_VolBoundGen = gen;
+    }
 }
 
 bool ParticlePass_Init()
@@ -290,9 +346,27 @@ bool ParticlePass_Init()
         }
     }
 
-    // Pool — one set per unique sprite texture (~256 generous).
+    // Set 1: binding 0 = froxel scatter volume (combined image sampler, FS) — the
+    // Stage-0 light probe. Always part of the layout; bound for every particle draw.
     {
-        constexpr u32 kMaxSets = 256;
+        VkDescriptorSetLayoutBinding b{};
+        b.binding         = 0;
+        b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b.descriptorCount = 1;
+        b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo lci{};
+        lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        lci.bindingCount = 1;
+        lci.pBindings    = &b;
+        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_VolSetLayout) != VK_SUCCESS) {
+            Msg("![VK Particles] vol set layout create failed");
+            return false;
+        }
+    }
+
+    // Pool — one set per unique sprite texture (~256 generous) + 1 for the vol set.
+    {
+        constexpr u32 kMaxSets = 256 + 1;   // +1 for the persistent vol (set 1) descriptor
         VkDescriptorPoolSize ps{};
         ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         ps.descriptorCount = kMaxSets;
@@ -324,22 +398,41 @@ bool ParticlePass_Init()
         }
     }
 
-    // Pipeline layout: set 0 + push mat4 viewProj (VS).
+    // Pipeline layout: set 0 (sprite) + set 1 (froxel volume) + the ParticlePush block
+    // (viewProj VS + froxel basis VS + volParams FS). The rain/wallmark passes share
+    // this layout but only push the first 64 bytes (viewProj) and never bind set 1 —
+    // valid, since their fragment shaders don't statically use set 1 or the FS bytes.
     {
+        VkDescriptorSetLayout sets[2] = { s_SetLayout, s_VolSetLayout };
         VkPushConstantRange pc{};
-        pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pc.offset     = 0;
-        pc.size       = sizeof(Fmatrix);
+        pc.size       = sizeof(ParticlePush);
         VkPipelineLayoutCreateInfo plci{};
         plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plci.setLayoutCount         = 1;
-        plci.pSetLayouts            = &s_SetLayout;
+        plci.setLayoutCount         = 2;
+        plci.pSetLayouts            = sets;
         plci.pushConstantRangeCount = 1;
         plci.pPushConstantRanges    = &pc;
         if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_Layout) != VK_SUCCESS) {
             Msg("![VK Particles] CreatePipelineLayout failed");
             return false;
         }
+    }
+
+    // Allocate the persistent vol (set 1) descriptor and point it at Vol's scatter
+    // volume (Vol::Init already ran — eager). Re-pointed by EnsureVolSet on regen.
+    {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = s_Pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &s_VolSetLayout;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &ai, &s_VolSet) != VK_SUCCESS) {
+            Msg("![VK Particles] vol set alloc failed");
+            return false;
+        }
+        EnsureVolSet();
     }
 
     for (u32 i = 0; i < kFramesInFlight; ++i)
@@ -375,9 +468,11 @@ void ParticlePass_Destroy()
     s_RainDropFS = VK_NULL_HANDLE;
     DestroyDistortRT();
     if (s_Layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_Layout, nullptr); s_Layout = VK_NULL_HANDLE; }
-    if (s_Pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr); s_Pool = VK_NULL_HANDLE; }
+    if (s_Pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr); s_Pool = VK_NULL_HANDLE; }  // frees s_VolSet too
+    s_VolSet = VK_NULL_HANDLE; s_VolBoundGen = kVolGenUnbound;
     if (s_Sampler)   { vkDestroySampler(VulkanHW.m_Device, s_Sampler, nullptr); s_Sampler = VK_NULL_HANDLE; }
     if (s_SetLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_SetLayout, nullptr); s_SetLayout = VK_NULL_HANDLE; }
+    if (s_VolSetLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_VolSetLayout, nullptr); s_VolSetLayout = VK_NULL_HANDLE; }
     s_VS = s_FS = VK_NULL_HANDLE;
     s_Init = false;
 }
@@ -585,10 +680,40 @@ void Pass_Particles(FrameContext& ctx)
     u32 vtxUsed = 0;
     u32 nDraw = 0, nHud = 0, nDistort = 0;
 
-    // Shared draw loop: builds billboards into the ring at the running offset
-    // and issues one draw per effect. `forcedPipe` overrides the per-blend
-    // pipeline (distort phase renders every effect with the distort pipeline).
-    auto drawList = [&](xr_vector<vkCParticleEffect*>& list, VkPipeline forcedPipe, u32& counter) {
+    // ---- Stage-0 volumetric smoke lighting setup -----------------------------
+    // Build the froxel camera basis the VS uses to map each vertex to its froxel.
+    // The probe (drawList's per-effect volParams.x) is enabled only for the WORLD
+    // phase, only when r_vol actually ran this frame (scatter is valid + SHADER_READ),
+    // and only on alpha-blended smoke — see drawList. The basis is built from the
+    // scene camera even for the HUD phase (which pushes strength 0, so it's unused).
+    EnsureVolSet();
+    const float smokeStrength = (Vol::Ready() && Vol::Wanted()) ? ps_r_vol_smoke : 0.0f;
+
+    ParticlePush push{};
+    {
+        const Vol::GridZParams gz = Vol::GetGridZ();
+        const Fvector& eye = Device.vCameraPosition;
+        Fvector dir; dir.set(0.f, 0.f, 1.f);
+        if (ctx.viewProj) dir = DeriveProjTerms(*ctx.viewProj).dir;
+        push.camPosNear[0]  = eye.x; push.camPosNear[1]  = eye.y; push.camPosNear[2]  = eye.z; push.camPosNear[3]  = gz.nearZ;
+        push.camDirLogFN[0] = dir.x; push.camDirLogFN[1] = dir.y; push.camDirLogFN[2] = dir.z; push.camDirLogFN[3] = gz.logFarNear;
+        push.volParams[1]   = ctx.extent.width  ? 1.0f / float(ctx.extent.width)  : 0.0f;
+        push.volParams[2]   = ctx.extent.height ? 1.0f / float(ctx.extent.height) : 0.0f;
+        push.volParams[3]   = ps_r_vol_smoke_clamp;
+    }
+
+    // Shared draw loop: builds billboards into the ring at the running offset and
+    // issues one draw per effect. `vpMat` is the phase's view-projection; `probe`
+    // is the Stage-0 light-probe strength, applied ONLY to alpha-blended smoke
+    // (PBM_BLEND) — additive fire/sparks/muzzle are self-emissive and would
+    // over-glow, so everything else pushes strength 0. The push carries viewProj,
+    // so it's re-issued whenever the strength changes (and always on the first
+    // drawable effect). `forcedPipe` overrides the per-blend pipeline (the distort
+    // phase renders every effect with one pipeline).
+    auto drawList = [&](xr_vector<vkCParticleEffect*>& list, VkPipeline forcedPipe,
+                        u32& counter, const Fmatrix& vpMat, float probe) {
+        push.viewProj = vpMat;
+        float lastStrength = -1.0f;   // != any real strength → push on first drawable effect
         for (vkCParticleEffect* e : list) {
             VkPipeline pipe = forcedPipe ? forcedPipe : ParticlePass::GetPipeline(e->GetBlendMode());
             if (pipe == VK_NULL_HANDLE) continue;          // build failure
@@ -602,6 +727,14 @@ void Pass_Particles(FrameContext& ctx)
             const u32 vcount = e->BuildVertices(dst, avail);
             if (vcount == 0) continue;
 
+            const float strength = (e->GetBlendMode() == PBM_BLEND) ? probe : 0.0f;
+            if (strength != lastStrength) {
+                push.volParams[0] = strength;
+                vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(ParticlePush), &push);
+                lastStrength = strength;
+            }
+
             if (pipe != lastPipe) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); lastPipe = pipe; }
             if (set  != lastSet)  { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 0, 1, &set, 0, nullptr); lastSet = set; }
 
@@ -614,6 +747,7 @@ void Pass_Particles(FrameContext& ctx)
     VkBuffer vbuf = ring.GetHandle();
     VkDeviceSize voff = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &voff);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Layout, 1, 1, &s_VolSet, 0, nullptr);
 
     VkRect2D sc{ {}, ctx.extent };
 
@@ -650,8 +784,7 @@ void Pass_Particles(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
         if (!s_world.empty() && ctx.viewProj) {
-            vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), ctx.viewProj);
-            drawList(s_world, VK_NULL_HANDLE, nDraw);
+            drawList(s_world, VK_NULL_HANDLE, nDraw, *ctx.viewProj, smokeStrength);   // alpha smoke catches the froxel light
         }
 
         if (!s_hud.empty()) {
@@ -662,8 +795,8 @@ void Pass_Particles(FrameContext& ctx)
             // against the HUD weapon itself.
             vp.minDepth = 0.0f; vp.maxDepth = 0.02f;
             vkCmdSetViewport(cmd, 0, 1, &vp);
-            vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), &Device.mFullTransform_hud2);
-            drawList(s_hud, VK_NULL_HANDLE, nHud);
+            // HUD smoke: no froxel probe (different projection/depth) → strength 0.
+            drawList(s_hud, VK_NULL_HANDLE, nHud, Device.mFullTransform_hud2, 0.0f);
         }
 
         vkCmdEndRendering(cmd);
@@ -713,8 +846,8 @@ void Pass_Particles(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
         if (!s_distort.empty() && ctx.viewProj) {
-            vkCmdPushConstants(cmd, s_Layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), ctx.viewProj);
-            drawList(s_distort, s_DistortPipe, nDistort);
+            // distort writes UV offsets, not colour — no probe → strength 0.
+            drawList(s_distort, s_DistortPipe, nDistort, *ctx.viewProj, 0.0f);
         }
 
         vkCmdEndRendering(cmd);

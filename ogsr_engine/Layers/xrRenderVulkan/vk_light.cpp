@@ -62,10 +62,18 @@ const FrameLights& CollectFrame(const Fvector& eye)
         cands.push_back({ l, d2 });
     }
 
-    if (cands.size() > kMaxLights) {
-        std::partial_sort(cands.begin(), cands.begin() + kMaxLights, cands.end(),
-                          [](const Cand& a, const Cand& b) { return a.d2 < b.d2; });
-        cands.resize(kMaxLights);
+    // NEAREST-FIRST ordering is REQUIRED: the UBO (foliage + the non-clustered
+    // fallback) reads only the first kMaxLights, so those must be the closest
+    // lights — otherwise a near light past slot 16 in registry order (e.g. the
+    // flashlight) silently drops from the UBO path. The clustered SSBO reads all
+    // of them; the order is harmless there. So sort by distance ALWAYS, capping
+    // at kMaxClusterLights (partial_sort when there are more than the cap).
+    auto byDist = [](const Cand& a, const Cand& b) { return a.d2 < b.d2; };
+    if (cands.size() > kMaxClusterLights) {
+        std::partial_sort(cands.begin(), cands.begin() + kMaxClusterLights, cands.end(), byDist);
+        cands.resize(kMaxClusterLights);
+    } else {
+        std::sort(cands.begin(), cands.end(), byDist);
     }
 
     // Fill the GPU array + pick the shadow-casting budget (1 spot + 1 point):

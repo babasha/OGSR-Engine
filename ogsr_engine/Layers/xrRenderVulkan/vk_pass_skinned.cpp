@@ -16,6 +16,7 @@
 #include "../xrRender/SkeletonCustom.h" // CKinematics
 
 #include "vk_pass_skinned.h"
+#include "vk_pass_ssao.h"              // SSAOPass::GetNormalFormat — NPC normal G-buffer target
 #include "vk_pass_world.h"              // g_DynamicVisuals / DynVisual
 #include "vk_swapchain.h"              // Swapchain.m_Format / m_DepthFormat
 #include "vk_scene_color.h"            // HDR scene target format
@@ -31,6 +32,10 @@
 
 #include <unordered_map>
 
+// Console cvar at GLOBAL scope — a block-scope extern inside namespace VK would mangle as
+// VK::ps_r_vsm_npc_dist -> LNK2001 (same trick as vk_pass_shadow's externs).
+extern float ps_r_vsm_npc_dist;   // VSM NPC shadow cull distance (m); 0 = no cull
+
 namespace VK {
 
 namespace {
@@ -45,11 +50,14 @@ namespace {
     VkShaderModule        s_shadowVS   = VK_NULL_HANDLE;  // depth-only caster VS (optional)
     VkShaderModule        s_prepassVS  = VK_NULL_HANDLE;  // depth-prepass AT caster VS (optional)
     VkShaderModule        s_prepassFS  = VK_NULL_HANDLE;  // ... + alpha-test FS (matches skinned.frag)
+    VkShaderModule        s_normalVS   = VK_NULL_HANDLE;  // NPC normal G-buffer VS (skins normal → world, optional)
+    VkShaderModule        s_normalFS   = VK_NULL_HANDLE;  // ... + AT FS writing worldN*0.5+0.5
     CVulkanBuffer         s_boneSSBO;
     Fmatrix*              s_boneMapped = nullptr;
     std::unordered_map<u32, VkPipeline> s_pipelines;        // keyed by vertex stride (36/40/44)
     std::unordered_map<u32, VkPipeline> s_shadowPipelines;  // depth-only casters, same key
     std::unordered_map<u32, VkPipeline> s_prepassPipelines; // scene depth-prepass AT casters
+    std::unordered_map<u32, VkPipeline> s_normalPipelines;  // NPC normal G-buffer casters, same key
 
     // Per-frame upload registry: every skeleton whose bones landed in the SSBO
     // this frame. Bones are stored PRE-MULTIPLIED by the object's world matrix,
@@ -214,6 +222,11 @@ namespace {
         s_prepassFS = g_ShaderManager->Load("shadow_skinned_at.frag.spv");
         if (s_prepassVS == VK_NULL_HANDLE || s_prepassFS == VK_NULL_HANDLE)
             Msg("![VK Skinned] shadow_skinned_at.{vert,frag}.spv missing — NPCs excluded from the depth prepass");
+        // Optional — absence just keeps NPCs on depth-derived GTAO normals (no NPC normal G-buffer).
+        s_normalVS = g_ShaderManager->Load("shadow_skinned_normal.vert.spv");
+        s_normalFS = g_ShaderManager->Load("shadow_skinned_normal.frag.spv");
+        if (s_normalVS == VK_NULL_HANDLE || s_normalFS == VK_NULL_HANDLE)
+            Msg("![VK Skinned] shadow_skinned_normal.{vert,frag}.spv missing — NPC AO normals disabled");
 
         // Descriptor set layout: 1 storage buffer (bone matrices), VERTEX stage.
         VkDescriptorSetLayoutBinding b{};
@@ -442,6 +455,98 @@ namespace {
         return p;
     }
 
+    // NPC NORMAL G-buffer pipeline: same skinning as the depth prepass (positions
+    // bit-match → LEQUAL passes only on the visible surface), but writes the
+    // world-space normal to a color attachment and does NOT write depth (tests
+    // against the already-laid prepass depth). Feeds GTAO real NPC normals.
+    static VkPipeline CreateNormalPipeline(u32 stride)
+    {
+        VkVertexInputBindingDescription   binding{};
+        VkVertexInputAttributeDescription attrs[6]{};
+        BuildSkinnedVI(stride, binding, attrs);
+
+        VkPipelineVertexInputStateCreateInfo vi{};
+        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
+        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_normalVS; stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_normalFS; stages[1].pName = "main";
+
+        VkPipelineInputAssemblyStateCreateInfo ia{};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo vp{};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1; vp.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode    = VK_CULL_MODE_NONE;
+        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth   = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        ds.depthTestEnable  = VK_TRUE;
+        ds.depthWriteEnable = VK_FALSE;                  // test only — the prepass owns the depth
+        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                           | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        cba.blendEnable    = VK_FALSE;
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkPipelineDynamicStateCreateInfo dynState{};
+        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
+
+        const VkFormat normalFmt = SSAOPass::GetNormalFormat();
+        VkPipelineRenderingCreateInfo prci{};
+        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        prci.colorAttachmentCount    = 1;
+        prci.pColorAttachmentFormats = &normalFmt;
+        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;   // tests the scene prepass depth
+
+        VkGraphicsPipelineCreateInfo pi{};
+        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pi.pNext             = &prci;
+        pi.stageCount        = 2;     pi.pStages             = stages;
+        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
+        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
+        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
+        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
+        pi.layout            = s_layout;
+
+        VkPipeline h = VK_NULL_HANDLE;
+        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
+        if (r != VK_SUCCESS) { Msg("![VK Skinned] normal pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        Msg("[VK Skinned] normal G-buffer pipeline created stride=%u", stride);
+        return h;
+    }
+
+    static VkPipeline GetNormalPipeline(u32 stride)
+    {
+        auto it = s_normalPipelines.find(stride);
+        if (it != s_normalPipelines.end()) return it->second;
+        VkPipeline p = CreateNormalPipeline(stride);
+        s_normalPipelines.emplace(stride, p);
+        return p;
+    }
+
     // Resolve a CKinematics child to its mesh + render mode (skinned leaves only).
     template <class TChild>
     static bool ResolveSkinnedLeaf(TChild* child, VK_Render_Mesh*& mesh, u16& rmode)
@@ -631,13 +736,10 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
 // them. Alpha-tested (a < 0.25, same as skinned.frag) so hair/strap cutouts
 // don't punch holes into the early-Z'd background. HUD never enters (s_uploads
 // only). Caller owns render begin/end and viewport (Pass_World prepass).
-void Skinned_RenderDepthPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
+// Shared draw loop for the near-camera skinned casters (depth prepass + normal
+// G-buffer differ only by which pipeline they bind, picked via `getPipe`).
+static void RenderSkinnedCasters(VkCommandBuffer cmd, const Fmatrix& viewProj, VkPipeline (*getPipe)(u32))
 {
-    if (!Init()) return;
-    if (s_prepassVS == VK_NULL_HANDLE || s_prepassFS == VK_NULL_HANDLE) return;
-    Skinned_UploadBones();   // idempotent; Pass_SunShadow usually did it already
-    if (s_uploads.empty()) return;
-
     // AO is short-range — only NPCs near the camera matter as occluders.
     constexpr float kPrepassRange = 60.f;
 
@@ -661,7 +763,7 @@ void Skinned_RenderDepthPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
             if (child->m_bEmissiveAdd) continue;   // collimator marks: blended, no depth
 
-            VkPipeline pipe = GetPrepassPipeline(mesh->vStride);
+            VkPipeline pipe = getPipe(mesh->vStride);
             if (pipe == VK_NULL_HANDLE) continue;
 
             if (pipe != lastPipe) {
@@ -697,6 +799,27 @@ void Skinned_RenderDepthPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
     }
 }
 
+void Skinned_RenderDepthPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
+{
+    if (!Init()) return;
+    if (s_prepassVS == VK_NULL_HANDLE || s_prepassFS == VK_NULL_HANDLE) return;
+    Skinned_UploadBones();   // idempotent; Pass_SunShadow usually did it already
+    if (s_uploads.empty()) return;
+    RenderSkinnedCasters(cmd, viewProj, &GetPrepassPipeline);
+}
+
+// NPC normal G-buffer: same near-camera casters, writing world-space normals
+// into the SSAO normal RT (depth-tested against the prepass depth, no write).
+// Caller owns the render begin/end + viewport (Pass_World, after the prepass).
+void Skinned_RenderNormalPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
+{
+    if (!Init()) return;
+    if (s_normalVS == VK_NULL_HANDLE || s_normalFS == VK_NULL_HANDLE) return;
+    Skinned_UploadBones();
+    if (s_uploads.empty()) return;
+    RenderSkinnedCasters(cmd, viewProj, &GetNormalPipeline);
+}
+
 bool Skinned_AnyCasterInSphere(const Fvector& pos, float range)
 {
     for (const SkelUpload& u : s_uploads)
@@ -707,6 +830,54 @@ bool Skinned_AnyCasterInSphere(const Fvector& pos, float range)
         if (pos.distance_to_sqr(c) <= rr * rr) return true;
     }
     return false;
+}
+
+// VSM skinned casters — one entry per visible world skinned leaf, for vk_vsm to bin +
+// rasterize into the virtual shadow atlas. Coarse skeleton world sphere per leaf (the
+// binner over-covers slightly, which is harmless — extra pages just clip). HUD excluded.
+void Skinned_CollectCasters(xr_vector<VsmSkinnedCaster>& out)
+{
+    if (!Init()) return;
+    Skinned_UploadBones();   // idempotent per Device.dwFrame
+    const float npcDist = ps_r_vsm_npc_dist;   // 0 = no cull (old behaviour)
+    for (const SkelUpload& u : s_uploads)
+    {
+        const Fsphere& bs = u.K->vis.sphere;
+        Fvector c; u.xform.transform_tiny(c, bs.P);
+        const float r = (bs.R > 0.f) ? bs.R : 1.f;
+        // Distant NPCs cast a few-texel shadow → skip the whole skeleton: saves the per-leaf
+        // skinning + VSM binning AND keeps us under kMaxSkinned so NEAR NPCs are never dropped
+        // when a crowd would otherwise overflow the cap. (Collect had NO cull before → it
+        // saturated at 256 leaves; log showed only ~40 actually cast.)
+        if (npcDist > 0.f) {
+            const float rr = npcDist + r;
+            if (Device.vCameraPosition.distance_to_sqr(c) > rr * rr) continue;
+        }
+        for (auto* child : u.K->children)
+        {
+            VK_Render_Mesh* mesh = nullptr; u16 rmode = 0;
+            if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+            if (child->m_bEmissiveAdd) continue;   // collimator marks don't cast
+            VsmSkinnedCaster sc{};
+            sc.sphere_P     = c;            sc.sphere_R = r;
+            sc.index_count  = mesh->iCount; sc.ib_first = mesh->iBase; sc.first_vertex = (s32)mesh->vBase;
+            sc.vb           = mesh->p_rm_Vertices->GetHandle();
+            sc.ib           = mesh->p_rm_Indices->GetHandle();
+            sc.iType        = mesh->iType;  sc.stride   = mesh->vStride;
+            sc.base_bone    = u.baseBone;   sc.bone_count = (u32)u.boneCount;
+            sc.skin_mode    = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+            out.push_back(sc);
+        }
+    }
+}
+
+VkDescriptorSet       Skinned_GetBoneSet()       { return s_set; }
+VkDescriptorSetLayout Skinned_GetBoneSetLayout() { return s_setLayout; }
+
+void Skinned_BuildVertexInput(u32 stride, VkVertexInputBindingDescription& binding,
+                              VkVertexInputAttributeDescription attrs[6])
+{
+    BuildSkinnedVI(stride, binding, attrs);
 }
 
 void Pass_Skinned(FrameContext& ctx)
@@ -755,6 +926,8 @@ void Skinned_Destroy()
     s_shadowPipelines.clear();
     for (auto& kv : s_prepassPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
     s_prepassPipelines.clear();
+    for (auto& kv : s_normalPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+    s_normalPipelines.clear();
     s_shadowVS = VK_NULL_HANDLE;   // module owned by g_ShaderManager
     s_prepassVS = VK_NULL_HANDLE; s_prepassFS = VK_NULL_HANDLE;
     s_uploads.clear(); s_uploadsHud.clear(); s_uploadFrame = u32(-1);

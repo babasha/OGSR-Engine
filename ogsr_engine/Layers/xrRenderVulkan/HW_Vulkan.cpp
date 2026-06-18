@@ -184,6 +184,7 @@ bool CVulkanHW::CreateLogicalDevice()
     deviceFeatures.features.wideLines = VK_TRUE;
     deviceFeatures.features.multiDrawIndirect = VK_TRUE;
     deviceFeatures.features.drawIndirectFirstInstance = VK_TRUE;  // trees: firstInstance encodes global tree index
+    deviceFeatures.features.shaderClipDistance = VK_TRUE;         // VSM: gl_ClipDistance clips page geometry to its atlas sub-rect
     deviceFeatures.pNext = &features12;
 
     // Tessellation (world heightmap displacement, R4 TESS_HM). Universal on

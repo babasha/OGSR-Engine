@@ -48,7 +48,7 @@ void NameBuffer(VkBuffer buf, const char* name);
 // ---------------------------------------------------------------------------
 // Phase 1 — per-frame GPU/CPU zones
 // ---------------------------------------------------------------------------
-constexpr u32 kMaxZones    = 24;   // passes + a little headroom for nesting
+constexpr u32 kMaxZones    = 32;   // top-level passes + sub-zones (World/*, Shadow/*) + headroom
 constexpr u32 kHistory     = 96;   // samples kept per zone (avg/min/max + graph)
 
 // Called by ExecutePasses. FrameBegin reads back the previous occupant of this
@@ -84,6 +84,7 @@ struct ZoneStat
     float cpuLast;                           // ms
     float ring[kHistory];                    // gpu ms history (oldest..newest via ringHead)
     u32   ringHead;
+    u32   depth;                             // nesting level: 0 = top-level pass; children DON'T sum into gpu_total
 };
 struct MemSnap   { u64 usedBytes; u64 budgetBytes; u32 allocCount; u32 blockCount; };
 struct FrameInfo { float cpuMs; float gpuMs; float fps; u32 draws, instances, tris, pipeBinds, descBinds; };

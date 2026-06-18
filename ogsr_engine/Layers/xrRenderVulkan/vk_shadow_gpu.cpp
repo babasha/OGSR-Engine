@@ -274,6 +274,20 @@ void Build()
 
 bool Built() { return s_built && !s_groups.empty() && s_cullPipe != VK_NULL_HANDLE; }
 
+VkBuffer GetMetaBuffer() { return s_meta ? s_meta->GetHandle() : VK_NULL_HANDLE; }
+u32      CasterCount()   { return s_total; }
+u32      MetaStride()    { return (u32)sizeof(GpuCasterMeta); }
+u32      GroupCount()    { return (u32)s_groups.size(); }
+u32      MaxGroupMesh()  { return s_maxGroupMesh; }
+
+bool GetGroupBind(u32 g, VkBuffer& vb, VkBuffer& ib, u32& stride, VkIndexType& iType)
+{
+    if (g >= s_groups.size()) return false;
+    const Group& grp = s_groups[g];
+    vb = grp.vb; ib = grp.ib; stride = grp.stride; iType = grp.iType;
+    return true;
+}
+
 void Cull(VkCommandBuffer cmd, const Target* tgts, const Fvector4* planes, u32 n,
           const Fvector& camPos, float lodDist)
 {

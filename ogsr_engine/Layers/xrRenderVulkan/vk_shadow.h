@@ -61,9 +61,27 @@ const Fmatrix& GetCascadeVP(u32 i);
 // Caster cull vs the cascade light column; inflate widens the box (cached
 // caster queues stay valid while the camera/sun drift between rebuilds).
 bool           CascadeSphereVisible(u32 i, const Fvector& center, float radius, float inflate = 0.f);
-VkImage        GetCascadeImage(u32 i);
-VkImageView    GetCascadeView(u32 i);
+VkImage        GetCascadeImage(u32 i);        // combined (sampled) cascade map
+VkImageView    GetCascadeView(u32 i);         // combined (sampled) cascade map
 u32            CascadeSize(u32 i);
+// Cached STATIC cascade depth (statics+trees+opaque casters), copy-SOURCE for the
+// sampled combined map above — same static/combined split the far map uses, so a
+// standing camera re-rasters nothing and only the dynamic (skinned) overlay + copy
+// run each frame. See vk_pass_shadow.cpp.
+VkImage        GetCascadeStaticImage(u32 i);
+VkImageView    GetCascadeStaticView(u32 i);
+
+// ---- Volumetric fog sun-shadow (r_vol_shadow): a dedicated low-res sun depth
+// rendered EVERY frame (no cache) so the FOG's sun occlusion updates CONTINUOUSLY.
+// The cascade/VSM caches refresh in ~1 s steps on a moving sun → the fog shafts
+// tremble / the field fog pulses; a per-frame map removes the step at the source.
+// Low-res → cheap even per-frame AND naturally soft (good for fog). Anchor-snapped
+// like the cascades so per-frame rendering itself doesn't shimmer.
+VkImage        GetFogShadowImage();
+VkImageView    GetFogShadowView();
+u32            FogShadowSize();
+void           ComputeFogShadowVP(const Fvector& sunDir);   // fresh every frame
+const Fmatrix& GetFogShadowVP();
 
 // ---- Rain occlusion map (R4 rt_smap_rain analogue): one top-down ortho
 // depth render of the statics around the camera. Receivers sample it to mask

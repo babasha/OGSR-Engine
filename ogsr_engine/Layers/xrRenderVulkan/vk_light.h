@@ -67,7 +67,8 @@ public:
 
 namespace Lights {
 
-constexpr u32 kMaxLights = 16;   // nearest active dynamic lights per frame
+constexpr u32 kMaxLights = 16;          // UBO array size — foliage + the non-clustered fallback path
+constexpr u32 kMaxClusterLights = 256;  // SSBO array size — the clustered forward path (vk_clustered)
 
 // GPU-side light record — must match the Lighting UBO `lights[]` entry layout.
 struct GpuLight {
@@ -77,8 +78,11 @@ struct GpuLight {
 };
 
 // Per-frame light set + the two shadow-casting picks (budget: 1 spot + 1 point).
+// `gpu` holds up to kMaxClusterLights (clustered path uploads them all to the
+// SSBO); the UBO + foliage read only the first kMaxLights. spotIdx/pointIdx are
+// indices into this same array, so they're valid for both paths.
 struct FrameLights {
-    GpuLight gpu[kMaxLights];
+    GpuLight gpu[kMaxClusterLights];
     u32      count    = 0;
     int      spotIdx  = -1;   // gpu[] index of the spot-shadowed light (flashlight), -1 = none
     int      pointIdx = -1;   // gpu[] index of the point-shadowed light (campfire),  -1 = none

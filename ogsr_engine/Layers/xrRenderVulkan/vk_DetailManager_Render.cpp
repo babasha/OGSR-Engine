@@ -488,4 +488,25 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     }
 }
 
+// ---- VSM grass-shadow caster access (read-only; see vk_vsm.cpp) -------------
+VkBuffer CDetailManager::Vsm_VisibleSSBO() const { return m_VisibleSSBO  ? m_VisibleSSBO->GetHandle()  : VK_NULL_HANDLE; }
+VkBuffer CDetailManager::Vsm_IndirectBuf() const { return m_IndirectCmdBuf ? m_IndirectCmdBuf->GetHandle() : VK_NULL_HANDLE; }
+u32      CDetailManager::Vsm_TypeCount()   const { return u32(objects.size()); }
+u32      CDetailManager::Vsm_SectionSize() const { return GPU_OUTPUT_CAPACITY / _max(u32(objects.size()), 1u); }
+u32      CDetailManager::Vsm_VertexStride() const { return (u32)sizeof(VK::CDetail::Vertex); }
+
+bool CDetailManager::Vsm_TypeMesh(u32 i, VkBuffer& vb, VkBuffer& ib, u32& indexCount) const
+{
+    if (i >= objects.size()) return false;
+    const VK::CDetail* obj = objects[i];
+    if (!obj || !obj->m_VertexBuffer || !obj->m_IndexBuffer || obj->m_IndexCount == 0) return false;
+    vb = obj->m_VertexBuffer->GetHandle();
+    ib = obj->m_IndexBuffer->GetHandle();
+    indexCount = obj->m_IndexCount;
+    return true;
+}
+
+VkDescriptorSetLayout CDetailManager::Vsm_GfxSetLayout() const { return m_GfxDescLayout; }
+VkDescriptorSet       CDetailManager::Vsm_TypeDiffuseSet(u32 i) const { return (i < m_GfxDescSets.size()) ? m_GfxDescSets[i] : VK_NULL_HANDLE; }
+
 }  // namespace VK

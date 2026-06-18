@@ -176,6 +176,19 @@ public:
     float        m_global_time_old = 0.0f;
     float        fade_distance    = 60.0f;
 
+    // ----- VSM grass-shadow caster access (read-only) -----------------------
+    // vk_vsm rasterizes NEAR grass into the virtual shadow atlas from the SAME
+    // GPU-driven instance buffer (1 frame stale — grass gen runs after VSM in the
+    // frame). The normal grass gen+draw is untouched; this is a read-only side path.
+    VkBuffer Vsm_VisibleSSBO()  const;
+    VkBuffer Vsm_IndirectBuf()  const;
+    u32      Vsm_TypeCount()    const;
+    u32      Vsm_SectionSize()  const;     // GPU_OUTPUT_CAPACITY / max(types,1) — VisibleSSBO per-type stride
+    u32      Vsm_VertexStride() const;     // grass mesh binding-0 stride (sizeof CDetail::Vertex)
+    bool     Vsm_TypeMesh(u32 i, VkBuffer& vb, VkBuffer& ib, u32& indexCount) const;
+    VkDescriptorSetLayout Vsm_GfxSetLayout() const;    // diffuse-sampler set layout (for the grass-page alpha test)
+    VkDescriptorSet       Vsm_TypeDiffuseSet(u32 i) const;
+
 private:
     // ----- Session B per-frame state ---------------------------------------
     DetailGfxPushConstants m_GfxConstants{};

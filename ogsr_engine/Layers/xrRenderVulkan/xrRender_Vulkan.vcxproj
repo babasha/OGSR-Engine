@@ -127,16 +127,22 @@
     <ClInclude Include="vk_profiler.h" />
     <ClInclude Include="vk_imgui.h" />
     <ClInclude Include="vk_vrs.h" />
+    <ClInclude Include="vk_vsm.h" />
     <ClInclude Include="vk_shadow_gpu.h" />
     <ClInclude Include="vk_world_gpu.h" />
+    <ClInclude Include="vk_clustered.h" />
+    <ClInclude Include="vk_volumetrics.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CRender_Vulkan.cpp" />
     <ClCompile Include="vk_profiler.cpp" />
     <ClCompile Include="vk_imgui.cpp" />
     <ClCompile Include="vk_vrs.cpp" />
+    <ClCompile Include="vk_vsm.cpp" />
     <ClCompile Include="vk_shadow_gpu.cpp" />
     <ClCompile Include="vk_world_gpu.cpp" />
+    <ClCompile Include="vk_clustered.cpp" />
+    <ClCompile Include="vk_volumetrics.cpp" />
     <ClCompile Include="stdafx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>

@@ -52,4 +52,16 @@ void Cull(VkCommandBuffer cmd, const Target* tgts, const Fvector4* planes, u32 n
 // the caller). Reuses the shared depth pipelines.
 void Draw(VkCommandBuffer cmd, Target tgt, const Fmatrix& lightVP);
 
+// Caster metadata access for OTHER systems that render the same opaque static
+// casters (VSM binning/render reuse this instead of re-walking the visuals).
+// GpuCasterMeta is std430, 48 B: vec3 sphere_P, float sphere_R, then draw ranges.
+VkBuffer GetMetaBuffer();   // VK_NULL_HANDLE until Built()
+u32      CasterCount();     // number of meta entries (deduped opaque casters)
+u32      MetaStride();      // sizeof(GpuCasterMeta) — for non-array SSBO binding sanity
+u32      GroupCount();      // number of (vb,ib,stride) groups
+u32      MaxGroupMesh();    // largest group's mesh count (cull/indirect region size)
+// Per-group vb/ib/stride for a foreign render loop (VSM draws the same casters into
+// its atlas using its own indirect buffer). Returns false if g is out of range.
+bool     GetGroupBind(u32 g, VkBuffer& vb, VkBuffer& ib, u32& stride, VkIndexType& iType);
+
 }} // namespace VK::ShadowGPU

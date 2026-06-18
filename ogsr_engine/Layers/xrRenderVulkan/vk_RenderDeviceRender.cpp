@@ -24,6 +24,9 @@
 #include "vk_pass_registry.h"  // VK::PassTimingDestroy() — GPU timing query pool teardown
 #include "vk_imgui.h"          // VK::ImGuiVK::Shutdown() — profiler overlay teardown
 #include "vk_vrs.h"            // VK::VRS::Destroy() — shading-rate image teardown
+#include "vk_vsm.h"            // VK::VSM::Destroy() — virtual shadow maps teardown
+#include "vk_clustered.h"      // VK::Clustered::Destroy() — clustered forward teardown
+#include "vk_volumetrics.h"    // VK::Vol::Init/Destroy() — froxel volumetrics
 #include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
 #include "vk_pass_particles.h" // VK::ParticlePass_Init/Destroy — billboard particle pass
@@ -138,6 +141,7 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     VK::TonemapPass::Init();       // HDR → swapchain composite (after SkyPass — shares the SPIRV loader)
     VK::BloomPass::Init();         // bright-pass + blur feeding the tonemap composite
     VK::SSAOPass::Init();          // GTAO from the depth prepass (EnvLight binding 8)
+    VK::Vol::Init();               // froxel volumetrics (3D volume eager so the tonemap binding 4 is valid)
     VK::ParticlePass_Init();
 
     // Load the particle-definition library (particles.xr / .pe-.pg) so
@@ -199,6 +203,9 @@ void vkRenderDeviceRender::Destroy()
     VK::EnvLight::Destroy();            Msg("[VK] DevRender::Destroy: EnvLight done");
     VK::ShadowMap::Destroy();          Msg("[VK] DevRender::Destroy: ShadowMap done");
     VK::VRS::Destroy();                 Msg("[VK] DevRender::Destroy: VRS done");
+    VK::VSM::Destroy();                 Msg("[VK] DevRender::Destroy: VSM done");
+    VK::Clustered::Destroy();           Msg("[VK] DevRender::Destroy: Clustered done");
+    VK::Vol::Destroy();                 Msg("[VK] DevRender::Destroy: Vol done");
     VK::ImGuiVK::Shutdown();            Msg("[VK] DevRender::Destroy: ImGui overlay done");
     VK::PassTimingDestroy();            Msg("[VK] DevRender::Destroy: PassTiming done");
     VK::PipelineCache::Destroy();       Msg("[VK] DevRender::Destroy: PipelineCache done");

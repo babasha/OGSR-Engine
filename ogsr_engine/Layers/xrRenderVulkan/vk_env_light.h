@@ -75,8 +75,17 @@ struct LightUBO {
     // SSS per-pixel puddles (SSFX deffer_terrain_high_flat port): water as a rising
     // LEVEL vs the detail micro-height — terrain texture relief (ruts) pools first.
     float pom_params7[4];   // x = enable, y = water level, z = micro-height contrast, w = macro mask scale
+    // Clustered forward (vk_clustered): the froxel-grid parameters the fragment
+    // needs to find its cluster. The light list itself lives in SSBOs bound at
+    // set bindings 17 (lights) / 18 (grid) / 19 (indices). Appended last (prefix-safe).
+    float cluster_params[4];  // x = sliceScale, y = sliceBias, z = near (m), w = enable (r_clustered)
+    float cluster_params2[4]; // x = grid X, y = grid Y, z = grid Z, w = max lights / cluster (debug scale)
+    // Dynamic-light terrain/static occlusion (r_light_occ): the forward shaders
+    // march the ground-height map (binding 13, via rain_vp) between fragment and
+    // light, so a buried lamp can't light through the ground. Appended (prefix-safe).
+    float light_occ[4];       // x = enable, y = bury bias, z = march bias, w = strength
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
 
 bool                  Init();                 // idempotent; safe to call from multiple pass inits
