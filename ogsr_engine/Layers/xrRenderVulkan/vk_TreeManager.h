@@ -136,8 +136,13 @@ public:
     // depth so GTAO sees them and the foliage color passes get early-Z
     // (same VP + alpha-ref as the LEQUAL color pass → re-raster matches).
     // Caller owns render begin/end, viewport and bias.
+    // minDist/maxDist: cull trees by camera distance to split the shadow into a
+    // cached STATIC layer (far: minDist=wind_shadow_dist) and a per-frame DYNAMIC
+    // layer (near: maxDist=wind_shadow_dist) so near trees sway in the wind without
+    // re-rasterizing the whole forest. Defaults = all trees (no split).
     void RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade = -1,
-                     const CFrustum* frustum = nullptr);
+                     const CFrustum* frustum = nullptr,
+                     float minDist = 0.0f, float maxDist = 1e9f);
 
     // VSM caster path (trees are static → temporal-friendly). vk_vsm provides the page
     // buffers (its own pageTable/pageList + this frame's clipmap UBO). VsmBin runs the

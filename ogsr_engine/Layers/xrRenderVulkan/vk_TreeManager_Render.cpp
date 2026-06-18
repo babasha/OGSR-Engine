@@ -46,6 +46,7 @@ extern float ps_r_wind_tree_anim;   // r_wind_tree_anim  — branch flutter spee
 extern float ps_r_wind_tree_trunk;  // r_wind_tree_trunk — trunk anim speed
 extern float ps_r_wind_tree_flutter;// r_wind_tree_flutter — crown flutter amplitude
 extern float ps_r_wind_tree_crown;  // r_wind_tree_crown — flutter fade-in height
+extern int   ps_r_vsm_tree_wind;    // r_vsm_tree_wind — TEST: wind in VSM tree shadow pages
 
 namespace VK
 {
@@ -422,7 +423,7 @@ void CTreeManager::CreateGfxPipelines()
 // metadata walk + per-tree draws are off the per-frame path).
 // ============================================================================
 void CTreeManager::RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade,
-                               const CFrustum* frustum)
+                               const CFrustum* frustum, float minDist, float maxDist)
 {
     if (!m_bBuilt || m_MetaCPU.empty()) return;
     if (m_XformDescSet == VK_NULL_HANDLE || m_GfxPipelineLayout == VK_NULL_HANDLE) return;
@@ -462,6 +463,12 @@ void CTreeManager::RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 
         for (u32 i = 0; i < grp.meshCount; ++i)
         {
             const GpuTreeMeta& m = m_MetaCPU[grp.meshOffset + i];
+            // Distance split (wind shadows): keep near trees in the per-frame
+            // dynamic layer and far trees in the cached static layer.
+            if (minDist > 0.0f || maxDist < 1e9f) {
+                const float d = Device.vCameraPosition.distance_to(m.sphere_P);
+                if (d < minDist || d >= maxDist) continue;
+            }
             if (frustum) {
                 if (!frustum->testSphere_dirty(m.sphere_P, m.sphere_R)) continue;
             } else if (cascade >= 0 ? !ShadowMap::CascadeSphereVisible((u32)cascade, m.sphere_P, m.sphere_R)
@@ -761,7 +768,9 @@ void CTreeManager::CreateVsmResources()
     // Page pipeline layout: set0 = transforms (reuse), set1 = diffuse (reuse), set2 = page data.
     {
         VkDescriptorSetLayout sets[3] = { m_XformDescLayout, m_TexDescLayout, m_VsmPageSetL };
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(u32) };   // uvScale, alphaRef, cap, pad
+        // 16 B base (uvScale, alphaRef, cap, pad) + 48 B TEST wind (wind_params,
+        // wsetup_trees, wind_anim) for r_vsm_tree_wind. See tree_vsm_page.vert.
+        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64 };
         VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
         plci.setLayoutCount = 3; plci.pSetLayouts = sets; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
         if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_VsmPageLayout) != VK_SUCCESS) return;
@@ -868,7 +877,26 @@ void CTreeManager::VsmRender(VkCommandBuffer cmd, VkBuffer pageList, VkBuffer cl
     for (u32 i = 0; i < 3; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmPageSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
     vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
 
-    struct { float uvScale, alphaRef; u32 cap, pad; } pc{ 1.0f / 2048.0f, 200.0f / 255.0f, kVsmTreeCap, 0u };
+    // Base push + TEST wind block (r_vsm_tree_wind). When off, wsetup/anim stay 0
+    // → ssfxTreeWind produces zero displacement (identical to the rigid path).
+    struct VsmPagePush {
+        float    uvScale, alphaRef; u32 cap, pad;
+        Fvector4 wind_params, wsetup_trees, wind_anim;
+    } pc{};
+    pc.uvScale = 1.0f / 2048.0f; pc.alphaRef = 200.0f / 255.0f; pc.cap = kVsmTreeCap;
+    if (ps_r_vsm_tree_wind) {
+        // ===== TEST/EXPERIMENTAL: wind on VSM tree shadow pages. Animates only when
+        // the static toroidal pages refresh (sun motion / round-robin) — a static sun
+        // leaves them frozen. Per-frame smoothness would need a dynamic-atlas tree
+        // path (not done). Same wind math as the forward tree (ssfx_tree_wind). =====
+        pc.wsetup_trees.set(ps_r_wind_tree_anim, ps_r_wind_tree_trunk, ps_r_wind_tree_bend, 0.1f);
+        if (g_pGamePersistent) {
+            const Fvector3 wa = g_pGamePersistent->Environment().wind_anim;
+            pc.wind_anim.set(wa.x, wa.y, wa.z, ps_r_wind_tree_flutter);
+            if (auto* E = g_pGamePersistent->Environment().CurrentEnv)
+                pc.wind_params.set(E->wind_direction, E->wind_velocity, 0.0f, 0.0f);
+        }
+    }
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VsmPageLayout, 0, 1, &m_XformDescSet, 0, nullptr);       // set0 transforms
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VsmPageLayout, 2, 1, &m_VsmPageSet[slot], 0, nullptr);   // set2 page data
     vkCmdPushConstants(cmd, m_VsmPageLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);

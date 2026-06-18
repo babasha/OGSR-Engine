@@ -158,6 +158,8 @@ float ps_r_wind_tree_anim    = 11.0f; // r_wind_tree_anim    — branch/leaf flu
 float ps_r_wind_tree_trunk   = 0.15f; // r_wind_tree_trunk   — trunk anim speed (SSFX wsetup_trees.y)
 float ps_r_wind_tree_flutter = 4.0f;  // r_wind_tree_flutter — crown/leaf flutter amplitude (our extra, SSFX has none)
 float ps_r_wind_tree_crown   = 4.0f;  // r_wind_tree_crown   — height (m) where leaf flutter fades in (low trunk stays still)
+float ps_r_wind_shadow_dist  = 40.0f; // r_wind_shadow_dist  — radius (m) where tree SHADOWS sway (near=per-frame, far=cached); 0 = all static (cheapest)
+int   ps_r_vsm_tree_wind     = 0;     // r_vsm_tree_wind — TEST/experimental: apply wind to VSM tree shadow pages (animates only when static pages refresh; static sun = frozen). Default OFF.
 
 // Vulkan lighting normalization knobs (live, no restart). Both used to be
 // literals scattered across the scene shaders (LDR-era compensation that
@@ -1069,6 +1071,8 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_wind_tree_trunk", &ps_r_wind_tree_trunk, 0.f, 2.f); // tree trunk anim speed
     CMD4(CCC_Float, "r_wind_tree_flutter", &ps_r_wind_tree_flutter, 0.f, 16.f); // crown/leaf flutter amplitude
     CMD4(CCC_Float, "r_wind_tree_crown", &ps_r_wind_tree_crown, 0.f, 30.f);     // height where leaf flutter fades in
+    CMD4(CCC_Float, "r_wind_shadow_dist", &ps_r_wind_shadow_dist, 0.f, 160.f);  // tree shadow wind radius (0 = all static)
+    CMD4(CCC_Integer, "r_vsm_tree_wind", &ps_r_vsm_tree_wind, 0, 1);            // TEST: wind in VSM tree shadow pages
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
     CMD4(CCC_Float, "r_ambient_floor", &ps_r_ambient_floor, 0.f, 0.5f);
     CMD4(CCC_Float, "r_wet_darken", &ps_r_wet_darken, 0.f, 1.f);

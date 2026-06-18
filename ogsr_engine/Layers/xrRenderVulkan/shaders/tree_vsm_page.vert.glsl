@@ -7,6 +7,7 @@
 // = gl_InstanceIndex / cap picks the per-tree xform. Then route to the page (ortho + atlas
 // sub-rect + clip), same as vsm_page.vert. See vk_TreeManager_Render.cpp.
 #include "vsm_common.glsl"
+#include "ssfx_tree_wind.glsl"   // TEST (r_vsm_tree_wind): same wind as the forward tree; s_waves @ set0 b1
 
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUV;    // SHORT2 SSCALED
@@ -22,7 +23,12 @@ layout(set = 2, binding = 2) uniform VsmParams {
     vec4 zparams;
 } vsm;
 
-layout(push_constant) uniform PC { float uvScale; float alphaRef; uint cap; uint pad; } pc;
+layout(push_constant) uniform PC {
+    float uvScale; float alphaRef; uint cap; uint pad;
+    vec4  wind_params;   // TEST wind (r_vsm_tree_wind): all 0 when off → no displacement
+    vec4  wsetup_trees;
+    vec4  wind_anim;
+} pc;
 
 layout(location = 0) out vec2 vUV;
 out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[4]; };
@@ -37,7 +43,20 @@ void main()
         return;
     }
     uint treeIdx = gl_InstanceIndex / pc.cap;
-    vec3 wp = (inst[treeIdx].xform * vec4(aPos, 1.0)).xyz;
+    mat4 X = inst[treeIdx].xform;
+    vec3 wp = (X * vec4(aPos, 1.0)).xyz;
+    // TEST wind (r_vsm_tree_wind): same world-space displacement as the forward
+    // tree (ssfx_tree_wind). Off → wsetup/anim are 0 → ssfxTreeWind returns 0.
+    {
+        float baseY = X[3].y;
+        float H     = wp.y - baseY;
+        float r     = -pc.wind_params.x + 1.57079;
+        vec2  wdir  = vec2(cos(r), sin(r));
+        float spd   = max(pc.wsetup_trees.w, clamp(pc.wind_params.y * 0.001, 0.0, 1.0));
+        wp += ssfxTreeWind(inst[treeIdx]._p0, wp, H, vUV.y, wdir, spd, baseY,
+                           pc.wind_anim.xyz, pc.wsetup_trees.x, pc.wsetup_trees.y,
+                           pc.wsetup_trees.z, pc.wind_anim.w);
+    }
 
     uvec4 pg   = pageList[slot];
     int   L    = int(pg.x);

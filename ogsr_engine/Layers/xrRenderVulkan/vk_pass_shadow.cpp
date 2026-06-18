@@ -44,6 +44,7 @@ extern int   ps_r_shadow_lod;      // caster-LOD: distant casters draw coarse ge
 extern float ps_r_shadow_lod_dist; // metres from camera beyond which casters go coarse
 extern int   ps_r_shadow_casc_cache; // cascade static-map cache (0 = re-raster every frame)
 extern float ps_r_shadow_casc_sun;   // sun-rotation degrees that forces a cascade static redraw
+extern float ps_r_wind_shadow_dist;  // tree-shadow wind radius: near (< dist) per-frame, far cached; 0 = all static
 extern int   ps_r_vsm;               // VSM on → its mask drives ALL sun receivers, so the cascade/far sun maps are redundant
 extern int   ps_r_vol;               // froxel volumetrics: samples the cascade for froxel SUN occlusion → keep it rendered even under VSM
 extern int   ps_r_vol_debug;
@@ -725,7 +726,11 @@ void Pass_SunShadow(FrameContext& ctx)
                     if (gpuShadows)
                         ShadowGPU::Draw(cmd, (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
                     if (RImplementation.Trees && RImplementation.Trees->IsBuilt())
-                        RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci);
+                        // Static (cached) layer = FAR trees only; near trees sway in
+                        // the per-frame dynamic overlay below (r_wind_shadow_dist;
+                        // 0 → minDist 0 → all trees cached, original behaviour).
+                        RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci,
+                                                           nullptr, ps_r_wind_shadow_dist, 1e9f);
                 }
 
                 vkCmdEndRendering(cmd);
@@ -767,8 +772,15 @@ void Pass_SunShadow(FrameContext& ctx)
             vkCmdSetViewport(cmd, 0, 1, &vpC);
             vkCmdSetScissor(cmd, 0, 1, &scC);
             vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
-            if (cascRaster)                                  // skinned (NPC) overlay → they also cast volumetric shadows
+            if (cascRaster) {                                // skinned (NPC) overlay → they also cast volumetric shadows
                 Skinned_RenderShadow(cmd, ShadowMap::GetCascadeVP(ci));
+                // NEAR trees, re-rasterized EVERY frame at their current wind pose
+                // (the far forest stays in the cached static map). Bounded by
+                // r_wind_shadow_dist → same cost class as the NPC overlay.
+                if (ps_r_wind_shadow_dist > 0.f && RImplementation.Trees && RImplementation.Trees->IsBuilt())
+                    RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci,
+                                                       nullptr, 0.0f, ps_r_wind_shadow_dist);
+            }
             vkCmdEndRendering(cmd);
 
             ImageBarrier(cmd, ShadowMap::GetCascadeImage(ci), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
