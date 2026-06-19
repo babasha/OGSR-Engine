@@ -16,10 +16,16 @@
 // Output: R8 visibility (1 = open, 0 = fully occluded). Pairs with
 // ssao_blur.frag (depth-aware 3×3) before receivers sample it.
 
+// MRT: target 0 = AO + bent normal (unchanged); target 1 = SSIL indirect light,
+// gathered in the SAME horizon march (the occluder that raises the horizon is the
+// surface that bounces light at us) from the PREVIOUS frame's lit colour — there
+// is no lit colour in the prepass, and prev-frame is the temporal foundation.
 layout(location = 0) out vec4 outAO;   // r = AO visibility, gba = world-space bent normal *0.5+0.5
+layout(location = 1) out vec4 outIL;   // rgb = indirect radiance (HDR, pre-exposure), a = 1
 
-layout(set = 0, binding = 0) uniform sampler2D uDepth;    // full-res scene depth (D32, prepass)
-layout(set = 0, binding = 2) uniform sampler2D uNormal;   // NPC normal G-buffer (rgb=worldN*0.5+0.5, a=valid); a=0 elsewhere
+layout(set = 0, binding = 0) uniform sampler2D uDepth;     // full-res scene depth (D32, prepass)
+layout(set = 0, binding = 2) uniform sampler2D uNormal;    // NPC normal G-buffer (rgb=worldN*0.5+0.5, a=valid); a=0 elsewhere
+layout(set = 0, binding = 3) uniform sampler2D uPrevColor; // PREVIOUS frame's lit scene, half-res (linear HDR) — IL source
 
 layout(push_constant) uniform PC {
     vec4 camDir;     // xyz = camera forward (unit)
@@ -27,7 +33,7 @@ layout(push_constant) uniform PC {
     vec4 camTopT;    // xyz = top   * tan(fovY/2), w = tan(fovY/2)
     vec4 zp;         // x = proj _33, y = proj _43, z = world radius (m), w = samples/side
     vec4 res;        // xy = AO target size, zw = 1 / AO target size
-    vec4 dbg;        // x = r_ssao_debug mode (2 = write linear depth, 3 = write normal.y)
+    vec4 dbg;        // x = r_ssao_debug mode (2 = depth, 3 = normal); y = SSIL on; z = SSIL firefly clamp
 } pc;
 
 const float PI = 3.14159265;
@@ -64,10 +70,11 @@ void main()
     if (pc.dbg.x > 1.5 && pc.dbg.x < 2.5) {
         float zv = clamp(pc.zp.y / (zndc - pc.zp.x), 0.0, 10000.0);
         outAO = vec4(clamp(zv * 0.01, 0.0, 1.0), 0.5, 0.5, 0.5);
+        outIL = vec4(0.0);
         return;
     }
 
-    if (zndc >= 0.9999) { outAO = vec4(1.0, 0.5, 0.5, 0.5); return; }   // sky / no prepass coverage (bentN encodes ~0 → receiver uses geomN)
+    if (zndc >= 0.9999) { outAO = vec4(1.0, 0.5, 0.5, 0.5); outIL = vec4(0.0); return; }   // sky / no prepass coverage (bentN encodes ~0 → receiver uses geomN)
 
     vec4 C    = fetchPos(uv);
     vec3 cPos = C.xyz;
@@ -107,7 +114,7 @@ void main()
 
     // r_ssao_debug 3: reconstructed world normal "up-ness" — flat ground ≈ 1,
     // walls ≈ 0.5, noise here means the depth-derivative normals are broken.
-    if (pc.dbg.x > 2.5 && pc.dbg.x < 3.5) { outAO = vec4(N.y * 0.5 + 0.5, 0.5, 0.5, 0.5); return; }
+    if (pc.dbg.x > 2.5 && pc.dbg.x < 3.5) { outAO = vec4(N.y * 0.5 + 0.5, 0.5, 0.5, 0.5); outIL = vec4(0.0); return; }
 
     // Screen axes as world directions — the original's view-space (x,y).
     vec3 rightU = normalize(pc.camRightT.xyz);
@@ -139,6 +146,14 @@ void main()
 
     float visibility = 0.0;
     vec3  bentNormal = vec3(0.0);
+
+    // SSIL: accumulate the colour of horizon-raising occluders (the surfaces that
+    // actually bounce light at this pixel), read from the PREVIOUS frame's lit
+    // scene. ilOn gates the prev-colour taps so r_ssil 0 costs nothing extra.
+    bool  ilOn      = pc.dbg.y > 0.5;
+    float fireClamp = pc.dbg.z;
+    vec3  ilAccum   = vec3(0.0);
+    float ilWsum    = 0.0;
 
     for (int slice = 0; slice < SLICES; ++slice)
     {
@@ -174,7 +189,22 @@ void main()
                 vec3 sHorizonV = sPos - cPos;
                 float falloff = clamp(dot(sHorizonV, sHorizonV) * falloff_mul, 0.0, 1.0);
                 float H = dot(normalize(sHorizonV), viewV);
-                cHorizonCos = (H > cHorizonCos) ? mix(H, cHorizonCos, falloff) : cHorizonCos;
+                if (H > cHorizonCos) {
+                    // This sample raised the horizon → it's a visible occluder
+                    // that bounces light. Accumulate its colour as a WEIGHTED
+                    // AVERAGE (range falloff × cosine to the receiver normal) — a
+                    // proper average, NOT a sum, so a single near sample can't
+                    // blow it up and flat ground (every neighbour is an "occluder")
+                    // doesn't glow.
+                    if (ilOn) {
+                        vec3  dirS = sHorizonV * inversesqrt(max(dot(sHorizonV, sHorizonV), 1e-6));
+                        float w    = (1.0 - falloff) * max(dot(dirS, N), 0.0);
+                        vec3  sc   = textureLod(uPrevColor, sTexCoord, 0.0).rgb;
+                        ilAccum += min(sc, vec3(fireClamp)) * w;
+                        ilWsum  += w;
+                    }
+                    cHorizonCos = mix(H, cHorizonCos, falloff);
+                }
             }
 
             float h = n + clamp(sideSign * fast_acos(cHorizonCos) - n, -PI * 0.5, PI * 0.5);
@@ -197,4 +227,15 @@ void main()
     float aoOut = clamp(visibility / float(SLICES), 0.0, 1.0);
     vec3  bn    = (dot(bentNormal, bentNormal) > 1e-6) ? normalize(bentNormal) : N;
     outAO = vec4(aoOut, bn * 0.5 + 0.5);
+
+    // IL = weighted AVERAGE of the occluders' colour (the light bouncing toward
+    // this pixel). No occlusion gate here — gating by (1-AO) concentrated the
+    // bounce into a bright rim at contacts (a "neon underglow"). Energy is handled
+    // at composite instead (fill shadows, not lit surfaces). Where there are no
+    // occluders (open sky-facing ground) ilWsum≈0 → IL 0. Composite applies the
+    // shadow gate + r_ssil_strength + exposure.
+    // Bake r_ssil_strength (dbg.w) here so the forward receivers apply a fixed
+    // ssilBoost() — keeps the strength a single live knob without a UBO field.
+    vec3 ilAvg = (ilWsum > 1e-3) ? ilAccum / ilWsum : vec3(0.0);
+    outIL = vec4(ilAvg * pc.dbg.w, 1.0);
 }

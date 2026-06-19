@@ -21,6 +21,7 @@
 
 #include "vk_volumetrics.h"        // VK::Vol — froxel in-scatter probe (Stage-0 smoke lighting) + ProjTerms
 #include "../xrRender/FVF.h"
+#include "../../xrParticles/psystem.h"  // PAPI::Particle / ParticleManager — Stage-1 smoke media collect
 #include "../../xr_3da/fmesh.h"   // MT_PARTICLE_EFFECT / MT_PARTICLE_GROUP
 #include "../../xr_3da/device.h"  // Device.mFullTransform_hud2 — HUD-FOV projection
 
@@ -32,6 +33,12 @@
 // old look; clamp bounds the per-froxel radiance added so smoke can't blow to white.
 extern float ps_r_vol_smoke;
 extern float ps_r_vol_smoke_clamp;
+// Stage-1 VMS: near-range cutoff for injected smoke media (tied to the terrain detail
+// bubble — capped at r__detail_radius so smoke media lives within the grass/terrain
+// zone where the froxel grid is fine; far smoke stays billboard-only).
+extern float ps_r_vol_smoke_dist;
+extern float ps_r_vol_smoke_dist_full;   // inner full-quality radius (volumetric LOD)
+extern int   ps_r__detail_radius;
 
 namespace VK {
 
@@ -628,6 +635,71 @@ VkDescriptorSet GetTextureSet(const char* texture_name)
 }
 
 }  // namespace ParticlePass
+
+void CollectSmokeParticles(xr_vector<VK::Vol::SmokeParticle>& out)
+{
+    // World-phase alpha smoke (PBM_BLEND) only — additive fire/sparks/muzzle are
+    // self-emissive (not media), HUD smoke uses a different projection. Same flatten
+    // as Pass_Particles. Each live PAPI particle → a media splat sample.
+    //
+    // Two-zone LOD: the exp-Z froxel grid is fine near the camera but coarse far away
+    // (distant smoke = blobby muddy clouds + wasted splat). FULL volumetric quality only
+    // inside dist_full (~12 m); from there density fades linearly to 0 by smoke_dist
+    // (capped at the terrain detail bubble r__detail_radius); beyond that the billboard
+    // alone represents it (still lit by the Stage-0 probe). So the pretty volumetric smoke
+    // is the near body, the muddy far blobs never form, and the expensive full-footprint
+    // splats concentrate near the camera (far footprints shrink with cell size anyway).
+    const Fvector& eye    = Device.vCameraPosition;
+    const Fvector& camDir = Device.vCameraDirection;   // forward — drop the behind-camera hemisphere
+    const float maxD      = _min(ps_r_vol_smoke_dist, float(_max(ps_r__detail_radius, 1)));
+    const float maxDSqr   = maxD * maxD;
+    const float distFull  = _min(ps_r_vol_smoke_dist_full, maxD);   // full-quality inner radius
+    const float fadeRange = _max(maxD - distFull, 0.001f);
+
+    static xr_vector<vkCParticleEffect*> collect;
+    for (const DynVisual& d : g_DynamicVisuals) {
+        if (!d.vis) continue;
+        const u32 t = d.vis->Type;
+        if (t != MT_PARTICLE_EFFECT && t != MT_PARTICLE_GROUP) continue;
+        collect.clear();
+        static_cast<vkParticleVisual*>(d.vis)->CollectEffects(collect);
+        for (vkCParticleEffect* e : collect) {
+            if (!e || e->GetBlendMode() != PBM_BLEND || e->GetHudMode()) continue;
+
+            PAPI::Particle* particles = nullptr;
+            u32 p_cnt = 0;
+            PAPI::ParticleManager()->GetParticles(e->GetHandleEffect(), particles, p_cnt);
+            if (!particles || !p_cnt) continue;
+
+            const bool xform = e->m_RT_Flags.is(vkCParticleEffect::flRT_XFORM);
+            for (u32 i = 0; i < p_cnt; ++i) {
+                const PAPI::Particle& m = particles[i];
+                if (m.colorA <= 0.003f) continue;            // invisible → contributes no media
+
+                Fvector wp;
+                if (xform) e->m_XFORM.transform_tiny(wp, m.pos);
+                else       wp.set(m.pos.x, m.pos.y, m.pos.z);
+
+                // Behind the camera → can never land in a view-frustum froxel (the splat
+                // would reject it anyway); cull here so it's not uploaded/splatted at all.
+                Fvector rel; rel.sub(wp, eye);
+                if (rel.dotproduct(camDir) <= 0.0f) continue;
+                const float d2 = eye.distance_to_sqr(wp);
+                if (d2 > maxDSqr) continue;                  // outside the detail bubble → billboard only
+                float dens = m.colorA;
+                const float dd = _sqrt(d2);
+                if (dd > distFull) dens *= _max(1.0f - (dd - distFull) / fadeRange, 0.0f);   // LOD fade → billboard
+                if (dens <= 0.003f) continue;
+
+                VK::Vol::SmokeParticle sp;
+                sp.pos[0] = wp.x; sp.pos[1] = wp.y; sp.pos[2] = wp.z;
+                sp.radius = (m.size.x + m.size.y) * 0.25f;   // avg billboard half-extent
+                sp.color[0] = m.colorR; sp.color[1] = m.colorG; sp.color[2] = m.colorB; sp.color[3] = dens;
+                out.push_back(sp);
+            }
+        }
+    }
+}
 
 void Pass_Particles(FrameContext& ctx)
 {

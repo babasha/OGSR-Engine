@@ -58,6 +58,17 @@ VkSampler   GetSampler();      // linear/clamp — receivers bilinearly upsample
 u32         Generation();      // bumps when the RTs are (re)created — rebind triggers
 float       Strength();        // ao_params.z for the Lighting UBO (0 disables in-shader)
 
+// SSIL — one-bounce indirect light, gathered in the SAME GTAO horizon march (MRT
+// target 1) from the previous frame's lit colour. The tonemap composite adds it
+// (binding 5). VK_NULL_HANDLE until the first Execute with r_ssil on.
+VkImageView GetILResultView();
+
+// Capture THIS frame's lit scene (half-res, linear HDR) into the history buffer
+// the NEXT frame's GTAO samples for IL. Blits `srcImage` (the composited HDR
+// scene, SHADER_READ) down to the half-res prev-colour target. Called from the
+// tonemap pass after the scene is complete. No-op when r_ssil is off.
+void CapturePrevColor(VkCommandBuffer cmd, VkImage srcImage, VkExtent2D srcExtent);
+
 // NPC normal G-buffer (full-res RGBA8). The skinned normal pass renders into it
 // between the depth prepass and Execute; GTAO samples it (real normals where an
 // NPC is visible, depth-derived fallback elsewhere). Null until EnsureTargets.

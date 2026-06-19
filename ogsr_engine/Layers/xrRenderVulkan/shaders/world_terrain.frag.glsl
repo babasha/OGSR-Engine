@@ -1,512 +1,36 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-#include "wet_common.glsl"   // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
-#include "vsm_sample.glsl"    // vsmSunShadow — screen-space VSM mask (set 1 binding 14)
-#include "cluster_lights.glsl"  // clustered forward (set 1 bindings 17-19, r_clustered)
+#include "light_ubo.glsl"       // DynLight + Lighting UBO (set 1 b0) + set-1 samplers (b1..13)
+#include "wet_common.glsl"       // vHash/vNoise/puddlesMaskProc/rippleLayer/rainRipples
+#include "vsm_sample.glsl"       // vsmSunShadow (set 1 b14)
+#include "cluster_lights.glsl"   // clustered forward (set 1 b17..19, r_clustered)
+#include "shadow_common.glsl"    // spotShadowF/pointShadowF/cascTap/cascSample/sunShadow
+#include "env_common.glsl"       // gtaoVis/gtaoBentN/coloredAO/skyAmbient/rainVis
+#include "light_shade.glsl"      // lightTerrainOcc/shadeDynLight/dynLights
+#include "flow_sim_sample.glsl"  // simWater*/simFlow/groundHm/waterDebugColor/flowWaves
+#include "wetness.glsl"          // applyWetnessTerrain + applyWetnessCore
+#include "surface_field.glsl"    // SF_* (smart heightmap; r_sf_debug viz)
+#include "surface_class.glsl"    // SC_* surface classification (r_sf_debug 5)
+#include "snow_displace.glsl"    // SnowFootprint (fragment footprint dimple)
 
-// World pass - TERRAIN splatting fragment shader.
-//
-// Texture splatting (R4 deffer_terrain_high / CBlender_BmmD):
-//   base  = s_base(uv)                       - terrain diffuse (e.g. terrain_escape)
-//   mask  = s_mask(uv); mask /= dot(mask,1)  - RGBA splat weights, normalized
-//   det   = dt_r*mask.r + dt_g*mask.g + dt_b*mask.b + dt_a*mask.a   - at detail UV
-//   albedo = 2 * base * det                  - R4 "2*base*detail" convention
-// Detail channels (CBlender_BmmD defaults): R grass, G asphalt, B earth, A gravel.
-// Lightmap modulation identical to world_lmap. POM / puddles / detail-normals
-// from the SSS shader are intentionally omitted (MVP - colour splatting only).
+// World pass - TERRAIN splatting fragment shader (R4 deffer_terrain_high /
+// CBlender_BmmD): albedo = 2*base*detail, detail blended by the RGBA splat mask.
+// Detail channels: R grass, G asphalt, B earth, A gravel. Adds per-channel detail
+// normal maps, micro contact-AO, dry sun-gloss, SSS puddles. Shared lighting/
+// shadow/wet helpers live in the includes above; terrain-specific POM, detail
+// normals, puddle placement and main() stay here.
 
-layout(set = 0, binding = 0) uniform sampler2D uBase;
-layout(set = 0, binding = 1) uniform sampler2D uMask;
-layout(set = 0, binding = 2) uniform sampler2D uDtR;   // grass
-layout(set = 0, binding = 3) uniform sampler2D uDtG;   // asphalt
-layout(set = 0, binding = 4) uniform sampler2D uDtB;   // earth
-layout(set = 0, binding = 5) uniform sampler2D uDtA;   // gravel/yantar
-layout(set = 0, binding = 6) uniform sampler2D uLmap;
-// Per-channel detail-normal maps (<detail>_bump). R4 CBlender_BmmD: tangent
-// normal packed as n = tex.wzy*2-1 (gloss in R). Blended by the splat mask,
-// feeds SUN + DYN only — the sharp sky cube stays on the flat geometric normal.
-layout(set = 0, binding = 7)  uniform sampler2D uDnR;   // grass   normal
-layout(set = 0, binding = 8)  uniform sampler2D uDnG;   // asphalt normal
-layout(set = 0, binding = 9)  uniform sampler2D uDnB;   // earth   normal
-layout(set = 0, binding = 10) uniform sampler2D uDnA;   // gravel  normal
-
-// Per-frame environment lighting (set 1) - see vk_env_light.{h,cpp}.
-struct DynLight {
-    vec4 pos;     // xyz = world position, w = range
-    vec4 color;   // rgb = colour,         w = 1 spot / 0 point
-    vec4 dir;     // xyz = spot direction, w = cos(cone/2)
-};
-layout(set = 1, binding = 0) uniform Lighting {
-    vec4 sun_dir;
-    vec4 sun_color;
-    vec4 hemi_color;
-    vec4 ambient;
-    mat4 sun_vp;      // sun light view-proj (shadow lookup)
-    vec4 counts;      // x = dynamic light count
-    DynLight lights[16];
-    mat4 spot_vp;        // spot (flashlight) shadow view-proj
-    vec4 shadow_params;  // x = spot-shadowed light index (-1 none), y = point-shadowed index
-    mat4 sun_near_vp;    // sun cascade 0 view-proj (25 m, per-frame, R4 scheme)
-    mat4 sun_c1_vp;      // sun cascade 1 view-proj (60 m, per-frame)
-    vec4 fog_color;      // rgb haze colour (env)
-    vec4 fog_params;     // x=-near*r, y=near, z=far, w=r; fog = saturate(dist*w + x)
-    vec4 eye_pos;        // xyz camera world pos
-    vec4 sky_params;     // x=cube cross-fade weight, y=ambient scale, z=sample LOD
-    vec4 ao_params;      // x=1/screenW, y=1/screenH, z=AO strength (0=off)
-    mat4 rain_vp;        // straight-down ortho VP for the rain occlusion map
-    vec4 rain_params;    // x=rain density, y=wetness, z=darken, w=reflection scale
-    mat4 scene_vp;       // (SSR puddles — declared for layout match, unused here)
-    vec4 cam_dir;
-    vec4 cam_rightT;
-    vec4 cam_topT;
-    vec4 pom_params;     // x=POM amplitude (UV), y=max steps, z=fade dist (m), w=on
-    vec4 pom_params2;    // x=blur, y=normal, z=self-shadow, w=contact AO
-    vec4 pom_params3;    // x=debug, y=ao_flat, z=ceil strength, w=floor strength
-    vec4 pom_params4;    // x=terrain POM enable, y=detail-normal strength, z=micro-AO strength, w=debug view
-    vec4 pom_params5;    // x=terrain gloss, y=geo-puddle radius, z=geo-puddle depth, w=puddle debug
-    vec4 pom_params6;    // x=water-sim enable (puddles + depth come from the flow sim), y=murk, z=refract
-    vec4 pom_params7;    // SSS per-pixel puddles: x=enable, y=water level, z=micro-height contrast, w=macro mask scale
-    vec4 cluster_params;  // x=sliceScale, y=sliceBias, z=near, w=enable (0 off, 1 on, 2 debug)
-    vec4 cluster_params2; // x=gridX, y=gridY, z=gridZ, w=maxLightsPerCluster
-    vec4 light_occ;       // x=enable, y=bury bias, z=march bias, w=strength (terrain/static light occlusion)
-} L;
-layout(set = 1, binding = 1) uniform sampler2D uShadow;
-layout(set = 1, binding = 2) uniform sampler2D uSpotShadow;
-layout(set = 1, binding = 3) uniform samplerCube uPointShadow;
-layout(set = 1, binding = 4) uniform sampler2D uShadowNear;    // sun cascade 0 (~0.61 cm texels)
-layout(set = 1, binding = 5) uniform sampler2D uShadowC1;      // sun cascade 1 (~1.46 cm texels)
-layout(set = 1, binding = 6) uniform samplerCube uSky0;        // sky ambient cube 0 (weather A)
-layout(set = 1, binding = 7) uniform samplerCube uSky1;        // sky ambient cube 1 (weather B)
-layout(set = 1, binding = 8) uniform sampler2D uAO;            // GTAO (half-res)
-layout(set = 1, binding = 9) uniform sampler2D uRainMap;       // top-down rain occlusion (wetness mask)
-layout(set = 1, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
-layout(set = 1, binding = 11) uniform sampler2D uWater;        // water depth (flow sim, metres)
-layout(set = 1, binding = 12) uniform sampler2D uFlow;         // water velocity (flow sim, uv/sec)
-layout(set = 1, binding = 13) uniform sampler2D uGround;       // top-down ground-height (statics+terrain, no trees)
-
-// Terrain/static occlusion for a dynamic light (r_light_occ) — see world_lmap.frag.
-float lightTerrainOcc(vec3 wp, vec3 lpos)
-{
-    if (L.light_occ.x < 0.5) return 1.0;
-    vec4 lc = L.rain_vp * vec4(lpos, 1.0);
-    if (lc.w <= 0.0) return 1.0;
-    vec2 luv = lc.xy * 0.5 + 0.5; luv.y = 1.0 - luv.y;
-    if (any(lessThan(luv, vec2(0.0))) || any(greaterThan(luv, vec2(1.0)))) return 1.0;
-    if (lc.z <= texture(uRainMap, luv).r + L.light_occ.y) return 1.0;   // light at/above the surface → no occlusion
-    vec4 fc = L.rain_vp * vec4(wp, 1.0);
-    if (fc.w <= 0.0) return 1.0;
-    vec2 fuv = fc.xy * 0.5 + 0.5; fuv.y = 1.0 - fuv.y;
-    if (any(lessThan(fuv, vec2(0.0))) || any(greaterThan(fuv, vec2(1.0)))) return 1.0;
-    float fragBelow = fc.z - texture(uRainMap, fuv).r;                  // >0 = fragment under the surface
-    return 1.0 - L.light_occ.w * (1.0 - smoothstep(0.0, L.light_occ.z, max(fragBelow, 0.0)));
-}
-
-// GTAO visibility - see world_lmap.frag (occludes hemi+ambient only).
-float gtaoVis()
-{
-    float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
-    return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);   // strength = exponent (0 = off)
-}
-
-// GTAO bent normal (gba of the AO RT, world-space): sky ambient fill sampled
-// along the unoccluded direction. Falls back to the geometric normal when AO is
-// off/not-ready or the texel is degenerate (sky/unwritten encode ~0).
-vec3 gtaoBentN(vec3 fallbackN)
-{
-    if (L.ao_params.z <= 0.0) return fallbackN;
-    vec3 b = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).gba * 2.0 - 1.0;
-    return (dot(b, b) > 0.25) ? normalize(b) : fallbackN;
-}
-
-// Colored AO - see world_lmap.frag (R4 compute_colored_ao port).
-vec3 coloredAO(float ao, vec3 albedo)
-{
-    vec3 a =  2.0404 * albedo - 0.3324;
-    vec3 b = -4.7951 * albedo + 0.6417;
-    vec3 c =  2.7552 * albedo + 0.6903;
-    return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
-}
-
-// Hemisphere sky ambient (R4 hmodel.h) - see world_lmap.frag.
-vec3 skyAmbient(vec3 N)
-{
-    float lod = L.sky_params.z;
-    float xf = clamp(L.sky_params.x, 0.0, 1.0);   // weather cross-fade — usually 0/1
-    vec3 a = textureLod(uSky0, N, lod).rgb;
-    return (xf > 0.01) ? mix(a, textureLod(uSky1, N, lod).rgb, xf) : a;  // 2nd cube only in transition
-}
-
-// Spot/point shadow + dynamic lights - same model as world_lmap.frag.
-float spotShadowF(vec3 wp)
-{
-    vec4 c = L.spot_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 1.0;
-    vec3 ndc = c.xyz / c.w;
-    vec2 uv = ndc.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.002;
-    vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x)
-            sum += (ref <= texture(uSpotShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
-    return sum * (1.0 / 9.0);
-}
-
-float pointShadowF(vec3 wp, vec3 lp, float range)
-{
-    vec3 d = wp - lp;
-    float z = max(max(abs(d.x), abs(d.y)), abs(d.z));
-    const float n = 0.1;
-    float refD = range * (z - n) / (max(z, n) * max(range - n, 1e-3));
-    return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
-}
-
-// Shade ONE dynamic light — same model as world_lmap.frag (passed-in fields so
-// it serves both the UBO array fallback and the clustered SSBO). gi = global idx.
-vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int sIdx, int pIdx)
-{
-    vec3  dv = lpos.xyz - wp;
-    float r  = lpos.w;
-    float d2 = dot(dv, dv);
-    if (d2 >= r * r) return vec3(0.0);
-    float d   = sqrt(max(d2, 1e-6));
-    vec3  ld  = dv / d;
-    float att = 1.0 - d / r;
-    att *= att;
-    if (lcol.w > 0.5)
-        att *= clamp((dot(-ld, ldir.xyz) - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
-    vec3 tint = lcol.rgb;
-    if (gi == sIdx) {
-        att *= spotShadowF(wp);
-        if (L.shadow_params.z > 0.5) {
-            vec4 cc = L.spot_vp * vec4(wp, 1.0);
-            if (cc.w > 0.0) {
-                vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
-                cuv.y = 1.0 - cuv.y;
-                tint *= textureLod(uSpotCookie, clamp(cuv, 0.0, 1.0), 0.0).rgb;
-            }
-        }
-    }
-    else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
-    else att *= lightTerrainOcc(wp, lpos.xyz);   // UNshadowed lamps: heightfield terrain occlusion (shadowed ones use their maps)
-    return tint * (att * max(dot(N, ld), 0.0));
-}
-
-// Clustered (r_clustered): only this froxel's lights from the SSBO; fallback:
-// the old per-fragment loop over the UBO's 16. See world_lmap.frag.
-vec3 dynLights(vec3 wp, vec3 N)
-{
-    int sIdx = int(L.shadow_params.x);
-    int pIdx = int(L.shadow_params.y);
-    vec3 acc = vec3(0.0);
-    if (L.cluster_params.w > 0.5) {
-        int ci  = clusterOfFragment(wp, L.eye_pos.xyz, L.cam_dir.xyz, gl_FragCoord.xy, L.ao_params.xy, L.cluster_params, L.cluster_params2);
-        int mxp = int(L.cluster_params2.w);
-        int cnt = int(clusterGrid[ci]);
-        for (int k = 0; k < cnt; ++k) {
-            int gi = int(clusterIndex[ci * mxp + k]);
-            acc += shadeDynLight(clusterLights[gi].pos, clusterLights[gi].color, clusterLights[gi].dir, wp, N, gi, sIdx, pIdx);
-        }
-    } else {
-        int n = int(L.counts.x + 0.5);
-        for (int i = 0; i < n; ++i)
-            acc += shadeDynLight(L.lights[i].pos, L.lights[i].color, L.lights[i].dir, wp, N, i, sIdx, pIdx);
-    }
-    return acc;
-}
-
-// Bilinear-weighted near-cascade PCF tap (textureGather) - see world_lmap.frag.
-float cascTap(sampler2D smap, vec2 uv, float ref)
-{
-    vec2 sz = vec2(textureSize(smap, 0));
-    vec2 t  = uv * sz - 0.5;
-    vec2 f  = fract(t);
-    vec4 d  = textureGather(smap, (floor(t) + 1.0) / sz, 0);
-    vec4 c  = step(vec4(ref), d);
-    return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
-}
-
-float cascSample(sampler2D smap, mat4 vp, vec3 wp, float bias_)
-{
-    vec3 n = (vp * vec4(wp, 1.0)).xyz;
-    vec2 uv = n.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99
-        || n.z <= 0.0 || n.z >= 1.0)
-        return -1.0;
-    float ref = n.z - bias_;
-    vec2  tx  = 1.0 / vec2(textureSize(smap, 0));
-    return 0.25 * (cascTap(smap, uv + vec2(-0.5, -0.5) * tx, ref)
-                 + cascTap(smap, uv + vec2( 0.5, -0.5) * tx, ref)
-                 + cascTap(smap, uv + vec2(-0.5,  0.5) * tx, ref)
-                 + cascTap(smap, uv + vec2( 0.5,  0.5) * tx, ref));
-}
-
-// Rain visibility + wet shading - see world_lmap.frag. Terrain extra: the
-// reflectivity scales with the ASPHALT splat weight (wet road mirrors the sky
-// harder than wet dirt/grass - R4 gives terrain material-dependent gloss too).
-float rainVis(vec3 wp)
-{
-    vec3 n = (L.rain_vp * vec4(wp, 1.0)).xyz;
-    vec2 uv = n.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || n.z <= 0.0 || n.z >= 1.0)
-        return 1.0;
-    // WIDE blur. The rain map renders the tree CANOPY, whose dappled occlusion is
-    // BLOCKY at the map resolution → "wetness cut into squares" under trees. Spread
-    // taps average the binary wet/dry into a smooth gradient (soft canopy shadow).
-    float ref = n.z - 0.0015;
-    vec2  px  = 1.0 / vec2(textureSize(uRainMap, 0));
-    float s = cascTap(uRainMap, uv, ref) * 2.0
-            + cascTap(uRainMap, uv + vec2( 3.0, 0.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2(-3.0, 0.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2(0.0,  3.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2(0.0, -3.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2( 2.0,  2.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2(-2.0,  2.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2( 2.0, -2.0) * px, ref)
-            + cascTap(uRainMap, uv + vec2(-2.0, -2.0) * px, ref);
-    return s * (1.0 / 10.0);
-}
-
-// vHash / vNoise / puddlesMaskProc → wet_common.glsl (shared, #included above).
-// (The old geometric-dip placement — geoLowAt/geoPuddle on a top-down ground-height
-//  map, and the procedural-sine puddleMask — was removed: SSFX/R4 place puddles per
-//  pixel, not from a height map; the SSS path below replaced it. See git history.)
-
-// SSS-FAITHFUL puddles (SSFX deffer_terrain_high_flat recipe). NO top-down ground-
-// height map — SSFX/R4 don't use one for PLACEMENT (R4's top-down map is only for
-// wetness gating, which is our rainVis). Pure per-pixel:
-//   puddles = saturate((wetness·PLANE − PixelHeight)·…) · SlopeMask · PuddlesMask
-//   PixelHeight = per-pixel detail MICRO-HEIGHT (the texture relief — ruts/grooves)
-//   SlopeMask   = flat ground only
-//   PuddlesMask = WHERE puddles sit. SSFX uses a per-level artist texture; SoC has
-//                 none, so we substitute a procedural blob field (distinct bodies).
-float sssPuddle(vec3 N, vec3 wp)
-{
-    float wet = clamp(L.rain_params.y, 0.0, 1.0);
-    if (wet <= 0.0) return 0.0;
-    float slope = clamp((1.0 - max(abs(N.x), abs(N.z)) - 0.9) * 13.0, 0.0, 1.0);
-    if (slope <= 0.0) return 0.0;
-    // GRADUAL FILL (SSFX rising water level): coverage rises with the wetness
-    // accumulator so puddles GROW from nothing as it rains and RECEDE as it dries.
-    // ×1.5 (not ×2) so the MAX coverage stays DISTINCT puddles, not giant "fields of
-    // water" on big flats (SSS limits this with an artist mask we don't have).
-    float cov = clamp(wet * L.pom_params7.y * 1.5, 0.0, 1.0);
-    return puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope;
-}
-
-// ===========================================================================
-// EXPERIMENTAL / PARKED: water flow sim (compute, vk_water_sim, r_water_sim off by
-// default). NOT used by the SSS puddle path above — these sample the sim's depth/
-// velocity (bindings 11/12) and only run when r_water_sim is on. Kept for a future
-// revisit; safe to ignore when reading the main wet/puddle path.
-// ===========================================================================
-// Water DEPTH (metres) from the flow sim, sampled at the pixel via rain_vp (the
-// sim grid is aligned to the rain map). 0 where dry. See vk_water_sim.
-float simWater(vec3 wp)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 0.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
-    return textureLod(uWater, uv, 0.0).r;
-}
-
-// Blurred water depth for PUDDLE placement. The sim/ground-height map catches
-// mesh folds/seams as 1-2 texel lines at 1024² → raw water reads as thin lines
-// along the creases. A 5-tap blur spreads that into smooth AREA puddles.
-float simWaterSoft(vec3 wp)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 0.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
-    vec2 px = 5.0 / vec2(textureSize(uWater, 0));
-    return textureLod(uWater, uv, 0.0).r * 0.4
-         + (textureLod(uWater, uv + vec2(px.x, 0.0), 0.0).r
-          + textureLod(uWater, uv - vec2(px.x, 0.0), 0.0).r
-          + textureLod(uWater, uv + vec2(0.0, px.y), 0.0).r
-          + textureLod(uWater, uv - vec2(0.0, px.y), 0.0).r) * 0.15;
-}
-
-// Water VELOCITY (uv/sec) from the flow sim — drives the moving-water surface.
-vec2 simFlow(vec3 wp)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return vec2(0.0);
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec2(0.0);
-    return vec2(textureLod(uFlow, uv, 0.0).r, -textureLod(uFlow, uv, 0.0).g);  // uv-vel -> world XZ (Z axis is flipped)
-}
-
-// Ground height (metres, relative) from the rain map ortho depth — for the flow
-// debug (water surface = groundHm + depth).
-float groundHm(vec3 wp)
-{
-    vec4 c = L.rain_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 0.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    return -textureLod(uRainMap, uv, 0.0).r * 349.0;
-}
-
-// Water debug colour. mode 1 = DEPTH ramp (dry≈black, shallow blue, deep cyan→
-// white). mode 2 = FLOW direction (downhill = −gradient of the water surface;
-// direction → RG, speed → brightness) — shows where water runs and collects.
-vec3 waterDebugColor(vec3 wp, int mode)
-{
-    float d = simWater(wp);
-    if (mode == 2) {
-        float e = 0.6;
-        float sx1 = groundHm(wp + vec3( e,0,0)) + simWater(wp + vec3( e,0,0));
-        float sx0 = groundHm(wp + vec3(-e,0,0)) + simWater(wp + vec3(-e,0,0));
-        float sz1 = groundHm(wp + vec3(0,0, e)) + simWater(wp + vec3(0,0, e));
-        float sz0 = groundHm(wp + vec3(0,0,-e)) + simWater(wp + vec3(0,0,-e));
-        vec2 flow = -vec2(sx1 - sx0, sz1 - sz0);
-        float sp  = clamp(length(flow) * 2.0, 0.0, 1.0);
-        vec2 dir  = (length(flow) > 1e-5) ? normalize(flow) : vec2(0.0);
-        vec3 c = vec3(dir * 0.5 + 0.5, 0.3) * sp;
-        return (d > 0.005) ? c : c * 0.15;
-    }
-    float t = clamp(d / 0.6, 0.0, 1.0);
-    vec3 c = vec3(0.0, t * 0.55, t) + vec3(smoothstep(0.75, 1.0, t));
-    return (d < 0.005) ? vec3(0.02) : c;
-}
-
-// Travelling surface waves ALONG the water flow (downhill). Where water moves
-// (slopes / streams) the surface shows ripples scrolling downstream, scaled by
-// flow speed; still pools (speed≈0) get ~none — the rain rings own those.
-// Returns an xz normal perturbation. Needs water present (a thin film).
-vec2 flowWaves(vec3 wp, float t)
-{
-    float d = simWater(wp);
-    if (d < 0.003) return vec2(0.0);
-    float e = 0.6;
-    float sx1 = groundHm(wp + vec3( e,0,0)) + simWater(wp + vec3( e,0,0));
-    float sx0 = groundHm(wp + vec3(-e,0,0)) + simWater(wp + vec3(-e,0,0));
-    float sz1 = groundHm(wp + vec3(0,0, e)) + simWater(wp + vec3(0,0, e));
-    float sz0 = groundHm(wp + vec3(0,0,-e)) + simWater(wp + vec3(0,0,-e));
-    vec2 flow = -vec2(sx1 - sx0, sz1 - sz0);
-    float spd = length(flow);
-    if (spd < 1e-4) return vec2(0.0);
-    vec2 dir = flow / spd;
-    float along = dot(wp.xz, dir);
-    float w = sin(along * 7.0  - t * (2.0 + spd * 30.0))
-            + 0.5 * sin(along * 16.0 - t * (3.5 + spd * 50.0) + 1.3);
-    float amp = clamp(spd * 6.0, 0.0, 1.0) * clamp(d * 8.0, 0.0, 1.0);
-    return dir * (w * amp * 0.5);
-}
-
-// rippleLayer / rainRipples → wet_common.glsl (shared, #included above).
-
-vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float asphalt, float pudIn, float sunMask)
-{
-    float wet = L.rain_params.y;
-    if (wet < 0.005)
-        return vec3(0.0);
-    wet *= rainVis(wp);
-    float upness = clamp(N.y, 0.0, 1.0);
-    float wetK = wet * mix(0.35, 1.0, upness);
-    float pud  = clamp(pudIn, 0.0, 1.0) * upness;
-    // Wet DARKEN: FULL inside deep puddles, ~NONE on open ground. Uses pud² so the
-    // dark WATER BODY fills in LATER than the reflection (below) — SSFX "shine first,
-    // then the water fills" as the puddle forms.
-    albedo *= 1.0 - L.rain_params.z * wetK * mix(0.05, 1.0, pud * pud);
-
-    // PERF: distance-fade + early-out the expensive reflection (see world_lmap).
-    // Terrain is the biggest screen area, so this gate matters most.
-    vec3  toEye    = L.eye_pos.xyz - wp;
-    float dist     = length(toEye);
-    float reflFade = smoothstep(70.0, 35.0, dist);
-    if (wetK * reflFade < 0.004) return vec3(0.0);
-
-    float t = L.sky_params.w;
-    // Ripples ONLY in puddles. Ripples over the whole wet ground are what read as
-    // "the entire terrain is water" — off-puddle ground must stay still. Gated by
-    // pud (+ rain + distance). velMS/foam stay sim-only (off here).
-    float ripFade = smoothstep(18.0, 8.0, dist)
-                  * clamp(L.rain_params.x * 1.5 + 0.1, 0.0, 1.0)
-                  * smoothstep(0.05, 0.35, pud);
-    vec2  vel   = (L.pom_params6.x > 0.5) ? simFlow(wp) : vec2(0.0);
-    float velMS = length(vel) * 150.0;
-    vec2  scrl  = (velMS > 0.01) ? normalize(vel) * (t * velMS * 0.25) : vec2(0.0);
-    // PUDDLE = FLAT WATER MIRROR (SSFX: Ne = lerp(Ne, up, pud²)). Inside a puddle
-    // the reflecting surface is the water plane, not the bumpy ground — flatten the
-    // normal toward world-up so it mirrors what's ABOVE. Off-puddle keeps the ground
-    // normal (its faint sheen must not act like a mirror).
-    vec3  Nbase = mix(N, vec3(0.0, 1.0, 0.0), clamp(pud * pud, 0.0, 1.0));
-    vec3  Nr = Nbase;
-    float crest = 0.0;
-    if (ripFade > 0.01) {
-        float rainAmp = 0.40 + 0.40 * clamp(L.rain_params.x, 0.0, 1.0);
-        vec2 rip = rainRipples(wp.xz - scrl, t * 0.7) * (rainAmp * ripFade);
-        if (velMS > 0.1)
-            rip += rainRipples(wp.xz * 1.6 - scrl * 1.6, t * 0.9) * (clamp(velMS * 0.12, 0.0, 0.5) * ripFade);
-        Nr = normalize(vec3(Nbase.x + rip.x, Nbase.y, Nbase.z + rip.y));
-        crest = clamp(length(rip) * 2.5, 0.0, 1.0);   // faint ring crest (not "boiling")
-    }
-    vec3 V = normalize(toEye);
-    vec3 R = reflect(-V, Nr);
-    float fres = pow(1.0 - clamp(dot(V, Nr), 0.0, 1.0), 3.0);
-    float xf = clamp(L.sky_params.x, 0.0, 1.0);
-    // ROUGHNESS by puddle (RDR2 wet/dry split): off-puddle wet ground reflects the
-    // sky BLURRED (a soft damp sheen, NOT a sky mirror → it won't read as water);
-    // a puddle uses the SHARP LOD0 cube (a real mirror). This is the main cure for
-    // "the whole terrain looks like water".
-    float reflLod = mix(5.0, 0.0, pud);
-    vec3 sky = textureLod(uSky0, R, reflLod).rgb;
-    if (xf > 0.01) sky = mix(sky, textureLod(uSky1, R, reflLod).rgb, xf);
-    // Puddle WATER BODY: a DARK, cool pool that deepens toward the centre (pud²) — the
-    // dark body + the sharp sky reflection on top is what reads as real water DEPTH
-    // (vs a flat wet patch). The darker the body, the "deeper" it looks.
-    // Puddle WATER BODY: dark cool pool, but not SO dark that the rippled reflection
-    // (the cool part — drop waves spreading) is hidden. Lighter than before so the
-    // ring waves stay readable on the water.
-    float pc   = clamp(pud, 0.0, 1.0);
-    float body = pc * pc;     // water BODY fills in later than the shine (reflection)
-    albedo = mix(albedo, albedo * vec3(0.34, 0.40, 0.46) * (1.0 - 0.25 * pc), body);
-    // SHINE leads: reflection ramps with pud (appears as soon as the spot starts to
-    // form — "first a shine, then the water"). Base 0.45 head-on so it's not a
-    // transparent film. fres pushes the rim to a full mirror.
-    float puddleK = wetK * pc * (0.45 + 0.55 * fres) * reflFade * clamp(L.rain_params.w, 0.0, 2.0);
-    // SUN GLINT on the water (SSFX specular_phong) — rippled normal → dancing sparkles.
-    vec3  Ld    = normalize(-L.sun_dir.xyz);
-    vec3  Hh    = normalize(Ld + V);
-    float glint = pow(max(dot(Nr, Hh), 0.0), 220.0) * pc * sunMask;
-    // Foam: whiten fast-moving water (sim streams only).
-    float foam = smoothstep(3.0, 6.0, velMS) * clamp(pud, 0.0, 1.0) * ripFade * 0.25;
-    // RING WAVE crests — the bright leading edge of each expanding ripple where a
-    // drop hit, so the waves are clearly VISIBLE on the puddle (the "cool" look).
-    vec3 crestCol = (L.sun_color.rgb + L.ambient.rgb) * (crest * pc * 0.07);
-    return sky * puddleK + L.sun_color.rgb * (glint * 3.0) + vec3(foam) + crestCol;
-}
-
-// NEAR cascade first (leaf-shaped dapples, smooth motion) - see world_lmap.frag.
-float sunShadow(vec3 worldPos)
-{
-    float s = cascSample(uShadowNear, L.sun_near_vp, worldPos, 0.0004);
-    if (s >= 0.0) return s;
-    s = cascSample(uShadowC1, L.sun_c1_vp, worldPos, 0.0006);
-    if (s >= 0.0) return s;
-
-    vec4 c = L.sun_vp * vec4(worldPos, 1.0);
-    if (c.w <= 0.0) return 1.0;
-    vec3 ndc = c.xyz / c.w;
-    vec2 uv = ndc.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.0015;
-    // 4 spread taps (was 3-3) - see world_lmap.frag.
-    vec2  texel = 1.0 / vec2(textureSize(uShadow, 0));
-    float sum = 0.0;
-    sum += (ref <= texture(uShadow, uv + vec2(-0.75, -0.75) * texel).r) ? 1.0 : 0.0;
-    sum += (ref <= texture(uShadow, uv + vec2( 0.75, -0.75) * texel).r) ? 1.0 : 0.0;
-    sum += (ref <= texture(uShadow, uv + vec2(-0.75,  0.75) * texel).r) ? 1.0 : 0.0;
-    sum += (ref <= texture(uShadow, uv + vec2( 0.75,  0.75) * texel).r) ? 1.0 : 0.0;
-    return sum * 0.25;
-}
+layout(set = 0, binding = 0)  uniform sampler2D uBase;   // terrain diffuse
+layout(set = 0, binding = 1)  uniform sampler2D uMask;   // RGBA splat weights
+layout(set = 0, binding = 2)  uniform sampler2D uDtR;    // grass   detail
+layout(set = 0, binding = 3)  uniform sampler2D uDtG;    // asphalt detail
+layout(set = 0, binding = 4)  uniform sampler2D uDtB;    // earth   detail
+layout(set = 0, binding = 5)  uniform sampler2D uDtA;    // gravel/yantar detail
+layout(set = 0, binding = 6)  uniform sampler2D uLmap;
+layout(set = 0, binding = 7)  uniform sampler2D uDnR;    // grass   normal (R4: n = tex.wzy*2-1, gloss = tex.r)
+layout(set = 0, binding = 8)  uniform sampler2D uDnG;    // asphalt normal
+layout(set = 0, binding = 9)  uniform sampler2D uDnB;    // earth   normal
+layout(set = 0, binding = 10) uniform sampler2D uDnA;    // gravel  normal
 
 layout(push_constant) uniform PushConstants {
     mat4  mvp;
@@ -522,11 +46,11 @@ layout(location = 3) in  vec3 vWorldPos;
 layout(location = 4) in  vec3 vNormal;
 layout(location = 0) out vec4 outColor;
 
-// ---- POM for terrain. The terrain set has NO `#` height map, so the relief
-// comes from the HIGH-PASSED luminance of the BASE albedo (where the macro
-// cracks / pebbles / twigs live). High-pass removes the large tone patches so
-// they don't become false cliffs; same relief march + normal + self-shadow +
-// contact AO + orientation weight as the wall POM (terrain = floor → r_pom_floor).
+// ---- Terrain POM. No `#` height map, so relief comes from the HIGH-PASSED
+// luminance of the BASE albedo (macro cracks / pebbles / twigs). High-pass
+// removes the large tone patches so they don't become false cliffs. Same march +
+// normal + self-shadow + contact AO as the wall POM. Off by default (swims at
+// grazing) - detail-normal mapping is the primary terrain relief source.
 float baseLuma(vec2 uv, float lod) { return dot(textureLod(uBase, uv, lod).rgb, vec3(0.299, 0.587, 0.114)); }
 
 float pomDepth(vec2 uv, float lod, float baseline)
@@ -537,7 +61,7 @@ float pomDepth(vec2 uv, float lod, float baseline)
 vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, out float outAO)
 {
     outN = N; outShadow = 1.0; outAO = 1.0;
-    if (L.pom_params4.x < 0.5) return uv;   // terrain POM disabled (r_pom_terrain 0) → flat ground
+    if (L.pom_params4.x < 0.5) return uv;   // terrain POM disabled (r_pom_terrain 0) -> flat ground
     float amp = L.pom_params.x;
     if (amp <= 0.0) return uv;
     float dist = length(L.eye_pos.xyz - wp);
@@ -564,15 +88,10 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
 
     vec3 V   = normalize(L.eye_pos.xyz - wp);
     vec3 Vts = vec3(dot(V, T), dot(V, B), dot(V, N));
-    // Terrain is viewed at GRAZING angles almost always (it's the floor), where
-    // the parallax offset blows up (Vts.z → 0) and the texture "swims"/mirrors
-    // as the camera moves. Cap the offset (clamp floor 0.55) and FADE it out at
-    // grazing (smoothstep on |Vts.z|) — kills the liquid look, keeps relief at
-    // more head-on angles. Normal/self-shadow/AO are unaffected (relief stays).
+    // Terrain is viewed at GRAZING angles almost always (it's the floor). Cap the
+    // offset (floor 0.55) and FADE it out at grazing - kills the liquid look.
     vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.55)) * amp * smoothstep(0.12, 0.45, abs(Vts.z));
 
-    // FEWER steps as POM fades with distance (rides the same `fade` that shrinks
-    // amp → invisible cut, halves the mid-distance march). Near stays full.
     int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)) * mix(0.5, 1.0, fade), 8.0, 64.0));
     float layerH = 1.0 / float(steps);
     vec2 dUV = Pmax * layerH;
@@ -592,19 +111,15 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
         else                                       { curUV += sUV; curD -= sD; }
     }
 
-    // Normal from base-luma gradient.
+    // Normal from base-luma gradient. Gentler gain (x3 vs x12 on walls) + tilt
+    // clamp - the base-luma gradient is high-contrast and would chrome-mirror.
     float tU = exp2(lod) / tsz.x, tV = exp2(lod) / tsz.y;
     float hu = baseLuma(curUV + vec2(tU, 0.0), lod) - baseLuma(curUV - vec2(tU, 0.0), lod);
     float hv = baseLuma(curUV + vec2(0.0, tV), lod) - baseLuma(curUV - vec2(0.0, tV), lod);
-    // Base-luma gradient is MUCH higher-contrast than the wall `#` map, so a
-    // gentler gain + a tilt clamp — otherwise the ground normal swings wildly
-    // and the sharp sky-cube sampling turns the terrain into a chrome mirror
-    // ("liquid Terminator"). ×3 (vs ×12 on walls) + ±0.6 tilt cap.
     float ns = L.pom_params2.y * 3.0 * fade * orient;
     vec3 nTS = normalize(vec3(clamp(-hu * ns, -0.6, 0.6), clamp(-hv * ns, -0.6, 0.6), 1.0));
     outN = normalize(T * nTS.x + B * nTS.y + N * nTS.z);
 
-    // Self-shadow toward the sun (horizon scan).
     if (L.pom_params2.z > 0.0) {
         vec3 Ld  = normalize(-L.sun_dir.xyz);
         vec3 Lts = vec3(dot(Ld, T), dot(Ld, B), dot(Ld, N));
@@ -619,7 +134,6 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
             outShadow = clamp(1.0 - occ * L.pom_params2.z * 20.0 * (1.0 - Lts.z) * orient, 0.0, 1.0);
         }
     }
-    // Contact AO (view-independent).
     if (L.pom_params2.w > 0.0) {
         float aoReach = (exp2(lod) / min(tsz.x, tsz.y)) * 4.0;
         float h0 = baseLuma(curUV, lod);
@@ -634,18 +148,16 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
     return curUV;
 }
 
-// ---- Detail NORMAL MAPPING (R4 CBlender_BmmD s_dn_*). The real ground-relief
-// mechanism on terrain (POM swims at grazing angles, so it stays off). Blends
-// the 4 per-channel tangent normals by the splat mask, then rotates into world
-// space via a screen-space cotangent frame (terrain has no per-vertex tangents).
-// `strength` scales the tangent slope (xy). Returns geomN unchanged when off.
+// ---- Detail NORMAL MAPPING (R4 CBlender_BmmD s_dn_*). The primary ground-relief
+// mechanism on terrain. Blends the 4 per-channel tangent normals by the splat
+// mask, then rotates into world space via a screen-space cotangent frame (terrain
+// has no per-vertex tangents). Returns geomN unchanged when off.
 vec3 detailNormal(vec3 geomN, vec2 duv, vec4 mask, float strength, out float outCav, out float outGloss)
 {
     outCav = 0.0; outGloss = 0.0;
     if (strength <= 0.0) return geomN;
     // One sample per channel; decode normal (R4: n = tex.wzy*2-1) AND gloss
-    // (R4: gloss = tex.r), both blended by the splat mask. Grass low gloss,
-    // asphalt high → material-aware specular without extra texture reads.
+    // (R4: gloss = tex.r), both blended by the splat mask.
     vec4 sR = texture(uDnR, duv), sG = texture(uDnG, duv);
     vec4 sB = texture(uDnB, duv), sA = texture(uDnA, duv);
     vec3 n = (sR.wzy * 2.0 - 1.0) * mask.r
@@ -655,13 +167,9 @@ vec3 detailNormal(vec3 geomN, vec2 duv, vec4 mask, float strength, out float out
     outGloss = sR.x * mask.r + sG.x * mask.g + sB.x * mask.b + sA.x * mask.a;
     n.xy *= strength;
     n = normalize(n);
-
-    // Cavity term: how far the micro-normal tilts off the surface (tangent
-    // z < 1 in grooves). Drives the micro contact AO below — always meaningful
-    // because the normals loaded (independent of whether detail alpha = height).
+    // Cavity: how far the micro-normal tilts off the surface (drives micro AO).
     outCav = clamp(1.0 - n.z, 0.0, 1.0);
 
-    // Cotangent frame (Schüler) from world-pos + detail-UV screen derivatives.
     vec3 dp1 = dFdx(vWorldPos), dp2 = dFdy(vWorldPos);
     vec2 du1 = dFdx(duv),       du2 = dFdy(duv);
     vec3 dp2p = cross(dp2, geomN), dp1p = cross(geomN, dp1);
@@ -672,6 +180,19 @@ vec3 detailNormal(vec3 geomN, vec2 duv, vec4 mask, float strength, out float out
     return normalize(T * n.x + B * n.y + geomN * n.z);
 }
 
+// SSS-faithful per-pixel puddle placement (SSFX deffer_terrain_high_flat recipe):
+// coverage rises with the wetness accumulator (grow/recede), gated to near-flat
+// up-facing ground. NO top-down height map for placement (SSFX/R4 don't use one).
+float sssPuddle(vec3 N, vec3 wp)
+{
+    float wet = clamp(L.rain_params.y, 0.0, 1.0);
+    if (wet <= 0.0) return 0.0;
+    float slope = clamp((1.0 - max(abs(N.x), abs(N.z)) - 0.9) * 13.0, 0.0, 1.0);
+    if (slope <= 0.0) return 0.0;
+    float cov = clamp(wet * L.pom_params7.y * 1.5, 0.0, 1.0);   // x1.5 = distinct, not fields
+    return puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope;
+}
+
 void main()
 {
     vec3 pomN; float pomShadow, pomAO;
@@ -680,10 +201,7 @@ void main()
     vec2 pDetailUV = vDetailUV + pDelta * pc.detailScale;
 
     // PUDDLE REFRACTION (SSFX N_refra): where a puddle covers this pixel, bend the
-    // bottom (base+detail) UV by the water-surface ripple → the bottom seen through
-    // the puddle wobbles. Estimate the puddle from the blob+slope here (the full pud
-    // is computed after the splat); gate tight (near + raining) so it costs ~nothing
-    // elsewhere.
+    // bottom (base+detail) UV by the water-surface ripple. Gate tight (near + raining).
     if (L.pom_params7.x > 0.5 && L.rain_params.y > 0.01 && L.rain_params.z >= 0.0) {
         vec3  gN = normalize(vNormal);
         float sl = clamp((1.0 - max(abs(gN.x), abs(gN.z)) - 0.9) * 13.0, 0.0, 1.0);
@@ -701,37 +219,39 @@ void main()
     vec4 base = texture(uBase, pUV);
     if (pc.alphaRef >= 0.0 && base.a < pc.alphaRef) discard;
 
-    // r_ssao_debug 1: show the raw AO map - see world_lmap.frag.
+    // r_ssao_debug 1: show the raw AO map.
     if (L.ao_params.w > 0.5) {
         outColor = vec4(vec3(textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r), base.a);
         return;
     }
-
-    // r_wet_debug 1: rain-map visibility - see world_lmap.frag.
+    // r_wet_debug 1: rain-map visibility.
     if (L.rain_params.z < 0.0) {
         outColor = vec4(vec3(rainVis(vWorldPos)), base.a);
         return;
     }
-
-    // r_puddle_debug moved below (the SSS source needs the detail micro-height,
-    // computed after the splat) — see the pud block.
-
-    // r_pom_debug 1: POM occlusion mask (contact AO × self-shadow).
+    // r_pom_debug 1: POM occlusion mask (contact AO x self-shadow).
     if (L.pom_params3.x > 0.5) {
         outColor = vec4(vec3(pomAO * pomShadow), base.a);
         return;
     }
-
-    // r_clustered_debug: per-cluster dynamic-light-count heatmap (blue 0 … red many).
+    // r_clustered_debug: per-cluster dynamic-light-count heatmap.
     if (L.cluster_params.w > 1.5) {
         int cnt = clusterLightCount(vWorldPos, L.eye_pos.xyz, L.cam_dir.xyz, gl_FragCoord.xy, L.ao_params.xy, L.cluster_params, L.cluster_params2);
         outColor = vec4(clusterHeat(cnt), base.a);
         return;
     }
 
-    // Splat mask (at the parallax-offset UV) - normalize so the 4 weights sum
-    // to 1. Empty/missing mask (1-1 white fallback - sum 4) degrades to an even
-    // blend; an all-zero mask falls back to pure grass so terrain never goes black.
+    // r_sf_debug: Surface Field viz (1 height, 2 slope, 3 curvature, 4 sky, 5 canopy).
+    int sfdbg = int(L.sf_params.y + 0.5);
+    if (sfdbg > 0) {
+        vec3 nn = normalize(vNormal);
+        outColor = vec4((sfdbg == 5) ? SC_DebugColor(SC_Refine(SC_GROUND, nn))   // terrain = ground
+                                      : SF_DebugColor(vWorldPos, nn, sfdbg), base.a);
+        return;
+    }
+
+    // Splat mask (at the parallax-offset UV) - normalize so the 4 weights sum to
+    // 1. Empty/missing mask -> even blend; all-zero -> pure grass (never black).
     vec4 mask = texture(uMask, pUV);
     float wsum = dot(mask, vec4(1.0));
     mask = (wsum > 1e-4) ? (mask / wsum) : vec4(1.0, 0.0, 0.0, 0.0);
@@ -742,24 +262,17 @@ void main()
     vec4 dA = texture(uDtA, pDetailUV);
     vec3 detail = dR.rgb * mask.r + dG.rgb * mask.g + dB.rgb * mask.b + dA.rgb * mask.a;
     // Detail height (R4 terrain AO source = detail diffuse alpha, splat-blended).
-    // On content that lacks a real height (alpha = 1) this collapses to 1 and the
-    // height term of the micro-AO does nothing — the normal cavity still works.
     float detH = dR.a * mask.r + dG.a * mask.g + dB.a * mask.b + dA.a * mask.a;
 
     vec3 albedo = 2.0 * base.rgb * detail;
 
-    // Lightmap (hemi/AO) + DYNAMIC R4-style sun (per-pixel N-L - shadow map) -
-    // same model as world_lmap.frag.
+    // Lightmap (hemi/AO) + DYNAMIC R4-style sun (per-pixel N.L x shadow map).
     vec4  lm      = texture(uLmap, vLmapUV);
     float hemiOcc = dot(lm.rgb, vec3(1.0 / 3.0));
-    vec3  geomN   = normalize(vNormal);   // flat — for the sky fill (cube is sharp → perturbed = mirror)
-    vec3  Nw      = pomN;                  // POM-perturbed — sun + dyn lights catch the relief
-    // Detail normal mapping: the primary ground-relief source. Overrides the
-    // POM normal (which is off by default) when r_terrain_normal > 0; the sky
-    // fill below keeps using geomN so up-facing ground never turns to mirror.
-    // LOD: the 4 detail-normal taps + AO + gloss only matter up close — fade the
-    // strength to 0 by distance so far terrain skips them entirely (detailNormal
-    // early-outs at strength 0). Big World-pass saving over the visible ground.
+    vec3  geomN   = normalize(vNormal);   // flat - for the sky fill (cube is sharp -> perturbed = mirror)
+    vec3  Nw      = pomN;                  // POM-perturbed - sun + dyn lights catch the relief
+    // Detail normal mapping: the primary ground-relief source. Faded to 0 by
+    // distance so far terrain skips the 4 taps + AO + gloss entirely.
     float dnStr  = L.pom_params4.y * smoothstep(45.0, 25.0, distance(L.eye_pos.xyz, vWorldPos));
     float cav    = 0.0;
     float glossT = 0.0;
@@ -767,25 +280,19 @@ void main()
         Nw = detailNormal(geomN, pDetailUV, mask, dnStr, cav, glossT);
 
     // Micro contact AO: darken grooves. Occlusion = max of the normal cavity
-    // (1-n.z) and the detail height pit (1-h²) — whichever the data provides.
-    // Cheap, no march, no swim. Applied to albedo (R4 base*=1-AO) so it shades
-    // both sun and ambient like real self-occlusion.
+    // (1-n.z) and the detail height pit (1-h^2). Applied to albedo (R4 base*=1-AO).
     float aoStr   = L.pom_params4.z;
     float occlT   = max(cav, 1.0 - detH * detH);
     float microAO = 1.0 - aoStr * clamp(occlT, 0.0, 1.0);
     albedo *= microAO;
 
-    // PUDDLE COVERAGE (0..1). SSS procedural placement is the default; the flow sim
-    // is the parked EXPERIMENTAL alternative (r_water_sim). detH/cav give the detail
-    // micro-height shown by the debug view.
+    // PUDDLE COVERAGE (0..1). SSS procedural placement default; flow sim is parked.
     float microH = min(detH, 1.0 - cav);
     float pud = (L.pom_params7.x > 0.5) ? sssPuddle(geomN, vWorldPos)
               : (L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(vWorldPos))
               : 0.0;
 
-    // r_puddle_debug: 1 = final puddle coverage (pud); 2 = the per-pixel detail
-    // MICRO-HEIGHT — dark = grooves/ruts, bright = proud bumps (flat grey = the
-    // detail has no usable height; puddles then rely on the procedural blob alone).
+    // r_puddle_debug: 1 = coverage; 2 = per-pixel detail micro-height.
     int pdbg = int(L.pom_params5.w + 0.5);
     if (pdbg > 0) {
         outColor = (L.pom_params6.x > 0.5) ? vec4(waterDebugColor(vWorldPos, pdbg), base.a)
@@ -799,16 +306,28 @@ void main()
     if (tdbg == 2) { outColor = vec4(vec3(microAO),  base.a); return; }
     if (tdbg == 3) { outColor = vec4(vec3(detH),     base.a); return; }
 
+    // SNOW (Surface Field consumer, r_snow): whiten by surface type x slope x sky
+    // exposure - flat up-facing ground accumulates, steep/under-cover none.
+    float snowBase = SC_SnowAmount(SC_Refine(SC_GROUND, geomN), geomN, SF_SkyExposure(vWorldPos));
+    // Organic growth: vary the coverage ONSET per world-location (multi-scale noise) so
+    // partial snow fills in irregular PATCHES, not per-terrain-triangle. At full coverage
+    // (sf_params.w -> 1) every threshold is met -> uniform snow.
+    float covThr = (vNoise(vWorldPos.xz * 0.13) * 0.55 + vNoise(vWorldPos.xz * 0.43) * 0.30
+                  + vNoise(vWorldPos.xz * 1.30) * 0.15) * 0.75;
+    float snow = snowBase * smoothstep(covThr, covThr + 0.22, clamp(L.sf_params.w, 0.0, 1.0));
+    albedo = mix(albedo, vec3(0.90, 0.93, 0.97), snow);
+    Nw = normalize(mix(Nw, geomN, snow));   // snow smooths the microrelief -> less "texturey"
+    if (L.deform_tex.x < 1.5)               // MESH mode: the snow mesh draws the dents on top
+        SnowFootprint(albedo, Nw, vWorldPos, snow);   // pressed-snow prints at recent foot contacts
+
     float sunMask = max(dot(Nw, normalize(-L.sun_dir.xyz)), 0.0);
     if (sunMask > 0.005) {
-        // VSM screen-space mask (r_vsm) vs cascade — gated per frame by shadow_params.w.
         float sunSh = (L.shadow_params.w > 0.5) ? vsmSunShadow(gl_FragCoord.xy * L.ao_params.xy)
                                                 : sunShadow(vWorldPos);
         sunMask *= sunSh * pomShadow;
     }
-    // Hemisphere sky fill (R4 hmodel) - see world_lmap.frag. sun_color/ambient
-    // arrive final from vk_env_light (r_sun_boost / r_ambient_floor).
-    vec3  occ      = coloredAO(gtaoVis(), albedo) * pomAO;
+    // Hemisphere sky fill (R4 hmodel). sun_color/ambient arrive final from vk_env_light.
+    vec3  occ      = coloredAO(gtaoVis(), albedo) * pomAO * ssilBoost();   // GTAO x POM AO x SSIL bounce (ambient only)
     float hemiOccL = hemiOcc;
     if (L.pom_params3.y > 0.5) { occ = vec3(1.0); hemiOccL = 1.0; }   // r_ao_flat debug
     vec3 lighting = skyAmbient(gtaoBentN(geomN)) * (hemiOccL * L.sky_params.y) * occ
@@ -816,11 +335,8 @@ void main()
                   + L.ambient.rgb * occ
                   + dynLights(vWorldPos, Nw);
 
-    // Dry sun gloss (R4 gloss in bump .r): a material-aware Blinn specular —
-    // asphalt/gravel glint, grass stays matte. Additive (specular is ~albedo-
-    // independent), respects the sun shadow (sunMask already folds it in), and
-    // FADES OUT as the ground wets so it doesn't double up with the wet
-    // reflection. Held subtle to avoid grazing-angle shimmer.
+    // Dry sun gloss (R4 gloss in bump .r): material-aware Blinn specular -
+    // asphalt/gravel glint, grass matte. Fades out as the ground wets.
     vec3  drySpec  = vec3(0.0);
     float glossStr = L.pom_params5.x;
     if (glossStr > 0.0 && glossT > 0.0 && sunMask > 0.005) {
@@ -828,16 +344,16 @@ void main()
         vec3  V    = normalize(L.eye_pos.xyz - vWorldPos);
         vec3  H    = normalize(Ld + V);
         float g    = clamp(glossT, 0.0, 1.0);
-        float shin = mix(16.0, 160.0, g);             // glossier → tighter highlight
+        float shin = mix(16.0, 160.0, g);             // glossier -> tighter highlight
         float s    = pow(max(dot(Nw, H), 0.0), shin) * g;
-        float dry  = 1.0 - clamp(L.rain_params.y, 0.0, 1.0);
+        float dry  = (1.0 - clamp(L.rain_params.y, 0.0, 1.0)) * (1.0 - snow);   // snow also kills the dry gloss
         drySpec    = L.sun_color.rgb * (s * glossStr * sunMask * dry);
     }
 
-    // Rain wetness (asphalt reflects harder) - see applyWetness above.
-    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw, mask.g, pud, sunMask);
+    // Rain wetness (terrain: pud passed in; asphalt reflectivity term was unused).
+    vec3 wetRefl = applyWetnessTerrain(albedo, vWorldPos, Nw, pud, sunMask);
 
-    // Distance fog (R4) - see world_lmap.frag.
+    // Distance fog (R4).
     vec3 col = albedo * lighting + drySpec + wetRefl;
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);

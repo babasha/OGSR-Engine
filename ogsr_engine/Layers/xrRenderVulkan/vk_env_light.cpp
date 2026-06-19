@@ -14,6 +14,8 @@
 #include "vk_vsm.h"                        // VSM receivers (bindings 14-16: atlas, page table, clipmap UBO)
 #include "vk_clustered.h"                  // Clustered forward (bindings 17-19: lights, grid, indices)
 #include "vk_water_sim.h"                  // WaterSim (binding 11 = water depth)
+#include "vk_deform.h"                     // Deform (binding 20 = snow deform press field)
+#include "vk_pass_skinned.h"               // Skinned_CollectFeet (snow footprint deformation)
 #include "vk_texture.h"                    // CVulkanTexture (fallback ambient cube)
 #include "vk_pass_sky.h"                   // SkyPass::AcquireAmbientCubes (hemisphere sky ambient)
 #include "vk_pass_ssao.h"                  // GTAO result (binding 8, white fallback until ready)
@@ -58,6 +60,17 @@ extern int   ps_r_light_occ;      // r_light_occ — dynamic-light terrain/stati
 extern int   ps_r_puddle_sss;     // r_puddle_sss — SSS per-pixel puddles (default source)
 extern float ps_r_puddle_level;   // r_puddle_level — water rise level vs micro-height
 extern float ps_r_puddle_scale;   // r_puddle_scale — macro puddle-body size (procedural mask freq)
+extern int   ps_r_sf;             // r_sf — Surface Field master enable (consumers later)
+extern int   ps_r_sf_debug;       // r_sf_debug — Surface Field debug view (0..5)
+extern float ps_r_sf_eps;         // r_sf_eps — derive finite-difference epsilon (m)
+extern float ps_r_snow;           // r_snow — TARGET snow coverage (Surface Field consumer)
+extern float ps_r_snow_rate;      // r_snow_rate — snow accumulate/melt speed (per sec)
+extern int   ps_r_snow_deform;        // r_snow_deform — footprint deformation enable
+extern float ps_r_snow_deform_depth;  // r_snow_deform_depth — print press depth (m)
+extern float ps_r_snow_deform_radius; // r_snow_deform_radius — print radius (m)
+extern float ps_r_snow_deform_time;   // r_snow_deform_time — print lifetime (sec, time-decay)
+extern int   ps_r_snow_deform_tex;    // r_snow_deform_tex — use the dense deform texture (vk_deform)
+extern int   ps_r_snow_mesh;          // r_snow_mesh — dense snow surface mesh (VHM-style)
 
 namespace VK { namespace EnvLight {
 
@@ -95,6 +108,11 @@ namespace {
     CVulkanTexture*       s_fallbackWhite = nullptr;
     VkImageView           s_boundAO[kFramesInFlight] = {};
 
+    // SSIL (binding 15): BLACK 1×1 fallback — black IL → ssilBoost() returns 1.0
+    // (no bounce) until the GTAO+IL pass has a frame / r_ssil is on.
+    CVulkanTexture*       s_fallbackBlack = nullptr;
+    VkImageView           s_boundIL[kFramesInFlight] = {};
+
     // Spot light cookie (flashlight beam texture, binding 10): loaded once per
     // texture name (Torch config "spot_texture"), per-slot bound-view tracking.
     VkImageView           s_boundCookie[kFramesInFlight] = {};
@@ -107,6 +125,9 @@ namespace {
     VkImageView           s_boundFlow[kFramesInFlight]  = {};
     // Ground-height map (binding 13, SSS puddle real-dip placement): lazy-bind.
     VkImageView           s_boundGround[kFramesInFlight] = {};
+    // Snow deform press field (binding 20, vk_deform): white fallback until the
+    // first Deform dispatch creates it (lazy, like water).
+    VkImageView           s_boundDeform[kFramesInFlight] = {};
 
     // Clustered forward (bindings 17/18/19 = lights/grid/indices SSBOs). Start on
     // the dummy buffer; Update() swaps in the real vk_clustered buffers once that
@@ -163,9 +184,10 @@ bool Init()
     // water-sim (r_water_sim, off by default); the SSS puddle path doesn't use them
     // but they stay bound (harmless) so the sim can be switched on without relayout.
     // All FRAGMENT.
-    VkDescriptorSetLayoutBinding b[20]{};
+    VkDescriptorSetLayoutBinding b[22]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Also visible to VS/TES: snow geometric displacement reads sf_params.w (coverage).
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     for (u32 i = 1; i < 14; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -181,16 +203,28 @@ bool Init()
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    // Snow deform press field (vk_deform): 20 = press texture. Read by the terrain
+    // tessellation eval (broad groove) + fragment (sharp dimple).
+    b[20].binding = 20; b[20].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[20].descriptorCount = 1;
+    b[20].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_VERTEX_BIT;
+    // SSIL (binding 21): one-bounce indirect-light buffer, sampled by the forward
+    // receivers (ssilBoost multiplies the ambient term). All FRAGMENT.
+    b[21].binding = 21; b[21].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[21].descriptorCount = 1;
+    b[21].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // The snow MESH (vk_pass_snow) vertex shader samples the RAIN map (9, base height)
+    // + deform field (20) to place + displace its dense grid -> need VERTEX visibility.
+    b[9].stageFlags  |= VK_SHADER_STAGE_VERTEX_BIT;
+    b[13].stageFlags |= VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 20; slci.pBindings = b;
+    slci.bindingCount = 22; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
     VkDescriptorPoolSize ps[3]{
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight * 2 },    // LightUBO + VSM clipmap UBO
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 14 },   // 13 shadow/sky/ao + VSM atlas
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 16 },   // 13 shadow/sky/ao + VSM atlas + deform + SSIL
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kFramesInFlight * 4 },    // VSM page table + 3 cluster SSBOs
     };
     VkDescriptorPoolCreateInfo pci{};
@@ -256,6 +290,15 @@ bool Init()
     }
     const VkImageView fbWhite = s_fallbackWhite->GetView();
 
+    // Black 1×1 for binding 15 (SSIL) — "no bounce" until the IL pass renders.
+    s_fallbackBlack = xr_new<CVulkanTexture>();
+    s_fallbackBlack->Create(1, 1, VK_FORMAT_R8G8B8A8_UNORM, 1);
+    {
+        const u8 black[4] = { 0, 0, 0, 255 };
+        s_fallbackBlack->UploadData(black, sizeof(black));
+    }
+    const VkImageView fbBlack = s_fallbackBlack->GetView();
+
     for (u32 i = 0; i < kFramesInFlight; ++i) {
         VkDescriptorBufferInfo bi{ s_ubo.GetHandle(), kSlotStride * i, sizeof(LightUBO) };
         VkDescriptorImageInfo  si[5]{};
@@ -283,6 +326,10 @@ bool Init()
         VkDescriptorImageInfo aoI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundAO[i] = fbWhite;
 
+        // Binding 21: SSIL — black fallback (ssilBoost=1); Update() swaps in the real IL view.
+        VkDescriptorImageInfo ilI{ s_cubeSampler, fbBlack, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundIL[i] = fbBlack;
+
         // Binding 10: spot cookie — white until the flashlight's texture loads
         // (shadow_params.z gates sampling anyway).
         VkDescriptorImageInfo ckI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -299,6 +346,11 @@ bool Init()
         // Update() swaps in ShadowMap::GetGroundView once it exists.
         VkDescriptorImageInfo gdI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundGround[i] = fbWhite;
+        // Binding 20: snow deform press field — white fallback until vk_deform runs;
+        // Update() swaps in Deform::GetView once it exists (gated by deform_tex.x so
+        // the white fallback is never actually sampled before then).
+        VkDescriptorImageInfo dfI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundDeform[i] = fbWhite;
 
         // Clustered forward (bindings 17/18/19): valid SSBO placeholder until the
         // vk_clustered module inits; Update() swaps in the real buffers (gated by
@@ -309,7 +361,7 @@ bool Init()
             { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
         };
 
-        VkWriteDescriptorSet w[17]{};
+        VkWriteDescriptorSet w[19]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
@@ -332,6 +384,10 @@ bool Init()
         w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[count].dstSet = s_set[i]; w[count].dstBinding = 8; w[count].descriptorCount = 1;
         w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &aoI;
+        ++count;
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 21; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &ilI;
         ++count;
         if (rainI.imageView != VK_NULL_HANDLE && rainI.sampler != VK_NULL_HANDLE) {
             w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -361,6 +417,10 @@ bool Init()
             w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &clI[k];
             ++count;
         }
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 20; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &dfI;
+        ++count;
         vkUpdateDescriptorSets(VulkanHW.m_Device, count, w, 0, nullptr);
     }
 
@@ -568,6 +628,26 @@ void Update(u32 slot)
         }
     }
 
+    // SSIL (binding 15): swap the real IL view in when r_ssil is on and the pass
+    // has a result, back to the BLACK fallback otherwise (ssilBoost → 1.0 = no-op).
+    {
+        VkImageView il   = SSAOPass::GetILResultView();
+        VkSampler   ilSp = SSAOPass::GetSampler();
+        if (il == VK_NULL_HANDLE || ilSp == VK_NULL_HANDLE) {
+            il = s_fallbackBlack ? s_fallbackBlack->GetView() : VK_NULL_HANDLE;
+            ilSp = s_cubeSampler;
+        }
+        if (il != VK_NULL_HANDLE && il != s_boundIL[slot]) {
+            VkDescriptorImageInfo ii{ ilSp, il, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 21; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundIL[slot] = il;
+        }
+    }
+
     // Binding 11: water depth (sim). Swap the white fallback for the real water
     // buffer once WaterSim has created it (lazy, one update per slot).
     {
@@ -607,6 +687,19 @@ void Update(u32 slot)
             s_boundGround[slot] = gv;
             { static bool s_gbl = false; if (!s_gbl) { s_gbl = true;
                 Msg("[VK Puddle] ground map bound to EnvLight binding 13 (slot %u)", slot); } }
+        }
+        // Binding 20: snow deform press field (vk_deform). Swap the white fallback for
+        // the real field once the first deform dispatch created it (lazy, like water).
+        VkImageView dv = Deform::GetView();
+        VkSampler   ds = Deform::GetSampler();
+        if (dv != VK_NULL_HANDLE && ds != VK_NULL_HANDLE && dv != s_boundDeform[slot]) {
+            VkDescriptorImageInfo ii{ ds, dv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 20; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundDeform[slot] = dv;
         }
     }
     ub.ao_params[0] = Device.dwWidth  ? 1.f / float(Device.dwWidth)  : 0.f;
@@ -712,6 +805,102 @@ void Update(u32 slot)
     ub.pom_params7[1] = ps_r_puddle_level;              // coverage (more/larger puddles)
     ub.pom_params7[2] = 0.f;                            // (was micro-height contrast — removed)
     ub.pom_params7[3] = ps_r_puddle_scale;              // puddle-body size (procedural mask freq)
+    // Surface Field ("smart heightmap"): metre-scale derive read in-shader (Phase
+    // 2.0). Consumers (snow/fog/water) come later; for now drives r_sf_debug.
+    ub.sf_params[0] = ps_r_sf ? 1.f : 0.f;              // enable (reserved for consumers)
+    ub.sf_params[1] = (float)ps_r_sf_debug;             // debug view 0..5
+    ub.sf_params[2] = ps_r_sf_eps;                      // finite-difference epsilon (m)
+    // Snow accumulation: r_snow is the TARGET; ease the actual coverage toward it at
+    // r_snow_rate/sec so snow "falls and covers" gradually (and melts when lowered).
+    {
+        static float s_snowAccum = 0.f;
+        const float target = (ps_r_snow < 0.f) ? 0.f : (ps_r_snow > 1.f ? 1.f : ps_r_snow);
+        const float dt     = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;   // clamp hitches
+        const float step   = ps_r_snow_rate * dt;
+        const float d      = target - s_snowAccum;
+        if      (d >  step) s_snowAccum += step;
+        else if (d < -step) s_snowAccum -= step;
+        else                s_snowAccum  = target;
+        ub.sf_params[3] = s_snowAccum;                  // actual coverage (consumer: SC_SnowAmount x this)
+    }
+
+    // Snow footprint deformation: a persistent ring of recent foot contacts. Each stamp
+    // fades over r_snow_deform_time seconds (TIME-based, so the trail lasts ~a minute,
+    // not just the last N metres); re-stepping a print refreshes it (trampled stays
+    // trampled). At 256 slots and ~4 contacts/s a full minute fits before recycle.
+    // snow_displace.glsl carves these (geometry in the tese, sharp dimple in the frag).
+    {
+        constexpr int kMaxStamps = 256;
+        struct DStamp { float x, z, r, s; };
+        static DStamp s_st[kMaxStamps] = {};
+        static int    s_cnt = 0, s_head = 0;
+        const float snowNow = ub.sf_params[3];
+        const bool  on      = ps_r_snow_deform && snowNow > 0.01f;
+
+        // Per-frame TIME decay: every live stamp loses dt/lifetime of its strength, so a
+        // print made now is gone in ~lifetime seconds (smooth fade, no pop).
+        if (ps_r_snow_deform) {
+            const float life = (ps_r_snow_deform_time > 0.1f) ? ps_r_snow_deform_time : 0.1f;
+            const float dt   = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+            const float dec  = dt / life;
+            for (int i = 0; i < s_cnt; ++i)
+                if (s_st[i].s > 0.f) s_st[i].s = (s_st[i].s > dec) ? (s_st[i].s - dec) : 0.f;
+        }
+
+        if (on) {
+            xr_vector<Fvector> feet;
+            // Player: first-person has no body skeleton in the render list, so estimate
+            // two feet from the camera XZ + facing (Y is irrelevant - the carve is XZ).
+            {
+                const Fvector& camp = Device.vCameraPosition;
+                Fvector fwd = Device.vCameraDirection; fwd.y = 0.f;
+                if (fwd.square_magnitude() > 1e-4f) fwd.normalize(); else fwd.set(0.f, 0.f, 1.f);
+                const Fvector perp = { -fwd.z, 0.f, fwd.x };   // right vector (XZ plane)
+                feet.push_back({ camp.x - perp.x * 0.13f, camp.y, camp.z - perp.z * 0.13f });
+                feet.push_back({ camp.x + perp.x * 0.13f, camp.y, camp.z + perp.z * 0.13f });
+            }
+            // NPCs (and any 3rd-person body): foot bones, fallback object root.
+            xr_vector<Fvector> npc; Skinned_CollectFeet(npc, 24);
+            for (const Fvector& f : npc) feet.push_back(f);
+
+            const float rad   = ps_r_snow_deform_radius;
+            const float minSp = rad * 0.8f;             // don't duplicate prints closer than this
+            for (const Fvector& f : feet) {
+                int hit = -1;                            // existing LIVE print at this spot?
+                for (int i = 0; i < s_cnt; ++i) {
+                    if (s_st[i].s <= 0.f) continue;      // skip faded/dead slots
+                    const float dx = s_st[i].x - f.x, dz = s_st[i].z - f.z;
+                    if (dx * dx + dz * dz < minSp * minSp) { hit = i; break; }
+                }
+                if (hit >= 0) { s_st[hit].s = 1.f; continue; }   // refresh, don't duplicate
+                s_st[s_head] = { f.x, f.z, rad, 1.f };           // new print (overwrites oldest)
+                s_head = (s_head + 1) % kMaxStamps;
+                if (s_cnt < kMaxStamps) ++s_cnt;
+            }
+        }
+        ub.deform_count[0] = float(on ? s_cnt : 0);
+        ub.deform_count[1] = ps_r_snow_deform_depth;          // press depth (m)
+        ub.deform_count[2] = ps_r_snow_deform_depth * 0.45f;  // ridge height (m)
+        ub.deform_count[3] = ps_r_snow_deform ? 1.f : 0.f;
+        for (int i = 0; i < kMaxStamps; ++i) {
+            ub.deform_stamps[i][0] = s_st[i].x;
+            ub.deform_stamps[i][1] = s_st[i].z;
+            ub.deform_stamps[i][2] = s_st[i].r;
+            ub.deform_stamps[i][3] = (i < s_cnt && s_st[i].s > 0.f) ? s_st[i].s : 0.f;
+        }
+
+        // Texture path (r_snow_deform_tex): the dense persistent press field. When on
+        // and ready, the shaders sample uDeform (binding 20) instead of the stamp loop.
+        const bool texOn = ps_r_snow_deform && ps_r_snow_deform_tex && Deform::Ready();
+        memcpy(ub.deform_vp, &Deform::GetVP(), sizeof(ub.deform_vp));
+        const float dsize = float(Deform::Size() ? Deform::Size() : 1);
+        // 0 = off, 1 = texture dent on the TERRAIN, 2 = MESH mode (terrain skips snow
+        // geometry; the dense snow mesh owns it — vk_pass_snow).
+        ub.deform_tex[0] = texOn ? (ps_r_snow_mesh ? 2.f : 1.f) : 0.f;
+        ub.deform_tex[1] = 1.f / dsize;                          // 1/size (uv step)
+        ub.deform_tex[2] = ps_r_snow_deform_depth;               // max dent depth (m)
+        ub.deform_tex[3] = (2.f * Deform::Half()) / dsize;       // world metres per texel
+    }
     // Periodic state log while debugging wetness (pairs with the mask view).
     if (ps_r_wet_debug) {
         static u32 s_wetLogCd = 0;
@@ -776,6 +965,7 @@ void Destroy()
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     if (s_fallbackCube) { s_fallbackCube->Destroy(); xr_delete(s_fallbackCube); }
     if (s_fallbackWhite) { s_fallbackWhite->Destroy(); xr_delete(s_fallbackWhite); }
+    if (s_fallbackBlack) { s_fallbackBlack->Destroy(); xr_delete(s_fallbackBlack); }
     for (auto& kv : s_cookieCache) {
         if (kv.second) { kv.second->Destroy(); xr_delete(kv.second); }
     }
@@ -787,7 +977,7 @@ void Destroy()
     s_dummyBuf.Destroy();
     s_mapped = nullptr;
     s_current = VK_NULL_HANDLE;
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundIL[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundDeform[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; }
     s_inited = false; s_failed = false;
 }
 

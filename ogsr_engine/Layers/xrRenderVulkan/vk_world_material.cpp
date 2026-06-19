@@ -636,6 +636,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     m->view_lmap    = lmap_tex   ? lmap_tex->GetView()   : s_WhiteLmap->GetView();
     m->alphaRef     = alphaRef;
     m->isWmark      = wmark;
+    m->name         = diffuse_name;
     m->tessellated  = (bumpx_tex != s_FlatBump);
     m->set          = AllocateSet();
     if (m->set == VK_NULL_HANDLE) {

@@ -125,6 +125,42 @@ int   ps_r_ssao_npc_normals = 1;
 // hemisphere — the deepened curve compensates to a comparable look.
 float ps_r_ssao_strength = 2.0f;
 
+// Vulkan SSIL — screen-space indirect lighting (one-bounce SSGI). The "IL +
+// COLOR" complement to GTAO's "AO": adds the coloured light bouncing off nearby
+// lit surfaces. FOLDED INTO the GTAO horizon march (the occluder that raises the
+// horizon also bounces its colour), gathered from the PREVIOUS frame's lit scene
+// (history buffer — also the temporal foundation). Requires r_ssao on (shared
+// pass). Reach = the GTAO radius.
+// Default OFF: the v2 horizon-folded IL still bands a little at half-res without
+// temporal accumulation (the planned next step), so it ships opt-in — r_ssil 1
+// to A/B. AO is unaffected either way.
+int   ps_r_ssil_enable   = 0;     // r_ssil — global on/off (gates the prev-colour taps in the GTAO march)
+int   ps_r_ssil_debug    = 0;     // r_ssil_debug — 1 = show ONLY the indirect bounce field
+// Strength multiplies the gathered radiance at composite. IL is an occluder-colour
+// AVERAGE gated by (1-AO)² (≈0 on open surfaces, only fills real recesses), added
+// on top of the forward ambient — keep it subtle so it tints corners without a
+// global brightness boost. Raise to taste.
+float ps_r_ssil_strength = 0.5f;
+
+// Vulkan motion vectors — screen-space (prevUV − curUV) reconstructed from the
+// prepass depth + the previous frame's view-proj. Foundation for DLSS/FSR
+// upscaling, frame-gen and the path-tracer denoiser. Phase 1 = camera + static
+// world (the dominant motion); self-moving geometry is a later phase. Default
+// ON (cheap fullscreen pass, no result consumer yet — harmless until DLSS lands).
+int   ps_r_motion_vectors  = 1;     // r_motion_vectors — global MV pass on/off
+int   ps_r_mv_debug        = 0;     // r_mv_debug       — false-colour overlay (verify sign/Y-flip/magnitude)
+float ps_r_mv_debug_scale  = 30.0f; // r_mv_debug_scale — overlay magnitude (per-frame UV motion is tiny)
+
+// SSFX tree wind (live tuning). Trunk bend defaulted DOWN from the SSFX 0.5 —
+// our trees are tall, the H² trunk term made them "sway like sails" at 0.5.
+float ps_r_wind_tree_bend    = 0.18f; // r_wind_tree_bend    — trunk sway intensity (SSFX wsetup_trees.z)
+float ps_r_wind_tree_anim    = 11.0f; // r_wind_tree_anim    — branch/leaf flutter speed (SSFX wsetup_trees.x)
+float ps_r_wind_tree_trunk   = 0.15f; // r_wind_tree_trunk   — trunk anim speed (SSFX wsetup_trees.y)
+float ps_r_wind_tree_flutter = 4.0f;  // r_wind_tree_flutter — crown/leaf flutter amplitude (our extra, SSFX has none)
+float ps_r_wind_tree_crown   = 4.0f;  // r_wind_tree_crown   — height (m) where leaf flutter fades in (low trunk stays still)
+float ps_r_wind_shadow_dist  = 40.0f; // r_wind_shadow_dist  — radius (m) where tree SHADOWS sway (near=per-frame, far=cached); 0 = all static (cheapest)
+int   ps_r_vsm_tree_wind     = 0;     // r_vsm_tree_wind — TEST/experimental: apply wind to VSM tree shadow pages (animates only when static pages refresh; static sun = frozen). Default OFF.
+
 // Vulkan lighting normalization knobs (live, no restart). Both used to be
 // literals scattered across the scene shaders (LDR-era compensation that
 // predates the HDR tonemap): sun ×1.25 in world/terrain/vlit/skinned/grass
@@ -276,6 +312,14 @@ float ps_r_vol_sun       = 3.0f;    // sun-beam in-scatter boost: directional sh
 float ps_r_vol_lights    = 2.5f;    // P2: local light (flashlight/lamp/campfire) in-scatter in fog — glow/cone strength; 0 = off
 float ps_r_vol_smoke     = 1.0f;    // Stage-0: light smoke billboards with the froxel in-scatter (sun shaft/flashlight/campfire catch the smoke); 0 = off (old flat look)
 float ps_r_vol_smoke_clamp = 6.0f;  // Stage-0: upper bound on the per-froxel radiance added to smoke (keeps it from blowing to white next to a campfire/sun beam)
+float ps_r_vol_smoke_inject  = 1.0f; // Stage-1 VMS: inject smoke-particle density into the froxel grid → smoke becomes real participating media (lit/shadowed like fog); 0 = off
+float ps_r_vol_smoke_density = 1.0f; // Stage-1 VMS: density mass per particle opacity (splat scale) — thicker/thinner injected smoke
+int   ps_r_vol_smoke_debug   = 0;    // VMS debug: 0 off / 1 smoke colour glow (albedo) / 2 density heatmap (grey) / 3 self-shadow sunVis (blue=shadowed, warm=sun-lit)
+float ps_r_vol_smoke_dist_full = 12.0f; // Stage-1 VMS LOD: radius (m) of FULL-quality volumetric smoke (close-up "beautiful" body); past it density fades to billboard by r_vol_smoke_dist.
+float ps_r_vol_smoke_dist    = 40.0f; // Stage-1 VMS: max distance (m) smoke injects as volumetric media (tied to the terrain detail bubble — capped at r__detail_radius); beyond it the billboard alone represents it (far froxels = coarse muddy blobs). Fades from dist_full → here.
+float ps_r_vol_smoke_footprint = 1.0f; // Stage-1.1 VMS: max smoke splat footprint in froxel cells (0 = point splat / cheapest; 1 = 3³ gaussian blob; 2 = 5³). Soft + denser; cost ~ particles × (2·fp+1)³ — watch the VolSmoke profiler zone.
+float ps_r_vol_smoke_shadow  = 1.0f; // Stage-2 VMS: smoke SELF-SHADOW strength (cloud sun-side bright, far/deep side dark — gives it volume). 0 = off (flat lit). Only smoky froxels march toward the sun.
+float ps_r_vol_smoke_shadow_step = 0.6f; // Stage-2 VMS: self-shadow sun-march step (world m); 6 steps total. Bigger = longer reach/softer, smaller = tighter.
 float ps_r_vol_noise     = 0.55f;   // P3: animated 3D noise on the fog density → drifting dust/mist ("living air"); 0 = off
 float ps_r_vol_noise_scale = 0.40f; // P3 noise frequency (world units; higher = finer motes)
 float ps_r_vol_noise_speed = 0.10f; // P3 drift speed of the dust
@@ -373,6 +417,25 @@ int   ps_r_terrain_debug = 0;
 // matte. Fades out as the ground wets (the wet reflection takes over). 0 = off.
 float ps_r_terrain_gloss = 0.5f;
 int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = coverage, 2 = micro-height / sim flow
+
+// SURFACE FIELD (the "smart heightmap"): metre-scale ground height/slope/curvature/
+// exposure/canopy derived from the rain+ground maps (shaders/surface_field.glsl).
+// r_sf = master enable for future consumers (snow/fog/water); r_sf_debug visualizes
+// the field; r_sf_eps tunes the finite-difference scale.
+int   ps_r_sf        = 0;       // r_sf — master enable (consumers later)
+int   ps_r_sf_debug  = 0;       // r_sf_debug — 0 off,1 height,2 slope,3 curvature,4 sky,5 canopy
+float ps_r_sf_eps    = 1.5f;    // r_sf_eps — derive finite-difference epsilon (metres)
+float ps_r_snow      = 0.f;     // r_snow — TARGET snow coverage 0..1 (Surface Field consumer; whitens by type x slope x sky)
+float ps_r_snow_rate = 0.25f;   // r_snow_rate — snow accumulate/melt speed per second (eases the actual amount toward r_snow)
+int   ps_r_snow_deform        = 1;      // r_snow_deform — footprint deformation (carve prints into the snow volume)
+float ps_r_snow_deform_depth  = 0.14f;  // r_snow_deform_depth — print press depth (m)
+float ps_r_snow_deform_radius = 0.22f;  // r_snow_deform_radius — print radius (m)
+float ps_r_snow_deform_time   = 60.f;   // r_snow_deform_time — print lifetime (sec); time-decay so the trail lasts ~a minute
+int   ps_r_snow_deform_tex    = 1;      // r_snow_deform_tex — dense persistent deform TEXTURE (vk_deform) vs the stamp loop
+int   ps_r_snow_mesh          = 0;      // r_snow_mesh — dense player-centred snow surface mesh (VHM-style; needs deform_tex)
+float ps_r_snow_berm          = 0.2f;   // r_snow_berm — displaced-snow BERM height around prints (fraction of dent depth)
+float ps_r_snow_ripple        = 0.9f;   // r_snow_ripple — wind-ripple/sastrugi relief strength on the open snow (0 = off)
+float ps_r_snow_rough         = 0.5f;   // r_snow_rough — trail/print IMPERFECTION (per-print width/depth + wavy edges)
 
 // SSS PUDDLES (SSFX deffer_terrain_high_flat port): the puddle look. Distinct
 // procedural puddle bodies (stand-in for SSFX's per-level artist puddles_mask) that
@@ -997,6 +1060,19 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_ssao_npc_normals", &ps_r_ssao_npc_normals, 0, 1); // NPC normal G-buffer for GTAO (A/B)
     CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 3);   // 1=AO map, 2=depth view, 3=normal view
     CMD4(CCC_Float, "r_ssao_strength", &ps_r_ssao_strength, 0.f, 4.f);
+    CMD4(CCC_Integer, "r_ssil", &ps_r_ssil_enable, 0, 1);        // SSIL (folded into GTAO) on/off (A/B; needs r_ssao on)
+    CMD4(CCC_Integer, "r_ssil_debug", &ps_r_ssil_debug, 0, 1);   // 1 = show ONLY the indirect bounce field
+    CMD4(CCC_Float, "r_ssil_strength", &ps_r_ssil_strength, 0.f, 8.f);  // IL intensity multiplier
+    CMD4(CCC_Integer, "r_motion_vectors", &ps_r_motion_vectors, 0, 1);  // screen-space MV pass on/off (DLSS/FSR/PT foundation)
+    CMD4(CCC_Integer, "r_mv_debug", &ps_r_mv_debug, 0, 1);              // false-colour MV overlay (grey=still, R=+x, G=+y)
+    CMD4(CCC_Float, "r_mv_debug_scale", &ps_r_mv_debug_scale, 1.f, 500.f); // MV overlay magnitude scale
+    CMD4(CCC_Float, "r_wind_tree_bend", &ps_r_wind_tree_bend, 0.f, 2.f);   // tree trunk sway intensity (0 = rigid)
+    CMD4(CCC_Float, "r_wind_tree_anim", &ps_r_wind_tree_anim, 0.f, 40.f);  // tree branch/leaf flutter speed
+    CMD4(CCC_Float, "r_wind_tree_trunk", &ps_r_wind_tree_trunk, 0.f, 2.f); // tree trunk anim speed
+    CMD4(CCC_Float, "r_wind_tree_flutter", &ps_r_wind_tree_flutter, 0.f, 16.f); // crown/leaf flutter amplitude
+    CMD4(CCC_Float, "r_wind_tree_crown", &ps_r_wind_tree_crown, 0.f, 30.f);     // height where leaf flutter fades in
+    CMD4(CCC_Float, "r_wind_shadow_dist", &ps_r_wind_shadow_dist, 0.f, 160.f);  // tree shadow wind radius (0 = all static)
+    CMD4(CCC_Integer, "r_vsm_tree_wind", &ps_r_vsm_tree_wind, 0, 1);            // TEST: wind in VSM tree shadow pages
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
     CMD4(CCC_Float, "r_ambient_floor", &ps_r_ambient_floor, 0.f, 0.5f);
     CMD4(CCC_Float, "r_wet_darken", &ps_r_wet_darken, 0.f, 1.f);
@@ -1066,6 +1142,14 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vol_lights",    &ps_r_vol_lights,    0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_smoke",     &ps_r_vol_smoke,     0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_smoke_clamp", &ps_r_vol_smoke_clamp, 0.0f, 64.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_inject",  &ps_r_vol_smoke_inject,  0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_density", &ps_r_vol_smoke_density, 0.0f, 16.0f);
+    CMD4(CCC_Integer, "r_vol_smoke_debug",   &ps_r_vol_smoke_debug,   0, 3);
+    CMD4(CCC_Float,   "r_vol_smoke_dist_full", &ps_r_vol_smoke_dist_full, 0.0f, 300.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_dist",    &ps_r_vol_smoke_dist,    0.0f, 300.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_footprint", &ps_r_vol_smoke_footprint, 0.0f, 3.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_shadow",  &ps_r_vol_smoke_shadow,  0.0f, 8.0f);
+    CMD4(CCC_Float,   "r_vol_smoke_shadow_step", &ps_r_vol_smoke_shadow_step, 0.05f, 4.0f);
     CMD4(CCC_Float,   "r_vol_noise",       &ps_r_vol_noise,       0.0f, 1.0f);
     CMD4(CCC_Float,   "r_vol_noise_scale", &ps_r_vol_noise_scale, 0.02f, 2.0f);
     CMD4(CCC_Float,   "r_vol_noise_speed", &ps_r_vol_noise_speed, 0.0f, 1.0f);
@@ -1106,6 +1190,20 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS puddles (default puddle source)
     CMD4(CCC_Float, "r_puddle_level", &ps_r_puddle_level, 0.f, 1.f);     // puddle coverage (more/larger puddles)
     CMD4(CCC_Float, "r_puddle_scale", &ps_r_puddle_scale, 0.1f, 6.f);    // puddle size (bigger = smaller pools)
+    CMD4(CCC_Integer, "r_sf", &ps_r_sf, 0, 1);                  // Surface Field master enable
+    CMD4(CCC_Integer, "r_sf_debug", &ps_r_sf_debug, 0, 5);      // 0 off,1 height,2 slope,3 curvature,4 sky,5 canopy
+    CMD4(CCC_Float, "r_sf_eps", &ps_r_sf_eps, 0.25f, 8.f);      // derive finite-difference epsilon (m)
+    CMD4(CCC_Float, "r_snow", &ps_r_snow, 0.f, 1.f);            // TARGET snow coverage (Surface Field consumer)
+    CMD4(CCC_Float, "r_snow_rate", &ps_r_snow_rate, 0.f, 5.f);  // snow accumulate/melt speed (per sec)
+    CMD4(CCC_Integer, "r_snow_deform", &ps_r_snow_deform, 0, 1);              // footprint deformation enable
+    CMD4(CCC_Float, "r_snow_deform_depth", &ps_r_snow_deform_depth, 0.f, 0.5f);   // print press depth (m)
+    CMD4(CCC_Float, "r_snow_deform_radius", &ps_r_snow_deform_radius, 0.05f, 1.f); // print radius (m)
+    CMD4(CCC_Float, "r_snow_deform_time", &ps_r_snow_deform_time, 1.f, 300.f);     // print lifetime (sec, time-decay)
+    CMD4(CCC_Integer, "r_snow_deform_tex", &ps_r_snow_deform_tex, 0, 1);           // dense deform texture (vk_deform) vs stamp loop
+    CMD4(CCC_Integer, "r_snow_mesh", &ps_r_snow_mesh, 0, 2);                       // dense snow surface mesh (1=on, 2=debug magenta)
+    CMD4(CCC_Float, "r_snow_berm", &ps_r_snow_berm, 0.f, 2.f);                     // displaced-snow berm height around prints
+    CMD4(CCC_Float, "r_snow_ripple", &ps_r_snow_ripple, 0.f, 4.f);                 // wind-ripple relief strength on open snow
+    CMD4(CCC_Float, "r_snow_rough", &ps_r_snow_rough, 0.f, 1.f);                   // trail/print imperfection (width/depth/edge noise)
     CMD4(CCC_Integer, "r_water_sim", &ps_r_water_sim, 0, 1);             // water flow sim master enable
     CMD4(CCC_Float, "r_water_rain", &ps_r_water_rain, 0.f, 5.f);         // sim rain input rate (depth/s)
     CMD4(CCC_Float, "r_water_evap", &ps_r_water_evap, 0.f, 20.f);        // sim leak rate (exp drain ∝ amount)

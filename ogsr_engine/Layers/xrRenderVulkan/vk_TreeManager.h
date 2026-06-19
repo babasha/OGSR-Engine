@@ -33,18 +33,21 @@ namespace VK
 class CVulkanTexture;
 struct FrameContext;
 
-// Tree graphics push constants (72 B, VS+FS). Matches tree.vert/frag.
+// Tree graphics push constants (160 B, VS+FS). Matches tree.vert/frag.
 struct TreeGfxPush
 {
-    Fmatrix  mViewProj;   // 64 B  world → clip
-    float    uvScale;     //  4 B  1/2048 (FTreeVisual_quant = 32768/16)
-    float    alphaRef;    //  4 B  fragment alpha cutoff
-    float    _pad0;       //  4 B  (vec4 below needs 16-byte alignment → offset 80)
-    float    _pad1;       //  4 B
-    Fvector4 vSunColor;   // 16 B  env sun colour (rgb); w unused
-    Fvector4 vHemiColor;  // 16 B  env hemi colour (rgb); w unused
+    Fmatrix  mViewProj;    // 64 B  world → clip
+    float    uvScale;      //  4 B  1/2048 (FTreeVisual_quant = 32768/16)
+    float    alphaRef;     //  4 B  fragment alpha cutoff
+    float    _pad0;        //  4 B  (vec4 below needs 16-byte alignment → offset 80)
+    float    _pad1;        //  4 B
+    Fvector4 vSunColor;    // 16 B  env sun colour (rgb); w unused
+    Fvector4 vHemiColor;   // 16 B  env hemi colour (rgb); w unused
+    Fvector4 wind_params;  // 16 B  SSFX (wind_direction, wind_velocity, _, _)
+    Fvector4 wsetup_trees; // 16 B  SSFX (branchSpeed, trunkSpeed, bend, minWindSpeed)
+    Fvector4 wind_anim;    // 16 B  Environment.wind_anim drift (xyz); w unused
 };
-static_assert(sizeof(TreeGfxPush) == 112, "TreeGfxPush must be 112 B");
+static_assert(sizeof(TreeGfxPush) == 160, "TreeGfxPush must be 160 B");
 
 // View frustum UBO (binding 1 of the cull set). 6 normalized planes, std140.
 struct TreeFrustumUBO
@@ -133,8 +136,13 @@ public:
     // depth so GTAO sees them and the foliage color passes get early-Z
     // (same VP + alpha-ref as the LEQUAL color pass → re-raster matches).
     // Caller owns render begin/end, viewport and bias.
+    // minDist/maxDist: cull trees by camera distance to split the shadow into a
+    // cached STATIC layer (far: minDist=wind_shadow_dist) and a per-frame DYNAMIC
+    // layer (near: maxDist=wind_shadow_dist) so near trees sway in the wind without
+    // re-rasterizing the whole forest. Defaults = all trees (no split).
     void RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade = -1,
-                     const CFrustum* frustum = nullptr);
+                     const CFrustum* frustum = nullptr,
+                     float minDist = 0.0f, float maxDist = 1e9f);
 
     // VSM caster path (trees are static → temporal-friendly). vk_vsm provides the page
     // buffers (its own pageTable/pageList + this frame's clipmap UBO). VsmBin runs the
@@ -186,6 +194,8 @@ private:
     VkDescriptorSetLayout      m_TexDescLayout = VK_NULL_HANDLE;
     VkDescriptorPool           m_TexDescPool   = VK_NULL_HANDLE;
     VkSampler                  m_TexSampler    = VK_NULL_HANDLE;
+    VK::CVulkanTexture*        m_WaveTex       = nullptr;          // SSFX wind flow map (s_waves)
+    VkSampler                  m_WaveSampler   = VK_NULL_HANDLE;   // linear/repeat for s_waves
     xr_vector<VkDescriptorSet> m_TexDescSets;
 
     // ----- Session B GPU resources -----

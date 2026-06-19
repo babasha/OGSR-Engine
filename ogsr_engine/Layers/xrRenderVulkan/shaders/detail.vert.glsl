@@ -17,29 +17,22 @@ layout(location = 6) in vec4  aInstColor;   // (sun, trail, objId, hemi)
 
 layout(push_constant) uniform DetailConstants {
     mat4 mViewProj;
-    vec4 vWave;             // (freq_x, freq_z, speed, time)
-    vec4 vWind;             // (dir.x, 0, dir.z, amplitude)
+    vec4 wind_params;       // (wind_direction, wind_velocity, treeAmplitude, _)
+    vec4 wsetup_grass;      // (animspeed, turbulence, push, wave) — SSFX grass tunables
+    vec4 wind_anim;         // (drift.x, drift.y, drift.z, minWindSpeed) — Environment.wind_anim
     vec4 vConsts;           // (s_x, s_y, sun.y, ambient_floor)
     vec4 vInteractors[4];   // xyz=pos, w=radius (0 = unused)
     vec4 vSunColor;         // env sun colour (rgb)
     vec4 vHemiColor;        // env hemi colour (rgb)
 } pc;
 
+#include "ssfx_wind.glsl"   // SSFX flow-map wind (s_waves @ set0 binding1)
+
 layout(location = 0) out vec2  vUV;
 layout(location = 1) out vec4  vColor;    // hemi + floor (shadow-independent part)
 layout(location = 2) out float vHeight;
 layout(location = 3) out vec3  vSunLit;   // sun part — attenuated by the shadow map in frag
 layout(location = 4) out vec3  vWPos;     // world-space position (shadow lookup)
-
-vec3 ApplyWind(vec3 pos, float h)
-{
-    float wf = h * h;
-    float p1 = pos.x * pc.vWave.x + pos.z * pc.vWave.y + pc.vWave.w * pc.vWave.z;
-    float p2 = pos.x * pc.vWave.y * 0.7 + pos.z * pc.vWave.x * 1.3 - pc.vWave.w * pc.vWave.z * 0.5;
-    float w  = sin(p1) * 0.6 + sin(p2) * 0.4;
-    vec3 dir = normalize(vec3(pc.vWind.x, 0.0, pc.vWind.z));
-    return pos + dir * w * pc.vWind.w * wf;
-}
 
 vec3 ApplyInteraction(vec3 pos, float h)
 {
@@ -68,7 +61,10 @@ void main()
         vec3(aInstRow0.w, aInstRow1.w, aInstRow2.w));
 
     vec3 worldPos = inst * vec4(aPos, 1.0);
-    worldPos      = ApplyWind(worldPos, aHeight);
+    // SSFX flow-map wind (replaces the old sine ApplyWind). Sample at the base
+    // world position, drift by Environment.wind_anim.
+    WindSetup W = ssfx_wind_setup(pc.wind_params, pc.wsetup_grass, pc.wind_anim.w);
+    worldPos     += ssfx_wind_grass(worldPos, aHeight, W, pc.wind_anim.xy);
     worldPos      = ApplyInteraction(worldPos, aHeight);
 
     // Trail press-down: gen-shader wrote trail intensity into aInstColor.g.

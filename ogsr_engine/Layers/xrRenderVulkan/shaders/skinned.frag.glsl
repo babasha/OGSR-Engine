@@ -80,6 +80,15 @@ layout(set = 2, binding = 6) uniform samplerCube uSky0;        // sky ambient cu
 layout(set = 2, binding = 7) uniform samplerCube uSky1;        // sky ambient cube 1 (weather B)
 layout(set = 2, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
 layout(set = 2, binding = 8) uniform sampler2D uAO;            // GTAO (half-res)
+layout(set = 2, binding = 21) uniform sampler2D uIL;          // SSIL one-bounce indirect light (half-res, r_ssil)
+
+// SSIL ambient boost - see light_ubo.glsl (SSFX hdiffuse *= IL). Multiplies the
+// ambient where AO does; 0/no-op where there's no bounce or r_ssil is off.
+vec3 ssilBoost()
+{
+    vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
+    return vec3(1.0) + il / (1.0 + il);
+}
 
 // GTAO visibility - see world_lmap.frag (occludes hemi+ambient only). NPCs are
 // IN the prepass depth (Skinned_RenderDepthPrepass), so this is real per-pixel
@@ -295,7 +304,7 @@ void main()
     // so a sky-cube sample in N is meaningless there).
     // GTAO gates ambient/hemi like the world shaders - never for the HUD
     // (hands would inherit the AO of whatever wall is behind them on screen).
-    vec3 occ = (pc.hudMode < 0.5) ? coloredAO(gtaoVis(), base.rgb) : vec3(1.0);
+    vec3 occ = (pc.hudMode < 0.5) ? coloredAO(gtaoVis(), base.rgb) * ssilBoost() : vec3(1.0);   // HUD path = vec3(1) → no IL on hands
     vec3 skyFill = (pc.hudMode < 0.5) ? skyAmbient(N) * (L.sky_params.y * 0.7 * pc.hemi)
                                       : vec3(0.0);   // HUD: light fully replaced below
     vec3 light = L.ambient.rgb * occ

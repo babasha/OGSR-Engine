@@ -31,6 +31,15 @@ VkPipeline CreatePipeline(VkShaderModule vs, VkShaderModule fs, VkFormat colorFm
                           const VkPipelineColorBlendAttachmentState& blend,
                           const char* tag);
 
+// MRT variant: `count` color attachments (formats + per-attachment blend states,
+// each `count` long). Same fullscreen skeleton otherwise. Used by GTAO+IL, which
+// writes target 0 = AO+bentN and target 1 = indirect light in one horizon march.
+VkPipeline CreatePipelineMRT(VkShaderModule vs, VkShaderModule fs,
+                             const VkFormat* colorFmts, u32 count,
+                             VkPipelineLayout layout,
+                             const VkPipelineColorBlendAttachmentState* blends,
+                             const char* tag);
+
 // One fullscreen draw into dstView at `extent`: DONT_CARE color load, positive
 // viewport + full scissor, bind `set` at 0, push `pushSize` bytes to FRAGMENT,
 // draw the 3-vertex fullscreen triangle. Caller's image must be in
@@ -39,5 +48,11 @@ VkPipeline CreatePipeline(VkShaderModule vs, VkShaderModule fs, VkFormat colorFm
 void DrawSimple(VkCommandBuffer cmd, VkImageView dstView, VkExtent2D extent,
                 VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
                 const void* push, u32 pushSize);
+
+// MRT variant of DrawSimple: `count` attachment views (DONT_CARE load, STORE),
+// otherwise identical. Each view's image must be in COLOR_ATTACHMENT_OPTIMAL.
+void DrawMRT(VkCommandBuffer cmd, const VkImageView* dstViews, u32 count, VkExtent2D extent,
+             VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
+             const void* push, u32 pushSize);
 
 }}  // namespace VK::Fullscreen

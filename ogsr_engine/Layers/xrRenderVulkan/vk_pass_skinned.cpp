@@ -17,6 +17,7 @@
 
 #include "vk_pass_skinned.h"
 #include "vk_pass_ssao.h"              // SSAOPass::GetNormalFormat — NPC normal G-buffer target
+#include "vk_motionvec.h"             // VK::MotionVec::Format — RG16F motion target (skinned MV overlay)
 #include "vk_pass_world.h"              // g_DynamicVisuals / DynVisual
 #include "vk_swapchain.h"              // Swapchain.m_Format / m_DepthFormat
 #include "vk_scene_color.h"            // HDR scene target format
@@ -52,12 +53,23 @@ namespace {
     VkShaderModule        s_prepassFS  = VK_NULL_HANDLE;  // ... + alpha-test FS (matches skinned.frag)
     VkShaderModule        s_normalVS   = VK_NULL_HANDLE;  // NPC normal G-buffer VS (skins normal → world, optional)
     VkShaderModule        s_normalFS   = VK_NULL_HANDLE;  // ... + AT FS writing worldN*0.5+0.5
+    VkShaderModule        s_mvVS       = VK_NULL_HANDLE;  // motion-vector VS (skins cur+prev pose, optional)
+    VkShaderModule        s_mvFS       = VK_NULL_HANDLE;  // ... → RG16F screen motion
+    VkPipelineLayout      s_mvLayout   = VK_NULL_HANDLE;  // set0 = bones + 144B push (cur/prev VP + bases)
     CVulkanBuffer         s_boneSSBO;
     Fmatrix*              s_boneMapped = nullptr;
     std::unordered_map<u32, VkPipeline> s_pipelines;        // keyed by vertex stride (36/40/44)
     std::unordered_map<u32, VkPipeline> s_shadowPipelines;  // depth-only casters, same key
     std::unordered_map<u32, VkPipeline> s_prepassPipelines; // scene depth-prepass AT casters
     std::unordered_map<u32, VkPipeline> s_normalPipelines;  // NPC normal G-buffer casters, same key
+    std::unordered_map<u32, VkPipeline> s_motionPipelines;  // motion-vector casters, same key
+
+    // Per-skeleton bone-slot record for the motion pass: maps a CKinematics to the
+    // absolute baseBone it occupied. Rolled each frame — s_prevBoneMap then holds
+    // LAST frame's slots, whose SSBO regions are still live (FRAMES_IN_FLIGHT≥2),
+    // so the MV vertex shader can skin the previous pose for true animation motion.
+    std::unordered_map<CKinematics*, std::pair<u32, u32>> s_curBoneMap;   // K -> {baseBone, boneCount}
+    std::unordered_map<CKinematics*, std::pair<u32, u32>> s_prevBoneMap;
 
     // Per-frame upload registry: every skeleton whose bones landed in the SSBO
     // this frame. Bones are stored PRE-MULTIPLIED by the object's world matrix,
@@ -75,6 +87,11 @@ namespace {
     // Push block — must match skinned.{vert,frag}.glsl PushConstants. hudMode (read
     // by the fragment) flags first-person HUD so it gets sun-direction-independent light.
     struct SkinPush { Fmatrix mvp; u32 skinMode; u32 baseBone; u32 boneCount; float hudMode; float hemi; };
+
+    // Motion-vector push — must match motion_vec_skinned.vert. 144 B (device max is
+    // 256 here, see vk_pipeline.cpp). curVP/prevVP project the cur/prev poses.
+    struct MVSkinPush { Fmatrix curVP; Fmatrix prevVP; u32 skinMode; u32 curBase; u32 prevBase; u32 boneCount; };
+    static_assert(sizeof(MVSkinPush) == 144, "must match motion_vec_skinned.vert PC block");
 
     // Vertex input for the vertHW_* layouts. loc0 pos FLOAT4; loc1/3/4 packed
     // normal/tangent/binormal (UBYTE4N); loc2 = FLOAT2 (36/40) or FLOAT4 (44);
@@ -227,6 +244,11 @@ namespace {
         s_normalFS = g_ShaderManager->Load("shadow_skinned_normal.frag.spv");
         if (s_normalVS == VK_NULL_HANDLE || s_normalFS == VK_NULL_HANDLE)
             Msg("![VK Skinned] shadow_skinned_normal.{vert,frag}.spv missing — NPC AO normals disabled");
+        // Optional — absence just keeps NPCs on camera-only motion vectors (no animation MV).
+        s_mvVS = g_ShaderManager->Load("motion_vec_skinned.vert.spv");
+        s_mvFS = g_ShaderManager->Load("motion_vec_skinned.frag.spv");
+        if (s_mvVS == VK_NULL_HANDLE || s_mvFS == VK_NULL_HANDLE)
+            Msg("![VK Skinned] motion_vec_skinned.{vert,frag}.spv missing — NPC animation motion vectors disabled");
 
         // Descriptor set layout: 1 storage buffer (bone matrices), VERTEX stage.
         VkDescriptorSetLayoutBinding b{};
@@ -266,6 +288,22 @@ namespace {
         plci.setLayoutCount = 3; plci.pSetLayouts = setLayouts;
         plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
         if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_layout) != VK_SUCCESS) { s_failed = true; return false; }
+
+        // Motion-vector pipeline layout: set 0 (bone SSBO) + set 1 (diffuse, for the
+        // alpha-test) + a 144-byte VERTEX push (cur/prev VP + bone bases). No light set
+        // — the MV fragment only needs the two clip positions + the cutout test.
+        if (s_mvVS != VK_NULL_HANDLE && s_mvFS != VK_NULL_HANDLE) {
+            VkDescriptorSetLayout mvSets[2] = { s_setLayout, matLayout };
+            VkPushConstantRange mvPcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(MVSkinPush) };
+            VkPipelineLayoutCreateInfo mvPlci{};
+            mvPlci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            mvPlci.setLayoutCount = 2; mvPlci.pSetLayouts = mvSets;
+            mvPlci.pushConstantRangeCount = 1; mvPlci.pPushConstantRanges = &mvPcr;
+            if (vkCreatePipelineLayout(VulkanHW.m_Device, &mvPlci, nullptr, &s_mvLayout) != VK_SUCCESS) {
+                Msg("![VK Skinned] motion-vector pipeline layout failed — NPC animation MV disabled");
+                s_mvVS = s_mvFS = VK_NULL_HANDLE;   // disable the MV path, keep the rest alive
+            }
+        }
 
         // Bone SSBO (host-visible, persistently mapped — Create sets HOST_ACCESS+MAPPED for STORAGE).
         // Sized FRAMES_IN_FLIGHT × kMaxBones: each in-flight frame owns region
@@ -547,6 +585,98 @@ namespace {
         return p;
     }
 
+    // MOTION-VECTOR pipeline: skins cur+prev pose (motion_vec_skinned.vert) and
+    // writes RG16F screen motion. Tests against the already-laid scene depth
+    // (LEQUAL, no write) so only the visible NPC surface overwrites the static
+    // camera field. Negative-height viewport (set by the caller) matches the
+    // forward/prepass raster so positions/depth bit-match → LEQUAL passes on equal.
+    static VkPipeline CreateMotionPipeline(u32 stride)
+    {
+        VkVertexInputBindingDescription   binding{};
+        VkVertexInputAttributeDescription attrs[6]{};
+        BuildSkinnedVI(stride, binding, attrs);
+
+        VkPipelineVertexInputStateCreateInfo vi{};
+        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
+        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_mvVS; stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_mvFS; stages[1].pName = "main";
+
+        VkPipelineInputAssemblyStateCreateInfo ia{};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo vp{};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1; vp.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode    = VK_CULL_MODE_NONE;
+        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth   = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        ds.depthTestEnable  = VK_TRUE;
+        ds.depthWriteEnable = VK_FALSE;                  // scene depth already owns the surface
+        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;   // RG16F motion
+        cba.blendEnable    = VK_FALSE;
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkPipelineDynamicStateCreateInfo dynState{};
+        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
+
+        VkFormat mvFmt = VK::MotionVec::Format();
+        VkPipelineRenderingCreateInfo prci{};
+        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        prci.colorAttachmentCount    = 1;
+        prci.pColorAttachmentFormats = &mvFmt;
+        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
+
+        VkGraphicsPipelineCreateInfo pi{};
+        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pi.pNext             = &prci;
+        pi.stageCount        = 2;     pi.pStages             = stages;
+        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
+        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
+        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
+        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
+        pi.layout            = s_mvLayout;
+
+        VkPipeline h = VK_NULL_HANDLE;
+        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
+        if (r != VK_SUCCESS) { Msg("![VK Skinned] motion pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        Msg("[VK Skinned] motion-vector pipeline created stride=%u", stride);
+        return h;
+    }
+
+    static VkPipeline GetMotionPipeline(u32 stride)
+    {
+        auto it = s_motionPipelines.find(stride);
+        if (it != s_motionPipelines.end()) return it->second;
+        VkPipeline p = CreateMotionPipeline(stride);
+        s_motionPipelines.emplace(stride, p);
+        return p;
+    }
+
     // Resolve a CKinematics child to its mesh + render mode (skinned leaves only).
     template <class TChild>
     static bool ResolveSkinnedLeaf(TChild* child, VK_Render_Mesh*& mesh, u16& rmode)
@@ -633,6 +763,11 @@ void Skinned_UploadBones()
     s_uploads.clear();
     s_uploadsHud.clear();
 
+    // Roll the bone-slot records: this frame's map becomes "previous" for the MV
+    // pass (its SSBO regions are still live), and we rebuild "current" below.
+    s_prevBoneMap = std::move(s_curBoneMap);
+    s_curBoneMap.clear();
+
     // Pick THIS frame's bone-SSBO region by the fence-guarded in-flight slot, so the
     // CPU never writes matrices a still-in-flight frame's GPU may be reading.
     const u32 slot  = CommandManager.GetCurrentFrame();
@@ -669,6 +804,46 @@ void Skinned_UploadBones()
     };
     uploadList(g_DynamicVisuals, s_uploads);
     uploadList(g_HudVisuals,     s_uploadsHud);
+
+    // Record this frame's world-skeleton slots so NEXT frame's MV pass can find the
+    // previous pose (HUD excluded — it never enters the MV pass).
+    for (const SkelUpload& u : s_uploads)
+        s_curBoneMap[u.K] = { u.baseBone, (u32)u.boneCount };
+}
+
+void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet)
+{
+    out.clear();
+    if (!s_inited || !s_boneMapped) return;
+    // STALKER human bipeds: feet = bip01_l_foot / bip01_r_foot (fallback l_foot/r_foot).
+    // s_boneMapped[baseBone+id] is already model->WORLD, so .c is the world foot pos.
+    for (const SkelUpload& u : s_uploads) {
+        if (!u.K) continue;
+        u16 lf = u.K->LL_BoneID("bip01_l_foot"); if (lf == BI_NONE) lf = u.K->LL_BoneID("l_foot");
+        u16 rf = u.K->LL_BoneID("bip01_r_foot"); if (rf == BI_NONE) rf = u.K->LL_BoneID("r_foot");
+        // ONLY real foot bones (bipeds). NO object-root fallback: the stamp is XZ-only
+        // (ignores height), so stamping a skeleton-less object's root made FLYING items
+        // (thrown bolt/grenade) leave a ground trail in mid-air.
+        if (lf != BI_NONE && lf < u.boneCount) { out.push_back(s_boneMapped[u.baseBone + lf].c); if (out.size() >= maxFeet) return; }
+        if (rf != BI_NONE && rf < u.boneCount) { out.push_back(s_boneMapped[u.baseBone + rf].c); if (out.size() >= maxFeet) return; }
+    }
+}
+
+// World PROPS / items (skeleton-less skinned visuals: thrown/dropped bolts, grenades,
+// debris). Returns their world root. The caller gates these by ground proximity (so a
+// FLYING item doesn't stamp) and prints them SHALLOW (an item sinks less than a boot).
+void Skinned_CollectProps(xr_vector<Fvector>& out, u32 maxProps)
+{
+    out.clear();
+    if (!s_inited || !s_boneMapped) return;
+    for (const SkelUpload& u : s_uploads) {
+        if (!u.K) continue;
+        u16 lf = u.K->LL_BoneID("bip01_l_foot"); if (lf == BI_NONE) lf = u.K->LL_BoneID("l_foot");
+        u16 rf = u.K->LL_BoneID("bip01_r_foot"); if (rf == BI_NONE) rf = u.K->LL_BoneID("r_foot");
+        if (lf != BI_NONE || rf != BI_NONE) continue;   // has feet -> biped, handled by CollectFeet
+        out.push_back(u.xform.c);                        // object root (world)
+        if (out.size() >= maxProps) return;
+    }
 }
 
 void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
@@ -820,6 +995,78 @@ void Skinned_RenderNormalPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
     RenderSkinnedCasters(cmd, viewProj, &GetNormalPipeline);
 }
 
+// NPC MOTION VECTORS (MV Phase 2a): re-draw the world skinned leaves into the
+// motion target, skinning the CURRENT and PREVIOUS pose so each pixel carries its
+// true screen motion (camera + animation + body travel). Depth-tested against the
+// complete scene depth (LEQUAL, no write) → only visible NPC pixels overwrite the
+// camera/static field. Caller owns render begin/end + the negative-height viewport
+// (MotionVec::ExecuteDynamic). HUD excluded. prevVP = last frame's view-proj.
+void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP)
+{
+    if (!Init()) return;
+    if (s_mvVS == VK_NULL_HANDLE || s_mvFS == VK_NULL_HANDLE || s_mvLayout == VK_NULL_HANDLE) return;
+    Skinned_UploadBones();   // idempotent; also rolls the prev-bone map
+    if (s_uploads.empty()) return;
+
+    VkPipeline lastPipe = VK_NULL_HANDLE;
+    VkDescriptorSet lastMatSet = VK_NULL_HANDLE;
+    bool boundBones = false;
+    u32 nDraw = 0;
+
+    for (const SkelUpload& u : s_uploads)
+    {
+        // Previous pose: same skeleton last frame. Its SSBO region is still live
+        // (FRAMES_IN_FLIGHT≥2). New skeletons (not seen last frame, or whose bone
+        // count changed) fall back to the current base → camera-only motion.
+        u32 prevBase = u.baseBone;
+        auto it = s_prevBoneMap.find(u.K);
+        if (it != s_prevBoneMap.end() && it->second.second == (u32)u.boneCount)
+            prevBase = it->second.first;
+
+        for (auto* child : u.K->children)
+        {
+            VK_Render_Mesh* mesh = nullptr;
+            u16 rmode = 0;
+            if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+            if (child->m_bEmissiveAdd) continue;   // collimator marks: no depth, skip
+
+            VkPipeline pipe = GetMotionPipeline(mesh->vStride);
+            if (pipe == VK_NULL_HANDLE) continue;
+            if (pipe != lastPipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+                lastPipe = pipe; boundBones = false; lastMatSet = VK_NULL_HANDLE;
+            }
+            if (!boundBones) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_mvLayout, 0, 1, &s_set, 0, nullptr);
+                boundBones = true;
+            }
+
+            // Diffuse (set 1) for the alpha-test — default white (a=1) never discards.
+            WorldMaterial* mat = child->m_pWorldMaterial ? child->m_pWorldMaterial : WorldMaterialCache::GetDefault();
+            VkDescriptorSet matSet = (mat && mat->set != VK_NULL_HANDLE) ? mat->set : VK_NULL_HANDLE;
+            if (matSet == VK_NULL_HANDLE) continue;
+            if (matSet != lastMatSet) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_mvLayout, 1, 1, &matSet, 0, nullptr);
+                lastMatSet = matSet;
+            }
+
+            const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+            MVSkinPush pc{ curVP, prevVP, skinMode, u.baseBone, prevBase, (u32)u.boneCount };
+            vkCmdPushConstants(cmd, s_mvLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+
+            VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
+            VkDeviceSize vbOff = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+            vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
+            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+            ++nDraw;
+        }
+    }
+
+    static bool s_diag = false;
+    if (!s_diag && nDraw) { s_diag = true; Msg("[VK Skinned] first MV render: skeletons=%zu draws=%u", s_uploads.size(), nDraw); }
+}
+
 bool Skinned_AnyCasterInSphere(const Fvector& pos, float range)
 {
     for (const SkelUpload& u : s_uploads)
@@ -928,9 +1175,14 @@ void Skinned_Destroy()
     s_prepassPipelines.clear();
     for (auto& kv : s_normalPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
     s_normalPipelines.clear();
+    for (auto& kv : s_motionPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+    s_motionPipelines.clear();
     s_shadowVS = VK_NULL_HANDLE;   // module owned by g_ShaderManager
     s_prepassVS = VK_NULL_HANDLE; s_prepassFS = VK_NULL_HANDLE;
+    s_mvVS = VK_NULL_HANDLE; s_mvFS = VK_NULL_HANDLE;
+    s_curBoneMap.clear(); s_prevBoneMap.clear();
     s_uploads.clear(); s_uploadsHud.clear(); s_uploadFrame = u32(-1);
+    if (s_mvLayout)  { vkDestroyPipelineLayout(VulkanHW.m_Device, s_mvLayout, nullptr); s_mvLayout = VK_NULL_HANDLE; }
     if (s_layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_layout, nullptr); s_layout = VK_NULL_HANDLE; }
     if (s_pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_setLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }

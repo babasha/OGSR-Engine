@@ -116,18 +116,19 @@ struct DetailGenUBO
 };
 static_assert(sizeof(DetailGenUBO) == 64, "Gen UBO must be 64 B");
 
-// Graphics push (208 B) — wind/lighting/interactors.
+// Graphics push (224 B) — SSFX wind / lighting / interactors.
 struct DetailGfxPushConstants
 {
     Fmatrix  mViewProj;                            // 64
-    Fvector4 vWave;                                // 16  (freq_x, freq_z, speed, time)
-    Fvector4 vWind;                                // 16  (dir.x, 0, dir.z, amplitude)
+    Fvector4 wind_params;                          // 16  (wind_direction, wind_velocity, treeAmplitude, _)
+    Fvector4 wsetup_grass;                         // 16  SSFX (animspeed, turbulence, push, wave)
+    Fvector4 wind_anim;                            // 16  Environment.wind_anim (xyz drift) + w = minWindSpeed
     Fvector4 vConsts;                              // 16  (1, 1, sun.y, ambient_floor)
     Fvector4 vInteractors[MAX_GRASS_INTERACTORS];  // 64  xyz=pos, w=radius (0=unused)
     Fvector4 vSunColor;                            // 16  env sun colour (rgb); w unused
     Fvector4 vHemiColor;                           // 16  env hemi colour (rgb); w unused
 };
-static_assert(sizeof(DetailGfxPushConstants) == 208, "Gfx push must be 208 B");
+static_assert(sizeof(DetailGfxPushConstants) == 224, "Gfx push must be 224 B");
 
 // HZB build push (32 B) — matches hzb_build.comp.glsl. srcMip/dstMip select
 // levels; isFirstPass=1 reads the depth buffer, =0 reads the previous HZB mip.
@@ -288,6 +289,7 @@ private:
     // Per-detail-type loaded diffuse textures (one entry per `objects[]`).
     xr_vector<VK::CVulkanTexture*> m_DetailTextures;
     VkSampler                      m_DetailSampler = VK_NULL_HANDLE;
+    VK::CVulkanTexture*            m_WaveTex       = nullptr;  // SSFX wind flow map (s_waves, wind_wave.dds)
 
     bool            m_bCreated         = false;
 

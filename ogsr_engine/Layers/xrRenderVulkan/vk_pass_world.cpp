@@ -25,6 +25,9 @@
 #include "vk_vsm.h"            // VK::VSM — virtual shadow maps page marking (WIP, r_vsm)
 #include "vk_clustered.h"      // VK::Clustered — clustered forward light cull (r_clustered)
 #include "vk_volumetrics.h"    // VK::Vol — froxel volumetric inject/integrate (r_vol)
+#include "vk_pass_particles.h" // VK::CollectSmokeParticles — Stage-1 smoke media inject
+
+extern float ps_r_vol_smoke_inject;   // gate the per-frame smoke collect (0 = skip)
 #include "HW_Vulkan.h"         // VulkanHW.m_bVRSSupported
 #include "../../xr_3da/device.h" // Device.dwTimeGlobal (cull diag throttle)
 
@@ -163,7 +166,13 @@ void Pass_World(FrameContext& ctx)
     // The composite is folded into the tonemap pass (gated on r_vol).
     if (VK::Vol::Wanted() && VK::Vol::Ready()) {
         const VK::ProjTerms vpt = VK::DeriveProjTerms(*ctx.viewProj);
-        VK::Vol::Execute(cmd, vpt, CommandManager.GetCurrentFrame());
+        // Stage-1 VMS: gather this frame's alpha-smoke particles to inject as media.
+        static xr_vector<VK::Vol::SmokeParticle> s_smoke;
+        s_smoke.clear();
+        if (ps_r_vol_smoke_inject > 0.0f)
+            VK::CollectSmokeParticles(s_smoke);
+        VK::Vol::Execute(cmd, vpt, CommandManager.GetCurrentFrame(),
+                         s_smoke.empty() ? nullptr : s_smoke.data(), (u32)s_smoke.size());
     }
 
     // Throttled average: static-collect CPU vs the whole-frame cpu — confirms the
@@ -207,8 +216,8 @@ void Pass_World(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &psc);
         vkCmdSetDepthBias(cmd, 0.f, 0.f, 0.f);   // depth pipelines have dynamic bias — none here
 
-        g_RenderQueue.FlushDepth(cmd, *ctx.viewProj, false /*include alpha-tested via AT variant*/);
-        if (gpuWorld) WorldGPU::DrawDepth(cmd, *ctx.viewProj);   // GPU static set into the prepass depth
+        g_RenderQueue.FlushDepth(cmd, *ctx.viewProj, false /*include alpha-tested*/, false /*alphaTestedOnly*/, true /*displaceTerrain: snow volume matches color*/);
+        if (gpuWorld) WorldGPU::DrawDepth(cmd, *ctx.viewProj, true /*displaceTerrain*/);   // GPU static set into the prepass depth
 
         // Trees into the prepass depth too: GTAO sees trunks/canopies (R4's
         // gbuffer includes trees — most wilderness SSAO comes from them) and
@@ -292,6 +301,10 @@ void Pass_World(FrameContext& ctx)
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
         VK::Prof::ZoneEnd(cmd, zSSAO);
+        // Motion vectors moved OUT of the World pass: the static depth-reconstruction
+        // now runs in MotionVec::ExecuteDynamic (registered after LODs), where the
+        // depth holds ALL opaque geometry — so trees (rigid → exact) and grass get
+        // correct camera motion for free, not the background's. See vk_motionvec.cpp.
 
         // VRS: build this frame's depth-driven shading-rate image (compute reads the
         // prepass depth → coarser rate with distance). Needs depth SHADER_READ.

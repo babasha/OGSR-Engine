@@ -35,7 +35,14 @@ layout(push_constant) uniform PC {
     float _pad1;
     vec4  vSunColor;    // env sun colour (rgb)
     vec4  vHemiColor;   // env hemi colour (rgb)
+    vec4  wind_params;  // SSFX (wind_direction, wind_velocity, _, _)
+    vec4  wsetup_trees; // SSFX (branchSpeed, trunkSpeed, bend, minWindSpeed)
+    vec4  wind_anim;    // Environment.wind_anim drift (xyz)
 } pc;
+
+// SSFX tree wind (trunk sway + crown flutter). Shared with the shadow caster
+// (tree_depth.vert) so the bent geometry and its shadow stay in sync.
+#include "ssfx_tree_wind.glsl"
 
 layout(location = 0) out vec2 vUV;
 layout(location = 1) out vec3 vLight;    // hemi + floor (shadow-independent part)
@@ -47,6 +54,19 @@ void main()
     TreeInstance t = inst[gl_InstanceIndex];
 
     vec4 worldPos = t.xform * vec4(aPos, 1.0);
+    // SSFX tree wind (trunk sway + crown flutter). baseY = tree origin world Y
+    // (xform translation) = per-tree phase; H = vertex height above base; tc_y =
+    // the scaled UV (fades flutter toward the trunk base).
+    float baseY = t.xform[3].y;
+    float H     = worldPos.y - baseY;
+    float r     = -pc.wind_params.x + 1.57079;
+    vec2  wdir  = vec2(cos(r), sin(r));
+    float spd   = max(pc.wsetup_trees.w, clamp(pc.wind_params.y * 0.001, 0.0, 1.0));
+    float tc_y  = aUV.y * pc.uvScale;
+    // Wind class (set at Build by texture name): 2 = foliage, 1 = trunk, 0 = rigid.
+    worldPos.xyz += ssfxTreeWind(t._p0, worldPos.xyz, H, tc_y, wdir, spd, baseY,
+                                 pc.wind_anim.xyz, pc.wsetup_trees.x, pc.wsetup_trees.y,
+                                 pc.wsetup_trees.z, pc.wind_anim.w);
     gl_Position   = pc.mViewProj * worldPos;
 
     vUV = aUV * pc.uvScale;

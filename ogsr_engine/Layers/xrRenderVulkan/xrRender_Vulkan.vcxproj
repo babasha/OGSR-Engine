@@ -110,6 +110,8 @@
     <ClInclude Include="vk_fullscreen.h" />
     <ClInclude Include="vk_pass_world.h" />
     <ClInclude Include="vk_env_light.h" />
+    <ClInclude Include="vk_deform.h" />
+    <ClInclude Include="vk_pass_snow.h" />
     <ClInclude Include="vk_light.h" />
     <ClInclude Include="vk_shadow.h" />
     <ClInclude Include="vk_pass_shadow.h" />
@@ -119,6 +121,7 @@
     <ClInclude Include="vk_pass_tonemap.h" />
     <ClInclude Include="vk_pass_bloom.h" />
     <ClInclude Include="vk_pass_ssao.h" />
+    <ClInclude Include="vk_motionvec.h" />
     <ClInclude Include="vk_pipeline_cache.h" />
     <ClInclude Include="vk_render_queue.h" />
     <ClInclude Include="vk_world_material.h" />
@@ -183,6 +186,7 @@
     <ClCompile Include="vk_pass_tonemap.cpp" />
     <ClCompile Include="vk_pass_bloom.cpp" />
     <ClCompile Include="vk_pass_ssao.cpp" />
+    <ClCompile Include="vk_motionvec.cpp" />
     <ClCompile Include="vk_pass_skinned.cpp" />
     <ClCompile Include="vk_env_light.cpp" />
     <ClCompile Include="vk_light.cpp" />
@@ -215,6 +219,8 @@
     <ClCompile Include="vk_wallmarks.cpp" />    <!-- static decals (bullet holes) — R4 CWallmarksEngine port -->
     <ClCompile Include="vk_rain.cpp" />         <!-- rain drops/splashes + thunderbolt (dxRainRender port) -->
     <ClCompile Include="vk_water_sim.cpp" />    <!-- shallow-water flow/accumulation sim (compute) -->
+    <ClCompile Include="vk_deform.cpp" />       <!-- snow deform press field (compute) -->
+    <ClCompile Include="vk_pass_snow.cpp" />    <!-- dense snow surface mesh (VHM-style) -->
 
     <ClCompile Include="vk_Detail.cpp" />
     <ClCompile Include="vk_DetailManager.cpp" />

@@ -943,6 +943,25 @@ void CDetailManager::LoadDetailTextures()
         m_DetailTextures[i] = tex;
     }
 
+    // SSFX wind flow map (s_waves). Sampled in the grass vertex shader to drive
+    // the flow-map wind. fx\wind_wave.dds ships with the SSFX "10 - Wind" module.
+    {
+        string_path full;
+        FS.update_path(full, "$game_textures$", "fx\\wind_wave.dds");
+        if (FS.exist(full)) {
+            auto* tex = xr_new<VK::CVulkanTexture>();
+            if (tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+                m_WaveTex = tex;
+                Msg("[VK Grass] SSFX wind flow map loaded: fx\\wind_wave.dds");
+            } else {
+                Msg("![VK Grass] LoadDDS failed for fx\\wind_wave.dds — grass wind will be flat");
+                xr_delete(tex);
+            }
+        } else {
+            Msg("![VK Grass] fx\\wind_wave.dds not found — grass wind will be flat (deploy the SSFX wind texture)");
+        }
+    }
+
     Msg("[VK Grass] Detail textures: %u loaded", (u32)m_DetailTextures.size());
 }
 
@@ -952,6 +971,7 @@ void CDetailManager::DestroyDetailTextures()
         if (t) { t->Destroy(); xr_delete(t); }
     }
     m_DetailTextures.clear();
+    if (m_WaveTex) { m_WaveTex->Destroy(); xr_delete(m_WaveTex); m_WaveTex = nullptr; }
 
     if (m_DetailSampler && VulkanHW.m_Device != VK_NULL_HANDLE) {
         vkDestroySampler(VulkanHW.m_Device, m_DetailSampler, nullptr);
@@ -1125,21 +1145,22 @@ void CDetailManager::CreateGfxPipeline()
 {
     if (!g_ShaderManager) { Msg("![VK Grass] g_ShaderManager null — gfx pipeline disabled"); return; }
 
-    // Descriptor layout: 1 binding, fragment-only sampler.
-    VkDescriptorSetLayoutBinding b{};
-    b.binding         = 0;
-    b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1;
-    b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Descriptor layout: binding 0 = per-type diffuse (fragment), binding 1 =
+    // SSFX wind flow map s_waves (vertex — sampled to drive the wind).
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 1; lci.pBindings = &b;
+    lci.bindingCount = 2; lci.pBindings = b;
     vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &m_GfxDescLayout);
 
-    // Pool: one set per object type. Use objects.size() (not GPU_MAX_OBJ_TYPES).
+    // Pool: one set per object type, 2 image samplers each (diffuse + flow map).
     const u32 nSets = _max(u32(objects.size()), 1u);
     VkDescriptorPoolSize ps{};
-    ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps.descriptorCount = nSets;
+    ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps.descriptorCount = nSets * 2;
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -1154,21 +1175,27 @@ void CDetailManager::CreateGfxPipeline()
         dai.pSetLayouts        = &m_GfxDescLayout;
         vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_GfxDescSets[i]);
 
-        // Bind the per-type texture (or fall back to dummy white if missing).
-        VkDescriptorImageInfo ii{};
-        ii.sampler     = m_DetailSampler;
-        ii.imageView   = (i < m_DetailTextures.size() && m_DetailTextures[i])
-                         ? m_DetailTextures[i]->GetView()
-                         : m_DummyHZBView;   // 1×1 white as a "missing texture" fallback
-        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = m_GfxDescSets[i];
-        w.dstBinding      = 0;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo      = &ii;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        // binding 0 = per-type diffuse (or dummy white); binding 1 = SSFX flow map
+        // (shared; dummy white when absent → flat wind, never crashes).
+        VkDescriptorImageInfo ii[2]{};
+        ii[0].sampler     = m_DetailSampler;
+        ii[0].imageView   = (i < m_DetailTextures.size() && m_DetailTextures[i])
+                            ? m_DetailTextures[i]->GetView()
+                            : m_DummyHZBView;
+        ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ii[1].sampler     = m_DetailSampler;
+        ii[1].imageView   = m_WaveTex ? m_WaveTex->GetView() : m_DummyHZBView;
+        ii[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w[2]{};
+        for (u32 k = 0; k < 2; ++k) {
+            w[k].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[k].dstSet          = m_GfxDescSets[i];
+            w[k].dstBinding      = k;
+            w[k].descriptorCount = 1;
+            w[k].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[k].pImageInfo      = &ii[k];
+        }
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
     }
 
     // Pipeline layout: set0 = per-type diffuse, set1 = shared env lighting

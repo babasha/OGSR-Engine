@@ -108,6 +108,7 @@ namespace {
     VkImageView   s_rainView  = VK_NULL_HANDLE;
     Fmatrix       s_rainVP;
     Fmatrix       s_rainViewM;   // world→light-view, kept for RainSphereVisible
+    float         s_rainEyeY = 0.f;   // ortho eye world-Y at the last redraw (exact height reconstruction)
 
     // Ground-height map: same ortho box/VP as the rain map but rendered from
     // STATICS+TERRAIN ONLY (no trees) — a CLEAN, stable top-down height field
@@ -187,6 +188,7 @@ VkImageView GetRainView()     { return s_rainView; }
 VkImage     GetGroundImage()  { return s_groundImage; }
 VkImageView GetGroundView()   { return s_groundView; }
 u32         RainSize()        { return kRainSize; }
+float       RainEyeY()        { return s_rainEyeY; }
 const Fmatrix& GetRainVP()    { return s_rainVP; }
 const Fmatrix& GetCascadeVP(u32 i) { return s_cascVP[i < kNumSunCascades ? i : 0]; }
 VkImage     GetCascadeImage(u32 i) { return (i < kNumSunCascades) ? s_cascImage[i] : VK_NULL_HANDLE; }
@@ -416,6 +418,7 @@ void ComputeRainVP()
     const Fvector dir{ 0.f, -1.f, 0.f };
     const Fvector up { 0.f,  0.f, 1.f };
     Fvector eye; eye.set(Device.vCameraPosition.x, Device.vCameraPosition.y + kRainEyeUp, Device.vCameraPosition.z);
+    s_rainEyeY = eye.y;   // remember for exact height reconstruction (snow mesh)
 
     Fmatrix view; view.build_camera_dir(eye, dir, up);
 

@@ -50,6 +50,7 @@ struct WorldMaterial
 
     VkDescriptorSet set      = VK_NULL_HANDLE;
     float           alphaRef = -1.0f;
+    shared_str      name;          // diffuse texture name (for classification, e.g. tree trunk vs crown)
 
     // --- Terrain splatting (R4 CBlender_BmmD) ---
     // When the diffuse name starts with "terrain\", this material also gets an

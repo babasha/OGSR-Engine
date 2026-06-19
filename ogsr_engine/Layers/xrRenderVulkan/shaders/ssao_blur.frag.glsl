@@ -8,9 +8,11 @@
 // 10 m behind it).
 
 layout(location = 0) out vec4 outAO;   // r = AO, gba = world bent normal *0.5+0.5
+layout(location = 1) out vec4 outIL;   // rgb = blurred SSIL indirect light
 
 layout(set = 0, binding = 0) uniform sampler2D uDepth;   // full-res scene depth
-layout(set = 0, binding = 1) uniform sampler2D uAO;      // half-res raw GTAO
+layout(set = 0, binding = 1) uniform sampler2D uAO;      // half-res raw GTAO (AO + bent normal)
+layout(set = 0, binding = 4) uniform sampler2D uILraw;   // half-res raw SSIL (from the GTAO horizon gather)
 
 layout(push_constant) uniform PC {
     // FULL SSAOPush layout — the C++ side pushes the same 96-byte block for
@@ -37,6 +39,7 @@ void main()
     vec2 uv = gl_FragCoord.xy * pc.res.zw;
     float z0 = viewDepth(uv);
 
+    // AO + bent normal: tight 3×3 (preserves contact-shadow detail).
     float sum = 0.0;
     float wsum = 0.0;
     vec3  bentSum = vec3(0.0);   // accumulate the world bent normal (decoded to [-1,1])
@@ -52,6 +55,19 @@ void main()
             wsum += w;
         }
 
+    // SSIL: wider 5×5 depth-aware blur. The horizon gather (4 slices, half-res)
+    // is far noisier/more banded than AO, so a broader kernel resolves the
+    // directional structure ("stripes") into a smooth indirect fill.
+    vec3  ilSum = vec3(0.0);
+    float ilW   = 0.0;
+    for (int y = -2; y <= 2; ++y)
+        for (int x = -2; x <= 2; ++x) {
+            vec2 o  = vec2(x, y) * pc.res.zw;
+            float w = exp(-abs(viewDepth(uv + o) - z0) * 16.0 / max(z0, 0.1));
+            ilSum += texture(uILraw, uv + o).rgb * w;
+            ilW   += w;
+        }
+
     // ±half-LSB IGN dither: the R8 target has 256 levels, and a LONG smooth
     // gradient (e.g. a straight fence's AO falloff on the ground) quantizes
     // into visible contour stripes — especially after the receivers' strength
@@ -65,4 +81,5 @@ void main()
     float ao = sum / max(wsum, 1e-4) + (dith - 0.5) / 255.0;
     vec3  bentN = (dot(bentSum, bentSum) > 1e-6) ? normalize(bentSum) : vec3(0.0);
     outAO = vec4(ao, bentN * 0.5 + 0.5);
+    outIL = vec4(ilSum / max(ilW, 1e-4), 1.0);
 }

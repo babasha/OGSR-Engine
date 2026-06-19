@@ -22,6 +22,7 @@ layout(set = 0, binding = 1) uniform sampler2D uBloom;   // blurred bright-pass 
 layout(set = 0, binding = 2) uniform sampler2D uDistort; // particle heat-haze offsets (rg, neutral 0.5)
 layout(set = 0, binding = 3) uniform sampler2D uDepth;   // scene depth (SSR puddles)
 layout(set = 0, binding = 4) uniform sampler3D uVolume;  // integrated volumetrics (rgb=in-scatter, a=transmittance)
+layout(set = 0, binding = 5) uniform sampler2D uIL;      // SSIL — half-res one-bounce indirect light (HDR, pre-exposure)
 
 // Shared per-frame environment set (same UBO/set the world shaders read at
 // set 1) — the SSR puddles need the rain mask/VP, the wetness factor and the
@@ -71,6 +72,7 @@ layout(push_constant) uniform PC {
     vec4 p2;   // x=cdlSlope, y=cdlSaturation, z=invGamma, w=distortAmount (0 = off)
     vec4 p3;   // xyz=cdlPower (2*(1-cg)), w=unused
     vec4 p4;   // x=vol mode (0 off / 1 composite / 2 debug), y=near, z=far, w=log2(far/near)
+    vec4 p5;   // SSIL: x=strength, y=debug (show only bounce), z=enable (0 = skip)
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -283,6 +285,17 @@ void main()
             c = vol.rgb * exposure * 8.0;             // r_vol_debug: raw in-scatter pattern
         else
             c = c * vol.a + vol.rgb * exposure;
+    }
+
+    // ---- SSIL debug view (r_ssil_debug) ----
+    // SSIL is now applied in the FORWARD shaders (ssilBoost() multiplies the ambient
+    // term, SSFX-style — see light_ubo.glsl), not here. The tonemap only offers a
+    // visualization of the raw bounce buffer the receivers consume.
+    if (pc.p5.y > 0.5) {
+        vec3 il = textureLod(uIL, uv, 0.0).rgb;
+        il = il / (1.0 + il);   // SSFX compression → [0,1) so HDR bounce stays visible
+        outColor = vec4(pow(clamp(il, 0.0, 1.0), vec3(pc.p2.z)), 1.0);
+        return;
     }
 
     // 2. Bloom (built exposure-scaled at quarter res, gaussian-blurred) added in

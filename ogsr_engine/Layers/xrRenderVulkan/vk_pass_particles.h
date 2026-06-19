@@ -21,6 +21,8 @@ enum EParticleBlendMode : int;
 
 namespace VK {
 
+namespace Vol { struct SmokeParticle; }   // vk_volumetrics.h — Stage-1 smoke media
+
 // Lifecycle (called from CRender::create / device teardown).
 bool ParticlePass_Init();
 void ParticlePass_Destroy();
@@ -30,6 +32,12 @@ void ParticlePass_Destroy();
 // effects (HUD-FOV projection + near depth range — muzzle flashes), and
 // PBM_DISTORT effects (rendered into the distortion buffer for the tonemap).
 void Pass_Particles(FrameContext& ctx);
+
+// Stage-1 VMS: gather this frame's alpha-smoke (PBM_BLEND, world-phase) particles
+// as participating media for the froxel grid — each live PAPI particle becomes a
+// {world pos, radius, albedo, density}. Appends to `out`. Called before Vol::Execute
+// (particles were simulated in CollectVisuals, so their data is valid).
+void CollectSmokeParticles(xr_vector<VK::Vol::SmokeParticle>& out);
 
 // Resources shared with the particle visual classes.
 namespace ParticlePass {
