@@ -25,10 +25,14 @@ layout(set = 0, binding = 0, std430) readonly buffer MetaBuf {
     TreeMeta meshes[];
 };
 
-// binding 1: view frustum (6 normalized planes), refreshed each frame.
-layout(set = 0, binding = 1, std140) uniform FrustumBlock {
-    vec4 planes[6];    // (nx, ny, nz, d)
-} frust;
+// binding 1 was a single-buffered frustum UBO — REMOVED. Written by the CPU each
+// frame into shared mapped memory, it raced the in-flight frames: while rotating,
+// the next frame's CPU write clobbered this frame's planes before the GPU cull read
+// them, so the colour cull tested a DIFFERENT (rotated) frustum than the depth
+// prepass → edge trees landed in the prepass depth but were culled from colour →
+// black tree silhouettes at the screen edge (only on the iGPU, by frame pacing).
+// The frustum now travels in PUSH CONSTANTS (recorded per dispatch → no aliasing).
+// The descriptor still declares binding 1 (unused) to avoid touching the layout.
 
 // binding 2: VkDrawIndexedIndirectCommand array (20 B each), write-only.
 struct DrawCommand {
@@ -48,6 +52,7 @@ layout(set = 0, binding = 3, std430) buffer CountBuf {
 } drawCount;
 
 layout(push_constant) uniform PC {
+    vec4 planes[6];     // view frustum (6 normalized planes) — per-frame, race-free
     uint mesh_count;    // trees in this group
     uint _unused;       // (cascade slot in shadow path; unused here)
     uint mesh_offset;   // start index in metadata buffer for this group
@@ -57,9 +62,22 @@ layout(push_constant) uniform PC {
 
 bool FrustumTest(vec3 center, float radius)
 {
+    // This GPU colour cull MUST be a SUPERSET of the depth-prepass cull, otherwise a
+    // tree at the frustum boundary can land in the prepass depth (occluding the world
+    // → black clear) yet be culled from the colour pass → black tree silhouettes at
+    // the screen edge while rotating. The boundary decision diverges between GPUs at
+    // FP precision (the 780M iGPU showed it; the dGPU did not). Two changes keep us a
+    // superset of the prepass (vk_pass_world.cpp builds CFrustum with LRTB|FAR):
+    //   1. SKIP the near plane (index 4) — the prepass has no near plane.
+    //   2. Add a metre of slack — the CPU CFrustum and this GPU extraction are
+    //      different code paths, so absorb any plane-equation difference.
+    // Planes are normalized (vk_cull.h), so dot+w is metres → the margin is metres.
+    // Plane order: 0=L 1=R 2=B 3=T 4=N 5=F.
+    const float margin = 1.0;
     for (int i = 0; i < 6; ++i)
     {
-        if (dot(frust.planes[i].xyz, center) + frust.planes[i].w < -radius)
+        if (i == 4) continue;   // near plane — excluded to match the prepass set
+        if (dot(pc.planes[i].xyz, center) + pc.planes[i].w < -radius - margin)
             return false;
     }
     return true;
