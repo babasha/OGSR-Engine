@@ -15,6 +15,7 @@
 #include "vk_buffer.h"             // CVulkanBuffer (debug AO readback)
 #include "vk_command_buffer.h"     // CommandManager.GetCurrentFrame()
 #include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline + draw
+#include "vk_motionvec.h"          // VK::MotionVec — temporal reprojection of the IL/AO history
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"   // Device camera basis + mProject
 
@@ -23,6 +24,7 @@ extern int ps_r_ssao_enable;       // r_ssao — global GTAO on/off (GLOBAL scop
 extern int ps_r_ssao_debug;        // r_ssao_debug — also enables the readback stats below
 extern int   ps_r_ssil_enable;     // r_ssil — fold-in SSIL on/off (gates the prev-colour taps in the horizon march)
 extern float ps_r_ssil_strength;   // r_ssil_strength — baked into the IL output (forward receivers apply a fixed ssilBoost)
+extern float ps_r_ssil_temporal;   // r_ssil_temporal — GTAO temporal accumulation α (0 = off; per-frame jitter + MV-reprojected EMA)
 
 namespace VK {
 
@@ -89,6 +91,22 @@ namespace {
     VkImageView   s_prevColorView  = VK_NULL_HANDLE;
     bool          s_prevColorCleared = false;          // false → first Execute clears it to black (valid SHADER_READ)
 
+    // TEMPORAL (r_ssil_temporal): persistent half-res copies of the PREVIOUS frame's
+    // FINAL AO and IL. The blur reprojects them through the motion vectors and EMA-
+    // blends — the per-frame-jittered gather averages into a band-free result. AO
+    // history is RGBA16F (matches s_img[0]); IL history is kILFormat (s_ilImg[0]).
+    VkImage       s_aoHist      = VK_NULL_HANDLE;
+    VmaAllocation s_aoHistAlloc = VK_NULL_HANDLE;
+    VkImageView   s_aoHistView  = VK_NULL_HANDLE;
+    VkImage       s_ilHist      = VK_NULL_HANDLE;
+    VmaAllocation s_ilHistAlloc = VK_NULL_HANDLE;
+    VkImageView   s_ilHistView  = VK_NULL_HANDLE;
+    bool          s_histCleared = false;   // false → first Execute clears both history buffers to a valid SHADER_READ black
+    bool          s_histValid   = false;   // a fresh final result was copied in last frame → safe to reproject
+    bool          s_temporalWasOn = false; // tracks the cvar edge so off→on starts clean (no stale-history blend)
+    u32           s_frame       = 0;       // monotonic frame counter → per-frame jitter phase
+    u32           s_mvWarm      = 0;       // frames MV has been enabled+present → only reproject once it has surely rendered (SHADER_READ)
+
     // FULL-res NPC normal G-buffer (skinned pass writes worldN*0.5+0.5, a=valid;
     // GTAO uses it where a=1, else falls back to depth-derived normals). RGBA8.
     constexpr VkFormat kNormalFormat = VK_FORMAT_R8G8B8A8_UNORM;
@@ -129,9 +147,10 @@ namespace {
         float camTopT[4];     // xyz = top   * tan(fovY/2), w = tan(fovY/2)
         float zp[4];          // proj _33, proj _43, radius, samples/side
         float res[4];         // AO size xy, 1/AO size zw
-        float dbg[4];         // x = r_ssao_debug mode (2 = depth, 3 = normal); y = SSIL on; z = SSIL firefly clamp
+        float dbg[4];         // x = r_ssao_debug mode (2 = depth, 3 = normal); y = SSIL on; z = SSIL firefly clamp; w = SSIL strength
+        float temporal[4];    // x = EMA α (0 = off); y = per-frame jitter phase [0,1); z = MV valid; w = history valid
     };
-    static_assert(sizeof(SSAOPush) == 96, "must match ssao.frag / ssao_blur.frag PC blocks");
+    static_assert(sizeof(SSAOPush) == 112, "must match ssao.frag / ssao_blur.frag PC blocks");
 
     u32 SampleCount()
     {
@@ -161,6 +180,11 @@ namespace {
         if (s_prevColorView) { vkDestroyImageView(VulkanHW.m_Device, s_prevColorView, nullptr); s_prevColorView = VK_NULL_HANDLE; }
         if (s_prevColor)     { vmaDestroyImage(VulkanHW.m_Allocator, s_prevColor, s_prevColorAlloc); s_prevColor = VK_NULL_HANDLE; s_prevColorAlloc = VK_NULL_HANDLE; }
         s_prevColorCleared = false;
+        if (s_aoHistView) { vkDestroyImageView(VulkanHW.m_Device, s_aoHistView, nullptr); s_aoHistView = VK_NULL_HANDLE; }
+        if (s_aoHist)     { vmaDestroyImage(VulkanHW.m_Allocator, s_aoHist, s_aoHistAlloc); s_aoHist = VK_NULL_HANDLE; s_aoHistAlloc = VK_NULL_HANDLE; }
+        if (s_ilHistView) { vkDestroyImageView(VulkanHW.m_Device, s_ilHistView, nullptr); s_ilHistView = VK_NULL_HANDLE; }
+        if (s_ilHist)     { vmaDestroyImage(VulkanHW.m_Allocator, s_ilHist, s_ilHistAlloc); s_ilHist = VK_NULL_HANDLE; s_ilHistAlloc = VK_NULL_HANDLE; }
+        s_histCleared = false; s_histValid = false;
         s_normExtent = {};
         s_extent = {};
     }
@@ -212,7 +236,8 @@ namespace {
             ici.mipLevels = 1; ici.arrayLayers = 1;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // [0] copied into the temporal IL history
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VmaAllocationCreateInfo aci{};
             aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -261,6 +286,44 @@ namespace {
                 Msg("![VK SSAO] prevColor view create failed"); return false;
             }
             s_prevColorCleared = false;
+        }
+        // Temporal history pair (half-res): AO history = RGBA16F (matches s_img[0]),
+        // IL history = kILFormat (matches s_ilImg[0]). copy dst (capture the final
+        // result) + sampled (reproject next frame). Cleared to black on first Execute.
+        {
+            struct { VkImage* img; VmaAllocation* alloc; VkImageView* view; VkFormat fmt; } hist[2] = {
+                { &s_aoHist, &s_aoHistAlloc, &s_aoHistView, VK_FORMAT_R16G16B16A16_SFLOAT },
+                { &s_ilHist, &s_ilHistAlloc, &s_ilHistView, kILFormat },
+            };
+            for (auto& h : hist) {
+                VkImageCreateInfo ici{};
+                ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+                ici.imageType = VK_IMAGE_TYPE_2D;
+                ici.format = h.fmt;
+                ici.extent = { want.width, want.height, 1 };
+                ici.mipLevels = 1; ici.arrayLayers = 1;
+                ici.samples = VK_SAMPLE_COUNT_1_BIT;
+                ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                VmaAllocationCreateInfo aci{};
+                aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+                if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, h.img, h.alloc, nullptr) != VK_SUCCESS) {
+                    Msg("![VK SSAO] temporal history create failed"); return false;
+                }
+                VkImageViewCreateInfo vci{};
+                vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                vci.image = *h.img;
+                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                vci.format = h.fmt;
+                vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                vci.subresourceRange.levelCount = 1;
+                vci.subresourceRange.layerCount = 1;
+                if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, h.view) != VK_SUCCESS) {
+                    Msg("![VK SSAO] temporal history view create failed"); return false;
+                }
+            }
+            s_histCleared = false; s_histValid = false;
         }
         // FULL-res NPC normal G-buffer (skinned pass renders into it, GTAO samples it).
         s_normExtent = sceneExtent;
@@ -369,23 +432,25 @@ bool Init()
     }
 
     // Set: 0 = scene depth, 1 = raw AO (blur only), 2 = NPC normal G-buffer
-    // (GTAO only), 3 = prev-frame colour (GTAO+IL gather), 4 = raw IL (blur only).
+    // (GTAO only), 3 = prev-frame colour (GTAO+IL gather), 4 = raw IL (blur only),
+    // 5 = motion vectors, 6 = AO history, 7 = IL history (blur temporal only).
     // Each pipeline statically uses a subset; the others' stale layout during a
     // draw is legal (all bindings are written each frame).
-    VkDescriptorSetLayoutBinding b[5]{};
-    for (u32 i = 0; i < 5; ++i) {
+    constexpr u32 kBindings = 8;
+    VkDescriptorSetLayoutBinding b[kBindings]{};
+    for (u32 i = 0; i < kBindings; ++i) {
         b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 5; slci.pBindings = b;
+    slci.bindingCount = kBindings; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         s_failed = true; return false;
     }
 
     const u32 nSets = kFramesInFlight * 2;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * 5 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * kBindings };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
@@ -443,28 +508,44 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     if (!Enabled()) return;
     if (!EnsureRTs(sceneExtent)) return;
 
+    // Temporal accumulation state (r_ssil_temporal). Reproject the previous frame's
+    // FINAL AO/IL through the motion vectors and EMA-blend; the per-frame-jittered
+    // gather (ssao.frag) makes each history a different realisation → averaging
+    // removes the directional banding. Only reproject with CONTINUOUS history (it was
+    // refreshed last frame) so an off→on toggle or a resize starts clean, and only
+    // once the MV target has surely rendered (else it could be UNDEFINED layout).
+    ++s_frame;
+    const bool temporalOn = (ps_r_ssil_temporal > 0.0f);
+    const bool histUsable = temporalOn && s_temporalWasOn && s_histValid;
+    if (MotionVec::Enabled() && MotionVec::GetResultView() != VK_NULL_HANDLE) { if (s_mvWarm < 4) ++s_mvWarm; }
+    else s_mvWarm = 0;
+    const bool  mvReady = histUsable && (s_mvWarm >= 2);
+    VkImageView mvBind  = mvReady ? MotionVec::GetResultView() : s_prevColorView;  // placeholder is valid SHADER_READ, never sampled when !mvReady
+    float jitterPhase = float(s_frame) * 0.61803399f; jitterPhase -= std::floor(jitterPhase);
+
     // Refresh this slot's sets (fence-guarded): depth view can change on swapchain
-    // recreate, AO/IL/prevColor views on RT recreate. 5 bindings × 2 sets/frame.
+    // recreate, AO/IL/prevColor/history views on RT recreate. 8 bindings × 2 sets/frame.
     const u32 slot = CommandManager.GetCurrentFrame() % kFramesInFlight;
     {
-        VkDescriptorImageInfo depthI{ s_sampNear, Swapchain.m_DepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo rawI  { s_sampNear, s_view[1],             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo normI { s_sampNear, s_normView,            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo prevI { s_sampLin,  s_prevColorView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo ilrawI{ s_sampNear, s_ilView[1],           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        // gtao uses 0,2,3; blur uses 0,1,4 — write all 5 to both sets so none is stale.
-        VkWriteDescriptorSet w[10]{};
-        VkDescriptorSet dst[10] = { s_setGtao[slot], s_setGtao[slot], s_setGtao[slot], s_setGtao[slot], s_setGtao[slot],
-                                    s_setBlur[slot], s_setBlur[slot], s_setBlur[slot], s_setBlur[slot], s_setBlur[slot] };
-        const u32 bind[10] = { 0, 1, 2, 3, 4, 0, 1, 2, 3, 4 };
-        const VkDescriptorImageInfo* ii[10] = { &depthI, &rawI, &normI, &prevI, &ilrawI,
-                                                &depthI, &rawI, &normI, &prevI, &ilrawI };
-        for (u32 i = 0; i < 10; ++i) {
+        VkDescriptorImageInfo depthI { s_sampNear, Swapchain.m_DepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo rawI   { s_sampNear, s_view[1],             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo normI  { s_sampNear, s_normView,            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo prevI  { s_sampLin,  s_prevColorView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ilrawI { s_sampNear, s_ilView[1],           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo mvI    { s_sampLin,  mvBind,                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo aoHistI{ s_sampLin,  s_aoHistView,          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo ilHistI{ s_sampLin,  s_ilHistView,          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        // gtao uses 0,2,3; blur uses 0,1,4,5,6,7 — write all 8 to both sets so none is stale.
+        const VkDescriptorImageInfo* src[8] = { &depthI, &rawI, &normI, &prevI, &ilrawI, &mvI, &aoHistI, &ilHistI };
+        VkWriteDescriptorSet w[16]{};
+        for (u32 i = 0; i < 16; ++i) {
+            const u32 bi = i % 8;
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = dst[i]; w[i].dstBinding = bind[i]; w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = ii[i];
+            w[i].dstSet = (i < 8) ? s_setGtao[slot] : s_setBlur[slot];
+            w[i].dstBinding = bi; w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = src[bi];
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 10, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 16, w, 0, nullptr);
     }
 
     // First use after (re)create: clear the prev-colour history to black so the
@@ -476,6 +557,21 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
         vkCmdClearColorImage(cmd, s_prevColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
         ImageBarrier(cmd, s_prevColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         s_prevColorCleared = true;
+    }
+
+    // First use: clear the temporal history pair to black so they're valid
+    // SHADER_READ when the blur set binds them (sampled only when history is valid,
+    // but the descriptor references them every frame). s_histValid stays false until
+    // a real final result is copied in below.
+    if (!s_histCleared) {
+        VkClearColorValue black{};
+        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        for (VkImage h : { s_aoHist, s_ilHist }) {
+            ImageBarrier(cmd, h, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdClearColorImage(cmd, h, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+            ImageBarrier(cmd, h, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        s_histCleared = true;
     }
 
     // Transition the AO + IL MRT pair for slot i together (one draw writes both).
@@ -511,6 +607,10 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     push.dbg[1] = ps_r_ssil_enable ? 1.0f : 0.0f;   // SSIL: gather prev-frame colour in the horizon march
     push.dbg[2] = kILFireClamp;
     push.dbg[3] = ps_r_ssil_enable ? ps_r_ssil_strength : 0.0f;   // baked into IL → forward ssilBoost; 0 when off
+    push.temporal[0] = temporalOn ? ps_r_ssil_temporal : 0.0f;     // EMA α (gather: gates jitter; blur: history weight)
+    push.temporal[1] = temporalOn ? jitterPhase : 0.0f;            // per-frame slice/radial rotation (0 → spatial path)
+    push.temporal[2] = mvReady   ? 1.0f : 0.0f;                    // reproject via MV (else same-pixel EMA)
+    push.temporal[3] = histUsable ? 1.0f : 0.0f;                   // blur may sample the history this frame
 
     // One-time dump of the reconstruction inputs — sanity vs the offline test
     // (expect _33 ≈ 1.0006, _43 ≈ -0.2 for zn 0.2 / zf 350, tan ≈ 0.6-1.1).
@@ -525,10 +625,36 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     Draw(cmd, s_view[1], s_ilView[1], s_pipeGtao, s_setGtao[slot], push);
     toRead(1);
 
-    // 2) Depth-aware 3×3 blur: raw [1] → final [0] (both AO and IL).
+    // 2) Depth-aware 3×3 blur: raw [1] → final [0] (both AO and IL). When temporal
+    // is on this draw also EMA-blends the reprojected history bound above.
     toColor(0);
     Draw(cmd, s_view[0], s_ilView[0], s_pipeBlur, s_setBlur[slot], push);
     toRead(0);
+
+    // 3) Capture this frame's FINAL AO + IL as next frame's temporal history. Single-
+    // buffered like prevColor: the dst→SHADER_READ barrier orders the next frame's
+    // reprojection read after this copy (same queue, submission order). Only while
+    // temporal is on — a gap invalidates the history so it isn't blended stale.
+    if (temporalOn) {
+        auto copyHist = [&](VkImage src, VkImage dst) {
+            ImageBarrier(cmd, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            ImageBarrier(cmd, dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageCopy region{};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = { s_extent.width, s_extent.height, 1 };
+            vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            ImageBarrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            ImageBarrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        };
+        copyHist(s_img[0],   s_aoHist);
+        copyHist(s_ilImg[0], s_ilHist);
+        s_histValid = true;
+    } else {
+        s_histValid = false;   // stale frames must not be reprojected after a gap
+    }
+    s_temporalWasOn = temporalOn;
 
     s_hasResult = true;
 

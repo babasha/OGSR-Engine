@@ -142,6 +142,19 @@ int   ps_r_ssil_debug    = 0;     // r_ssil_debug — 1 = show ONLY the indirect
 // global brightness boost. Raise to taste.
 float ps_r_ssil_strength = 0.5f;
 
+// r_ssil_temporal — temporal accumulation for the GTAO pass (the missing piece
+// that lets r_ssil ship ON). The horizon-folded IL bands without it because the
+// 4-slice gather is directionally quantized AND static per frame (so a plain EMA
+// of identical frames is a no-op). With temporal > 0 the gather noise is rotated
+// PER FRAME (so each frame's bands differ) and the result is reprojected via the
+// motion vectors ([[vk_motionvec]]) and EMA-blended — the per-frame patterns
+// average into a smooth fill. AO shares the same march, so it is accumulated too
+// (≥ the current spatial-only quality, just temporally stable). The value IS the
+// history weight α (0 = OFF → byte-identical to the spatial-only path; ~0.9 =
+// strong smoothing). Needs r_motion_vectors on for reprojection (falls back to
+// same-pixel EMA when MV is unavailable).
+float ps_r_ssil_temporal = 0.0f;
+
 // Vulkan motion vectors — screen-space (prevUV − curUV) reconstructed from the
 // prepass depth + the previous frame's view-proj. Foundation for DLSS/FSR
 // upscaling, frame-gen and the path-tracer denoiser. Phase 1 = camera + static
@@ -1065,6 +1078,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_ssil", &ps_r_ssil_enable, 0, 1);        // SSIL (folded into GTAO) on/off (A/B; needs r_ssao on)
     CMD4(CCC_Integer, "r_ssil_debug", &ps_r_ssil_debug, 0, 1);   // 1 = show ONLY the indirect bounce field
     CMD4(CCC_Float, "r_ssil_strength", &ps_r_ssil_strength, 0.f, 8.f);  // IL intensity multiplier
+    CMD4(CCC_Float, "r_ssil_temporal", &ps_r_ssil_temporal, 0.f, 0.97f);  // GTAO temporal accumulation α (0=off; lets r_ssil ship clean)
     CMD4(CCC_Integer, "r_motion_vectors", &ps_r_motion_vectors, 0, 1);  // screen-space MV pass on/off (DLSS/FSR/PT foundation)
     CMD4(CCC_Integer, "r_mv_debug", &ps_r_mv_debug, 0, 1);              // false-colour MV overlay (grey=still, R=+x, G=+y)
     CMD4(CCC_Float, "r_mv_debug_scale", &ps_r_mv_debug_scale, 1.f, 500.f); // MV overlay magnitude scale
