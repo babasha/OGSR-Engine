@@ -259,8 +259,10 @@ int   ps_r_vsm_mark_half  = 1;       // page-mark at half-res (4x fewer threads/
 // cell, the whole static atlas pass is SKIPPED and last frame's atlas is reused (the dynamic
 // NPC/grass atlas still re-renders). Standing/aiming on a vista: VSMrender ~10ms -> ~0. Also
 // page-snaps the static clipmap window (vs texel) so sub-page camera moves don't invalidate.
-// DEFAULT OFF (0 = exactly the Step-0 per-frame path) — A/B knob. Live.
-int   ps_r_vsm_cache     = 0;
+// DEFAULT ON (1): the toroidal per-page cache is the shipping path. Measured 2026-06-19 A/B in
+// the same scene with r_vol on: VSMrender 14.2 -> 2.4 ms, gpu_total 23.3 -> 12.5 ms, fps 43 -> 83.
+// 0 = the Step-0 render-all-every-frame baseline (A/B knob; was the old default). Live.
+int   ps_r_vsm_cache     = 1;
 // Sun-rotation tolerance (deg) before the cached static atlas re-renders. Larger = holds the
 // cache longer (cheaper) but a bigger one-shot shadow jump when it ticks (temporal resolve is
 // meant to smooth it). 0.05 ~ the old cascade-cache threshold. Live-tunable.
