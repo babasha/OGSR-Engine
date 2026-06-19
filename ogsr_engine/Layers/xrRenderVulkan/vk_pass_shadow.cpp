@@ -244,11 +244,17 @@ void Pass_SunShadow(FrameContext& ctx)
     // water-sim maps and the spot/point dynamic-light shadows (Shadow/Dyn) below are NOT
     // sun shadows → they are unaffected.
     const bool vsmActive = ps_r_vsm && VK::VSM::MaskReady();
-    // Froxel volumetrics samples the sun cascade per-froxel for in-air occlusion
-    // (god rays through windows). VSM's screen-space mask can't answer arbitrary
-    // world/air points, so when r_vol is on we keep the NEAR cascades rendered even
-    // under VSM (the far map stays VSM-only). Cached → ~one redraw/sec on motion.
-    const bool cascForVol = (ps_r_vol || ps_r_vol_debug);
+    // Froxel volumetrics samples the sun per-froxel for in-air occlusion (god rays
+    // through windows). It can read EITHER the cascade OR the VSM STATIC ATLAS directly
+    // (vol_inject sampleVSMStatic, selected by gridParams.w==1 = atlas ready + no
+    // r_vol_shadow). When the atlas IS the fog occluder, the near cascades are pure
+    // redundant fallback under VSM → drop them and reclaim the ~2.2ms double-pay (the
+    // per-frame Casc0+Casc1 combined rebuild). The shader gracefully falls back to the
+    // cleared, fully-lit cascade for the rare froxel with no resident VSM page. We keep
+    // the cascades alive for the fog ONLY when VSM is NOT the occluder: atlas not yet
+    // ready, or r_vol_shadow's dedicated per-frame map (which falls back to the cascade).
+    const bool fogUsesVSM = VK::VSM::AtlasReady() && !ps_r_vol_shadow;
+    const bool cascForVol = (ps_r_vol || ps_r_vol_debug) && !fogUsesVSM;
     const bool cascRaster = !vsmActive || cascForVol;   // render the cascade casters this frame
     // r_vol toggled WHILE under VSM: the near cascades were sitting idle (cleared /
     // never transitioned), so their cached-static state + image layouts are stale.

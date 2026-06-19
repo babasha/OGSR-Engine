@@ -126,10 +126,15 @@ void CTreeManager::CreateCullPipeline()
     }
     vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
 
-    // Pipeline layout: 1 set + 20 B push (5 u32).
+    // Pipeline layout: 1 set + push = frustum planes (6×vec4 = 96 B) + 5 u32 (20 B).
+    // The frustum used to live in a single-buffered UBO (binding 1) but that raced
+    // the in-flight frames during rotation (the next frame's CPU write clobbered this
+    // frame's planes before the GPU cull read them) → the colour cull tested a rotated
+    // frustum vs the depth prepass → black tree silhouettes at screen edges. Push
+    // constants are recorded per dispatch, so they can't alias across frames.
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.offset = 0; pcr.size = 5 * sizeof(u32);
+    pcr.offset = 0; pcr.size = sizeof(TreeCullPush);   // 116 B (< 128 B push limit)
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1; plci.pSetLayouts = &m_CullDescLayout;
@@ -511,13 +516,12 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     const Fmatrix& vp = *ctx.viewProj;
     const u32 numGroups = (u32)m_Groups.size();
 
-    // ----- 1) Refresh frustum UBO (Gribb/Hartmann; same extraction as grass). -
-    if (m_FrustumUBO && m_FrustumUBO->IsMapped())
-    {
-        TreeFrustumUBO* fu = (TreeFrustumUBO*)m_FrustumUBO->m_Mapped;
-        VK::ExtractFrustumPlanes(vp, fu->planes);   // shared Gribb/Hartmann (vk_cull.h)
-        m_FrustumUBO->Flush();
-    }
+    // ----- 1) Extract this frame's frustum planes (Gribb/Hartmann; same as grass).
+    // These go into the per-dispatch PUSH below — NOT the shared UBO — so a rotating
+    // camera's next-frame planes can't clobber this frame's cull (the old single-
+    // buffered UBO did, producing black tree silhouettes at the screen edge).
+    TreeCullPush cullPush{};
+    VK::ExtractFrustumPlanes(vp, cullPush.planes);
 
     // ----- 2) Clear per-group draw counts; barrier transfer→compute. ----------
     // Same cross-frame WAR hazard as grass: m_TreeIndirectBuffer and
@@ -552,9 +556,14 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     for (u32 g = 0; g < numGroups; ++g)
     {
         const TreeIndirectGroup& grp = m_Groups[g];
-        u32 pushData[5] = { grp.meshCount, 0u, grp.meshOffset, g * m_MaxGroupMeshCount, g };
+        // planes stay as extracted above; only the per-group indices change.
+        cullPush.mesh_count  = grp.meshCount;
+        cullPush._unused     = 0u;
+        cullPush.mesh_offset = grp.meshOffset;
+        cullPush.output_base = g * m_MaxGroupMeshCount;
+        cullPush.count_index = g;
         vkCmdPushConstants(cmd, m_CullPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(pushData), pushData);
+                           0, sizeof(cullPush), &cullPush);
         vkCmdDispatch(cmd, (grp.meshCount + 255) / 256, 1, 1);
     }
 

@@ -50,10 +50,29 @@ struct TreeGfxPush
 static_assert(sizeof(TreeGfxPush) == 160, "TreeGfxPush must be 160 B");
 
 // View frustum UBO (binding 1 of the cull set). 6 normalized planes, std140.
+// LEGACY: kept only so the cull descriptor still has a valid buffer bound at
+// binding 1 — the planes now travel via TreeCullPush (see below) to avoid the
+// single-buffered cross-frame race that caused black tree silhouettes at the
+// screen edge during rotation.
 struct TreeFrustumUBO
 {
     Fvector4 planes[6];  // 96 B
 };
+
+// Cull compute push constants (116 B). The frustum planes ride in push constants
+// (recorded per dispatch) instead of the racy single-buffered UBO. planes FIRST
+// (offset 0) keeps the trailing u32s 4-aligned and the total under the 128 B
+// guaranteed push limit. Mirrors tree_cull.comp's push_constant block.
+struct TreeCullPush
+{
+    Fvector4 planes[6];   // 96 B  view frustum (normalized; 0=L 1=R 2=B 3=T 4=N 5=F)
+    u32      mesh_count;   //  4 B  trees in this group
+    u32      _unused;      //  4 B
+    u32      mesh_offset;  //  4 B  start index in the metadata buffer
+    u32      output_base;  //  4 B  base index into the indirect command buffer
+    u32      count_index;  //  4 B  index into the draw-count buffer (= group)
+};
+static_assert(sizeof(TreeCullPush) == 116, "TreeCullPush must be 116 B");
 
 // ============================================================================
 // Per-instance data uploaded to GPU. The vertex shader reads

@@ -175,8 +175,14 @@ float sunShadow(vec3 worldPos)
         float f = sampleFogShadow(worldPos);
         if (f >= 0.0) return f;
     } else if (mode > 0.5) {
+        // VSM STATIC ATLAS is the occluder. Under VSM the near cascades are NOT
+        // rendered for the fog (vk_pass_shadow cascForVol → cascRaster false), so their
+        // combined maps hold stale/frozen depth — DON'T fall through to them. A froxel
+        // with no resident VSM page is treated as LIT (the atlas covers the visible
+        // frustum; misses are rare air points over non-visible ground). This makes the
+        // fog occlusion independent of cascade state and reclaims the ~2.2ms double-pay.
         float v = sampleVSMStatic(worldPos);
-        if (v >= 0.0) return v;
+        return (v >= 0.0) ? v : 1.0;
     }
     // Smaller bias than the surface receivers: a froxel is in AIR (no self-shadow
     // acne to hide), so a tight bias just reduces light leaking THROUGH walls.
