@@ -13,9 +13,12 @@ layout(location = 1) out vec4 outIL;   // rgb = blurred SSIL indirect light
 layout(set = 0, binding = 0) uniform sampler2D uDepth;   // full-res scene depth
 layout(set = 0, binding = 1) uniform sampler2D uAO;      // half-res raw GTAO (AO + bent normal)
 layout(set = 0, binding = 4) uniform sampler2D uILraw;   // half-res raw SSIL (from the GTAO horizon gather)
+layout(set = 0, binding = 5) uniform sampler2D uMV;      // full-res motion vectors (prevUV − curUV, UV space) — temporal reprojection
+layout(set = 0, binding = 6) uniform sampler2D uAOhist;  // half-res PREV-frame final AO (temporal history)
+layout(set = 0, binding = 7) uniform sampler2D uILhist;  // half-res PREV-frame final IL (temporal history)
 
 layout(push_constant) uniform PC {
-    // FULL SSAOPush layout — the C++ side pushes the same 96-byte block for
+    // FULL SSAOPush layout — the C++ side pushes the same 112-byte block for
     // both the GTAO and blur pipelines, so the offsets here MUST match
     // ssao.frag (declaring only {zp, res} made zp alias camDir and res alias
     // camRightT → uv exploded past [0,1] → the whole output collapsed to one
@@ -26,6 +29,7 @@ layout(push_constant) uniform PC {
     vec4 zp;         // x = proj _33, y = proj _43
     vec4 res;        // xy = AO target size, zw = 1 / AO target size
     vec4 dbg;        // unused here
+    vec4 temporal;   // x = EMA α (0 = off); y = jitter phase (unused here); z = MV valid; w = history valid
 } pc;
 
 float viewDepth(vec2 uv)
@@ -43,6 +47,7 @@ void main()
     float sum = 0.0;
     float wsum = 0.0;
     vec3  bentSum = vec3(0.0);   // accumulate the world bent normal (decoded to [-1,1])
+    float aoMin = 1.0, aoMax = 0.0;   // current-frame neighbourhood bounds (temporal anti-ghost clamp)
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x) {
             vec2 o  = vec2(x, y) * pc.res.zw;
@@ -53,6 +58,7 @@ void main()
             sum  += t.r * w;
             bentSum += (t.gba * 2.0 - 1.0) * w;
             wsum += w;
+            aoMin = min(aoMin, t.r); aoMax = max(aoMax, t.r);
         }
 
     // SSIL: wider 5×5 depth-aware blur. The horizon gather (4 slices, half-res)
@@ -60,12 +66,15 @@ void main()
     // directional structure ("stripes") into a smooth indirect fill.
     vec3  ilSum = vec3(0.0);
     float ilW   = 0.0;
+    vec3  ilMin = vec3(1e9), ilMax = vec3(0.0);   // IL neighbourhood bounds (temporal anti-ghost clamp)
     for (int y = -2; y <= 2; ++y)
         for (int x = -2; x <= 2; ++x) {
             vec2 o  = vec2(x, y) * pc.res.zw;
             float w = exp(-abs(viewDepth(uv + o) - z0) * 16.0 / max(z0, 0.1));
-            ilSum += texture(uILraw, uv + o).rgb * w;
+            vec3 il = texture(uILraw, uv + o).rgb;
+            ilSum += il * w;
             ilW   += w;
+            ilMin = min(ilMin, il); ilMax = max(ilMax, il);
         }
 
     // ±half-LSB IGN dither: the R8 target has 256 levels, and a LONG smooth
@@ -80,6 +89,28 @@ void main()
     float dith = fract(IGN_MARIA * fract(dot(gl_FragCoord.xy, IGN_BLUMENAU)));
     float ao = sum / max(wsum, 1e-4) + (dith - 0.5) / 255.0;
     vec3  bentN = (dot(bentSum, bentSum) > 1e-6) ? normalize(bentSum) : vec3(0.0);
+    vec3  ilOut = ilSum / max(ilW, 1e-4);
+
+    // ── Temporal accumulation (r_ssil_temporal) ──────────────────────────────
+    // Reproject the previous frame's final AO/IL through the motion vectors and
+    // EMA-blend. The gather is jittered per frame (ssao.frag), so the history is a
+    // DIFFERENT realisation of the same signal → averaging removes the directional
+    // banding the spatial blur alone leaves. α=0 (off) or no valid history → pure
+    // spatial result, identical to before. Neighbourhood-clamping the history to
+    // this frame's local min/max bounds ghosting on motion/disocclusion; an off-
+    // screen reprojection falls back to the current frame.
+    float alpha = pc.temporal.x;
+    if (alpha > 0.0 && pc.temporal.w > 0.5) {
+        vec2 mv     = (pc.temporal.z > 0.5) ? texture(uMV, uv).rg : vec2(0.0);
+        vec2 prevUV = uv + mv;
+        if (all(greaterThanEqual(prevUV, vec2(0.0))) && all(lessThanEqual(prevUV, vec2(1.0)))) {
+            float aoH = clamp(texture(uAOhist, prevUV).r, aoMin, aoMax);
+            ao = mix(ao, aoH, alpha);
+            vec3 ilH = clamp(texture(uILhist, prevUV).rgb, ilMin, ilMax);
+            ilOut = mix(ilOut, ilH, alpha);
+        }
+    }
+
     outAO = vec4(ao, bentN * 0.5 + 0.5);
-    outIL = vec4(ilSum / max(ilW, 1e-4), 1.0);
+    outIL = vec4(ilOut, 1.0);
 }

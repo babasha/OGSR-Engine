@@ -33,7 +33,8 @@ layout(push_constant) uniform PC {
     vec4 camTopT;    // xyz = top   * tan(fovY/2), w = tan(fovY/2)
     vec4 zp;         // x = proj _33, y = proj _43, z = world radius (m), w = samples/side
     vec4 res;        // xy = AO target size, zw = 1 / AO target size
-    vec4 dbg;        // x = r_ssao_debug mode (2 = depth, 3 = normal); y = SSIL on; z = SSIL firefly clamp
+    vec4 dbg;        // x = r_ssao_debug mode (2 = depth, 3 = normal); y = SSIL on; z = SSIL firefly clamp; w = SSIL strength
+    vec4 temporal;   // x = EMA α (0 = temporal off); y = per-frame jitter phase [0,1); z = MV valid; w = history valid (blur only)
 } pc;
 
 const float PI = 3.14159265;
@@ -139,6 +140,14 @@ void main()
     const vec2  IGN_BLUMENAU = vec2(0.06711056, 0.00583715);
     float noiseOffset    = fract(IGN_MARIA * fract(dot(vec2(ip) + 5.588238, IGN_BLUMENAU)));
     float noiseDirection = fract(IGN_MARIA * fract(dot(vec2(ip), IGN_BLUMENAU)));
+
+    // Temporal: rotate the per-pixel slice direction + radial phase by a per-FRAME
+    // amount so each frame samples a DIFFERENT set of slices/texels. The blur then
+    // EMA-accumulates the frames into a smooth result (kills the 4-slice directional
+    // banding that a static pattern can't escape). temporal.y is 0 when r_ssil_temporal
+    // is off → these become no-ops and the output is identical to the spatial path.
+    noiseDirection = fract(noiseDirection + pc.temporal.y);
+    noiseOffset    = fract(noiseOffset    + pc.temporal.y * 0.61803399);
 
     float falloff_mul   = 2.0 / (radius * radius);
     vec2  screen_res_mul = (1.0 / float(nSample)) * pc.res.zw;
