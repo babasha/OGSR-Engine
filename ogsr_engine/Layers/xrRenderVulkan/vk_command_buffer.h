@@ -7,6 +7,7 @@
 
 #pragma once
 #include "vk_core.h"
+#include <mutex>
 
 // Command buffer management (triple buffering)
 class CVulkanCommandManager
@@ -42,6 +43,17 @@ private:
     u8*             m_StagingPtr     = nullptr;          // persistently mapped
     VkDeviceSize    m_StagingSize    = 0;
     VkDeviceSize    m_StagingHead    = 0;
+
+    // The whole upload path (m_UploadCmd recording + staging ring + m_UploadValue)
+    // is touched from BOTH the main render thread (per-frame FlushUploads/Submit)
+    // AND the seqParallel worker thread (spawn-time texture/buffer loads route
+    // through UploadImage/UploadBuffer). A VkCommandBuffer may not be recorded by
+    // one thread while another ends/resets/submits it — doing so corrupts driver
+    // state (observed: c0000005 inside the NV driver at vkCmdPipelineBarrier2 while
+    // an NPC streamed in). This serializes every upload op. Recursive because
+    // StageBytes (on ring-wrap) and FlushUploadsAndWait re-enter locked methods on
+    // the same thread.
+    std::recursive_mutex m_UploadMutex;
 
     void EnsureUploadCmdOpen();
     // Copy `size` bytes into the staging ring (opening the upload cmd); returns the

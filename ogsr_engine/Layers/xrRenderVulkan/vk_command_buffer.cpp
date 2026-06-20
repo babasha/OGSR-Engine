@@ -201,12 +201,23 @@ bool CVulkanCommandManager::Submit(VkCommandBuffer cmd, VkSemaphore waitSemaphor
         waitVals[nWait]   = 0;   // binary — value ignored
         nWait++;
     }
-    const bool waitUpload = (m_UploadTimeline != VK_NULL_HANDLE && m_UploadValue > 0);
+    // Snapshot the upload timeline under the upload lock: a worker thread may be
+    // mid-FlushUploads (++m_UploadValue then transfer submit). Capturing both under
+    // the lock yields a value whose copy has already been submitted, so this
+    // graphics frame waits on a consistent, in-flight upload point.
+    VkSemaphore uploadSem;
+    u64         uploadVal;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_UploadMutex);
+        uploadSem = m_UploadTimeline;
+        uploadVal = m_UploadValue;
+    }
+    const bool waitUpload = (uploadSem != VK_NULL_HANDLE && uploadVal > 0);
     if (waitUpload) {
-        waitSems[nWait]   = m_UploadTimeline;
+        waitSems[nWait]   = uploadSem;
         waitStages[nWait] = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
                           | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
-        waitVals[nWait]   = m_UploadValue;
+        waitVals[nWait]   = uploadVal;
         nWait++;
     }
 
@@ -339,6 +350,7 @@ VkDeviceSize CVulkanCommandManager::StageBytes(const void* data, VkDeviceSize si
 
 void CVulkanCommandManager::UploadBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_UploadMutex);   // shared upload cmd/ring — see header
     if (g_bDeviceLost || dst == VK_NULL_HANDLE || !data || size == 0 || !m_StagingPtr) return;
 
     // Pathological oversize (> whole ring): one-off temp staging, synchronous on the
@@ -376,6 +388,7 @@ void CVulkanCommandManager::UploadImage(VkImage dst, const void* data, VkDeviceS
                                         const VkBufferImageCopy* regions, u32 regionCount,
                                         u32 mipLevels, u32 arrayLayers)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_UploadMutex);   // shared upload cmd/ring — see header
     if (g_bDeviceLost || dst == VK_NULL_HANDLE || !data || size == 0 || !regions || regionCount == 0 || !m_StagingPtr)
         return;
     if (size > m_StagingSize) {
@@ -429,6 +442,7 @@ void CVulkanCommandManager::UploadImage(VkImage dst, const void* data, VkDeviceS
 
 void CVulkanCommandManager::FlushUploads()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_UploadMutex);   // shared upload cmd/ring — see header
     if (g_bDeviceLost || !m_UploadOpen) return;
     vkEndCommandBuffer(m_UploadCmd);
     m_UploadOpen = false;
@@ -454,6 +468,7 @@ void CVulkanCommandManager::FlushUploads()
 
 void CVulkanCommandManager::FlushUploadsAndWait()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_UploadMutex);   // held across submit+wait so the ring reset is atomic
     FlushUploads();
     if (m_UploadTimeline == VK_NULL_HANDLE || m_UploadValue == 0) return;
 

@@ -58,7 +58,16 @@ namespace {
         if (!name || !name[0]) return false;
         string_path leaf;
         xr_sprintf(leaf, "%s.dds", name);
+        // World diffuse textures are usually global ($game_textures$), but some
+        // levels pack their terrain base into the level's own archive alongside
+        // the lightmaps (e.g. Garbage: shader wants terrain\terrain_garbage +
+        // terrain\terrain_garbage_lm, and only the _lm lived in $level$ — the
+        // base was missed here and the ground rendered as the white default).
+        // Mirror the lmap / detail / LOD-atlas loaders: try the global store
+        // first, then fall back to $level$.
         FS.update_path(out, "$game_textures$", leaf);
+        if (FS.exist(out)) return true;
+        FS.update_path(out, "$level$", leaf);
         return FS.exist(out);
     }
 
@@ -322,9 +331,19 @@ bool Init()
         return false;
     }
 
-    // Pool sized for ~level worth of unique level shaders (549 in test logs).
-    // Round up to 1024 to absorb spawned visual textures too.
-    constexpr u32 kMaxSets = 1024;
+    // The material cache is NAME-keyed and persists for the whole device
+    // lifetime — it is NOT reset per level, because persistent visuals (the
+    // actor's HUD/weapon, carried items) survive a location change and keep a
+    // raw WorldMaterial* into this cache. So sets accumulate across every
+    // location loaded this session: ~549 unique materials per level in test
+    // logs. Sized for ~30 distinct levels so a full playthrough (revisits are
+    // cache hits) never exhausts the pool — exhaustion previously cascaded into
+    // VK_ERROR_OUT_OF_POOL_MEMORY → default-fallback churn → a multi-second
+    // frame → TDR → DEVICE_LOST on the 2nd–3rd transition. A set is 4 image
+    // samplers; 16384 sets is a few MB of pool — cheap insurance.
+    // TODO: the leak-free fix is ref-counting materials (free when the last
+    // visual referencing one is destroyed) so the pool can actually shrink.
+    constexpr u32 kMaxSets = 16384;
     VkDescriptorPoolSize ps{};
     ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ps.descriptorCount = kMaxSets * 4;   // 4 image samplers per set
@@ -409,9 +428,11 @@ bool Init()
         tlci.pBindings    = tb;
         vkCreateDescriptorSetLayout(VulkanHW.m_Device, &tlci, nullptr, &s_TerrainSetLayout);
 
-        // Terrain materials are few (a handful of ground textures per level);
-        // 256 sets is generous.
-        constexpr u32 kMaxTerrain = 256;
+        // Terrain materials are few per level (a handful of ground textures),
+        // but — like the diffuse pool above — they accumulate across every
+        // location this session (cache is never reset). 4096 covers a full
+        // multi-level playthrough without exhausting this pool either.
+        constexpr u32 kMaxTerrain = 4096;
         VkDescriptorPoolSize tps{};
         tps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         tps.descriptorCount = kMaxTerrain * 11;
@@ -589,6 +610,12 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
 
     string_path full;
     if (!ResolveTexturePath(diffuse_name, full)) {
+        // A world/terrain material whose base .dds can't be resolved silently
+        // fell back to the 1x1 white default — that is exactly how a level ends
+        // up with an all-white "no terrain" ground (e.g. terrain\terrain_bolota
+        // on Garbage: its .thm ships but the bitmap is absent from the textures
+        // archive). Log it once per unique name so the culprit is visible.
+        Msg("![VK WorldMaterial] base texture NOT FOUND: '%s.dds' -> WHITE default (terrain/world will be blank)", diffuse_name);
         s_Cache.emplace(std::move(key), s_Default);
         return s_Default;
     }

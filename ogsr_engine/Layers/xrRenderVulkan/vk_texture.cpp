@@ -624,6 +624,34 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
         dataSize = dstSize;
     }
 
+    // Guard against a DDS whose header over-claims its contents (truncated file
+    // or a wrong dwMipMapCount — seen on some level-packed textures reached via
+    // the $level$ fallback). UploadData walks the full mip chain to build copy
+    // regions; if those reference more bytes than we actually read, the driver's
+    // vkCmdCopyBufferToImage reads past the staging buffer → GPU/driver crash
+    // (was: hard crash mid-game when such an NPC/level texture streamed in).
+    // Mirror UploadData's exact size walk; on shortfall, fail the load so the
+    // caller falls back to the white default instead of feeding the driver.
+    {
+        VkDeviceSize expected = 0;
+        for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
+            if (IsCompressedFormat(format))
+                expected += (VkDeviceSize)((w + 3) / 4) * ((h + 3) / 4) * GetBlockSize(format);
+            else {
+                const u32 bpp = (format == VK_FORMAT_R8_UNORM) ? 1u : (format == VK_FORMAT_R8G8_UNORM) ? 2u : 4u;
+                expected += (VkDeviceSize)w * h * bpp;
+            }
+            if (w > 1) w >>= 1;
+            if (h > 1) h >>= 1;
+        }
+        if (expected > dataSize) {
+            Msg("![Vulkan] DDS truncated/corrupt: '%s' needs %llu bytes (%ux%u mips=%u) but only %llu present — skipping (white default)",
+                filename, (unsigned long long)expected, width, height, mipLevels, (unsigned long long)dataSize);
+            xr_free(data);
+            return false;
+        }
+    }
+
     // Upload
     UploadData(data, dataSize);
 
