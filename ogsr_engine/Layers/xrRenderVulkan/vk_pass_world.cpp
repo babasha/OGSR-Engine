@@ -26,6 +26,7 @@
 #include "vk_clustered.h"      // VK::Clustered — clustered forward light cull (r_clustered)
 #include "vk_volumetrics.h"    // VK::Vol — froxel volumetric inject/integrate (r_vol)
 #include "vk_pass_particles.h" // VK::CollectSmokeParticles — Stage-1 smoke media inject
+#include "vk_DetailManager.h"  // RImplementation.Details — shared Hi-Z pyramid (r_hzb_cull)
 
 extern float ps_r_vol_smoke_inject;   // gate the per-frame smoke collect (0 = skip)
 #include "HW_Vulkan.h"         // VulkanHW.m_bVRSSupported
@@ -36,6 +37,7 @@ extern int ps_r_cull;
 extern int ps_r_gpu_world;   // GPU-driven static world forward path (A/B with 0)
 extern int ps_r_clustered;   // clustered forward light cull (A/B with 0)
 extern int ps_r_clustered_debug; // clustered froxel light-count heatmap (also activates the cull)
+extern int ps_r_hzb_cull;    // Hi-Z occlusion cull of the GPU-driven static color pass (A/B with 0)
 extern int ps_r_ssao_npc_normals;   // NPC normal G-buffer for GTAO (global scope: block-scope extern in namespace VK would mangle → LNK2001)
 
 namespace VK {
@@ -382,6 +384,26 @@ void Pass_World(FrameContext& ctx)
         }
     }
 
+    // r_hzb_cull (Phase A): build the Hi-Z pyramid from THIS frame's PREPASS depth,
+    // then occlusion-cull the GPU static set into a 2nd indirect buffer drawn only
+    // by the color pass below — meshes fully behind nearer geometry skip the heavy
+    // forward shading. Outside any render pass; depth is DEPTH_ATTACHMENT here
+    // (SSAO/VRS/VSM restored it), which BuildHZBForFrame expects. We SHARE the grass
+    // pyramid: grass Render runs after Pass_World, so its BuildHZB no-ops (same-frame
+    // stamp) and reuses this prepass-depth build. The depth prepass already drew the
+    // full frustum set (it is the pyramid source), so this never over-culls.
+    bool worldOccluded = false;
+    if (prepass && gpuWorld && ps_r_hzb_cull && WorldGPU::OcclusionReady()
+        && RImplementation.Details && RImplementation.Details->HZBReady())
+    {
+        const int zHZB = VK::Prof::ZoneBegin(cmd, "World/HZBcull");
+        RImplementation.Details->BuildHZBForFrame(ctx);
+        WorldGPU::CullColor(cmd, *ctx.viewProj, Device.vCameraPosition,
+                            RImplementation.Details->HZBView(), RImplementation.Details->HZBSampler());
+        worldOccluded = true;
+        VK::Prof::ZoneEnd(cmd, zHZB);
+    }
+
     // Targets travel in FrameContext; both are already in their attachment layout
     // (Begin set them, ExecutePasses ordered prior passes). No transition here.
 
@@ -504,8 +526,9 @@ void Pass_World(FrameContext& ctx)
     const int zStatics = VK::Prof::ZoneBegin(cmd, "World/Statics");
     g_RenderQueue.Flush(ctx);
     // GPU static set (drawn after the CPU flush so DrawColor's self-contained
-    // pushes don't disturb Flush's push state). EnvLight set = set 1.
-    if (gpuWorld) WorldGPU::DrawColor(cmd, *ctx.viewProj, EnvLight::GetCurrentSet());
+    // pushes don't disturb Flush's push state). EnvLight set = set 1. worldOccluded
+    // → draw the Hi-Z-culled set (CullColor ran above); else the frustum set.
+    if (gpuWorld) WorldGPU::DrawColor(cmd, *ctx.viewProj, EnvLight::GetCurrentSet(), worldOccluded);
     VK::Prof::ZoneEnd(cmd, zStatics);
 
     // Dynamic (spawned) visuals — collected by CRender::add_Visual this frame.

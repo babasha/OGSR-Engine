@@ -60,6 +60,19 @@ u32  SubmitCpuMeshes(RenderQueue& q, const Fmatrix& viewProj, bool doCull);
 // → per-group indirect/count regions. MUST run OUTSIDE a dynamic-rendering scope.
 void Cull(VkCommandBuffer cmd, const Fmatrix& viewProj);
 
+// True if the Hi-Z occlusion cull pipeline built OK (world_cull_hzb.comp + the
+// 2nd indirect/count buffers). When false, CullColor no-ops and DrawColor must
+// fall back to the frustum set (useOcclusion=false).
+bool OcclusionReady();
+
+// Phase A occlusion cull: frustum + Hi-Z test the static set against `hzbView`
+// (the depth pyramid built from THIS frame's prepass depth) → a SEPARATE indirect/
+// count region (cmds2/counts2) drawn only by DrawColor(useOcclusion=true). The
+// depth prepass keeps the full frustum set (Cull), so the pyramid is complete and
+// this never over-culls. MUST run OUTSIDE a render pass, AFTER the HZB build.
+void CullColor(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& cameraPos,
+               VkImageView hzbView, VkSampler hzbSampler);
+
 // Depth prepass: indirect depth-only draw of the culled statics (solid + AT
 // variants), reusing the shared depth pipelines. INSIDE the prepass BeginRendering.
 void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrain = false);
@@ -67,6 +80,9 @@ void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrai
 // Color pass: indirect forward draw of the culled statics. Binds per group the
 // pipeline (derived like Flush) + material set + env set, pushes mvp(=viewProj)
 // + per-material tail. INSIDE the color BeginRendering. `envSet` = EnvLight set.
-void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet);
+// useOcclusion=true draws the Hi-Z-culled set (CullColor's cmds2/counts2) instead
+// of the frustum set — the caller passes true only when CullColor ran this frame.
+void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet,
+               bool useOcclusion = false);
 
 }} // namespace VK::WorldGPU

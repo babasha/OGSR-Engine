@@ -237,8 +237,29 @@ void CDetailManager::BuildHZB(VK::FrameContext& ctx)
     if (Swapchain.m_DepthImage == VK_NULL_HANDLE) return;
     if (m_HZBDescSets.size() != m_HZBMipCount) return;
 
+    // Build the pyramid at most once per frame. With r_hzb_cull, Pass_World builds
+    // it from the PREPASS depth (before its color pass) for WorldGPU::CullColor;
+    // grass Render then calls BuildHZB again at the top of Render() → this guard
+    // makes the second call a no-op (otherwise the depth is max-reduced twice and,
+    // worse, grass would rebuild from post-color depth, undoing the early build).
+    if (m_HZBBuiltFrame == Device.dwFrame) return;
+    m_HZBBuiltFrame = Device.dwFrame;
+
     const VkCommandBuffer cmd = ctx.cmd;
     auto mipDim = [](u32 base, u32 lvl) { const u32 v = base >> lvl; return v ? v : 1u; };
+
+    // WAR: order the previous frame's HZB reads (grass gen sample at gen binding 6
+    // + WorldGPU::CullColor's occlusion sample) before this frame's max-reduce
+    // writes — the pyramid is single-buffered across frames in flight. (Grass's own
+    // Render() WAR covers its buffers but now runs after this earlier build.)
+    {
+        VkMemoryBarrier war{};
+        war.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        war.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        war.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &war, 0, nullptr, 0, nullptr);
+    }
 
     // 1) depth DEPTH_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL (compute sample).
     {

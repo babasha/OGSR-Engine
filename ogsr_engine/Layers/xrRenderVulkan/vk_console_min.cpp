@@ -310,6 +310,15 @@ int   ps_r_gpu_world = 1;
 int   ps_r_clustered       = 0;
 int   ps_r_clustered_debug = 0;
 
+// Hi-Z occlusion cull for the GPU-driven static color pass (vk_world_gpu, Phase A
+// of cluster cull). Pass_World builds a depth pyramid from this frame's PREPASS
+// depth, then a compute pass frustum+occlusion-tests the static set into a second
+// indirect buffer drawn only in the (heavy forward) color pass — meshes fully
+// behind nearer geometry skip shading. The depth prepass still draws the full
+// frustum set (builds the pyramid), so this never over-culls. Default OFF (A/B);
+// needs r_gpu_world 1. No effect if the occlusion pipeline failed to build.
+int   ps_r_hzb_cull = 0;
+
 // Froxel volumetric lighting (vk_volumetrics, r_vol) — P1. A 3D froxel grid over
 // the frustum: compute injects sun in-scatter (Henyey-Greenstein phase × cascade
 // sun-shadow) + height/base fog, integrates it front-to-back, and the tonemap
@@ -1145,6 +1154,9 @@ void xrRender_initconsole()
     // r_clustered_debug 1 = per-cluster light-count heatmap on the world.
     CMD4(CCC_Integer, "r_clustered",       &ps_r_clustered,       0, 1);
     CMD4(CCC_Integer, "r_clustered_debug", &ps_r_clustered_debug, 0, 1);
+
+    // Hi-Z occlusion cull of the GPU-driven static color pass (vk_world_gpu).
+    CMD4(CCC_Integer, "r_hzb_cull", &ps_r_hzb_cull, 0, 1);
 
     // Froxel volumetric lighting (vk_volumetrics) — P1: sun god rays + depth fog.
     CMD4(CCC_Integer, "r_vol",           &ps_r_vol,           0, 1);
