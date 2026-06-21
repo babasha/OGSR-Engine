@@ -270,6 +270,7 @@ private:
     u32             m_HZBMipCount     = 0;
     VkExtent2D      m_HZBDepthExtent  = { 0, 0 };         // depth extent HZB was sized for (resize detect)
     bool            m_bHZBLayoutInit  = false;            // HZB transitioned UNDEFINED→GENERAL once
+    u32             m_HZBBuiltFrame   = 0xFFFFFFFFu;      // Device.dwFrame the pyramid was last built (build-once-per-frame guard)
 
     // HZB build compute pipeline. One descriptor set per mip pass.
     VkPipeline             m_HZBPipeline       = VK_NULL_HANDLE;
@@ -311,6 +312,17 @@ public:
     // World-slot lookup. Returns DS_empty for out-of-bounds queries
     // (id0..3 = ID_Empty marker).
     DetailSlot& QueryDB(int sx, int sz);
+
+    // ----- Hi-Z occlusion pyramid sharing (Phase A: WorldGPU::CullColor) -----
+    // Pass_World builds the pyramid from THIS frame's PREPASS depth (before its
+    // color pass) so the GPU-driven static color pass can occlusion-cull against
+    // it. The build is frame-stamped (m_HZBBuiltFrame) → grass's own BuildHZB at
+    // the top of Render() then no-ops, so the pyramid is built once per frame
+    // regardless of which caller runs first. HZB lives in VK_IMAGE_LAYOUT_GENERAL.
+    void        BuildHZBForFrame(struct VK::FrameContext& ctx) { BuildHZB(ctx); }
+    bool        HZBReady()   const { return m_HZBImage != VK_NULL_HANDLE && m_HZBView != VK_NULL_HANDLE && m_HZBPipeline != VK_NULL_HANDLE; }
+    VkImageView HZBView()    const { return m_HZBView; }
+    VkSampler   HZBSampler() const { return m_HZBSampler; }
 
 private:
     // Session A

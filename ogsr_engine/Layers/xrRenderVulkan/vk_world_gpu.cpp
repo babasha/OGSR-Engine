@@ -19,6 +19,7 @@
 #include "vk_env_light.h"       // EnvLight::GetCurrentSet (set 1, terrain snow-depth)
 #include "vk_shaders.h"         // g_ShaderManager
 #include "vk_cull.h"            // VK::ExtractFrustumPlanes
+#include "../../xr_3da/device.h" // Device.dwTimeGlobal (occlusion-stats throttle)
 #include <algorithm>
 
 namespace VK { namespace WorldGPU {
@@ -42,6 +43,9 @@ struct Group {
 };
 
 struct CullPush { Fvector4 planes[6]; u32 numGroups, maxGroupMesh, total, _pad; };
+// Hi-Z occlusion cull push (192 B) — matches world_cull_hzb.comp `PC`, same shape
+// as the proven detail_generate.comp push (viewProj + planes + cameraPos).
+struct CullColorPush { Fmatrix viewProj; Fvector4 planes[6]; Fvector4 cameraPos; u32 numGroups, maxGroupMesh, total, _pad; };
 
 bool s_built = false;
 u32  s_total = 0;
@@ -51,14 +55,34 @@ xr_vector<vkRender_Visual*> s_meshSet;   // pointer-sorted, for InSet() (CPU-que
 xr_vector<vkFVisual*> s_cpuMeshes;       // non-GPU static leaves (wmark/tess/no-diffuse) — CPU draws these
 
 CVulkanBuffer* s_meta     = nullptr;
-CVulkanBuffer* s_indirect = nullptr;   // numGroups * maxGroupMesh cmds
-CVulkanBuffer* s_count    = nullptr;   // numGroups u32
+CVulkanBuffer* s_indirect = nullptr;   // numGroups * maxGroupMesh cmds (frustum set)
+CVulkanBuffer* s_count    = nullptr;   // numGroups u32 (frustum set)
 
 VkDescriptorSetLayout s_setL  = VK_NULL_HANDLE;
 VkDescriptorPool      s_pool  = VK_NULL_HANDLE;
 VkDescriptorSet       s_set   = VK_NULL_HANDLE;
 VkPipelineLayout      s_cullLayout = VK_NULL_HANDLE;
 VkPipeline            s_cullPipe   = VK_NULL_HANDLE;
+
+// ---- Phase A: Hi-Z occlusion cull (separate set, drawn only in the color pass) ----
+bool s_occlReady = false;
+CVulkanBuffer* s_indirect2 = nullptr;  // numGroups * maxGroupMesh cmds (occlusion set)
+CVulkanBuffer* s_count2    = nullptr;  // numGroups u32 (occlusion set)
+VkDescriptorSetLayout s_setL2  = VK_NULL_HANDLE;
+VkDescriptorPool      s_pool2  = VK_NULL_HANDLE;
+VkDescriptorSet       s_set2   = VK_NULL_HANDLE;
+VkPipelineLayout      s_cullLayout2 = VK_NULL_HANDLE;
+VkPipeline            s_cullPipe2   = VK_NULL_HANDLE;
+
+// Occlusion-stats readback (host-visible, mapped): per-frame we copy both count
+// sets here [0..nGroups)=frustum, [nGroups..2n)=occlusion; CPU sums them throttled
+// to log "culled K of N". Read is a frame or two stale (no fence wait) — fine for a
+// diagnostic. Created raw via VMA (HOST_ACCESS_RANDOM = readable; the CVulkanBuffer
+// helper only offers SEQUENTIAL_WRITE for storage buffers).
+VkBuffer      s_countReadback      = VK_NULL_HANDLE;
+VmaAllocation s_countReadbackAlloc = VK_NULL_HANDLE;
+u32*          s_countReadbackPtr   = nullptr;
+u32           s_nGroups            = 0;   // cached group count (readback stride)
 
 void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
                 VkPipelineStageFlags ss, VkPipelineStageFlags ds)
@@ -146,6 +170,61 @@ bool CreateCullPipeline()
     return true;
 }
 
+// Hi-Z occlusion cull pipeline (world_cull_hzb.comp). 4 bindings: meta (0),
+// cmds2 (1), count2 (2) — written once here; HZB combined-image-sampler (3) —
+// (re)written per-frame in CullColor since the depth pyramid view/sampler can
+// change on resize. Best-effort: failure leaves s_occlReady=false (the base
+// frustum path keeps working; the color pass just won't occlusion-cull).
+bool CreateCullColorPipeline()
+{
+    if (!g_ShaderManager) g_ShaderManager = xr_new<VK::CVulkanSPIRVLoader>();
+    VkShaderModule cs = g_ShaderManager->Load("world_cull_hzb.comp.spv");
+    if (!cs) { Msg("![VK WorldGPU] world_cull_hzb.comp.spv load failed — occlusion cull disabled"); return false; }
+
+    VkDescriptorSetLayoutBinding b[4]{};
+    for (u32 i = 0; i < 3; ++i) {
+        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[3].descriptorCount = 1; b[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    lci.bindingCount = 4; lci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL2) != VK_SUCCESS) return false;
+
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 } };
+    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool2) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dai.descriptorPool = s_pool2; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setL2;
+    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set2) != VK_SUCCESS) return false;
+
+    VkDescriptorBufferInfo bi[3] = {
+        { s_meta->GetHandle(),      0, VK_WHOLE_SIZE },
+        { s_indirect2->GetHandle(), 0, VK_WHOLE_SIZE },
+        { s_count2->GetHandle(),    0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet w[3]{};
+    for (u32 i = 0; i < 3; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set2; w[i].dstBinding = i;
+        w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
+    }
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);   // binding 3 (HZB) written per-frame
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullColorPush) };
+    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL2; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_cullLayout2) != VK_SUCCESS) return false;
+
+    VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module = cs; cp.stage.pName = "main";
+    cp.layout = s_cullLayout2;
+    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &s_cullPipe2) != VK_SUCCESS) return false;
+    return true;
+}
+
 } // anonymous namespace
 
 void Build()
@@ -183,6 +262,37 @@ void Build()
     std::sort(meshes.begin(), meshes.end(), [&](vkFVisual* a, vkFVisual* b) { return key(a) < key(b); });
 
     s_total = (u32)meshes.size();
+
+    // DIAG (one-shot): SWI LOD-level distribution of the GPU-set progressive meshes.
+    // Tells us if there are INTERMEDIATE LODs (sw_count>2) to grade through (smooth,
+    // no popping) or only fine+coarse, and the finest->coarsest triangle reduction
+    // (= the LOD savings headroom). Drives whether main-view LOD is graduated or binary.
+    {
+        u32 progN = 0, multiN = 0, swMin = 0xFFFFFFFFu, swMax = 0; u64 swSum = 0;
+        u64 fineTris = 0, coarseTris = 0; u32 hist[9] = { 0 };   // buckets sw_count = 1,2,..,8,9+
+        for (vkFVisual* fv : meshes) {
+            if (fv->Type != MT_PROGRESSIVE) continue;
+            auto* pg = static_cast<vkFProgressive*>(fv);
+            if (!pg->sw_counts || pg->sw_count == 0) continue;
+            ++progN;
+            const u32 c = pg->sw_count;
+            swMin = _min(swMin, c); swMax = _max(swMax, c); swSum += c;
+            hist[_min(c, 9u) - 1]++;
+            if (c > 1) { ++multiN; fineTris += pg->sw_counts[0] / 3; coarseTris += pg->sw_counts[c - 1] / 3; }
+        }
+        if (progN) {
+            Msg("[VK WorldGPU] SWI-LOD: %u progressive (%u multi-level), sw_count min/avg/max = %u/%.1f/%u",
+                progN, multiN, swMin, double(swSum) / progN, swMax);
+            Msg("[VK WorldGPU] SWI-LOD hist[1..9+] = %u %u %u %u %u %u %u %u %u",
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8]);
+            if (multiN) Msg("[VK WorldGPU] SWI-LOD tris: finest avg=%llu coarsest avg=%llu (%.0f%% fewer)",
+                (unsigned long long)(fineTris / multiN), (unsigned long long)(coarseTris / multiN),
+                100.0 * (1.0 - double(coarseTris) / double(_max((u64)1, fineTris))));
+        } else {
+            Msg("[VK WorldGPU] SWI-LOD: no progressive meshes in the GPU set");
+        }
+    }
+
     xr_vector<GpuMeshMeta> meta(s_total);
     for (u32 i = 0; i < s_total; ++i) {
         vkFVisual* fv = meshes[i];
@@ -255,8 +365,34 @@ void Build()
 
     if (!CreateCullPipeline()) { Msg("![VK WorldGPU] cull pipeline failed — disabled"); s_groups.clear(); return; }
 
-    Msg("[VK WorldGPU] built: %u GPU meshes, %u groups, maxGroup=%u | cpu-set=%u (non-GPU static leaves)",
-        s_total, nGroups, s_maxGroupMesh, (u32)s_cpuMeshes.size());
+    // Phase A: a SECOND indirect/count set + Hi-Z cull pipeline for r_hzb_cull.
+    // Best-effort — if it fails, the base frustum path is unaffected (s_occlReady
+    // stays false → CullColor no-ops, DrawColor uses the frustum set).
+    s_indirect2 = xr_new<CVulkanBuffer>();
+    s_indirect2->Create((VkDeviceSize)nGroups * s_maxGroupMesh * sizeof(VkDrawIndexedIndirectCommand), iu,
+                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_count2 = xr_new<CVulkanBuffer>();
+    s_count2->Create((VkDeviceSize)nGroups * sizeof(u32), iu, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_occlReady = CreateCullColorPipeline();
+    if (!s_occlReady) Msg("![VK WorldGPU] Hi-Z occlusion cull unavailable (r_hzb_cull will be a no-op)");
+
+    // Host-visible readback for the occlusion-stats log (frustum vs occlusion counts).
+    s_nGroups = nGroups;
+    if (s_occlReady) {
+        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.size = (VkDeviceSize)2 * nGroups * sizeof(u32);
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO;
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VmaAllocationInfo ai{};
+        if (vmaCreateBuffer(VulkanHW.m_Allocator, &bci, &aci, &s_countReadback, &s_countReadbackAlloc, &ai) == VK_SUCCESS)
+            s_countReadbackPtr = (u32*)ai.pMappedData;
+    }
+
+    Msg("[VK WorldGPU] built: %u GPU meshes, %u groups, maxGroup=%u | cpu-set=%u (non-GPU static leaves) | occlusion=%d",
+        s_total, nGroups, s_maxGroupMesh, (u32)s_cpuMeshes.size(), s_occlReady ? 1 : 0);
 }
 
 u32 SubmitCpuMeshes(VK::RenderQueue& q, const Fmatrix& viewProj, bool doCull)
@@ -309,6 +445,72 @@ void Cull(VkCommandBuffer cmd, const Fmatrix& viewProj)
     pc.numGroups = nGroups; pc.maxGroupMesh = s_maxGroupMesh; pc.total = s_total;
     vkCmdPushConstants(cmd, s_cullLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (s_total + 255) / 256, 1, 1);
+
+    MemBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+}
+
+bool OcclusionReady() { return s_occlReady; }
+
+void CullColor(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& cameraPos,
+               VkImageView hzbView, VkSampler hzbSampler)
+{
+    if (!Built() || !s_occlReady) return;
+    if (hzbView == VK_NULL_HANDLE || hzbSampler == VK_NULL_HANDLE) return;
+    const u32 nGroups = (u32)s_groups.size();
+
+    // Occlusion-stats log (throttled): sum the readback copied a frame or two ago.
+    // frustum = sum(s_count) = frustum-visible; occl = sum(s_count2) = also Hi-Z
+    // visible; the difference is what occlusion removed from the heavy color pass.
+    if (s_countReadbackPtr) {
+        static u32 s_statLast = 0;
+        if (Device.dwTimeGlobal > s_statLast + 3000) {
+            s_statLast = Device.dwTimeGlobal;
+            u32 frust = 0, occl = 0;
+            for (u32 g = 0; g < s_nGroups; ++g) { frust += s_countReadbackPtr[g]; occl += s_countReadbackPtr[s_nGroups + g]; }
+            Msg("[VK WorldGPU] occlusion: frustum=%u -> visible=%u (culled %u | %u total meshes)",
+                frust, occl, frust >= occl ? frust - occl : 0u, s_total);
+        }
+    }
+
+    // Point binding 3 at this frame's HZB (view/sampler can change on resize).
+    VkDescriptorImageInfo hi{};
+    hi.sampler     = hzbSampler;
+    hi.imageView   = hzbView;
+    hi.imageLayout = VK_IMAGE_LAYOUT_GENERAL;   // HZB lives in GENERAL (see CreateHZB)
+    VkWriteDescriptorSet hw{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    hw.dstSet = s_set2; hw.dstBinding = 3; hw.descriptorCount = 1;
+    hw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; hw.pImageInfo = &hi;
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &hw, 0, nullptr);
+
+    // WAR-guard vs the previous frame's indirect reads of cmds2/count2.
+    MemBarrier(cmd, 0, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+               VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vkCmdFillBuffer(cmd, s_count2->GetHandle(), 0, (VkDeviceSize)nGroups * sizeof(u32), 0u);
+    MemBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cullPipe2);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cullLayout2, 0, 1, &s_set2, 0, nullptr);
+    CullColorPush pc{};
+    pc.viewProj = viewProj;
+    VK::ExtractFrustumPlanes(viewProj, pc.planes);   // same normalized planes as the frustum cull
+    pc.cameraPos.set(cameraPos.x, cameraPos.y, cameraPos.z, 0.f);
+    pc.numGroups = nGroups; pc.maxGroupMesh = s_maxGroupMesh; pc.total = s_total;
+    vkCmdPushConstants(cmd, s_cullLayout2, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, (s_total + 255) / 256, 1, 1);
+
+    // Snapshot both count sets → host readback (for the throttled stats log above,
+    // read next frame). Global compute-write→transfer-read barrier covers s_count
+    // (frustum, written earlier) and s_count2 (just dispatched).
+    if (s_countReadback) {
+        MemBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferCopy cA{ 0, 0, (VkDeviceSize)nGroups * sizeof(u32) };
+        vkCmdCopyBuffer(cmd, s_count->GetHandle(),  s_countReadback, 1, &cA);
+        VkBufferCopy cB{ 0, (VkDeviceSize)nGroups * sizeof(u32), (VkDeviceSize)nGroups * sizeof(u32) };
+        vkCmdCopyBuffer(cmd, s_count2->GetHandle(), s_countReadback, 1, &cB);
+    }
 
     MemBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
@@ -386,11 +588,16 @@ void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrai
     }
 }
 
-void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet)
+void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet, bool useOcclusion)
 {
     if (!Built()) return;
     const VkShaderStageFlags kStages = PipelineCache::GetPushStages();
     const u32 nGroups = (u32)s_groups.size();
+    // r_hzb_cull: draw the Hi-Z-culled set (CullColor must have run this frame).
+    // Falls back to the frustum set if occlusion isn't ready/active.
+    const bool occ = useOcclusion && s_occlReady;
+    VkBuffer indirectBuf = (occ ? s_indirect2 : s_indirect)->GetHandle();
+    VkBuffer countBuf    = (occ ? s_count2    : s_count   )->GetHandle();
 
     // mvp + uvScale at offset 0 (constant: world-space verts, SHORT2 SSCALED TCs) —
     // re-pushed per layout flip. Per-material tail {aref, detailScale, hemi} at 72.
@@ -452,7 +659,7 @@ void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet env
         if (grp.ib != lastIB || grp.iType != lastIType) { vkCmdBindIndexBuffer(cmd, grp.ib, 0, grp.iType); lastIB = grp.ib; lastIType = grp.iType; }
         const VkDeviceSize cmdOff = (VkDeviceSize)g * s_maxGroupMesh * sizeof(VkDrawIndexedIndirectCommand);
         const VkDeviceSize cntOff = (VkDeviceSize)g * sizeof(u32);
-        vkCmdDrawIndexedIndirectCount(cmd, s_indirect->GetHandle(), cmdOff, s_count->GetHandle(), cntOff,
+        vkCmdDrawIndexedIndirectCount(cmd, indirectBuf, cmdOff, countBuf, cntOff,
                                       s_maxGroupMesh, sizeof(VkDrawIndexedIndirectCommand));
     }
 }
@@ -464,9 +671,16 @@ void Destroy()
     if (s_cullLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_cullLayout, nullptr); s_cullLayout = VK_NULL_HANDLE; }
     if (s_pool)       { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_setL)       { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setL, nullptr); s_setL = VK_NULL_HANDLE; }
+    if (s_cullPipe2)   { vkDestroyPipeline(VulkanHW.m_Device, s_cullPipe2, nullptr); s_cullPipe2 = VK_NULL_HANDLE; }
+    if (s_cullLayout2) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_cullLayout2, nullptr); s_cullLayout2 = VK_NULL_HANDLE; }
+    if (s_pool2)       { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool2, nullptr); s_pool2 = VK_NULL_HANDLE; }
+    if (s_setL2)       { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setL2, nullptr); s_setL2 = VK_NULL_HANDLE; }
     auto del = [](CVulkanBuffer*& b) { if (b) { xr_delete(b); b = nullptr; } };
-    del(s_meta); del(s_indirect); del(s_count);
-    s_groups.clear(); s_meshSet.clear(); s_cpuMeshes.clear(); s_total = 0; s_maxGroupMesh = 0; s_set = VK_NULL_HANDLE; s_built = false;
+    del(s_meta); del(s_indirect); del(s_count); del(s_indirect2); del(s_count2);
+    if (s_countReadback) { vmaDestroyBuffer(VulkanHW.m_Allocator, s_countReadback, s_countReadbackAlloc);
+                           s_countReadback = VK_NULL_HANDLE; s_countReadbackAlloc = VK_NULL_HANDLE; s_countReadbackPtr = nullptr; }
+    s_groups.clear(); s_meshSet.clear(); s_cpuMeshes.clear(); s_total = 0; s_maxGroupMesh = 0; s_nGroups = 0;
+    s_set = VK_NULL_HANDLE; s_set2 = VK_NULL_HANDLE; s_occlReady = false; s_built = false;
 }
 
 }} // namespace VK::WorldGPU

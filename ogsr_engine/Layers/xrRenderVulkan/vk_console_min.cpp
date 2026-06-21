@@ -155,6 +155,20 @@ float ps_r_ssil_strength = 0.5f;
 // same-pixel EMA when MV is unavailable).
 float ps_r_ssil_temporal = 0.0f;
 
+// r_ssao_temporal — the SAME temporal accumulation, but as a first-class control
+// for the AO channel (so it works WITHOUT r_ssil). Value = history weight α. The
+// gather noise (slice direction + radial phase) is rotated per frame → each frame
+// is a DIFFERENT realisation of the AO → MV-reprojected EMA averages them into a
+// stable, low-noise result, which also lets the sample count drop (r2_ssao) without
+// banding showing. 0 = OFF (byte-identical spatial path); ~0.85 = clean+stable.
+// Needs r_motion_vectors on for moving-camera reprojection (else same-pixel EMA —
+// fine when still). AO and IL share one jitter+history; the effective α used by the
+// blur is max(r_ssao_temporal, r_ssil_temporal).
+// DEFAULT ON 0.85 (2026-06-21): measured ~free (no SSAO cost change vs 0) and it
+// keeps AO stable + clean at the now-default LOW sample count (see SampleCount()).
+// Reprojection rides r_motion_vectors (also default ON); MV off → same-pixel EMA.
+float ps_r_ssao_temporal = 0.85f;
+
 // Vulkan motion vectors — screen-space (prevUV − curUV) reconstructed from the
 // prepass depth + the previous frame's view-proj. Foundation for DLSS/FSR
 // upscaling, frame-gen and the path-tracer denoiser. Phase 1 = camera + static
@@ -309,6 +323,15 @@ int   ps_r_gpu_world = 1;
 // light-count heatmap (validates the cull).
 int   ps_r_clustered       = 0;
 int   ps_r_clustered_debug = 0;
+
+// Hi-Z occlusion cull for the GPU-driven static color pass (vk_world_gpu, Phase A
+// of cluster cull). Pass_World builds a depth pyramid from this frame's PREPASS
+// depth, then a compute pass frustum+occlusion-tests the static set into a second
+// indirect buffer drawn only in the (heavy forward) color pass — meshes fully
+// behind nearer geometry skip shading. The depth prepass still draws the full
+// frustum set (builds the pyramid), so this never over-culls. Default OFF (A/B);
+// needs r_gpu_world 1. No effect if the occlusion pipeline failed to build.
+int   ps_r_hzb_cull = 0;
 
 // Froxel volumetric lighting (vk_volumetrics, r_vol) — P1. A 3D froxel grid over
 // the frustum: compute injects sun in-scatter (Henyey-Greenstein phase × cascade
@@ -1075,6 +1098,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_ssao_npc_normals", &ps_r_ssao_npc_normals, 0, 1); // NPC normal G-buffer for GTAO (A/B)
     CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 3);   // 1=AO map, 2=depth view, 3=normal view
     CMD4(CCC_Float, "r_ssao_strength", &ps_r_ssao_strength, 0.f, 4.f);
+    CMD4(CCC_Float, "r_ssao_temporal", &ps_r_ssao_temporal, 0.f, 0.97f);  // AO temporal accumulation α (0=off; jitter+MV-reprojected EMA; needs r_motion_vectors for moving cam)
     CMD4(CCC_Integer, "r_ssil", &ps_r_ssil_enable, 0, 1);        // SSIL (folded into GTAO) on/off (A/B; needs r_ssao on)
     CMD4(CCC_Integer, "r_ssil_debug", &ps_r_ssil_debug, 0, 1);   // 1 = show ONLY the indirect bounce field
     CMD4(CCC_Float, "r_ssil_strength", &ps_r_ssil_strength, 0.f, 8.f);  // IL intensity multiplier
@@ -1145,6 +1169,9 @@ void xrRender_initconsole()
     // r_clustered_debug 1 = per-cluster light-count heatmap on the world.
     CMD4(CCC_Integer, "r_clustered",       &ps_r_clustered,       0, 1);
     CMD4(CCC_Integer, "r_clustered_debug", &ps_r_clustered_debug, 0, 1);
+
+    // Hi-Z occlusion cull of the GPU-driven static color pass (vk_world_gpu).
+    CMD4(CCC_Integer, "r_hzb_cull", &ps_r_hzb_cull, 0, 1);
 
     // Froxel volumetric lighting (vk_volumetrics) — P1: sun god rays + depth fog.
     CMD4(CCC_Integer, "r_vol",           &ps_r_vol,           0, 1);

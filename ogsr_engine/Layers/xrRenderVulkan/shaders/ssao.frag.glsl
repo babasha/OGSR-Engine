@@ -40,13 +40,15 @@ layout(push_constant) uniform PC {
 const float PI = 3.14159265;
 const int   SLICES = 4;
 
-// Fast acos approx (Drobot) — same one R4 uses.
+// Was the Drobot fast-acos approximation (R4). Its ~0.04° error is SYSTEMATIC in
+// the input angle, and on a flat surface viewed at a grazing angle (floor, distant
+// slopes) the AO should be a constant 1.0 — so that smooth angle-dependent error
+// becomes smooth distance-dependent BANDS that no amount of sampling/blur/temporal
+// removes (the error is in the angle function, not the sample noise). Use the exact
+// acos — at half-res the cost is negligible. Kept the name to avoid touching callers.
 float fast_acos(float v)
 {
-    v = clamp(v, -1.0, 1.0);
-    float res = -0.156583 * abs(v) + (PI * 0.5);
-    res *= sqrt(1.0 - abs(v));
-    return (v >= 0.0) ? res : PI - res;
+    return acos(clamp(v, -1.0, 1.0));
 }
 
 // Camera-relative world position + view depth from the scene depth at uv.
@@ -81,14 +83,27 @@ void main()
     vec3 cPos = C.xyz;
     vec3 viewV = -normalize(cPos);
 
-    // Normal from depth: per axis pick the neighbour with the smaller view-depth
-    // step — the other side of a silhouette edge would bend the normal.
+    // Normal from depth. Per axis: on a SMOOTH surface both one-sided depth steps
+    // are ~equal, so the old `pick the closer side` ternary flipped between the
+    // forward and backward difference based on sub-LSB depth quantization → the
+    // reconstructed normal ALTERNATED pixel-to-pixel → terraced BANDS (visible in
+    // r_ssao_debug 3 on the floor and on distant terrain even though the depth ramp
+    // looks smooth — the derivative amplifies quantization the ramp hides). Fix: use
+    // a CENTERED difference when smooth (stable, 2-texel baseline averages out the
+    // quantization, no flip) and only fall back to the one-sided CLOSER neighbour at
+    // a real depth discontinuity (silhouette edge) so edges still don't smear N.
     vec4 R = fetchPos(uv + vec2(pc.res.z, 0.0));
     vec4 L = fetchPos(uv - vec2(pc.res.z, 0.0));
     vec4 U = fetchPos(uv + vec2(0.0, pc.res.w));
     vec4 D = fetchPos(uv - vec2(0.0, pc.res.w));
-    vec3 ddx = (abs(R.w - C.w) < abs(C.w - L.w)) ? (R.xyz - cPos) : (cPos - L.xyz);
-    vec3 ddy = (abs(U.w - C.w) < abs(C.w - D.w)) ? (U.xyz - cPos) : (cPos - D.xyz);
+    float dxR = abs(R.w - C.w), dxL = abs(C.w - L.w);
+    float dyU = abs(U.w - C.w), dyD = abs(C.w - D.w);
+    vec3 ddx = (max(dxR, dxL) > 1.5 * min(dxR, dxL) + 1e-5)
+             ? ((dxR < dxL) ? (R.xyz - cPos) : (cPos - L.xyz))
+             : (R.xyz - L.xyz) * 0.5;
+    vec3 ddy = (max(dyU, dyD) > 1.5 * min(dyU, dyD) + 1e-5)
+             ? ((dyU < dyD) ? (U.xyz - cPos) : (cPos - D.xyz))
+             : (U.xyz - D.xyz) * 0.5;
     vec3 N = normalize(cross(ddy, ddx));
     if (dot(N, viewV) < 0.0) N = -N;               // face the camera regardless of winding
 
