@@ -197,6 +197,11 @@ int   ps_r_vsm_tree_wind     = 0;     // r_vsm_tree_wind — TEST/experimental: 
 float ps_r_sun_boost     = 1.25f;
 float ps_r_ambient_floor = 0.05f;
 
+// Grass alpha-test cutoff (live). Lower = fatter/denser blades (less "see-through"),
+// higher = thinner. Was hard-coded 0.5 in detail.frag → blades too thin, you could
+// see the ground through the grass. 0.33 keeps more of each blade body.
+float ps_r_grass_aref    = 0.33f;
+
 // Rain wetness knobs (live): darken = how much wet albedo darkens (0 = off,
 // 0.4 ≈ wet asphalt), refl = sky-reflection strength on wet surfaces.
 // r_wet_debug 1 = world shaders draw the wet mask (wetness × rain-map
@@ -1114,6 +1119,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_wind_shadow_dist", &ps_r_wind_shadow_dist, 0.f, 160.f);  // tree shadow wind radius (0 = all static)
     CMD4(CCC_Integer, "r_vsm_tree_wind", &ps_r_vsm_tree_wind, 0, 1);            // TEST: wind in VSM tree shadow pages
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
+    CMD4(CCC_Float, "r_grass_aref", &ps_r_grass_aref, 0.05f, 0.9f);
     CMD4(CCC_Float, "r_ambient_floor", &ps_r_ambient_floor, 0.f, 0.5f);
     CMD4(CCC_Float, "r_wet_darken", &ps_r_wet_darken, 0.f, 1.f);
     CMD4(CCC_Float, "r_wet_refl", &ps_r_wet_refl, 0.f, 3.f);
