@@ -109,7 +109,11 @@ float sunShadow1(vec3 worldPos)
 void main()
 {
     vec4 diff = texture(uDiffuse, vUV);
-    if (diff.a < 0.5) discard;
+    // Alpha-test cutoff is live-tunable via r_grass_aref (pc.vConsts.x). Lower =
+    // fatter/denser blades (kills the "see-through" look); fall back to 0.5 if
+    // the push slot is ever zero.
+    float aref = pc.vConsts.x > 0.001 ? pc.vConsts.x : 0.5;
+    if (diff.a < aref) discard;
 
     // r_ssao_debug 1: grass shows the raw AO map too.
     if (L.ao_params.w > 0.5) {
