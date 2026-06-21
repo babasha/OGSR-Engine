@@ -25,6 +25,7 @@ extern int ps_r_ssao_debug;        // r_ssao_debug — also enables the readback
 extern int   ps_r_ssil_enable;     // r_ssil — fold-in SSIL on/off (gates the prev-colour taps in the horizon march)
 extern float ps_r_ssil_strength;   // r_ssil_strength — baked into the IL output (forward receivers apply a fixed ssilBoost)
 extern float ps_r_ssil_temporal;   // r_ssil_temporal — GTAO temporal accumulation α (0 = off; per-frame jitter + MV-reprojected EMA)
+extern float ps_r_ssao_temporal;   // r_ssao_temporal — same temporal accumulation as a first-class AO control (works without r_ssil)
 
 namespace VK {
 
@@ -159,7 +160,12 @@ namespace {
         // defaults to medium then (set r2_ssao to override; st_opt_off is
         // honoured once any other value was chosen at least once... for now
         // 0 == "unset" → medium, since legacy configs predate this pass).
-        const u32 q = ps_r_ao_quality ? ps_r_ao_quality : 2;
+        // Unset (legacy user.ltx carries r2_ssao off = 0) now defaults to LOW = 2
+        // samples (was medium = 3): with temporal accumulation default ON
+        // (r_ssao_temporal) 2 samples is band-free + measured ~33% cheaper than 4
+        // (RTX 5070: SSAO 2.04ms→1.36ms; the real win is the bandwidth-bound iGPU).
+        // Explicit r2_ssao st_opt_med/high still forces 3/4 for users who want it.
+        const u32 q = ps_r_ao_quality ? ps_r_ao_quality : 1;
         return q <= 1 ? 2 : (q == 2 ? 3 : 4);
     }
 
@@ -515,7 +521,11 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     // refreshed last frame) so an off→on toggle or a resize starts clean, and only
     // once the MV target has surely rendered (else it could be UNDEFINED layout).
     ++s_frame;
-    const bool temporalOn = (ps_r_ssil_temporal > 0.0f);
+    // Temporal is now driven by EITHER r_ssao_temporal (AO, standalone) OR r_ssil_temporal
+    // (legacy SSIL path). AO and IL share one per-frame jitter + one history pair, so the
+    // blur EMA uses the stronger of the two α's.
+    const float temporalAlpha = std::max(ps_r_ssao_temporal, ps_r_ssil_temporal);
+    const bool temporalOn = (temporalAlpha > 0.0f);
     const bool histUsable = temporalOn && s_temporalWasOn && s_histValid;
     if (MotionVec::Enabled() && MotionVec::GetResultView() != VK_NULL_HANDLE) { if (s_mvWarm < 4) ++s_mvWarm; }
     else s_mvWarm = 0;
@@ -607,7 +617,7 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     push.dbg[1] = ps_r_ssil_enable ? 1.0f : 0.0f;   // SSIL: gather prev-frame colour in the horizon march
     push.dbg[2] = kILFireClamp;
     push.dbg[3] = ps_r_ssil_enable ? ps_r_ssil_strength : 0.0f;   // baked into IL → forward ssilBoost; 0 when off
-    push.temporal[0] = temporalOn ? ps_r_ssil_temporal : 0.0f;     // EMA α (gather: gates jitter; blur: history weight)
+    push.temporal[0] = temporalOn ? temporalAlpha : 0.0f;          // EMA α (gather: gates jitter; blur: history weight)
     push.temporal[1] = temporalOn ? jitterPhase : 0.0f;            // per-frame slice/radial rotation (0 → spatial path)
     push.temporal[2] = mvReady   ? 1.0f : 0.0f;                    // reproject via MV (else same-pixel EMA)
     push.temporal[3] = histUsable ? 1.0f : 0.0f;                   // blur may sample the history this frame

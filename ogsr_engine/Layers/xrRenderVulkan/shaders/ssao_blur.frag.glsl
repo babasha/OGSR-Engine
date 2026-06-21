@@ -104,7 +104,14 @@ void main()
         vec2 mv     = (pc.temporal.z > 0.5) ? texture(uMV, uv).rg : vec2(0.0);
         vec2 prevUV = uv + mv;
         if (all(greaterThanEqual(prevUV, vec2(0.0))) && all(lessThanEqual(prevUV, vec2(1.0)))) {
-            float aoH = clamp(texture(uAOhist, prevUV).r, aoMin, aoMax);
+            // RELAXED neighbourhood clamp for AO: a TIGHT min/max clamp re-introduces
+            // the very low-frequency structure temporal is meant to average out (it
+            // drags the smooth history back into the current jittered frame's narrow
+            // local range every frame). Add a slack margin (~1× the local range,
+            // floored) so the EMA can average broad structure while still bounding
+            // gross ghosts on disocclusion/motion.
+            float aoRange = max(aoMax - aoMin, 0.05);
+            float aoH = clamp(texture(uAOhist, prevUV).r, aoMin - aoRange, aoMax + aoRange);
             ao = mix(ao, aoH, alpha);
             vec3 ilH = clamp(texture(uILhist, prevUV).rgb, ilMin, ilMax);
             ilOut = mix(ilOut, ilH, alpha);
