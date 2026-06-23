@@ -29,7 +29,21 @@ float puddleCoverage(vec3 wp, vec3 N, float wet, float upness)
 // (puddle coverage, already in [0,1]); this darkens albedo (inout) and returns
 // the additive puddle/glint reflection. Math is byte-identical to all three
 // pre-refactor copies.
-vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud, float sunMask)
+// Bent-normal specular occlusion (UE/Jimenez SIGGRAPH'16): treat AO as a
+// visibility CONE around the bent normal — its half-angle WIDENS as ao→0
+// (solid-angle exact: cosα = 1−ao). If the reflection ray R points OUTSIDE that
+// open cone (i.e. into geometry), fade the environment reflection out. ao=1 →
+// cone = full hemisphere → no occlusion. Pure math (bentN/ao supplied by caller).
+// Kills wet/puddle reflections glowing out of crevices and from under overhangs
+// where the open sky can't physically reach.
+float specOcclusion(vec3 bentN, vec3 R, float ao)
+{
+    float cosCone = clamp(1.0 - ao, 0.0, 1.0);
+    float d       = dot(normalize(bentN), normalize(R));
+    return smoothstep(cosCone - 0.15, cosCone + 0.15, d);
+}
+
+vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud, float sunMask, vec3 bentN, float ao)
 {
     // DARKEN: FULL in deep puddles (pud^2 -> body fills AFTER the shine), ~NONE open.
     albedo *= 1.0 - L.rain_params.z * wetK * mix(0.05, 1.0, pud * pud);
@@ -76,11 +90,15 @@ vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud,
     float foam = smoothstep(3.0, 6.0, velMS) * pud * ripFade * 0.25;
     // RING WAVE crests - bright leading edge of each ripple (visible drop waves).
     vec3 crestCol = (L.sun_color.rgb + L.ambient.rgb) * (crest * pud * 0.07);
-    return sky * puddleK + L.sun_color.rgb * (glint * 3.0) + vec3(foam) + crestCol;
+    // Bent-normal spec occlusion (r_spec_occ = L.pom_params6.w, 0 = off): applies
+    // ONLY to the ENV sky reflection — sun glint / foam / ripple crests have their
+    // own visibility (sun shadow), so leave them untouched.
+    float specOcc = (L.pom_params6.w > 0.0) ? mix(1.0, specOcclusion(bentN, R, ao), L.pom_params6.w) : 1.0;
+    return sky * (puddleK * specOcc) + L.sun_color.rgb * (glint * 3.0) + vec3(foam) + crestCol;
 }
 
 // world_lmap / world_vlit: down-facing kill in wetK, pud from puddleCoverage.
-vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask)
+vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask, vec3 bentN, float ao)
 {
     float wet = L.rain_params.y;
     if (wet < 0.005) return vec3(0.0);
@@ -89,13 +107,13 @@ vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask)
     // Kill wetness on DOWN-facing surfaces (ceilings/overhang undersides).
     float wetK = wet * mix(0.35, 1.0, upness) * smoothstep(-0.15, 0.05, N.y);
     float pud  = puddleCoverage(wp, N, wet, upness);
-    return applyWetnessCore(albedo, wp, N, wetK, pud, sunMask);
+    return applyWetnessCore(albedo, wp, N, wetK, pud, sunMask, bentN, ao);
 }
 
 // world_terrain: pud arrives from the caller's per-pixel sssPuddle. Terrain's
 // wetK has NO down-facing smoothstep and pud is gated by upness here - matches
 // the pre-refactor terrain applyWetness exactly.
-vec3 applyWetnessTerrain(inout vec3 albedo, vec3 wp, vec3 N, float pudIn, float sunMask)
+vec3 applyWetnessTerrain(inout vec3 albedo, vec3 wp, vec3 N, float pudIn, float sunMask, vec3 bentN, float ao)
 {
     float wet = L.rain_params.y;
     if (wet < 0.005) return vec3(0.0);
@@ -103,7 +121,7 @@ vec3 applyWetnessTerrain(inout vec3 albedo, vec3 wp, vec3 N, float pudIn, float 
     float upness = clamp(N.y, 0.0, 1.0);
     float wetK = wet * mix(0.35, 1.0, upness);
     float pud  = clamp(pudIn, 0.0, 1.0) * upness;
-    return applyWetnessCore(albedo, wp, N, wetK, pud, sunMask);
+    return applyWetnessCore(albedo, wp, N, wetK, pud, sunMask, bentN, ao);
 }
 
 #endif // WETNESS_GLSL

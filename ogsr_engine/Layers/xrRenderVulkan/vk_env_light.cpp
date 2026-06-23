@@ -54,6 +54,7 @@ extern int   ps_r_puddle_debug;   // r_puddle_debug — draw the geometric puddl
 extern int   ps_r_water_sim;      // r_water_sim — water flow sim enable (puddles from the sim)
 extern float ps_r_water_murk;     // r_water_murk — volumetric absorption per metre
 extern float ps_r_water_refract;  // r_water_refract — bottom refraction strength
+extern float ps_r_spec_occ;       // r_spec_occ — bent-normal specular occlusion of wet reflections
 extern int   ps_r_clustered;      // r_clustered — clustered forward light culling (vk_clustered)
 extern int   ps_r_clustered_debug; // r_clustered_debug — per-cluster light-count heatmap
 extern int   ps_r_light_occ;      // r_light_occ — dynamic-light terrain/static occlusion (ground map march)
@@ -799,7 +800,7 @@ void Update(u32 slot)
     ub.pom_params6[0] = (ps_r_water_sim && ps_r_rain_enable) ? 1.f : 0.f;  // sim puddles off when r_rain off
     ub.pom_params6[1] = ps_r_water_murk;                // volumetric absorption /m
     ub.pom_params6[2] = ps_r_water_refract;             // bottom refraction strength
-    ub.pom_params6[3] = 0.f;
+    ub.pom_params6[3] = ps_r_spec_occ;                 // bent-normal spec occlusion of wet reflections
     // SSS puddles (default source). Gate off when r_rain is off so dry weather clears.
     ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? 1.f : 0.f;
     ub.pom_params7[1] = ps_r_puddle_level;              // coverage (more/larger puddles)

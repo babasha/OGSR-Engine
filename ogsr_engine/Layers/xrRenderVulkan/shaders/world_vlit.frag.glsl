@@ -220,7 +220,7 @@ void main()
                   + dynLights(vWorldPos, Nw);
 
     // Rain wetness - see world_lmap.frag.
-    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw, sunMask);
+    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw, sunMask, gtaoBentN(geomN), gtaoVisRaw());
 
     // Distance fog (R4).
     vec3 col = albedo * lighting + wetRefl;

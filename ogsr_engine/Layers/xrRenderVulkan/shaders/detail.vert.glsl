@@ -64,7 +64,10 @@ void main()
     // SSFX flow-map wind (replaces the old sine ApplyWind). Sample at the base
     // world position, drift by Environment.wind_anim.
     WindSetup W = ssfx_wind_setup(pc.wind_params, pc.wsetup_grass, pc.wind_anim.w);
-    worldPos     += ssfx_wind_grass(worldPos, aHeight, W, pc.wind_anim.xy);
+    // wind_params.w = per-detail-type wind scale, pushed each draw: 0 for models
+    // flagged DO_NO_WAVING (the tiny "asphalt" plants R4 keeps static), 1 for
+    // normal grass. Without this the SSFX wind stretched those micro-meshes.
+    worldPos     += ssfx_wind_grass(worldPos, aHeight, W, pc.wind_anim.xy) * pc.wind_params.w;
     worldPos      = ApplyInteraction(worldPos, aHeight);
 
     // Trail press-down: gen-shader wrote trail intensity into aInstColor.g.

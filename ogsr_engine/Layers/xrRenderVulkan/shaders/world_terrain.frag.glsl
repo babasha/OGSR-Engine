@@ -351,7 +351,7 @@ void main()
     }
 
     // Rain wetness (terrain: pud passed in; asphalt reflectivity term was unused).
-    vec3 wetRefl = applyWetnessTerrain(albedo, vWorldPos, Nw, pud, sunMask);
+    vec3 wetRefl = applyWetnessTerrain(albedo, vWorldPos, Nw, pud, sunMask, gtaoBentN(geomN), gtaoVisRaw());
 
     // Distance fog (R4).
     vec3 col = albedo * lighting + drySpec + wetRefl;

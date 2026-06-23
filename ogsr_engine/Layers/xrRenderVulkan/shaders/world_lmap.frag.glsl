@@ -241,7 +241,7 @@ void main()
                   + dynLights(vWorldPos, Nw);
 
     // Rain wetness: darken + sky reflection where the rain map says open sky.
-    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw, sunMask);
+    vec3 wetRefl = applyWetness(albedo, vWorldPos, Nw, sunMask, gtaoBentN(geomN), gtaoVisRaw());
 
     // Distance fog (R4): fade to the env haze colour with view distance.
     vec3 col = albedo * lighting + wetRefl;

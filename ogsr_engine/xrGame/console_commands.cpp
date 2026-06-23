@@ -943,6 +943,36 @@ struct CCC_JumpToLevel : public IConsole_Command
     }
 };
 
+// Re-enable / disable a console command at runtime. Mods (e.g. this addon)
+// disable dev commands like jump_to_level via Lua get_console():disable_command().
+// `cmd_enable jump_to_level` flips it back on so it can be used for testing.
+struct CCC_SetCmdEnabled : public IConsole_Command
+{
+    bool m_enable;
+    CCC_SetCmdEnabled(LPCSTR N, bool enable) : IConsole_Command(N), m_enable(enable) {}
+
+    virtual void Execute(LPCSTR args)
+    {
+        string256 name;
+        name[0] = 0;
+        sscanf(args, "%s", name);
+        CConsole::vecCMD_IT it = Console->Commands.find(name);
+        if (it == Console->Commands.end())
+        {
+            Msg("! No such console command: \"%s\"", name);
+            return;
+        }
+        it->second->SetEnabled(m_enable);
+        Msg("- Command \"%s\" %s", name, m_enable ? "enabled" : "disabled");
+    }
+
+    virtual void fill_tips(vecTips& tips, u32 mode)
+    {
+        for (CConsole::vecCMD_IT it = Console->Commands.begin(); it != Console->Commands.end(); ++it)
+            tips.push_back(it->first);
+    }
+};
+
 class CCC_Spawn : public IConsole_Command
 {
 public:
@@ -1605,6 +1635,8 @@ void CCC_RegisterCommands()
 #endif // DEBUG
 
     //#ifndef MASTER_GOLD
+    CMD2(CCC_SetCmdEnabled, "cmd_enable", true);    // re-enable a mod-disabled console command
+    CMD2(CCC_SetCmdEnabled, "cmd_disable", false);
     CMD1(CCC_JumpToLevel, "jump_to_level");
     CMD1(CCC_Spawn, "g_spawn");
     CMD1(CCC_SpawnToInventory, "g_spawn_to_inventory");

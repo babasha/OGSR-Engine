@@ -31,6 +31,7 @@
 #include "vk_env_light.h"               // VK::EnvLight::GetCurrentSet — set 1 (shadow lookup)
 #include "vk_cull.h"                    // VK::ExtractFrustumPlanes (shared with TreeManager)
 #include "HW_Vulkan.h"
+#include "../xrRender/DetailFormat.h"   // DO_NO_WAVING
 
 #include "../../xr_3da/IGame_Persistent.h"
 #include "../../xr_3da/IGame_Level.h"           // g_pGameLevel, CurrentEntity, Objects
@@ -45,6 +46,7 @@ extern float ps_current_detail_density; // 0..1, default 0.6 (lower = denser)
 extern float ps_current_detail_scale;   // r__detail_scale, 0.7..1.5 — per-item size multiplier
 extern float ps_r_sun_boost;            // r_sun_boost — global sun multiplier (see vk_env_light)
 extern float ps_r_grass_aref;           // r_grass_aref — grass alpha-test cutoff (lower = fatter blades)
+extern int   ps_r_grass_nowave;         // r_grass_nowave — respect DO_NO_WAVING (1) or wind everything (0)
 
 namespace VK
 {
@@ -170,7 +172,7 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     // speed from these; drift comes from the shared Environment.wind_anim
     // accumulator. Defaults match the SSFX "10 - Wind" MCM (grass animspeed 9.5,
     // turbulence 1.4, push 1.5, wave 0.4; min wind speed 0.1).
-    m_GfxConstants.wind_params.set(windDirAngle, windVel, 0.0f, 0.0f);
+    m_GfxConstants.wind_params.set(windDirAngle, windVel, 0.0f, 1.0f);   // .w = wind scale, overridden per detail type in the draw loop (DO_NO_WAVING → 0)
     m_GfxConstants.wsetup_grass.set(9.5f, 1.4f, 1.5f, 0.4f);
     m_GfxConstants.wind_anim.set(windAnim.x, windAnim.y, windAnim.z, 0.1f);
     m_GfxConstants.vConsts.set(ps_r_grass_aref, 1.0f, sun_dir.y, 0.2f);   // x = grass alpha cutoff; sun.y feeds shader hemi calc
@@ -494,6 +496,13 @@ void CDetailManager::Render(VK::FrameContext& ctx)
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_GfxPipelineLayout, 0, 1, &m_GfxDescSets[i], 0, nullptr);
         }
+
+        // Per-detail-type wind scale: DO_NO_WAVING models (tiny shoots in asphalt)
+        // stay static like R4 (push 0 into wind_params.w); normal grass waves (1).
+        const float windScale = (ps_r_grass_nowave && (obj->m_Flags & DO_NO_WAVING)) ? 0.0f : 1.0f;
+        vkCmdPushConstants(cmd, m_GfxPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           offsetof(DetailGfxPushConstants, wind_params) + 3u * sizeof(float),
+                           sizeof(float), &windScale);
 
         VkBuffer vbs[2] = { obj->m_VertexBuffer->GetHandle(), m_VisibleSSBO->GetHandle() };
         VkDeviceSize off[2] = { 0, u64(i) * u64(sectionSize) * sizeof(DetailInstance) };
