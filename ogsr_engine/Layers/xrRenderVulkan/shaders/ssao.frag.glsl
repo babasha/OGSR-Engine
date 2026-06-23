@@ -28,7 +28,7 @@ layout(set = 0, binding = 2) uniform sampler2D uNormal;    // NPC normal G-buffe
 layout(set = 0, binding = 3) uniform sampler2D uPrevColor; // PREVIOUS frame's lit scene, half-res (linear HDR) — IL source
 
 layout(push_constant) uniform PC {
-    vec4 camDir;     // xyz = camera forward (unit)
+    vec4 camDir;     // xyz = camera forward (unit); w = r_ssao_bias = grazing fade N·V threshold (fade AO→open below it → kills flat-floor banding)
     vec4 camRightT;  // xyz = right * tan(fovX/2), w = tan(fovX/2)
     vec4 camTopT;    // xyz = top   * tan(fovY/2), w = tan(fovY/2)
     vec4 zp;         // x = proj _33, y = proj _43, z = world radius (m), w = samples/side
@@ -92,10 +92,17 @@ void main()
     // a CENTERED difference when smooth (stable, 2-texel baseline averages out the
     // quantization, no flip) and only fall back to the one-sided CLOSER neighbour at
     // a real depth discontinuity (silhouette edge) so edges still don't smear N.
-    vec4 R = fetchPos(uv + vec2(pc.res.z, 0.0));
-    vec4 L = fetchPos(uv - vec2(pc.res.z, 0.0));
-    vec4 U = fetchPos(uv + vec2(0.0, pc.res.w));
-    vec4 D = fetchPos(uv - vec2(0.0, pc.res.w));
+    // Wider 2-texel baseline: depth quantization is ~constant per texel, so a
+    // larger neighbour spacing grows the position delta and shrinks the RELATIVE
+    // quantization → smoother N on grazing flat ground. The residual AO bands
+    // there are the 4-slice visibility integral amplifying a quantization-banded
+    // normal (a flat floor's TRUE normal is constant, so any N variation = noise).
+    // Costs a touch of N sharpness at small features — fine at half-res.
+    const float NB = 2.0;
+    vec4 R = fetchPos(uv + vec2(NB * pc.res.z, 0.0));
+    vec4 L = fetchPos(uv - vec2(NB * pc.res.z, 0.0));
+    vec4 U = fetchPos(uv + vec2(0.0, NB * pc.res.w));
+    vec4 D = fetchPos(uv - vec2(0.0, NB * pc.res.w));
     float dxR = abs(R.w - C.w), dxL = abs(C.w - L.w);
     float dyU = abs(U.w - C.w), dyD = abs(C.w - D.w);
     vec3 ddx = (max(dxR, dxL) > 1.5 * min(dxR, dxL) + 1e-5)
@@ -138,6 +145,12 @@ void main()
 
     const float radius  = pc.zp.z;
     const int   nSample = int(pc.zp.w + 0.5);
+
+    // r_ssao_debug 4: FULLY-OPEN AO — skip the horizon march so no sample can
+    // occlude. On a flat floor this MUST be a constant ~1.0; if bands still show
+    // here, they come from the reconstructed normal / few-slice integral, not the
+    // horizon sampling (decisive split for chasing the residual floor bands).
+    bool dbgOpen = (pc.dbg.x > 3.5 && pc.dbg.x < 4.5);
 
     // Pixels per world unit at this depth → sampling radius in texels.
     float proj_scale    = pc.res.y / (2.0 * pc.camTopT.w);
@@ -201,7 +214,7 @@ void main()
             float sideSign = -1.0 + 2.0 * float(side);
             float cHorizonCos = -1.0;
 
-            for (int samp = 0; samp < nSample; ++samp)
+            for (int samp = 0; samp < nSample && !dbgOpen; ++samp)
             {
                 // Min offset: R4 uses 4+sample FULL-res texels; we run at half
                 // res, so 2+sample keeps the same world-space footprint — the
@@ -211,8 +224,9 @@ void main()
                 vec2 sTexCoord = uv + sideSign * s * vec2(omega.x, -omega.y);
                 vec3 sPos = fetchPos(sTexCoord).xyz;
                 vec3 sHorizonV = sPos - cPos;
-                float falloff = clamp(dot(sHorizonV, sHorizonV) * falloff_mul, 0.0, 1.0);
-                float H = dot(normalize(sHorizonV), viewV);
+                float d2 = dot(sHorizonV, sHorizonV);
+                float falloff = clamp(d2 * falloff_mul, 0.0, 1.0);
+                float H = dot(sHorizonV * inversesqrt(max(d2, 1e-12)), viewV);
                 if (H > cHorizonCos) {
                     // This sample raised the horizon → it's a visible occluder
                     // that bounces light. Accumulate its colour as a WEIGHTED
@@ -249,6 +263,20 @@ void main()
     }
 
     float aoOut = clamp(visibility / float(SLICES), 0.0, 1.0);
+
+    // Grazing-angle fade (pc.camDir.w = r_ssao_bias = the N·V threshold). The
+    // depth-reconstructed normal is unreliable at grazing angles, so a flat open
+    // surface fails to cancel its OWN horizon there → residual self-occlusion
+    // (AO < 1) that pow(ao, r_ssao_strength) blows into the floor "bands". Where
+    // the surface faces away from the viewer (N·V → 0) we fade AO back to fully
+    // open; head-on surfaces (reliable recon, real contact shade) keep full AO.
+    // This kills the bands at ANY strength because it removes the bogus AO at the
+    // source instead of fighting the pow. (Horizon/elevation biases couldn't: the
+    // open-side horizon is clamp-saturated, so biasing it is a no-op on flat ground.)
+    float ndv       = clamp(dot(N, viewV), 0.0, 1.0);
+    float grazeFade = smoothstep(pc.camDir.w, pc.camDir.w + 0.25, ndv);
+    aoOut = mix(1.0, aoOut, grazeFade);
+
     vec3  bn    = (dot(bentNormal, bentNormal) > 1e-6) ? normalize(bentNormal) : N;
     outAO = vec4(aoOut, bn * 0.5 + 0.5);
 

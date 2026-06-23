@@ -13,6 +13,15 @@ float gtaoVis()
     return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);
 }
 
+// Raw GTAO visibility (NO strength exponent) — for the specular-occlusion cone,
+// which wants the geometric openness, not the artistically deepened diffuse AO.
+// Returns 1.0 (fully open) when AO is off so spec occlusion becomes a no-op.
+float gtaoVisRaw()
+{
+    if (L.ao_params.z <= 0.0) return 1.0;
+    return clamp(textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r, 0.0, 1.0);
+}
+
 // GTAO bent normal (gba of the AO RT, world-space): the average UNOCCLUDED
 // direction. Sky fill sampled along it pulls ambient from where the hemisphere
 // is open. Falls back to the geometric normal when AO is off or degenerate.

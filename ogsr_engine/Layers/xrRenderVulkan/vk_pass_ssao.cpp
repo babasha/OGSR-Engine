@@ -26,6 +26,7 @@ extern int   ps_r_ssil_enable;     // r_ssil — fold-in SSIL on/off (gates the 
 extern float ps_r_ssil_strength;   // r_ssil_strength — baked into the IL output (forward receivers apply a fixed ssilBoost)
 extern float ps_r_ssil_temporal;   // r_ssil_temporal — GTAO temporal accumulation α (0 = off; per-frame jitter + MV-reprojected EMA)
 extern float ps_r_ssao_temporal;   // r_ssao_temporal — same temporal accumulation as a first-class AO control (works without r_ssil)
+extern float ps_r_ssao_bias;       // r_ssao_bias — grazing-surface horizon bias (rejects coplanar floor samples → kills flat-ground AO bands)
 
 namespace VK {
 
@@ -601,6 +602,7 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
     const ProjTerms pt = DeriveProjTerms(Device.mFullTransform);
     SSAOPush push{};
     push.camDir[0] = pt.dir.x; push.camDir[1] = pt.dir.y; push.camDir[2] = pt.dir.z;
+    push.camDir[3] = ps_r_ssao_bias;   // grazing-surface horizon bias (ssao.frag rejects coplanar samples)
     push.camRightT[0] = pt.right.x * pt.tanX; push.camRightT[1] = pt.right.y * pt.tanX;
     push.camRightT[2] = pt.right.z * pt.tanX; push.camRightT[3] = pt.tanX;
     push.camTopT[0]   = pt.top.x  * pt.tanY;  push.camTopT[1]   = pt.top.y  * pt.tanY;

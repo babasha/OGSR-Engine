@@ -169,6 +169,14 @@ float ps_r_ssil_temporal = 0.0f;
 // Reprojection rides r_motion_vectors (also default ON); MV off → same-pixel EMA.
 float ps_r_ssao_temporal = 0.85f;
 
+// GTAO grazing-angle fade threshold (N·V). The depth-reconstructed normal is
+// unreliable at grazing angles, where a flat OPEN surface fails to cancel its own
+// horizon → residual self-occlusion (AO<1) that r_ssao_strength's pow blows into
+// the floor "bands". Below this N·V the AO fades back to fully open; head-on
+// surfaces keep full AO (real contact shade). Kills the bands at ANY strength.
+// 0 = off (old self-occluding look); higher = fades more of the grazing floor.
+float ps_r_ssao_bias = 0.30f;
+
 // Vulkan motion vectors — screen-space (prevUV − curUV) reconstructed from the
 // prepass depth + the previous frame's view-proj. Foundation for DLSS/FSR
 // upscaling, frame-gen and the path-tracer denoiser. Phase 1 = camera + static
@@ -201,6 +209,11 @@ float ps_r_ambient_floor = 0.05f;
 // higher = thinner. Was hard-coded 0.5 in detail.frag → blades too thin, you could
 // see the ground through the grass. 0.33 keeps more of each blade body.
 float ps_r_grass_aref    = 0.33f;
+
+// Respect the DO_NO_WAVING detail flag (1) or force SSFX wind on every detail type
+// (0, the old behaviour). R4 keeps flagged micro-plants (tiny shoots in asphalt)
+// static; without this they stretched under the tree/grass wind.
+int   ps_r_grass_nowave  = 1;
 
 // Rain wetness knobs (live): darken = how much wet albedo darkens (0 = off,
 // 0.4 ≈ wet asphalt), refl = sky-reflection strength on wet surfaces.
@@ -521,6 +534,10 @@ int   ps_r_water_iters  = 1;   // legacy (velocity sim runs 1 step/frame)
 // how much the surface ripples bend the view of the bottom.
 float ps_r_water_murk   = 1.2f;
 float ps_r_water_refract = 0.02f;
+
+// Bent-normal specular occlusion of wet/puddle sky reflections (UE-style). 0 = off,
+// 1 = full; fades reflections in crevices / under overhangs where sky can't reach.
+float ps_r_spec_occ     = 1.0f;
 
 // PN-triangle silhouette curvature (R4 TESS_PN). OFF by default: it rounds
 // hard-surface props (barrels/crates/walls) by inflating along smoothed
@@ -1101,9 +1118,10 @@ void xrRender_initconsole()
     CMD3(CCC_Token, "r2_ssao", &ps_r_ao_quality, qssao_token);
     CMD4(CCC_Integer, "r_ssao", &ps_r_ssao_enable, 0, 1);        // global GTAO on/off (perf A/B + real off)
     CMD4(CCC_Integer, "r_ssao_npc_normals", &ps_r_ssao_npc_normals, 0, 1); // NPC normal G-buffer for GTAO (A/B)
-    CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 3);   // 1=AO map, 2=depth view, 3=normal view
+    CMD4(CCC_Integer, "r_ssao_debug", &ps_r_ssao_debug, 0, 4);   // 1=AO map, 2=depth view, 3=normal view, 4=fully-open AO (no horizon → isolates normal/integral banding)
     CMD4(CCC_Float, "r_ssao_strength", &ps_r_ssao_strength, 0.f, 4.f);
     CMD4(CCC_Float, "r_ssao_temporal", &ps_r_ssao_temporal, 0.f, 0.97f);  // AO temporal accumulation α (0=off; jitter+MV-reprojected EMA; needs r_motion_vectors for moving cam)
+    CMD4(CCC_Float, "r_ssao_bias", &ps_r_ssao_bias, 0.f, 0.9f);           // grazing-fade N·V threshold (fades AO→open at grazing → kills flat-floor bands at any strength; 0=off)
     CMD4(CCC_Integer, "r_ssil", &ps_r_ssil_enable, 0, 1);        // SSIL (folded into GTAO) on/off (A/B; needs r_ssao on)
     CMD4(CCC_Integer, "r_ssil_debug", &ps_r_ssil_debug, 0, 1);   // 1 = show ONLY the indirect bounce field
     CMD4(CCC_Float, "r_ssil_strength", &ps_r_ssil_strength, 0.f, 8.f);  // IL intensity multiplier
@@ -1120,6 +1138,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_vsm_tree_wind", &ps_r_vsm_tree_wind, 0, 1);            // TEST: wind in VSM tree shadow pages
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
     CMD4(CCC_Float, "r_grass_aref", &ps_r_grass_aref, 0.05f, 0.9f);
+    CMD4(CCC_Integer, "r_grass_nowave", &ps_r_grass_nowave, 0, 1);
     CMD4(CCC_Float, "r_ambient_floor", &ps_r_ambient_floor, 0.f, 0.5f);
     CMD4(CCC_Float, "r_wet_darken", &ps_r_wet_darken, 0.f, 1.f);
     CMD4(CCC_Float, "r_wet_refl", &ps_r_wet_refl, 0.f, 3.f);
@@ -1260,6 +1279,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_water_iters", &ps_r_water_iters, 1, 6);         // sim relaxation steps per frame
     CMD4(CCC_Float, "r_water_murk", &ps_r_water_murk, 0.f, 8.f);         // volumetric absorption /m (deeper feel)
     CMD4(CCC_Float, "r_water_refract", &ps_r_water_refract, 0.f, 0.2f);  // bottom refraction strength
+    CMD4(CCC_Float, "r_spec_occ", &ps_r_spec_occ, 0.f, 1.f);             // bent-normal spec occlusion of wet reflections
 
     CMD3(CCC_Mask64, "r4_enable_tessellation", &ps_r2_ls_flags_ext, R2FLAGEXT_ENABLE_TESSELLATION); // Need restart
 
