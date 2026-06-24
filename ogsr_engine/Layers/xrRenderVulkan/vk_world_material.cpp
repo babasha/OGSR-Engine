@@ -14,6 +14,8 @@
 
 #include <unordered_map>
 #include <string>
+#include <array>
+#include <set>
 
 namespace VK { namespace WorldMaterialCache {
 
@@ -50,7 +52,9 @@ namespace {
     CVulkanTexture*                                    s_TerrainDetail[4] = {};       // R/G/B/A diffuse details
     CVulkanTexture*                                    s_TerrainNormal[4] = {};       // R/G/B/A <detail>_bump normal maps
     CVulkanTexture*                                    s_FlatNormal       = nullptr;  // 1×1 (0,0,1) tangent normal fallback
-    std::unordered_map<std::string, CVulkanTexture*>   s_TerrainDetCache;             // by name (diffuse + normal + mask)
+    CVulkanTexture*                                    s_TerrainHeight[4] = {};       // R/G/B/A <detail>_height maps (SSFX terrain POM)
+    CVulkanTexture*                                    s_FlatHeight       = nullptr;  // 1×1 mid-grey height fallback (uniform -> no relief)
+    std::unordered_map<std::string, CVulkanTexture*>   s_TerrainDetCache;             // by name (diffuse + normal + height + mask)
 
     // Resolved file path: $game_textures$\\<name>.dds
     bool ResolveTexturePath(const char* name, string_path& out)
@@ -257,12 +261,105 @@ namespace {
         return tex;
     }
 
-    // Write the 11-binding terrain set: base, mask, dt_r..dt_a, lmap, dn_r..dn_a.
-    void WriteTerrainSet(VkDescriptorSet set, const VkImageView v[11])
+    // Local mirror of CBlender_DESC's on-disk layout (the real header drags in the
+    // R4-only Blender_Recorder, which won't compile here). pack(4) + field order
+    // must match xrRender\blenders\Blender.h exactly so sizeof == the serialized
+    // record (u64 + 128 + 32 + 4 + 2 -> 176 bytes under pack(4)).
+#pragma pack(push, 4)
+    struct BmmdDescRaw { CLASS_ID CLS; char cName[128]; char cComputer[32]; u32 cTime; u16 version; };
+#pragma pack(pop)
+    static const CLASS_ID kCLS_BmmD = MK_CLSID('B', 'm', 'm', 'D', 'o', 'l', 'd', ' ');
+
+    // ----- Per-shader terrain detail sets from shaders.xr (CBlender_BmmD) -------
+    // Each terrain shader (e.g. "levels\l01_escape_grass") is a B_BmmD blender that
+    // names its own 4 channel-detail textures (oR/oG/oB/oA). The VK renderer never
+    // parsed shaders.xr, so it hardcoded one global set. This reads the blender DB
+    // (chunk 2) and maps blender-name(lower) -> {R,G,B,A}. Binary layout verified
+    // against ResourceManager_Loader.cpp + IBlenderXr::Load + Blender_BmmD::Load.
+    std::unordered_map<std::string, std::array<std::string, 4>> s_BlenderDet;
+    bool s_BlenderDetLoaded = false;
+
+    void LoadTerrainBlenderMap()
     {
-        VkDescriptorImageInfo ii[11]{};
-        VkWriteDescriptorSet  w[11]{};
-        for (int i = 0; i < 11; ++i) {
+        if (s_BlenderDetLoaded) return;
+        s_BlenderDetLoaded = true;
+
+        // shaders.xr sits at the gamedata root inside gamedata.db_base_configs.
+        // Try the canonical alias forms (open directly — more robust than exist()).
+        IReader* F = FS.r_open("$game_data$", "shaders.xr");
+        if (!F) F = FS.r_open("$fs_root$", "gamedata\\shaders.xr");
+        if (!F) F = FS.r_open("$game_config$", "..\\shaders.xr");
+        if (!F) {
+            Msg("[VK Terrain] shaders.xr not found -> per-shader detail sets OFF (global defaults)");
+            return;
+        }
+
+        // Compressed-library guard (mirror ResourceManager_Loader): read 8-byte id.
+        char id8[8];
+        F->r(id8, 8);
+        if (0 == strncmp(id8, "shENGINE", 8)) {
+            Msg("![VK Terrain] shaders.xr compressed (shENGINE) -> using global defaults");
+            FS.r_close(F);
+            return;
+        }
+
+        // Property stream helpers: each prop = u32 type + stringZ name + sizeof(data).
+        auto skip_marker = [](IReader& r) { r.r_u32(); r.skip_stringZ(); };
+        auto skip_prop   = [](IReader& r, u32 n) { r.r_u32(); r.skip_stringZ(); r.advance(n); };
+        auto read_str64  = [](IReader& r, string64& out) { r.r_u32(); r.skip_stringZ(); r.r(out, sizeof(string64)); };
+
+        int total = 0, bmmd = 0;
+        if (IReader* fs = F->open_chunk(2)) {
+            IReader* chunk; int cid = 0;
+            while ((chunk = fs->open_chunk(cid)) != nullptr) {
+                ++total;
+                BmmdDescRaw desc;
+                chunk->r(&desc, sizeof(desc));
+                if (desc.CLS == kCLS_BmmD && desc.version >= 3) {
+                    string64 R{}, G{}, B{}, A{};
+                    skip_marker(*chunk);                    // "General"
+                    skip_prop(*chunk, 12u);                 // oPriority  (xrP_INTEGER = 3*int)
+                    skip_prop(*chunk, 4u);                  // oStrictSorting (xrP_BOOL = BOOL)
+                    skip_marker(*chunk);                    // "Base texture"
+                    skip_prop(*chunk, sizeof(string64));     // oT_Name
+                    skip_prop(*chunk, sizeof(string64));     // oT_xform
+                    skip_marker(*chunk);                    // "Detail map"
+                    skip_prop(*chunk, sizeof(string64));     // oT2_Name
+                    skip_prop(*chunk, sizeof(string64));     // oT2_xform
+                    read_str64(*chunk, R);                  // oR_Name
+                    read_str64(*chunk, G);                  // oG_Name
+                    read_str64(*chunk, B);                  // oB_Name
+                    read_str64(*chunk, A);                  // oA_Name
+
+                    std::string key(desc.cName);
+                    for (char& c : key) c = (char)tolower((unsigned char)c);
+                    s_BlenderDet[key] = { std::string(R), std::string(G), std::string(B), std::string(A) };
+                    ++bmmd;
+                }
+                chunk->close();
+                ++cid;
+            }
+            fs->close();
+        }
+        FS.r_close(F);
+
+        // Variety summary: how many DISTINCT detail-sets across all terrain shaders.
+        std::set<std::string> distinct;
+        for (auto& kv : s_BlenderDet)
+            distinct.insert(kv.second[0] + "|" + kv.second[1] + "|" + kv.second[2] + "|" + kv.second[3]);
+        Msg("[VK Terrain] shaders.xr: %d blenders, %d B_BmmD terrain shaders, %u DISTINCT detail-sets",
+            total, bmmd, (u32)distinct.size());
+        int n = 0;
+        for (const std::string& s : distinct) { Msg("[VK Terrain]   set %d: %s", n++, s.c_str()); }
+    }
+
+    // Write the 15-binding terrain set: base, mask, dt_r..dt_a, lmap, dn_r..dn_a,
+    // dh_r..dh_a (the 4 <detail>_height maps for SSFX-style terrain POM).
+    void WriteTerrainSet(VkDescriptorSet set, const VkImageView v[15])
+    {
+        VkDescriptorImageInfo ii[15]{};
+        VkWriteDescriptorSet  w[15]{};
+        for (int i = 0; i < 15; ++i) {
             ii[i].sampler     = s_Sampler;
             ii[i].imageView   = v[i];
             ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -273,7 +370,7 @@ namespace {
             w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[i].pImageInfo      = &ii[i];
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 11, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 15, w, 0, nullptr);
     }
 
     WorldMaterial* CreateDefaultWhite()
@@ -413,10 +510,11 @@ bool Init()
 
     // ----- Terrain splatting set layout + pool + default channel details -----
     {
-        // 11 combined image samplers, fragment-only: base, mask, dt_r..dt_a,
-        // lmap, dn_r..dn_a (the 4 <detail>_bump tangent normal maps).
-        VkDescriptorSetLayoutBinding tb[11]{};
-        for (int i = 0; i < 11; ++i) {
+        // 15 combined image samplers, fragment-only: base, mask, dt_r..dt_a,
+        // lmap, dn_r..dn_a (the 4 <detail>_bump tangent normal maps), dh_r..dh_a
+        // (the 4 <detail>_height maps for SSFX-style terrain parallax-occlusion).
+        VkDescriptorSetLayoutBinding tb[15]{};
+        for (int i = 0; i < 15; ++i) {
             tb[i].binding         = (u32)i;
             tb[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             tb[i].descriptorCount = 1;
@@ -424,7 +522,7 @@ bool Init()
         }
         VkDescriptorSetLayoutCreateInfo tlci{};
         tlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        tlci.bindingCount = 11;
+        tlci.bindingCount = 15;
         tlci.pBindings    = tb;
         vkCreateDescriptorSetLayout(VulkanHW.m_Device, &tlci, nullptr, &s_TerrainSetLayout);
 
@@ -435,7 +533,7 @@ bool Init()
         constexpr u32 kMaxTerrain = 4096;
         VkDescriptorPoolSize tps{};
         tps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        tps.descriptorCount = kMaxTerrain * 11;
+        tps.descriptorCount = kMaxTerrain * 15;
         VkDescriptorPoolCreateInfo tpci{};
         tpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         tpci.maxSets       = kMaxTerrain;
@@ -455,6 +553,13 @@ bool Init()
         s_FlatNormal = xr_new<CVulkanTexture>();
         s_FlatNormal->CreateFromData(flatN, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
 
+        // Flat height fallback (mid-grey .r=0.5). The POM march reads a UNIFORM
+        // height -> zero parallax for any channel whose `_height` map is missing
+        // (graceful on packs that ship details without height maps).
+        const u8 flatH[4] = { 128, 128, 128, 255 };
+        s_FlatHeight = xr_new<CVulkanTexture>();
+        s_FlatHeight->CreateFromData(flatH, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
+
         // Default channel-detail textures (CBlender_BmmD defaults). Per-shader
         // overrides live in shaders.xr; these cover the common case.
         static const char* kDet[4] = {
@@ -472,10 +577,20 @@ bool Init()
             s_TerrainNormal[i] = GetOrLoadGameTex(s_TerrainDetCache, bn.c_str(), s_FlatNormal);
             Msg("[VK Terrain] detail-normal '%s' -> %s", bn.c_str(),
                 (s_TerrainNormal[i] != s_FlatNormal) ? "loaded" : "MISSING (flat)");
+
+            // <detail>_height for SSFX-style terrain POM. Missing -> flat (no relief).
+            std::string hn = std::string(kDet[i]) + "_height";
+            s_TerrainHeight[i] = GetOrLoadGameTex(s_TerrainDetCache, hn.c_str(), s_FlatHeight);
+            Msg("[VK Terrain] detail-height '%s' -> %s", hn.c_str(),
+                (s_TerrainHeight[i] != s_FlatHeight) ? "loaded" : "MISSING (flat)");
         }
+
+        // Probe shaders.xr for per-shader detail sets (diagnostic for now; the
+        // per-material lookup that consumes s_BlenderDet is the next step).
+        LoadTerrainBlenderMap();
     }
 
-    Msg("[VK WorldMaterial] Init OK (pool=%u sets base+detail+lmap+bump#; terrain pool=256 x11 w/ detail-normals; anisotropic 16x)", kMaxSets);
+    Msg("[VK WorldMaterial] Init OK (pool=%u sets base+detail+lmap+bump#; terrain pool x15 w/ detail-normals + detail-heights; anisotropic 16x)", kMaxSets);
     return true;
 }
 
@@ -540,18 +655,23 @@ void Destroy()
     // skipping shared fallbacks.
     for (auto& kv : s_TerrainDetCache) {
         if (kv.second && kv.second != s_GreyDetail && kv.second != s_WhiteMask
-            && kv.second != s_FlatNormal) {
+            && kv.second != s_FlatNormal && kv.second != s_FlatHeight) {
             kv.second->Destroy();
             xr_delete(kv.second);
         }
     }
     s_TerrainDetCache.clear();
-    for (int i = 0; i < 4; ++i) { s_TerrainDetail[i] = nullptr; s_TerrainNormal[i] = nullptr; }
+    for (int i = 0; i < 4; ++i) { s_TerrainDetail[i] = nullptr; s_TerrainNormal[i] = nullptr; s_TerrainHeight[i] = nullptr; }
 
     if (s_FlatNormal) {
         s_FlatNormal->Destroy();
         xr_delete(s_FlatNormal);
         s_FlatNormal = nullptr;
+    }
+    if (s_FlatHeight) {
+        s_FlatHeight->Destroy();
+        xr_delete(s_FlatHeight);
+        s_FlatHeight = nullptr;
     }
 
     if (s_WhiteMask) {
@@ -695,7 +815,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
             xr_sprintf(mask_name, "%s_mask", diffuse_name);
             CVulkanTexture* mask = GetOrLoadGameTex(s_TerrainDetCache, mask_name, s_WhiteMask);
 
-            const VkImageView v[11] = {
+            const VkImageView v[15] = {
                 m->view,
                 mask ? mask->GetView() : s_WhiteMask->GetView(),
                 s_TerrainDetail[0]->GetView(), s_TerrainDetail[1]->GetView(),
@@ -703,6 +823,8 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
                 m->view_lmap,
                 s_TerrainNormal[0]->GetView(), s_TerrainNormal[1]->GetView(),
                 s_TerrainNormal[2]->GetView(), s_TerrainNormal[3]->GetView(),
+                s_TerrainHeight[0]->GetView(), s_TerrainHeight[1]->GetView(),
+                s_TerrainHeight[2]->GetView(), s_TerrainHeight[3]->GetView(),
             };
             WriteTerrainSet(tset, v);
             m->isTerrain  = true;

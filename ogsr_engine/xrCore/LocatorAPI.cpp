@@ -724,6 +724,33 @@ void CLocatorAPI::_initialize(u32 flags, LPCSTR fs_name)
     strconcat(sizeof(_path), base_path, FS.get_path(fsgame::fs_root)->m_Path, "gamedata");
 
     ProcessExternalMods(base_path);
+
+    // External .xdb mods (mods\*.xdb) are registered here, AFTER the loose
+    // gamedata\ folders were scanned in the fsgame path loop above. By the
+    // "last registration wins" rule in Register(), that lets a mod archive
+    // shadow the user's own override files dropped into gamedata\ (e.g. a
+    // 600MB texture-pack .xdb hiding a replacement texture placed in
+    // gamedata\textures\detail\). gamedata\ is meant to be the canonical
+    // highest-priority override, so re-scan its physical sub-paths now: their
+    // loose files re-register on top and win. rescan_physical_path erases only
+    // loose (VFS_STANDARD_FILE) entries and preserves archived ones, so the
+    // base .db and the external mods stay intact UNDERNEATH. Restricted to
+    // paths under gamedata\ on purpose — re-scanning $fs_root$ would re-process
+    // the base .db archives that live there and lift them back above the mods.
+    {
+        const size_t base_len = xr_strlen(base_path);
+        for (auto& pathe : pathes)
+        {
+            FS_Path* P = pathe.second;
+            if (!P)
+                continue;
+            if (_strnicmp(P->m_Path, base_path, base_len) != 0)
+                continue; // gamedata\ subtree only
+            if (!is_dir_exists(P->m_Path))
+                continue;
+            rescan_physical_path(P->m_Path, P->m_Flags.is(FS_Path::flRecurse));
+        }
+    }
 #endif
 
     u32 M2 = Memory.mem_usage();

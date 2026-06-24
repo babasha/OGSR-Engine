@@ -31,6 +31,10 @@ layout(set = 0, binding = 7)  uniform sampler2D uDnR;    // grass   normal (R4: 
 layout(set = 0, binding = 8)  uniform sampler2D uDnG;    // asphalt normal
 layout(set = 0, binding = 9)  uniform sampler2D uDnB;    // earth   normal
 layout(set = 0, binding = 10) uniform sampler2D uDnA;    // gravel  normal
+layout(set = 0, binding = 11) uniform sampler2D uDhR;    // grass   height (SSFX-style, .r = elevation)
+layout(set = 0, binding = 12) uniform sampler2D uDhG;    // asphalt height
+layout(set = 0, binding = 13) uniform sampler2D uDhB;    // earth   height
+layout(set = 0, binding = 14) uniform sampler2D uDhA;    // gravel  height
 
 layout(push_constant) uniform PushConstants {
     mat4  mvp;
@@ -46,40 +50,46 @@ layout(location = 3) in  vec3 vWorldPos;
 layout(location = 4) in  vec3 vNormal;
 layout(location = 0) out vec4 outColor;
 
-// ---- Terrain POM. No `#` height map, so relief comes from the HIGH-PASSED
-// luminance of the BASE albedo (macro cracks / pebbles / twigs). High-pass
-// removes the large tone patches so they don't become false cliffs. Same march +
-// normal + self-shadow + contact AO as the wall POM. Off by default (swims at
-// grazing) - detail-normal mapping is the primary terrain relief source.
-float baseLuma(vec2 uv, float lod) { return dot(textureLod(uBase, uv, lod).rgb, vec3(0.299, 0.587, 0.114)); }
-
-float pomDepth(vec2 uv, float lod, float baseline)
+// ---- Terrain POM (SSFX-style REAL heightfield parallax). Marches the view ray
+// against the 4 blended <detail>_height maps in DETAIL-texture space, so pebbles/
+// cracks physically shift and self-occlude (the "volumetric" ground) - not merely
+// shaded like pure normal mapping. Off by default (r_pom_terrain 0). The splat
+// mask is the macro weight (≈constant over the tiny parallax offset) - sampled
+// once and passed in. depth = 1 - height (white = raised).
+float detailH(vec2 duv, vec4 mask, float lod)
 {
-    return clamp(0.5 - (baseLuma(uv, lod) - baseline) * 4.0, 0.0, 1.0);
+    return textureLod(uDhR, duv, lod).r * mask.r
+         + textureLod(uDhG, duv, lod).r * mask.g
+         + textureLod(uDhB, duv, lod).r * mask.b
+         + textureLod(uDhA, duv, lod).r * mask.a;
 }
 
-vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, out float outAO)
+// Returns the parallax-offset DETAIL uv; outputs sun self-shadow, contact AO and
+// the height at the hit point (feeds micro-AO / puddles). All height taps use an
+// explicit lod so the march is derivative-safe inside the loop.
+vec2 terrainPOM(vec2 duv, vec4 mask, vec3 N, vec3 wp, out float outShadow, out float outAO, out float outH)
 {
-    outN = N; outShadow = 1.0; outAO = 1.0;
-    if (L.pom_params4.x < 0.5) return uv;   // terrain POM disabled (r_pom_terrain 0) -> flat ground
-    float amp = L.pom_params.x;
-    if (amp <= 0.0) return uv;
+    vec2  dtsz = vec2(textureSize(uDhR, 0));
+    vec2  ddx  = dFdx(duv) * dtsz, ddy = dFdy(duv) * dtsz;
+    float lod  = max(0.5 * log2(max(dot(ddx, ddx), dot(ddy, ddy))), 0.0) + L.pom_params2.x;
+
+    outShadow = 1.0; outAO = 1.0;
+    outH = detailH(duv, mask, lod);
+    if (L.pom_params4.x < 0.5) return duv;   // r_pom_terrain 0 -> flat (normal-map only)
+    float amp = L.pom_params.x;              // r_pom_height (detail-uv units)
+    if (amp <= 0.0) return duv;
     float dist = length(L.eye_pos.xyz - wp);
     float fade = 1.0 - smoothstep(L.pom_params.z * 0.5, L.pom_params.z, dist);
-    amp *= fade;
+    if (fade <= 0.002) return duv;
     float orient = (N.y >= 0.0)
-        ? mix(1.0, L.pom_params3.w, clamp( N.y, 0.0, 1.0))
-        : mix(1.0, L.pom_params3.z, clamp(-N.y, 0.0, 1.0));
-    amp *= orient;
-    if (amp <= 1e-5) return uv;
+        ? mix(1.0, L.pom_params3.w, clamp( N.y, 0.0, 1.0))   // up-facing (floor)
+        : mix(1.0, L.pom_params3.z, clamp(-N.y, 0.0, 1.0));  // down-facing (ceiling)
+    amp *= fade * orient;
+    if (amp <= 1e-5) return duv;
 
-    vec2  tsz = vec2(textureSize(uBase, 0));
-    vec2  ddx = dFdx(uv) * tsz, ddy = dFdy(uv) * tsz;
-    float lod = max(0.5 * log2(max(dot(ddx, ddx), dot(ddy, ddy))), 0.0) + L.pom_params2.x;
-    float baseline = baseLuma(uv, lod + 3.0);
-
+    // Screen-space cotangent frame (terrain has no per-vertex tangents).
     vec3 dp1 = dFdx(wp), dp2 = dFdy(wp);
-    vec2 du1 = dFdx(uv), du2 = dFdy(uv);
+    vec2 du1 = dFdx(duv), du2 = dFdy(duv);
     vec3 dp2p = cross(dp2, N), dp1p = cross(N, dp1);
     vec3 T = dp2p * du1.x + dp1p * du2.x;
     vec3 B = dp2p * du1.y + dp1p * du2.y;
@@ -88,61 +98,52 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
 
     vec3 V   = normalize(L.eye_pos.xyz - wp);
     vec3 Vts = vec3(dot(V, T), dot(V, B), dot(V, N));
-    // Terrain is viewed at GRAZING angles almost always (it's the floor). Cap the
-    // offset (floor 0.55) and FADE it out at grazing - kills the liquid look.
+    // Terrain is the floor - viewed at GRAZING angles. Cap the offset (floor 0.55)
+    // and fade it out near grazing to kill the liquid "swim".
     vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.55)) * amp * smoothstep(0.12, 0.45, abs(Vts.z));
 
-    int steps = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)) * mix(0.5, 1.0, fade), 8.0, 64.0));
+    int   steps  = int(clamp(mix(L.pom_params.y, 12.0, abs(Vts.z)) * mix(0.5, 1.0, fade), 8.0, 64.0));
     float layerH = 1.0 / float(steps);
-    vec2 dUV = Pmax * layerH;
+    vec2  dUV    = Pmax * layerH;
 
-    float curD = 0.0;
-    vec2  curUV = uv;
-    float curH = pomDepth(curUV, lod, baseline);
+    float curD  = 0.0;
+    vec2  curUV = duv;
+    float curH  = 1.0 - detailH(curUV, mask, lod);
     for (int i = 0; i < 64; ++i) {
         if (i >= steps || curD >= curH) break;
         curUV -= dUV; curD += layerH;
-        curH = pomDepth(curUV, lod, baseline);
+        curH = 1.0 - detailH(curUV, mask, lod);
     }
     vec2 sUV = dUV; float sD = layerH;
-    for (int j = 0; j < 6; ++j) {
+    for (int j = 0; j < 6; ++j) {     // binary refine of the intersection
         sUV *= 0.5; sD *= 0.5;
-        if (curD < pomDepth(curUV, lod, baseline)) { curUV -= sUV; curD += sD; }
-        else                                       { curUV += sUV; curD -= sD; }
+        if (curD < 1.0 - detailH(curUV, mask, lod)) { curUV -= sUV; curD += sD; }
+        else                                        { curUV += sUV; curD -= sD; }
     }
+    outH = detailH(curUV, mask, lod);
 
-    // Normal from base-luma gradient. Gentler gain (x3 vs x12 on walls) + tilt
-    // clamp - the base-luma gradient is high-contrast and would chrome-mirror.
-    float tU = exp2(lod) / tsz.x, tV = exp2(lod) / tsz.y;
-    float hu = baseLuma(curUV + vec2(tU, 0.0), lod) - baseLuma(curUV - vec2(tU, 0.0), lod);
-    float hv = baseLuma(curUV + vec2(0.0, tV), lod) - baseLuma(curUV - vec2(0.0, tV), lod);
-    float ns = L.pom_params2.y * 3.0 * fade * orient;
-    vec3 nTS = normalize(vec3(clamp(-hu * ns, -0.6, 0.6), clamp(-hv * ns, -0.6, 0.6), 1.0));
-    outN = normalize(T * nTS.x + B * nTS.y + N * nTS.z);
-
+    // Sun self-shadow: short height march toward the light in tangent space.
     if (L.pom_params2.z > 0.0) {
         vec3 Ld  = normalize(-L.sun_dir.xyz);
         vec3 Lts = vec3(dot(Ld, T), dot(Ld, B), dot(Ld, N));
-        vec2 lxy = Lts.xy;
-        if (Lts.z > 0.02 && dot(lxy, lxy) > 1e-6) {
-            vec2  sdir  = normalize(lxy);
-            float reach = (exp2(lod) / min(tsz.x, tsz.y)) * 6.0;
-            float h0    = baseLuma(curUV, lod);
+        if (Lts.z > 0.02 && dot(Lts.xy, Lts.xy) > 1e-6) {
+            vec2  sdir  = normalize(Lts.xy);
+            float reach = length(Pmax) * 0.6;
             float occ   = 0.0;
             for (int s = 1; s <= 8; ++s)
-                occ = max(occ, baseLuma(curUV + sdir * reach * (float(s) * 0.125), lod) - h0);
-            outShadow = clamp(1.0 - occ * L.pom_params2.z * 20.0 * (1.0 - Lts.z) * orient, 0.0, 1.0);
+                occ = max(occ, detailH(curUV + sdir * reach * (float(s) * 0.125), mask, lod) - outH);
+            outShadow = clamp(1.0 - occ * L.pom_params2.z * 16.0 * (1.0 - Lts.z) * orient, 0.0, 1.0);
         }
     }
+    // Contact AO from surrounding height pits.
     if (L.pom_params2.w > 0.0) {
-        float aoReach = (exp2(lod) / min(tsz.x, tsz.y)) * 4.0;
-        float h0 = baseLuma(curUV, lod);
+        float reach = length(Pmax) * 0.5 + 1.0 / max(dtsz.x, 1.0);
         float aoSum =
-              max(0.0, baseLuma(curUV + vec2( aoReach, 0.0), lod) - h0)
-            + max(0.0, baseLuma(curUV + vec2(-aoReach, 0.0), lod) - h0)
-            + max(0.0, baseLuma(curUV + vec2(0.0,  aoReach), lod) - h0)
-            + max(0.0, baseLuma(curUV + vec2(0.0, -aoReach), lod) - h0);
-        outAO = clamp(1.0 - (aoSum * 0.25) * L.pom_params2.w * 6.0, 0.35, 1.0);
+              max(0.0, detailH(curUV + vec2( reach, 0.0), mask, lod) - outH)
+            + max(0.0, detailH(curUV + vec2(-reach, 0.0), mask, lod) - outH)
+            + max(0.0, detailH(curUV + vec2(0.0,  reach), mask, lod) - outH)
+            + max(0.0, detailH(curUV + vec2(0.0, -reach), mask, lod) - outH);
+        outAO = clamp(1.0 - (aoSum * 0.25) * L.pom_params2.w * 5.0, 0.35, 1.0);
         outAO = mix(1.0, outAO, orient);
     }
     return curUV;
@@ -195,10 +196,19 @@ float sssPuddle(vec3 N, vec3 wp)
 
 void main()
 {
-    vec3 pomN; float pomShadow, pomAO;
-    vec2 pUV = parallaxUV(vUV, normalize(vNormal), vWorldPos, pomN, pomShadow, pomAO);
-    vec2 pDelta = pUV - vUV;
-    vec2 pDetailUV = vDetailUV + pDelta * pc.detailScale;
+    vec3 geomN = normalize(vNormal);
+    // Splat mask (macro weights). Sample BEFORE parallax - the offset is tiny in
+    // macro UV. Normalize so the 4 weights sum to 1; empty/missing -> even blend,
+    // all-zero -> pure grass (never black).
+    vec4 mask = texture(uMask, vUV);
+    float wsum = dot(mask, vec4(1.0));
+    mask = (wsum > 1e-4) ? (mask / wsum) : vec4(1.0, 0.0, 0.0, 0.0);
+
+    // Real-heightfield terrain POM in DETAIL space (the volumetric ground). Base/
+    // mask stay at vUV (macro is low-freq -> not parallaxed -> stable at grazing).
+    float pomShadow, pomAO, detH;
+    vec2 pDetailUV = terrainPOM(vDetailUV, mask, geomN, vWorldPos, pomShadow, pomAO, detH);
+    vec2 pUV = vUV;
 
     // PUDDLE REFRACTION (SSFX N_refra): where a puddle covers this pixel, bend the
     // bottom (base+detail) UV by the water-surface ripple. Gate tight (near + raining).
@@ -250,34 +260,45 @@ void main()
         return;
     }
 
-    // Splat mask (at the parallax-offset UV) - normalize so the 4 weights sum to
-    // 1. Empty/missing mask -> even blend; all-zero -> pure grass (never black).
-    vec4 mask = texture(uMask, pUV);
-    float wsum = dot(mask, vec4(1.0));
-    mask = (wsum > 1e-4) ? (mask / wsum) : vec4(1.0, 0.0, 0.0, 0.0);
-
     vec4 dR = texture(uDtR, pDetailUV);
     vec4 dG = texture(uDtG, pDetailUV);
     vec4 dB = texture(uDtB, pDetailUV);
     vec4 dA = texture(uDtA, pDetailUV);
-    vec3 detail = dR.rgb * mask.r + dG.rgb * mask.g + dB.rgb * mask.b + dA.rgb * mask.a;
-    // Detail height (R4 terrain AO source = detail diffuse alpha, splat-blended).
-    float detH = dR.a * mask.r + dG.a * mask.g + dB.a * mask.b + dA.a * mask.a;
+
+    // HEIGHT-BASED detail blend (Mishkinis "advanced terrain texture splatting"):
+    // bias each splat weight by that channel's REAL detail height, so the RAISED
+    // material wins per-texel -> sharp interlocking transitions (gravel poking
+    // through grass) instead of a soft linear cross-fade. Channels the mask doesn't
+    // carry are gated out; degenerate -> falls back to the plain mask. `bw` then
+    // drives BOTH the diffuse and the detail normal so the relief follows the same
+    // boundaries. (Missing height maps = flat 0.5 -> gracefully ~linear.)
+    vec4 chH = vec4(texture(uDhR, pDetailUV).r, texture(uDhG, pDetailUV).r,
+                    texture(uDhB, pDetailUV).r, texture(uDhA, pDetailUV).r);
+    vec4 bw = mask;
+    {
+        const float blendDepth = 0.25;                       // transition width (smaller = sharper)
+        vec4  wh   = mask + chH;
+        float maxw = max(max(wh.x, wh.y), max(wh.z, wh.w));
+        vec4  b    = max(wh - (maxw - blendDepth), 0.0) * step(vec4(1e-4), mask);
+        float bsum = dot(b, vec4(1.0));
+        if (bsum > 1e-5) bw = b / bsum;
+    }
+    vec3 detail = dR.rgb * bw.r + dG.rgb * bw.g + dB.rgb * bw.b + dA.rgb * bw.a;
+    // detH (REAL detail height at the parallax hit) comes from terrainPOM.
 
     vec3 albedo = 2.0 * base.rgb * detail;
 
     // Lightmap (hemi/AO) + DYNAMIC R4-style sun (per-pixel N.L x shadow map).
     vec4  lm      = texture(uLmap, vLmapUV);
     float hemiOcc = dot(lm.rgb, vec3(1.0 / 3.0));
-    vec3  geomN   = normalize(vNormal);   // flat - for the sky fill (cube is sharp -> perturbed = mirror)
-    vec3  Nw      = pomN;                  // POM-perturbed - sun + dyn lights catch the relief
+    vec3  Nw      = geomN;                 // base normal; detailNormal perturbs it near so sun/dyn catch the relief
     // Detail normal mapping: the primary ground-relief source. Faded to 0 by
     // distance so far terrain skips the 4 taps + AO + gloss entirely.
     float dnStr  = L.pom_params4.y * smoothstep(45.0, 25.0, distance(L.eye_pos.xyz, vWorldPos));
     float cav    = 0.0;
     float glossT = 0.0;
     if (dnStr > 0.0)
-        Nw = detailNormal(geomN, pDetailUV, mask, dnStr, cav, glossT);
+        Nw = detailNormal(geomN, pDetailUV, bw, dnStr, cav, glossT);
 
     // Micro contact AO: darken grooves. Occlusion = max of the normal cavity
     // (1-n.z) and the detail height pit (1-h^2). Applied to albedo (R4 base*=1-AO).
