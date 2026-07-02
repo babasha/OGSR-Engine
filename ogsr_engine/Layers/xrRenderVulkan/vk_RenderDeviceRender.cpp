@@ -31,6 +31,7 @@
 #include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
 #include "vk_pass_particles.h" // VK::ParticlePass_Init/Destroy — billboard particle pass
+#include "vk_gpu_particles.h"  // VK::GPUParticles — GPU-driven particles (Phase 0)
 #include "vk_wallmarks.h"      // VK::Wallmarks::Destroy — static decals teardown
 #include "vk_rain.h"           // VK::RainPass_Destroy — weather effects teardown
 #include "vk_water_sim.h"      // VK::WaterSim::Destroy — water flow sim teardown
@@ -146,6 +147,7 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     VK::BloomPass::Init();         // bright-pass + blur feeding the tonemap composite
     VK::SSAOPass::Init();          // GTAO from the depth prepass (EnvLight binding 8) + folded-in SSIL (tonemap binding 5)
     VK::MotionVec::Init();         // screen-space motion vectors from the prepass depth (DLSS/FSR/PT foundation; needs Swapchain.m_Format)
+    VK::GPUParticles::Init();      // GPU-driven particles Phase 1 — pool + free-list + compute emit/sim/draw
     VK::Vol::Init();               // froxel volumetrics (3D volume eager so the tonemap binding 4 is valid)
     VK::ParticlePass_Init();
 
@@ -200,6 +202,7 @@ void vkRenderDeviceRender::Destroy()
     VK::Deform::Destroy();              Msg("[VK] DevRender::Destroy: Deform done");
     VK::SnowMesh_Destroy();            Msg("[VK] DevRender::Destroy: SnowMesh done");
     VK::ParticlePass_Destroy();         Msg("[VK] DevRender::Destroy: ParticlePass done");
+    VK::GPUParticles::Destroy();        Msg("[VK] DevRender::Destroy: GPUParticles done");
     VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
     VK::SSAOPass::Destroy();            Msg("[VK] DevRender::Destroy: SSAOPass done");
     VK::MotionVec::Destroy();           Msg("[VK] DevRender::Destroy: MotionVec done");

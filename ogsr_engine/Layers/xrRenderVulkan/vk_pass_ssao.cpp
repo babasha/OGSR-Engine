@@ -26,7 +26,7 @@ extern int   ps_r_ssil_enable;     // r_ssil — fold-in SSIL on/off (gates the 
 extern float ps_r_ssil_strength;   // r_ssil_strength — baked into the IL output (forward receivers apply a fixed ssilBoost)
 extern float ps_r_ssil_temporal;   // r_ssil_temporal — GTAO temporal accumulation α (0 = off; per-frame jitter + MV-reprojected EMA)
 extern float ps_r_ssao_temporal;   // r_ssao_temporal — same temporal accumulation as a first-class AO control (works without r_ssil)
-extern float ps_r_ssao_bias;       // r_ssao_bias — grazing-surface horizon bias (rejects coplanar floor samples → kills flat-ground AO bands)
+extern float ps_r_ssao_bias;       // r_ssao_bias — grazing-angle N·V fade of the AO result (flat grazing floor → fully open)
 
 namespace VK {
 
@@ -96,7 +96,7 @@ namespace {
     // TEMPORAL (r_ssil_temporal): persistent half-res copies of the PREVIOUS frame's
     // FINAL AO and IL. The blur reprojects them through the motion vectors and EMA-
     // blends — the per-frame-jittered gather averages into a band-free result. AO
-    // history is RGBA16F (matches s_img[0]); IL history is kILFormat (s_ilImg[0]).
+    // history is R16F (matches s_img[0]); IL history is kILFormat (s_ilImg[0]).
     VkImage       s_aoHist      = VK_NULL_HANDLE;
     VmaAllocation s_aoHistAlloc = VK_NULL_HANDLE;
     VkImageView   s_aoHistView  = VK_NULL_HANDLE;
@@ -208,7 +208,7 @@ namespace {
             VkImageCreateInfo ici{};
             ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;   // r=AO (R16F kills contouring) + gba=world bent normal
+            ici.format = VK_FORMAT_R16_SFLOAT;   // AO only (R16F kills R8 contouring; bent normal retired → 4× less bandwidth than the old RGBA16F)
             ici.extent = { want.width, want.height, 1 };
             ici.mipLevels = 1; ici.arrayLayers = 1;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -225,7 +225,7 @@ namespace {
             vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             vci.image = s_img[i];
             vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            vci.format = VK_FORMAT_R16_SFLOAT;
             vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             vci.subresourceRange.levelCount = 1;
             vci.subresourceRange.layerCount = 1;
@@ -294,12 +294,12 @@ namespace {
             }
             s_prevColorCleared = false;
         }
-        // Temporal history pair (half-res): AO history = RGBA16F (matches s_img[0]),
+        // Temporal history pair (half-res): AO history = R16F (matches s_img[0]),
         // IL history = kILFormat (matches s_ilImg[0]). copy dst (capture the final
         // result) + sampled (reproject next frame). Cleared to black on first Execute.
         {
             struct { VkImage* img; VmaAllocation* alloc; VkImageView* view; VkFormat fmt; } hist[2] = {
-                { &s_aoHist, &s_aoHistAlloc, &s_aoHistView, VK_FORMAT_R16G16B16A16_SFLOAT },
+                { &s_aoHist, &s_aoHistAlloc, &s_aoHistView, VK_FORMAT_R16_SFLOAT },
                 { &s_ilHist, &s_ilHistAlloc, &s_ilHistView, kILFormat },
             };
             for (auto& h : hist) {
@@ -363,11 +363,11 @@ namespace {
             }
         }
 
-        // Host buffer for the debug readback (RGBA16F = 4 halfs = 8 bytes per AO texel; R = AO).
+        // Host buffer for the debug readback (R16F = one half per AO texel).
         s_dbgBuf.Destroy();
         s_dbgMap = nullptr;
         s_dbgCountdown = -1;
-        s_dbgBuf.Create(VkDeviceSize(want.width) * want.height * 4 * sizeof(u16),
+        s_dbgBuf.Create(VkDeviceSize(want.width) * want.height * sizeof(u16),
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
         s_dbgMap = static_cast<u16*>(s_dbgBuf.Map());
 
@@ -377,11 +377,11 @@ namespace {
         return true;
     }
 
-    // MRT: target 0 = AO+bentN (RGBA16F), target 1 = SSIL (RGBA16F). Both opaque,
+    // MRT: target 0 = AO (R16F), target 1 = SSIL (RGBA16F). Both opaque,
     // all channels, no blend. gtao + blur share this two-attachment layout.
     VkPipeline CreatePipe(VkShaderModule vs, VkShaderModule fs)
     {
-        const VkFormat fmts[2] = { VK_FORMAT_R16G16B16A16_SFLOAT, kILFormat };
+        const VkFormat fmts[2] = { VK_FORMAT_R16_SFLOAT, kILFormat };
         const VkPipelineColorBlendAttachmentState blends[2] = {
             Fullscreen::OpaqueAttachment(), Fullscreen::OpaqueAttachment() };
         return Fullscreen::CreatePipelineMRT(vs, fs, fmts, 2, s_layout, blends, "SSAO");
@@ -660,8 +660,14 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
             ImageBarrier(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             ImageBarrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         };
-        copyHist(s_img[0],   s_aoHist);
-        copyHist(s_ilImg[0], s_ilHist);
+        copyHist(s_img[0], s_aoHist);
+        // IL history only while SSIL actually runs — with r_ssil off the IL
+        // final is black anyway and the blur never samples uILhist (ilOn gate);
+        // skipping saves a full-image RGBA16F copy per frame. A later ssil-on
+        // starts against stale/black history, which the neighbourhood clamp
+        // bounds and the EMA re-converges in ~1/(1-α) frames.
+        if (ps_r_ssil_enable != 0)
+            copyHist(s_ilImg[0], s_ilHist);
         s_histValid = true;
     } else {
         s_histValid = false;   // stale frames must not be reprojected after a gap
@@ -677,7 +683,7 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
             const u32 n = s_extent.width * s_extent.height;
             u32 mn = 255, mx = 0; u64 sum = 0; u32 below200 = 0;
             for (u32 i = 0; i < n; ++i) {
-                const u8 v = AoHalfToU8(s_dbgMap[i * 4]);   // R = AO (4 halfs/texel, gba = bent normal)
+                const u8 v = AoHalfToU8(s_dbgMap[i]);   // one half per texel (R16F)
                 mn = std::min(mn, (u32)v); mx = std::max(mx, (u32)v);
                 sum += v; below200 += (v < 200);
             }
@@ -687,11 +693,22 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
             for (u32 r = 1; r <= 3; ++r) {   // rows at 25/50/75% height, 5 taps each
                 const u32 cy = s_extent.height * r / 4;
                 Msg("[VK SSAO]   row %u%%: %u %u %u %u %u", r * 25,
-                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width / 6)     * 4]),
-                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width / 3)     * 4]),
-                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width / 2)     * 4]),
-                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width * 2 / 3) * 4]),
-                    AoHalfToU8(s_dbgMap[(cy * s_extent.width + s_extent.width * 5 / 6) * 4]));
+                    AoHalfToU8(s_dbgMap[cy * s_extent.width + s_extent.width / 6]),
+                    AoHalfToU8(s_dbgMap[cy * s_extent.width + s_extent.width / 3]),
+                    AoHalfToU8(s_dbgMap[cy * s_extent.width + s_extent.width / 2]),
+                    AoHalfToU8(s_dbgMap[cy * s_extent.width + s_extent.width * 2 / 3]),
+                    AoHalfToU8(s_dbgMap[cy * s_extent.width + s_extent.width * 5 / 6]));
+            }
+            // Full-image AO dump for offline analysis (the tooling that cracked
+            // the полосы saga). Overwrites <cwd>\ssao_dump.bin on every readback
+            // while r_ssao_debug is active; reader = _parked/ssao_dump_view.js
+            // (detects the channel count from the file size — R16F → 1 channel).
+            if (FILE* f = fopen("ssao_dump.bin", "wb")) {
+                fwrite(&s_extent.width, 4, 1, f);
+                fwrite(&s_extent.height, 4, 1, f);
+                fwrite(s_dbgMap, sizeof(u16), n, f);
+                fclose(f);
+                Msg("[VK SSAO] AO dump written: ssao_dump.bin (%ux%u R16F)", s_extent.width, s_extent.height);
             }
         }
         if (s_dbgCooldown == 0 && s_dbgCountdown <= 0) {

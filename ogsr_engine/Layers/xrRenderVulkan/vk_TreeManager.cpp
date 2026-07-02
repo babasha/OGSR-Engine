@@ -21,6 +21,7 @@
 #include "CRender_Vulkan.h"
 
 #include <algorithm>
+#include <cfloat>
 
 namespace VK
 {
@@ -253,6 +254,7 @@ void CTreeManager::Build()
     // ----- Upload + allocate.
     UploadMetadata(meta);
     UploadTransforms(xforms);
+    BuildMeshlets(trees, meta);   // Phase A: VSM meshlet-cull clusters (r_vsm_meshlet)
     CreateIndirectBuffers();
     CreateTextureDescriptors(uniqueViews);
 
@@ -309,6 +311,179 @@ void CTreeManager::UploadTransforms(const xr_vector<GpuTreeInstance>& xforms)
 {
     UploadDeviceLocal(m_TreeTransformsBuffer, xforms.data(),
                       xforms.size() * sizeof(GpuTreeInstance), 0);
+}
+
+// ============================================================================
+// Phase A — meshlet clusters for the VSM per-page meshlet-cull path.
+// ⛔ NO NET PERF GAIN on dGPU (2026-07-02) — VSMrender is fill-bound, cutting vertices didn't help.
+// KEPT (correct, picture identical) but DISABLED via r_vsm_meshlet=0. Don't re-chase; see the cvar
+// block in vk_console_min.cpp + memory [[vulkan-vsm-meshlet-plan]]. Possible future value on iGPU.
+// ============================================================================
+namespace {
+
+// Triangles per meshlet cluster (tunable — Phase C sweeps 64/128/256).
+constexpr u32 kMeshletTris = 128;
+
+// 10-bit Morton (Z-order) — spatial sort so a meshlet's triangles stay compact.
+inline u32 Part1By2(u32 n) {
+    n &= 0x3ff;
+    n = (n | (n << 16)) & 0x030000ff;
+    n = (n | (n <<  8)) & 0x0300f00f;
+    n = (n | (n <<  4)) & 0x030c30c3;
+    n = (n | (n <<  2)) & 0x09249249;
+    return n;
+}
+inline u32 Morton3(u32 x, u32 y, u32 z) { return Part1By2(x) | (Part1By2(y) << 1) | (Part1By2(z) << 2); }
+
+// GPU-readback of a device-local sub-range into a freshly-allocated host vector.
+// Pools carry TRANSFER_SRC (rvk_loader). Returns false on any failure.
+bool ReadbackRange(VkBuffer src, VkDeviceSize offset, VkDeviceSize size, xr_vector<u8>& out)
+{
+    if (src == VK_NULL_HANDLE || size == 0) return false;
+    CVulkanBuffer stg;
+    stg.Create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) { stg.Destroy(); return false; }
+    VkBufferCopy cp{ offset, 0, size };
+    vkCmdCopyBuffer(cmd, src, stg.GetHandle(), 1, &cp);
+    VulkanHW.EndSingleTimeCommands(cmd);   // waits (one-shot)
+    stg.Invalidate();
+    void* p = stg.Map();
+    if (!p) { stg.Destroy(); return false; }
+    out.resize((size_t)size);
+    memcpy(out.data(), p, (size_t)size);
+    stg.Unmap();
+    stg.Destroy();
+    return true;
+}
+
+}  // namespace
+
+void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
+                                 const xr_vector<GpuTreeMeta>& meta)
+{
+    if (m_TotalCount == 0 || trees.size() < m_TotalCount || meta.size() < m_TotalCount) return;
+
+    // A unique mesh = one (vb, ib, vBase, vCount, ib_first, index_count) span. Instances
+    // of the same species share it, so we meshletize + read back geometry ONCE per span.
+    struct MeshKey {
+        VkBuffer vb, ib; u32 vBase, vCount, ibFirst, idxCount, stride;
+        bool operator==(const MeshKey& o) const {
+            return vb == o.vb && ib == o.ib && vBase == o.vBase && vCount == o.vCount &&
+                   ibFirst == o.ibFirst && idxCount == o.idxCount && stride == o.stride;
+        }
+    };
+    xr_vector<MeshKey>            keys;
+    xr_vector<GpuTreeMeshletRange> uniqRange;   // meshlet slice per unique mesh
+    xr_vector<u32>               treeUniq(m_TotalCount, ~0u);   // tree -> unique-mesh index
+
+    // Output accumulators (uploaded once at the end).
+    xr_vector<GpuMeshlet> meshlets;   meshlets.reserve(4096);
+    xr_vector<u16>        mIndices;   mIndices.reserve(1 << 18);
+
+    for (u32 i = 0; i < m_TotalCount; ++i)
+    {
+        const vkFTreeVisual* t = trees[i];
+        if (!t || !t->m_mesh.p_rm_Vertices || !t->m_mesh.p_rm_Indices) continue;
+        MeshKey k{ t->m_mesh.p_rm_Vertices->GetHandle(), t->m_mesh.p_rm_Indices->GetHandle(),
+                   t->m_mesh.vBase, t->m_mesh.vCount, meta[i].ib_first, meta[i].index_count,
+                   t->m_mesh.vStride };
+        if (k.vCount == 0 || k.idxCount < 3 || k.stride < 12) continue;
+
+        // Already meshletized?
+        u32 u = ~0u;
+        for (u32 j = 0; j < keys.size(); ++j) if (keys[j] == k) { u = j; break; }
+        if (u != ~0u) { treeUniq[i] = u; continue; }
+
+        // --- Read back this mesh's positions + indices (relative to vBase). ---
+        xr_vector<u8> vbytes, ibbytes;
+        if (!ReadbackRange(k.vb, (VkDeviceSize)k.vBase * k.stride, (VkDeviceSize)k.vCount * k.stride, vbytes)) continue;
+        if (!ReadbackRange(k.ib, (VkDeviceSize)k.ibFirst * sizeof(u16), (VkDeviceSize)k.idxCount * sizeof(u16), ibbytes)) continue;
+        const u16* idx = (const u16*)ibbytes.data();
+        auto pos = [&](u32 v) -> Fvector {
+            const float* f = (const float*)(vbytes.data() + (size_t)v * k.stride);
+            return Fvector{ f[0], f[1], f[2] };
+        };
+        const u32 triCount = k.idxCount / 3;
+
+        // --- Per-triangle centroids + their AABB (Morton normalization box). ---
+        xr_vector<Fvector> cen(triCount);
+        Fvector cmin{ FLT_MAX, FLT_MAX, FLT_MAX }, cmax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+        for (u32 tri = 0; tri < triCount; ++tri) {
+            const Fvector a = pos(idx[tri * 3 + 0]), b = pos(idx[tri * 3 + 1]), c = pos(idx[tri * 3 + 2]);
+            Fvector ctr{ (a.x + b.x + c.x) / 3.f, (a.y + b.y + c.y) / 3.f, (a.z + b.z + c.z) / 3.f };
+            cen[tri] = ctr;
+            cmin.min(ctr); cmax.max(ctr);
+        }
+        const float ex = (std::max)(cmax.x - cmin.x, 1e-4f);
+        const float ey = (std::max)(cmax.y - cmin.y, 1e-4f);
+        const float ez = (std::max)(cmax.z - cmin.z, 1e-4f);
+
+        // --- Morton-sort triangle order. ---
+        xr_vector<u32> order(triCount);
+        for (u32 tri = 0; tri < triCount; ++tri) order[tri] = tri;
+        xr_vector<u32> code(triCount);
+        for (u32 tri = 0; tri < triCount; ++tri) {
+            const u32 qx = (u32)(std::min)(1023.f, (std::max)(0.f, (cen[tri].x - cmin.x) / ex * 1023.f));
+            const u32 qy = (u32)(std::min)(1023.f, (std::max)(0.f, (cen[tri].y - cmin.y) / ey * 1023.f));
+            const u32 qz = (u32)(std::min)(1023.f, (std::max)(0.f, (cen[tri].z - cmin.z) / ez * 1023.f));
+            code[tri] = Morton3(qx, qy, qz);
+        }
+        std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return code[a] < code[b]; });
+
+        // --- Slice into clusters; local sphere per cluster; emit reordered indices. ---
+        const u32 base = (u32)meshlets.size();
+        for (u32 s = 0; s < triCount; s += kMeshletTris) {
+            const u32 e = (std::min)(triCount, s + kMeshletTris);
+            const u32 firstIndex = (u32)mIndices.size();
+            Fvector bmin{ FLT_MAX, FLT_MAX, FLT_MAX }, bmax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+            for (u32 o = s; o < e; ++o) {
+                const u32 tri = order[o];
+                for (u32 w = 0; w < 3; ++w) {
+                    const u16 vi = idx[tri * 3 + w];
+                    mIndices.push_back(vi);
+                    const Fvector p = pos(vi);
+                    bmin.min(p); bmax.max(p);
+                }
+            }
+            Fvector ctr{ (bmin.x + bmax.x) * 0.5f, (bmin.y + bmax.y) * 0.5f, (bmin.z + bmax.z) * 0.5f };
+            float r2 = 0.f;
+            for (u32 o = s; o < e; ++o) {
+                const u32 tri = order[o];
+                for (u32 w = 0; w < 3; ++w) r2 = (std::max)(r2, ctr.distance_to_sqr(pos(idx[tri * 3 + w])));
+            }
+            GpuMeshlet ml{};
+            ml.center = ctr; ml.radius = sqrtf(r2);
+            ml.first_index = firstIndex; ml.index_count = (e - s) * 3;
+            meshlets.push_back(ml);
+        }
+
+        u = (u32)keys.size();
+        keys.push_back(k);
+        uniqRange.push_back({ base, (u32)meshlets.size() - base });
+        treeUniq[i] = u;
+    }
+
+    if (meshlets.empty() || mIndices.empty()) { Msg("[VK Trees] Meshlets: nothing built"); return; }
+
+    // Per-tree range (index-aligned with transforms/meta); trees with no mesh get {0,0}.
+    xr_vector<GpuTreeMeshletRange> treeRange(m_TotalCount, GpuTreeMeshletRange{ 0, 0 });
+    for (u32 i = 0; i < m_TotalCount; ++i)
+        if (treeUniq[i] != ~0u) treeRange[i] = uniqRange[treeUniq[i]];
+
+    // Upload: GpuMeshlet[] (SSBO), dedicated meshlet IB (u16), per-tree ranges (SSBO).
+    UploadDeviceLocal(m_MeshletBuffer, meshlets.data(), meshlets.size() * sizeof(GpuMeshlet), 0);
+    UploadDeviceLocal(m_MeshletIndexBuffer, mIndices.data(), mIndices.size() * sizeof(u16),
+                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    UploadDeviceLocal(m_TreeMeshletRangeBuffer, treeRange.data(),
+                      treeRange.size() * sizeof(GpuTreeMeshletRange), 0);
+
+    m_MeshletTotal      = (u32)meshlets.size();
+    m_MeshletIndexTotal = (u32)mIndices.size();
+    m_MeshletsReady     = true;
+    Msg("[VK Trees] Meshlets: %u clusters (%u tris/cluster) from %u unique meshes, %u idx (%u KB) — %u instances",
+        m_MeshletTotal, kMeshletTris, (u32)keys.size(), m_MeshletIndexTotal,
+        (u32)(m_MeshletIndexTotal * sizeof(u16) / 1024), m_TotalCount);
 }
 
 void CTreeManager::CreateIndirectBuffers()
@@ -430,6 +605,11 @@ void CTreeManager::Destroy()
     destroyBuf(m_TreeTransformsBuffer);
     destroyBuf(m_TreeIndirectBuffer);
     destroyBuf(m_TreeDrawCountBuffer);
+    destroyBuf(m_MeshletBuffer);           // Phase A meshlet clusters
+    destroyBuf(m_MeshletIndexBuffer);
+    destroyBuf(m_TreeMeshletRangeBuffer);
+    m_MeshletsReady = false;
+    m_MeshletTotal = m_MeshletIndexTotal = 0;
 
     m_TexDescSets.clear();
     if (m_TexDescPool != VK_NULL_HANDLE) {

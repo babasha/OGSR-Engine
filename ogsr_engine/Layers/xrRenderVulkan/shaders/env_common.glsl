@@ -25,11 +25,23 @@ float gtaoVisRaw()
 // GTAO bent normal (gba of the AO RT, world-space): the average UNOCCLUDED
 // direction. Sky fill sampled along it pulls ambient from where the hemisphere
 // is open. Falls back to the geometric normal when AO is off or degenerate.
+//
+// ⚠️ RETIRED to the geometric normal (2026-07-01, the полосы saga verdict).
+// The dumped bent normal carries screen-fixed quantization stripes inherited
+// from the depth-RECONSTRUCTED normal, and EVERY consumer-side gate failed in
+// the field: an alignment deadband re-printed the stripes (the recon normal is
+// systematically ~15-25° off geomN at grazing → the blend factor itself rode
+// the stripes), and an AO.r-driven gate merely relocated them into occluded
+// areas (under benches/NPCs/sheds — exactly where the gate lets bentN through).
+// Any nonzero bentN use = stripes somewhere; its visual value was documented
+// as subtle ("не особо вижу разницу", 2026-06-16). So: geometric normal,
+// always. The gba data still ships in the AO RT; the clean re-enable path, if
+// ever wanted, is encoding the bent TILT (bentN − reconN) in the GTAO pass so
+// the recon normal's common-mode striping cancels, then applying that tilt to
+// the receiver's geomN here.
 vec3 gtaoBentN(vec3 fallbackN)
 {
-    if (L.ao_params.z <= 0.0) return fallbackN;
-    vec3 b = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).gba * 2.0 - 1.0;
-    return (dot(b, b) > 0.25) ? normalize(b) : fallbackN;
+    return fallbackN;
 }
 
 // SSIL — one-bounce indirect-light boost for the AMBIENT term (SSFX combine_1.ps:

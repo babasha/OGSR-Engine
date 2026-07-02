@@ -35,12 +35,16 @@ struct Key
     // depth bias so the re-rasterized flat margins win ties vs the (flat)
     // depth prepass.
     bool            tess         = false;
+    // Emissive-additive variant (level `effects\glow` billboards, `selflight`
+    // model parts — lamp halos/projector faces): blend (SRC_ALPHA, ONE), depth
+    // test but NO write, no bias. The FS goes unlit via the aref == -3 marker.
+    bool            emis         = false;
 
     bool operator==(const Key& o) const noexcept
     {
         return stride == o.stride && tcOffset == o.tcOffset
             && vs == o.vs && fs == o.fs && depthTest == o.depthTest
-            && wmark == o.wmark && tess == o.tess;
+            && wmark == o.wmark && tess == o.tess && emis == o.emis;
     }
 };
 
@@ -131,6 +135,7 @@ struct hash<VK::PipelineCache::Key>
         h ^= std::hash<bool>{}(k.depthTest)           + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(k.wmark)               + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(k.tess)                + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.emis)                + 0x517cc1b7 + (h << 6) + (h >> 2);
         return h;
     }
 };

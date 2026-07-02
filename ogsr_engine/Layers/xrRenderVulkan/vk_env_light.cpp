@@ -50,6 +50,7 @@ extern float ps_r_terrain_normal; // r_terrain_normal — terrain detail normal-
 extern float ps_r_terrain_ao;     // r_terrain_ao — terrain micro contact AO strength
 extern int   ps_r_terrain_debug;  // r_terrain_debug — terrain debug view (0..3)
 extern float ps_r_terrain_gloss;  // r_terrain_gloss — terrain dry sun-gloss strength
+extern float ps_r_glass_opacity;  // r_glass_opacity — glass opacity ceiling (frag glass branches)
 extern int   ps_r_puddle_debug;   // r_puddle_debug — draw the geometric puddle mask
 extern int   ps_r_water_sim;      // r_water_sim — water flow sim enable (puddles from the sim)
 extern float ps_r_water_murk;     // r_water_murk — volumetric absorption per metre
@@ -71,6 +72,8 @@ extern float ps_r_snow_deform_depth;  // r_snow_deform_depth — print press dep
 extern float ps_r_snow_deform_radius; // r_snow_deform_radius — print radius (m)
 extern float ps_r_snow_deform_time;   // r_snow_deform_time — print lifetime (sec, time-decay)
 extern int   ps_r_snow_deform_tex;    // r_snow_deform_tex — use the dense deform texture (vk_deform)
+extern float ps_r_mud_deform;         // r_mud_deform — mud footprints on soft terrain (same deform texture, no snow needed)
+extern float ps_r_mud_depth;          // r_mud_depth — mud print POM carve depth (fraction of the detail height range)
 extern int   ps_r_snow_mesh;          // r_snow_mesh — dense snow surface mesh (VHM-style)
 
 namespace VK { namespace EnvLight {
@@ -207,7 +210,9 @@ bool Init()
     // Snow deform press field (vk_deform): 20 = press texture. Read by the terrain
     // tessellation eval (broad groove) + fragment (sharp dimple).
     b[20].binding = 20; b[20].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[20].descriptorCount = 1;
-    b[20].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_VERTEX_BIT;
+    // + TESS_CONTROL: the terrain TCS samples the press field to gate subdivision
+    // to patches that actually contain prints (mud path — no always-on tess cost).
+    b[20].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
     // SSIL (binding 21): one-bounce indirect-light buffer, sampled by the forward
     // receivers (ssilBoost multiplies the ambient term). All FRAGMENT.
     b[21].binding = 21; b[21].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[21].descriptorCount = 1;
@@ -794,8 +799,8 @@ void Update(u32 slot)
     ub.pom_params4[2] = ps_r_terrain_ao;            // terrain micro contact AO strength
     ub.pom_params4[3] = (float)ps_r_terrain_debug;  // terrain debug view (0..3)
     ub.pom_params5[0] = ps_r_terrain_gloss;         // terrain dry sun-gloss strength
-    ub.pom_params5[1] = 0.f;                         // (was geo puddle radius — removed)
-    ub.pom_params5[2] = 0.f;                         // (was geo puddle depth  — removed)
+    ub.pom_params5[1] = ps_r_glass_opacity;          // glass opacity ceiling (r_glass_opacity; frag glass branches)
+    ub.pom_params5[2] = ps_r_mud_deform;             // mud footprint strength (terrain reads the deform field on soft splats)
     ub.pom_params5[3] = (float)ps_r_puddle_debug;   // puddle debug mode (0 off, 1 coverage, 2 micro/flow)
     ub.pom_params6[0] = (ps_r_water_sim && ps_r_rain_enable) ? 1.f : 0.f;  // sim puddles off when r_rain off
     ub.pom_params6[1] = ps_r_water_murk;                // volumetric absorption /m
@@ -804,7 +809,7 @@ void Update(u32 slot)
     // SSS puddles (default source). Gate off when r_rain is off so dry weather clears.
     ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? 1.f : 0.f;
     ub.pom_params7[1] = ps_r_puddle_level;              // coverage (more/larger puddles)
-    ub.pom_params7[2] = 0.f;                            // (was micro-height contrast — removed)
+    ub.pom_params7[2] = ps_r_mud_depth;                 // mud print POM carve depth (fraction of the height range)
     ub.pom_params7[3] = ps_r_puddle_scale;              // puddle-body size (procedural mask freq)
     // Surface Field ("smart heightmap"): metre-scale derive read in-shader (Phase
     // 2.0). Consumers (snow/fog/water) come later; for now drives r_sf_debug.
@@ -892,7 +897,8 @@ void Update(u32 slot)
 
         // Texture path (r_snow_deform_tex): the dense persistent press field. When on
         // and ready, the shaders sample uDeform (binding 20) instead of the stamp loop.
-        const bool texOn = ps_r_snow_deform && ps_r_snow_deform_tex && Deform::Ready();
+        // Mud footprints (r_mud_deform) ride the same texture, snow or not.
+        const bool texOn = ps_r_snow_deform_tex && (ps_r_snow_deform || ps_r_mud_deform > 0.f) && Deform::Ready();
         memcpy(ub.deform_vp, &Deform::GetVP(), sizeof(ub.deform_vp));
         const float dsize = float(Deform::Size() ? Deform::Size() : 1);
         // 0 = off, 1 = texture dent on the TERRAIN, 2 = MESH mode (terrain skips snow

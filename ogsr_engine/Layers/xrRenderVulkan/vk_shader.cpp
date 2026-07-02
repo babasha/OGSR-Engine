@@ -37,6 +37,7 @@ CVulkanShader::CVulkanShader()
     , m_bLandscape(false)
     , m_bWmark(false)
     , m_bAlphaRef(false)
+    , m_bGlass(false)
 {
     // Initialize default pipeline config
     m_PipelineConfig.depthTest = true;
@@ -100,6 +101,26 @@ void CVulkanShader::Create(LPCSTR name, LPCSTR tex_diffuse)
         // Alpha test shaders use discard in fragment shader (alphaRef > 0)
         m_bAlphaRef = true;
         m_PipelineConfig.blendEnable = false;  // Will use shader discard for now
+    }
+
+    // Translucent GLASS: the engine "glass" shader (model/lamp panes), or a
+    // trans/aref LEVEL shader whose diffuse lives in glas\ / wnd (windows,
+    // e.g. def_trans + glas\glas_dirt on Cordon). R4 draws these BLENDED; our
+    // opaque path alpha-TESTED them at 0.78 — a semi-transparent pane has no
+    // texel that passes, so the glass was simply invisible. Grates/fences on
+    // def_trans keep the alpha test (their textures aren't under glas\/wnd).
+    {
+        xr_string tex_lower = m_TexDiffuse.size() ? m_TexDiffuse.c_str() : "";
+        std::transform(tex_lower.begin(), tex_lower.end(), tex_lower.begin(), ::tolower);
+        // glas\ textures are glass BY DEFINITION — flag them regardless of the
+        // shader (the village windows use plain `default` + glas\glas_windows1
+        // and stayed opaque under the aref-only rule). "wnd" alone is too loose
+        // (window FRAMES live there too) — it still requires a trans shader.
+        if (shader_lower.find("glass") != xr_string::npos ||
+            tex_lower.find("glas\\") != xr_string::npos ||
+            tex_lower.rfind("glas", 0) == 0 ||
+            (m_bAlphaRef && tex_lower.find("wnd") != xr_string::npos))
+            m_bGlass = true;
     }
 
     // Check for additive shaders (effects, glows)

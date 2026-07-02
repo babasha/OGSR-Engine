@@ -109,6 +109,13 @@ float sunShadow1(vec3 worldPos)
 void main()
 {
     vec4 diff = texture(uDiffuse, vUV);
+    // Mip-fade compensation (r_grass_asharp, pc.vConsts.y), DISTANCE-driven: alpha
+    // MIPs average the blade against its transparent background, so far grass
+    // dissolves see-through. NOT lod-driven — textureQueryLod is high on thin
+    // blades even right at the camera (minification is geometric, not distance),
+    // which striped/fringed near grass in-game. Distance ramp: untouched inside
+    // 15 m, full boost (1 + 4·asharp) by 60 m.
+    diff.a *= 1.0 + smoothstep(15.0, 60.0, length(vWPos - L.eye_pos.xyz)) * 4.0 * pc.vConsts.y;
     // Alpha-test cutoff is live-tunable via r_grass_aref (pc.vConsts.x). Lower =
     // fatter/denser blades (kills the "see-through" look); fall back to 0.5 if
     // the push slot is ever zero.

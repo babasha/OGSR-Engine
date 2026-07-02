@@ -21,6 +21,7 @@ layout(set = 0, binding = 2) readonly buffer PageTable  { uint pageTable[]; };  
 layout(set = 0, binding = 3) buffer CasterPages { uint casterPages[]; };         // c*CAP + i -> slot
 layout(set = 0, binding = 4) buffer Indirect    { uint indirect[]; };            // 5 u32 per caster (VkDrawIndexedIndirectCommand)
 layout(set = 0, binding = 5) buffer Stats       { uint stats[]; };               // [0]=draws [1]=instances [2]=maxPages
+layout(set = 0, binding = 6) buffer DynUsed     { uint dynUsed[]; };             // dyn slot -> 1 if any dynamic caster binned into it (the resolve skips untouched dyn pages)
 
 layout(push_constant) uniform Push { uint casterCount; uint cap; } pc;
 
@@ -47,7 +48,10 @@ void main()
         for (int px = p0.x; px <= p1.x; ++px) {
             uint slot = pageTable[vsmPageIndex(L, ivec2(px, py))];
             if (slot == VSM_UNMAPPED) continue;
-            if (cnt < pc.cap) casterPages[c * pc.cap + cnt] = slot;   // thread owns this slice → no atomic
+            if (cnt < pc.cap) {
+                casterPages[c * pc.cap + cnt] = slot;   // thread owns this slice → no atomic
+                atomicOr(dynUsed[slot], 1u);            // this dyn page will get real caster depth
+            }
             ++cnt;
         }
     }

@@ -24,6 +24,11 @@ namespace {
     VkDescriptorPool                                   s_Pool         = VK_NULL_HANDLE;
     VkSampler                                          s_Sampler      = VK_NULL_HANDLE;
     std::unordered_map<std::string, WorldMaterial*>    s_Cache;
+
+    // Per-level namespace for lightmap-related cache keys (see SetLevelTag in
+    // the header): lmap names repeat across levels but resolve to DIFFERENT
+    // $level$ .dds files, and this cache outlives level changes by design.
+    std::string s_LevelTag;
     WorldMaterial*                                     s_Default      = nullptr;
 
     // Detail-texture cache (shared by reference across materials).
@@ -119,7 +124,11 @@ namespace {
     {
         if (!lmap_name || !lmap_name[0]) return s_WhiteLmap;
 
-        std::string key(lmap_name);
+        // Level-tagged key: the same "lmap#01" on another level is a DIFFERENT
+        // texture (loaded from that level's $level$ dir below).
+        std::string key(s_LevelTag);
+        key.push_back('|');
+        key.append(lmap_name);
         auto it = s_LmapTexCache.find(key);
         if (it != s_LmapTexCache.end()) return it->second;
 
@@ -520,6 +529,10 @@ bool Init()
             tb[i].descriptorCount = 1;
             tb[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
         }
+        // uMask (1) also feeds the terrain TESS EVAL: the mud footprint geometric
+        // carve reads the splat softness so asphalt never dents.
+        if (VulkanHW.m_bTessellationSupported)
+            tb[1].stageFlags |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
         VkDescriptorSetLayoutCreateInfo tlci{};
         tlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         tlci.bindingCount = 15;
@@ -709,22 +722,39 @@ void Destroy()
     }
 }
 
+void SetLevelTag(const char* tag)
+{
+    s_LevelTag = (tag && tag[0]) ? tag : "";
+    Msg("[VK WorldMaterial] level tag: '%s'", s_LevelTag.c_str());
+}
+
 WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark)
 {
     if (!s_SetLayout || !s_Default) return s_Default;
     if (!diffuse_name || !diffuse_name[0]) return s_Default;
 
-    // Same diffuse can pair with different lmaps — key on both.
+    // Same diffuse can pair with different lmaps — key on both. Lmap-bearing
+    // materials are ALSO namespaced by the level tag: lmap names repeat across
+    // levels with different content, and the cache survives level changes (a
+    // stale entry would keep the previous level's lightmap in its descriptor
+    // set — the "baked patches after a level transition" bug). Lmap-less
+    // materials (weapons/NPC/props) stay global so persistent visuals keep
+    // hitting their entries.
     std::string key(diffuse_name);
     key.push_back('|');
-    if (lmap_name && lmap_name[0]) key.append(lmap_name);
+    if (lmap_name && lmap_name[0]) { key.append(lmap_name); key.push_back('|'); key.append(s_LevelTag); }
 
     auto it = s_Cache.find(key);
     if (it != s_Cache.end()) {
         // Materials are shared by texture pair — if ANY user is a wallmark
         // shader, the whole material renders as a decal (textures are
-        // decal-dedicated in practice).
-        if (wmark && it->second != s_Default) it->second->isWmark = true;
+        // decal-dedicated in practice). Same upgrade for glass (aref == -2).
+        if (wmark && it->second != s_Default) {
+            it->second->isWmark = true;
+            if (alphaRef < -3.5f)      it->second->isLitBlend = true;
+            else if (alphaRef < -2.5f) it->second->isEmisAdd  = true;
+            else if (alphaRef < -1.5f) it->second->isGlass    = true;
+        }
         return it->second;
     }
 
@@ -783,6 +813,9 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     m->view_lmap    = lmap_tex   ? lmap_tex->GetView()   : s_WhiteLmap->GetView();
     m->alphaRef     = alphaRef;
     m->isWmark      = wmark;
+    m->isLitBlend   = wmark && alphaRef < -3.5f;                       // -4 = lit-blend (lightplanes)
+    m->isEmisAdd    = wmark && alphaRef < -2.5f && alphaRef > -3.5f;   // -3 = emissive-additive marker
+    m->isGlass      = wmark && alphaRef < -1.5f && alphaRef > -2.5f;   // -2 = the glass marker (vk_Visual LoadTexture)
     m->name         = diffuse_name;
     m->tessellated  = (bumpx_tex != s_FlatBump);
     m->set          = AllocateSet();

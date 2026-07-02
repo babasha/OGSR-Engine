@@ -9,6 +9,10 @@
 #include "vk_pass_particles.h"
 #include "vk_Particles.h"
 #include "vk_pass_world.h"        // g_DynamicVisuals / DynVisual
+#include "vk_render_queue.h"      // g_RenderQueue.GlassItems() — glass refraction into the distort RT
+#include "vk_Visual.h"            // vkFVisual mesh access (glass pane re-draw)
+#include "vk_world_material.h"    // WorldMaterial::isEmisAdd — glow halos skip refraction
+#include "vk_pass_skinned.h"      // Skinned_RenderGlassDistort — kinematics panes refraction
 #include "vk_shaders.h"
 #include "vk_texture.h"
 #include "vk_buffer.h"
@@ -39,6 +43,7 @@ extern float ps_r_vol_smoke_clamp;
 extern float ps_r_vol_smoke_dist;
 extern float ps_r_vol_smoke_dist_full;   // inner full-quality radius (volumetric LOD)
 extern int   ps_r__detail_radius;
+extern float ps_r_glass_refr;            // r_glass_refr — glass refraction (uneven-pane wobble) strength, 0 = off
 
 namespace VK {
 
@@ -114,6 +119,140 @@ namespace {
     VkShaderModule   s_RainDropFS   = VK_NULL_HANDLE;
     VkPipeline       s_RainDropPipe = VK_NULL_HANDLE;
     constexpr VkFormat kDistortFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+    // ---- Glass refraction (r_glass_refr) ------------------------------------
+    // The late-glass panes (RenderQueue::GlassItems) are re-drawn into the same
+    // distortion RT with a procedural "uneven old glass" wobble — the tonemap
+    // then bends whatever is behind the pane. Two pipelines (world stride-32
+    // sub-layouts: base UV at offset 24 = lmap, 28 = vert-lit); push = mvp+strength.
+    VkPipeline       s_GlassDistortPipe[2] = {};   // [0]=tcOffset 24, [1]=28
+    VkPipelineLayout s_GlassDistortLayout  = VK_NULL_HANDLE;
+    VkShaderModule   s_GlassVS = VK_NULL_HANDLE, s_GlassFS = VK_NULL_HANDLE;
+
+    struct GlassDistortPush { Fmatrix mvp; float strength; float pad[3]; };
+
+    VkPipeline BuildGlassDistortPipeline(u32 tcOffset)
+    {
+        if (s_GlassDistortLayout == VK_NULL_HANDLE) {
+            VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(GlassDistortPush) };
+            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+            if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_GlassDistortLayout) != VK_SUCCESS)
+                return VK_NULL_HANDLE;
+        }
+        if (!s_GlassVS) s_GlassVS = g_ShaderManager->Load("glass_distort.vert.spv");
+        if (!s_GlassFS) s_GlassFS = g_ShaderManager->Load("glass_distort.frag.spv");
+        if (!s_GlassVS || !s_GlassFS) return VK_NULL_HANDLE;
+
+        VkVertexInputBindingDescription bind{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
+        VkVertexInputAttributeDescription attrs[2] = {
+            { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 },
+            { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset },
+        };
+        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;
+        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs;
+
+        VkPipelineShaderStageCreateInfo st[2]{};
+        st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = s_GlassVS; st[0].pName = "main";
+        st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = s_GlassFS; st[1].pName = "main";
+
+        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_FALSE;   // occluded panes must not warp
+        ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendAttachmentState ba{};
+        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        ba.blendEnable         = VK_TRUE;                       // same as the haze sprites
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        ba.colorBlendOp        = VK_BLEND_OP_ADD;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        cb.attachmentCount = 1; cb.pAttachments = &ba;
+
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
+
+        VkFormat colorFormat = kDistortFormat;
+        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFormat;
+        prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
+
+        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        pi.pNext = &prci;
+        pi.stageCount = 2;                 pi.pStages             = st;
+        pi.pVertexInputState = &vi;        pi.pInputAssemblyState = &ia;
+        pi.pViewportState = &vp;           pi.pRasterizationState = &rs;
+        pi.pMultisampleState = &ms;        pi.pDepthStencilState  = &ds;
+        pi.pColorBlendState = &cb;         pi.pDynamicState       = &dynState;
+        pi.layout = s_GlassDistortLayout;
+
+        VkPipeline h = VK_NULL_HANDLE;
+        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h) != VK_SUCCESS) {
+            Msg("![VK Particles] glass-distort pipeline failed (tcOffset=%u)", tcOffset);
+            return VK_NULL_HANDLE;
+        }
+        return h;
+    }
+
+    // Re-draw the glass panes into the (already begun) distortion pass.
+    void DrawGlassDistort(VkCommandBuffer cmd, const Fmatrix& viewProj)
+    {
+        if (ps_r_glass_refr <= 0.001f) return;
+        const auto& items = g_RenderQueue.GlassItems();
+        if (items.empty()) return;
+
+        VkPipeline lastPipe = VK_NULL_HANDLE;
+        VkBuffer lastVB = VK_NULL_HANDLE, lastIB = VK_NULL_HANDLE;
+        for (const DrawItem& it : items) {
+            auto* rv = it.vis;
+            if (!rv || (rv->Type != MT_NORMAL && rv->Type != MT_PROGRESSIVE)) continue;
+            auto* fv = static_cast<vkFVisual*>(rv);
+            if (!fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) continue;
+            if (fv->m_mesh.vStride != 32) continue;                     // world layouts only
+            if (fv->m_pWorldMaterial && (fv->m_pWorldMaterial->isEmisAdd || fv->m_pWorldMaterial->isLitBlend)) continue;   // glow halos / light beams don't refract
+            const u32 slot = (fv->m_mesh.tcOffset == 28) ? 1u : 0u;
+            if (s_GlassDistortPipe[slot] == VK_NULL_HANDLE)
+                s_GlassDistortPipe[slot] = BuildGlassDistortPipeline(fv->m_mesh.tcOffset);
+            VkPipeline pipe = s_GlassDistortPipe[slot];
+            if (pipe == VK_NULL_HANDLE) continue;
+
+            if (pipe != lastPipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+                lastPipe = pipe; lastVB = lastIB = VK_NULL_HANDLE;
+            }
+            GlassDistortPush pc{};
+            pc.mvp.mul(viewProj, it.xform);
+            pc.strength = ps_r_glass_refr;
+            vkCmdPushConstants(cmd, s_GlassDistortLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+
+            VkBuffer vb = fv->m_mesh.p_rm_Vertices->GetHandle();
+            if (vb != lastVB) { VkDeviceSize off = 0; vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off); lastVB = vb; }
+            VkBuffer ib = fv->m_mesh.p_rm_Indices->GetHandle();
+            if (ib != lastIB) { vkCmdBindIndexBuffer(cmd, ib, 0, fv->m_mesh.iType); lastIB = ib; }
+            const u32 firstIndex = it.iCountOverride ? it.iBaseOverride  : fv->m_mesh.iBase;
+            const u32 indexCount = it.iCountOverride ? it.iCountOverride : fv->m_mesh.iCount;
+            vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex, (s32)fv->m_mesh.vBase, 0);
+        }
+    }
 
     void DestroyDistortRT()
     {
@@ -465,6 +604,10 @@ void ParticlePass_Destroy()
         if (s_Pipelines[i]) { vkDestroyPipeline(VulkanHW.m_Device, s_Pipelines[i], nullptr); s_Pipelines[i] = VK_NULL_HANDLE; }
     }
     if (s_DistortPipe)  { vkDestroyPipeline(VulkanHW.m_Device, s_DistortPipe, nullptr); s_DistortPipe = VK_NULL_HANDLE; }
+    for (u32 i = 0; i < 2; ++i)
+        if (s_GlassDistortPipe[i]) { vkDestroyPipeline(VulkanHW.m_Device, s_GlassDistortPipe[i], nullptr); s_GlassDistortPipe[i] = VK_NULL_HANDLE; }
+    if (s_GlassDistortLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_GlassDistortLayout, nullptr); s_GlassDistortLayout = VK_NULL_HANDLE; }
+    s_GlassVS = s_GlassFS = VK_NULL_HANDLE;
     if (s_WallmarkPipe) { vkDestroyPipeline(VulkanHW.m_Device, s_WallmarkPipe, nullptr); s_WallmarkPipe = VK_NULL_HANDLE; }
     if (s_BloodPipe)    { vkDestroyPipeline(VulkanHW.m_Device, s_BloodPipe, nullptr); s_BloodPipe = VK_NULL_HANDLE; }
     if (s_RainPipe)     { vkDestroyPipeline(VulkanHW.m_Device, s_RainPipe, nullptr); s_RainPipe = VK_NULL_HANDLE; }
@@ -634,6 +777,16 @@ VkDescriptorSet GetTextureSet(const char* texture_name)
     return set;
 }
 
+VkImageView GetTextureView(const char* texture_name)
+{
+    if (!s_Init || !texture_name || !texture_name[0]) return VK_NULL_HANDLE;
+    GetTextureSet(texture_name);                      // ensure loaded + cached
+    auto it = s_TexCache.find(std::string(texture_name));
+    if (it != s_TexCache.end() && it->second.tex)
+        return it->second.tex->GetView();
+    return VK_NULL_HANDLE;
+}
+
 }  // namespace ParticlePass
 
 void CollectSmokeParticles(xr_vector<VK::Vol::SmokeParticle>& out)
@@ -705,7 +858,11 @@ void Pass_Particles(FrameContext& ctx)
 {
     if (!s_Init)                   return;
     if (ctx.cmd == VK_NULL_HANDLE) return;
-    if (g_DynamicVisuals.empty() && g_HudVisuals.empty() && s_DistortImg == VK_NULL_HANDLE) return;
+    // Glass refraction needs the distort phase even with no particle around —
+    // and not only for world-path glass (kinematics cabinet panes come via the
+    // skinned uploads, invisible to the queue), so gate on the cvar alone.
+    const bool glassRefr = ps_r_glass_refr > 0.001f;
+    if (g_DynamicVisuals.empty() && g_HudVisuals.empty() && s_DistortImg == VK_NULL_HANDLE && !glassRefr) return;
 
     // Flatten visible particle visuals into leaf effects, split by phase:
     //   1. world  — scene projection, the bulk (fire/smoke/anomalies);
@@ -734,9 +891,10 @@ void Pass_Particles(FrameContext& ctx)
     };
     collectList(g_DynamicVisuals);
     collectList(g_HudVisuals);
+    // Glass refraction also drives the distort phase (panes re-drawn as wobble).
     // Once the distort RT exists it must be refreshed (cleared) EVERY frame —
     // otherwise the tonemap would re-apply last frame's frozen haze.
-    const bool runDistort = !s_distort.empty() || s_DistortImg != VK_NULL_HANDLE;
+    const bool runDistort = !s_distort.empty() || s_DistortImg != VK_NULL_HANDLE || glassRefr;
     if (s_world.empty() && s_hud.empty() && !runDistort) return;
 
     VkCommandBuffer cmd = ctx.cmd;
@@ -920,6 +1078,14 @@ void Pass_Particles(FrameContext& ctx)
         if (!s_distort.empty() && ctx.viewProj) {
             // distort writes UV offsets, not colour — no probe → strength 0.
             drawList(s_distort, s_DistortPipe, nDistort, *ctx.viewProj, 0.0f);
+        }
+
+        // Glass refraction: re-draw the late-glass panes as procedural wobble
+        // (r_glass_refr) — the tonemap bends the scene behind them. Both halves:
+        // world-path panes (windows/doors/vehicles) + kinematics (cabinet doors).
+        if (ps_r_glass_refr > 0.001f && ctx.viewProj) {
+            DrawGlassDistort(cmd, *ctx.viewProj);
+            Skinned_RenderGlassDistort(cmd, *ctx.viewProj, ps_r_glass_refr);
         }
 
         vkCmdEndRendering(cmd);

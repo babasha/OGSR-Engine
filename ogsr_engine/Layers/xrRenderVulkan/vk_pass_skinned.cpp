@@ -1,4 +1,4 @@
-// xrRenderVulkan - Vulkan renderer for X-Ray Engine
+﻿// xrRenderVulkan - Vulkan renderer for X-Ray Engine
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
 //
 // Original work, "declared otherwise" per the root LICENSE.md. Non-commercial
@@ -8,7 +8,7 @@
 // xrRenderVulkan - Skinned-mesh pass (STEP B sub-step 2). See vk_pass_skinned.h.
 #include "stdafx.h"
 
-// CKinematics (children + LL_GetTransform_R/LL_BoneCount) — same compat trick as
+// CKinematics (children + LL_GetTransform_R/LL_BoneCount) â€” same compat trick as
 // the skeleton wrapper TUs. Keep dxRender_Visual mapped (children is xr_vector<dxRender_Visual*>).
 #define FBasicVisualH
 #include "vk_FBasicVisual.h"            // pulls vk_SkeletonCompat.h (dxRender_Visual->vkRender_Visual, vk_Visual.h)
@@ -16,8 +16,8 @@
 #include "../xrRender/SkeletonCustom.h" // CKinematics
 
 #include "vk_pass_skinned.h"
-#include "vk_pass_ssao.h"              // SSAOPass::GetNormalFormat — NPC normal G-buffer target
-#include "vk_motionvec.h"             // VK::MotionVec::Format — RG16F motion target (skinned MV overlay)
+#include "vk_pass_ssao.h"              // SSAOPass::GetNormalFormat â€” NPC normal G-buffer target
+#include "vk_motionvec.h"             // VK::MotionVec::Format â€” RG16F motion target (skinned MV overlay)
 #include "vk_pass_world.h"              // g_DynamicVisuals / DynVisual
 #include "vk_swapchain.h"              // Swapchain.m_Format / m_DepthFormat
 #include "vk_scene_color.h"            // HDR scene target format
@@ -25,15 +25,15 @@
 #include "vk_buffer.h"                // CVulkanBuffer
 #include "vk_world_material.h"        // WorldMaterial / WorldMaterialCache (set 1 = diffuse)
 #include "HW_Vulkan.h"                // VulkanHW.m_Device
-#include "vk_command_buffer.h"        // CommandManager.GetCurrentFrame() — in-flight slot
-#include "vk_pipeline_cache.h"        // PipelineCache::GetCacheObject() — shared disk-backed cache
-#include "vk_env_light.h"             // EnvLight — shared per-frame sun/hemi/ambient UBO (set 2)
-#include "vk_shadow.h"                // ShadowMap::SphereVisible — caster culling
+#include "vk_command_buffer.h"        // CommandManager.GetCurrentFrame() â€” in-flight slot
+#include "vk_pipeline_cache.h"        // PipelineCache::GetCacheObject() â€” shared disk-backed cache
+#include "vk_env_light.h"             // EnvLight â€” shared per-frame sun/hemi/ambient UBO (set 2)
+#include "vk_shadow.h"                // ShadowMap::SphereVisible â€” caster culling
 #include "../../xr_3da/device.h"      // Device.mFullTransform_hud (HUD projection), dwFrame
 
 #include <unordered_map>
 
-// Console cvar at GLOBAL scope — a block-scope extern inside namespace VK would mangle as
+// Console cvar at GLOBAL scope â€” a block-scope extern inside namespace VK would mangle as
 // VK::ps_r_vsm_npc_dist -> LNK2001 (same trick as vk_pass_shadow's externs).
 extern float ps_r_vsm_npc_dist;   // VSM NPC shadow cull distance (m); 0 = no cull
 
@@ -51,10 +51,10 @@ namespace {
     VkShaderModule        s_shadowVS   = VK_NULL_HANDLE;  // depth-only caster VS (optional)
     VkShaderModule        s_prepassVS  = VK_NULL_HANDLE;  // depth-prepass AT caster VS (optional)
     VkShaderModule        s_prepassFS  = VK_NULL_HANDLE;  // ... + alpha-test FS (matches skinned.frag)
-    VkShaderModule        s_normalVS   = VK_NULL_HANDLE;  // NPC normal G-buffer VS (skins normal → world, optional)
+    VkShaderModule        s_normalVS   = VK_NULL_HANDLE;  // NPC normal G-buffer VS (skins normal â†’ world, optional)
     VkShaderModule        s_normalFS   = VK_NULL_HANDLE;  // ... + AT FS writing worldN*0.5+0.5
     VkShaderModule        s_mvVS       = VK_NULL_HANDLE;  // motion-vector VS (skins cur+prev pose, optional)
-    VkShaderModule        s_mvFS       = VK_NULL_HANDLE;  // ... → RG16F screen motion
+    VkShaderModule        s_mvFS       = VK_NULL_HANDLE;  // ... â†’ RG16F screen motion
     VkPipelineLayout      s_mvLayout   = VK_NULL_HANDLE;  // set0 = bones + 144B push (cur/prev VP + bases)
     CVulkanBuffer         s_boneSSBO;
     Fmatrix*              s_boneMapped = nullptr;
@@ -65,8 +65,8 @@ namespace {
     std::unordered_map<u32, VkPipeline> s_motionPipelines;  // motion-vector casters, same key
 
     // Per-skeleton bone-slot record for the motion pass: maps a CKinematics to the
-    // absolute baseBone it occupied. Rolled each frame — s_prevBoneMap then holds
-    // LAST frame's slots, whose SSBO regions are still live (FRAMES_IN_FLIGHT≥2),
+    // absolute baseBone it occupied. Rolled each frame â€” s_prevBoneMap then holds
+    // LAST frame's slots, whose SSBO regions are still live (FRAMES_IN_FLIGHTâ‰¥2),
     // so the MV vertex shader can skin the previous pose for true animation motion.
     std::unordered_map<CKinematics*, std::pair<u32, u32>> s_curBoneMap;   // K -> {baseBone, boneCount}
     std::unordered_map<CKinematics*, std::pair<u32, u32>> s_prevBoneMap;
@@ -82,20 +82,20 @@ namespace {
 
     constexpr u32 kMaxBones       = 16384;   // bone-matrix slots PER frame-in-flight (~1 MB each)
     constexpr u32 kFramesInFlight = CVulkanCommandManager::FRAMES_IN_FLIGHT;
-    // Set 2 (per-frame sun/hemi/ambient) is the shared EnvLight set — see vk_env_light.{h,cpp}.
+    // Set 2 (per-frame sun/hemi/ambient) is the shared EnvLight set â€” see vk_env_light.{h,cpp}.
 
-    // Push block — must match skinned.{vert,frag}.glsl PushConstants. hudMode (read
+    // Push block â€” must match skinned.{vert,frag}.glsl PushConstants. hudMode (read
     // by the fragment) flags first-person HUD so it gets sun-direction-independent light.
     struct SkinPush { Fmatrix mvp; u32 skinMode; u32 baseBone; u32 boneCount; float hudMode; float hemi; };
 
-    // Motion-vector push — must match motion_vec_skinned.vert. 144 B (device max is
+    // Motion-vector push â€” must match motion_vec_skinned.vert. 144 B (device max is
     // 256 here, see vk_pipeline.cpp). curVP/prevVP project the cur/prev poses.
     struct MVSkinPush { Fmatrix curVP; Fmatrix prevVP; u32 skinMode; u32 curBase; u32 prevBase; u32 boneCount; };
     static_assert(sizeof(MVSkinPush) == 144, "must match motion_vec_skinned.vert PC block");
 
     // Vertex input for the vertHW_* layouts. loc0 pos FLOAT4; loc1/3/4 packed
     // normal/tangent/binormal (UBYTE4N); loc2 = FLOAT2 (36/40) or FLOAT4 (44);
-    // loc5 = 4 bone indices (40 only, dummy @0 elsewhere — unused by those modes).
+    // loc5 = 4 bone indices (40 only, dummy @0 elsewhere â€” unused by those modes).
     static void BuildSkinnedVI(u32 stride, VkVertexInputBindingDescription& b,
                                VkVertexInputAttributeDescription attrs[6])
     {
@@ -116,8 +116,21 @@ namespace {
         }
     }
 
-    static VkPipeline CreatePipeline(u32 stride, bool additive)
+    VkShaderModule s_glassDistFS = VK_NULL_HANDLE;   // glass_distort_skinned.frag (variant 3)
+
+    // Pipeline variants: 0 = lit opaque, 1 = additive unlit (collimator marks),
+    // 2 = GLASS (lit, src-alpha blend, no depth write â€” kinematics furniture/door
+    // panes; the opaque path rendered them as solid texture), 3 = GLASS DISTORT
+    // (same panes re-drawn into the heat-haze RT = refraction, r_glass_refr).
+    static VkPipeline CreatePipeline(u32 stride, u32 variant)
     {
+        const bool additive = (variant == 1u);
+        const bool glass    = (variant == 2u);
+        const bool distort  = (variant == 3u);
+        if (distort && s_glassDistFS == VK_NULL_HANDLE) {
+            s_glassDistFS = g_ShaderManager->Load("glass_distort_skinned.frag.spv");
+            if (s_glassDistFS == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+        }
         VkVertexInputBindingDescription   binding{};
         VkVertexInputAttributeDescription attrs[6]{};
         BuildSkinnedVI(stride, binding, attrs);
@@ -133,7 +146,7 @@ namespace {
         stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_vs; stages[0].pName = "main";
         stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_fs; stages[1].pName = "main";
+        stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = distort ? s_glassDistFS : s_fs; stages[1].pName = "main";
 
         VkPipelineInputAssemblyStateCreateInfo ia{};
         ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -157,7 +170,7 @@ namespace {
         VkPipelineDepthStencilStateCreateInfo ds{};
         ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = additive ? VK_FALSE : VK_TRUE;   // marks don't write depth (R4 zb(true,false))
+        ds.depthWriteEnable = (additive || glass || distort) ? VK_FALSE : VK_TRUE;   // marks/glass don't write depth (R4 zb(true,false))
         ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
         VkPipelineColorBlendAttachmentState ba{};
@@ -165,11 +178,23 @@ namespace {
                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
         ba.blendEnable    = VK_FALSE;
         if (additive) {
-            // Collimator marks (R4 hud_reddotsight: blend(srcalpha, one)) —
+            // Collimator marks (R4 hud_reddotsight: blend(srcalpha, one)) â€”
             // the dot ADDS light over the sight glass.
             ba.blendEnable         = VK_TRUE;
             ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
             ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            ba.colorBlendOp        = VK_BLEND_OP_ADD;
+            ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+        }
+        if (glass || distort) {
+            // Translucent pane over whatever is behind (lit output, capped
+            // alpha comes from the fragment â€” skinMode bit 32). The distort
+            // variant blends the wobble over the haze RT's neutral 0.5.
+            ba.blendEnable         = VK_TRUE;
+            ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
             ba.colorBlendOp        = VK_BLEND_OP_ADD;
             ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
             ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
@@ -184,7 +209,8 @@ namespace {
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
 
-        VkFormat colorFormat = VK::SceneColor::Format();
+        // Variant 3 renders into the particle heat-haze RT (RGBA8), not the scene.
+        VkFormat colorFormat = distort ? VK_FORMAT_R8G8B8A8_UNORM : VK::SceneColor::Format();
         VkPipelineRenderingCreateInfo prci{};
         prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         prci.colorAttachmentCount    = 1;
@@ -204,16 +230,16 @@ namespace {
         VkPipeline h = VK_NULL_HANDLE;
         VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
         if (r != VK_SUCCESS) { Msg("![VK Skinned] pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
-        Msg("[VK Skinned] pipeline created stride=%u additive=%d", stride, (int)additive);
+        Msg("[VK Skinned] pipeline created stride=%u variant=%u", stride, variant);
         return h;
     }
 
-    static VkPipeline GetPipeline(u32 stride, bool additive = false)
+    static VkPipeline GetPipeline(u32 stride, u32 variant = 0u)
     {
-        const u32 key = stride | (additive ? 0x10000u : 0u);
+        const u32 key = stride | (variant << 16);
         auto it = s_pipelines.find(key);
         if (it != s_pipelines.end()) return it->second;
-        VkPipeline p = CreatePipeline(stride, additive);
+        VkPipeline p = CreatePipeline(stride, variant);
         s_pipelines.emplace(key, p);
         return p;
     }
@@ -230,25 +256,25 @@ namespace {
             Msg("![VK Skinned] failed to load skinned.vert/frag.spv");
             s_failed = true; return false;
         }
-        // Optional — absence just disables NPC shadow casting.
+        // Optional â€” absence just disables NPC shadow casting.
         s_shadowVS = g_ShaderManager->Load("shadow_skinned.vert.spv");
         if (s_shadowVS == VK_NULL_HANDLE)
-            Msg("![VK Skinned] shadow_skinned.vert.spv missing — skinned shadow casting disabled");
-        // Optional — absence just keeps NPCs out of the depth prepass (no NPC AO).
+            Msg("![VK Skinned] shadow_skinned.vert.spv missing â€” skinned shadow casting disabled");
+        // Optional â€” absence just keeps NPCs out of the depth prepass (no NPC AO).
         s_prepassVS = g_ShaderManager->Load("shadow_skinned_at.vert.spv");
         s_prepassFS = g_ShaderManager->Load("shadow_skinned_at.frag.spv");
         if (s_prepassVS == VK_NULL_HANDLE || s_prepassFS == VK_NULL_HANDLE)
-            Msg("![VK Skinned] shadow_skinned_at.{vert,frag}.spv missing — NPCs excluded from the depth prepass");
-        // Optional — absence just keeps NPCs on depth-derived GTAO normals (no NPC normal G-buffer).
+            Msg("![VK Skinned] shadow_skinned_at.{vert,frag}.spv missing â€” NPCs excluded from the depth prepass");
+        // Optional â€” absence just keeps NPCs on depth-derived GTAO normals (no NPC normal G-buffer).
         s_normalVS = g_ShaderManager->Load("shadow_skinned_normal.vert.spv");
         s_normalFS = g_ShaderManager->Load("shadow_skinned_normal.frag.spv");
         if (s_normalVS == VK_NULL_HANDLE || s_normalFS == VK_NULL_HANDLE)
-            Msg("![VK Skinned] shadow_skinned_normal.{vert,frag}.spv missing — NPC AO normals disabled");
-        // Optional — absence just keeps NPCs on camera-only motion vectors (no animation MV).
+            Msg("![VK Skinned] shadow_skinned_normal.{vert,frag}.spv missing â€” NPC AO normals disabled");
+        // Optional â€” absence just keeps NPCs on camera-only motion vectors (no animation MV).
         s_mvVS = g_ShaderManager->Load("motion_vec_skinned.vert.spv");
         s_mvFS = g_ShaderManager->Load("motion_vec_skinned.frag.spv");
         if (s_mvVS == VK_NULL_HANDLE || s_mvFS == VK_NULL_HANDLE)
-            Msg("![VK Skinned] motion_vec_skinned.{vert,frag}.spv missing — NPC animation motion vectors disabled");
+            Msg("![VK Skinned] motion_vec_skinned.{vert,frag}.spv missing â€” NPC animation motion vectors disabled");
 
         // Descriptor set layout: 1 storage buffer (bone matrices), VERTEX stage.
         VkDescriptorSetLayoutBinding b{};
@@ -291,7 +317,7 @@ namespace {
 
         // Motion-vector pipeline layout: set 0 (bone SSBO) + set 1 (diffuse, for the
         // alpha-test) + a 144-byte VERTEX push (cur/prev VP + bone bases). No light set
-        // — the MV fragment only needs the two clip positions + the cutout test.
+        // â€” the MV fragment only needs the two clip positions + the cutout test.
         if (s_mvVS != VK_NULL_HANDLE && s_mvFS != VK_NULL_HANDLE) {
             VkDescriptorSetLayout mvSets[2] = { s_setLayout, matLayout };
             VkPushConstantRange mvPcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(MVSkinPush) };
@@ -300,13 +326,13 @@ namespace {
             mvPlci.setLayoutCount = 2; mvPlci.pSetLayouts = mvSets;
             mvPlci.pushConstantRangeCount = 1; mvPlci.pPushConstantRanges = &mvPcr;
             if (vkCreatePipelineLayout(VulkanHW.m_Device, &mvPlci, nullptr, &s_mvLayout) != VK_SUCCESS) {
-                Msg("![VK Skinned] motion-vector pipeline layout failed — NPC animation MV disabled");
+                Msg("![VK Skinned] motion-vector pipeline layout failed â€” NPC animation MV disabled");
                 s_mvVS = s_mvFS = VK_NULL_HANDLE;   // disable the MV path, keep the rest alive
             }
         }
 
-        // Bone SSBO (host-visible, persistently mapped — Create sets HOST_ACCESS+MAPPED for STORAGE).
-        // Sized FRAMES_IN_FLIGHT × kMaxBones: each in-flight frame owns region
+        // Bone SSBO (host-visible, persistently mapped â€” Create sets HOST_ACCESS+MAPPED for STORAGE).
+        // Sized FRAMES_IN_FLIGHT Ã— kMaxBones: each in-flight frame owns region
         // [slot*kMaxBones, (slot+1)*kMaxBones). Frame S only writes its region after
         // WaitForFence(S) in CRender::Begin proved the GPU finished the previous frame-S
         // submission that read it, so the regions still in flight (S+1/S+2) are never
@@ -330,7 +356,7 @@ namespace {
 
     // Depth-only caster pipeline (sun shadow map): shadow_skinned.vert skins the
     // vertex and writes light-clip depth; no fragment stage, no color. Reuses
-    // s_layout (sets 1/2 simply go unbound — the shader only touches set 0).
+    // s_layout (sets 1/2 simply go unbound â€” the shader only touches set 0).
     static VkPipeline CreateShadowPipeline(u32 stride)
     {
         VkVertexInputBindingDescription   binding{};
@@ -360,7 +386,7 @@ namespace {
         rs.cullMode        = VK_CULL_MODE_NONE;
         rs.frontFace       = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rs.lineWidth       = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;       // dynamic — caller sets the same bias as statics
+        rs.depthBiasEnable = VK_TRUE;       // dynamic â€” caller sets the same bias as statics
 
         VkPipelineMultisampleStateCreateInfo ms{};
         ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -411,7 +437,7 @@ namespace {
     }
 
     // Depth-PREPASS caster pipeline: skinned skinning + alpha-test fragment
-    // (same a<0.25 discard as the color pass → identical coverage). Renders
+    // (same a<0.25 discard as the color pass â†’ identical coverage). Renders
     // into the scene depth, so no depth bias and the scene depth format.
     static VkPipeline CreatePrepassPipeline(u32 stride)
     {
@@ -494,7 +520,7 @@ namespace {
     }
 
     // NPC NORMAL G-buffer pipeline: same skinning as the depth prepass (positions
-    // bit-match → LEQUAL passes only on the visible surface), but writes the
+    // bit-match â†’ LEQUAL passes only on the visible surface), but writes the
     // world-space normal to a color attachment and does NOT write depth (tests
     // against the already-laid prepass depth). Feeds GTAO real NPC normals.
     static VkPipeline CreateNormalPipeline(u32 stride)
@@ -536,7 +562,7 @@ namespace {
         VkPipelineDepthStencilStateCreateInfo ds{};
         ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_FALSE;                  // test only — the prepass owns the depth
+        ds.depthWriteEnable = VK_FALSE;                  // test only â€” the prepass owns the depth
         ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
         VkPipelineColorBlendAttachmentState cba{};
@@ -589,7 +615,7 @@ namespace {
     // writes RG16F screen motion. Tests against the already-laid scene depth
     // (LEQUAL, no write) so only the visible NPC surface overwrites the static
     // camera field. Negative-height viewport (set by the caller) matches the
-    // forward/prepass raster so positions/depth bit-match → LEQUAL passes on equal.
+    // forward/prepass raster so positions/depth bit-match â†’ LEQUAL passes on equal.
     static VkPipeline CreateMotionPipeline(u32 stride)
     {
         VkVertexInputBindingDescription   binding{};
@@ -690,7 +716,7 @@ namespace {
     // Draw one list of uploaded skeletons. Bones in the SSBO are already
     // world-space (pre-multiplied at upload), so viewProj is pushed as-is.
     // lastPipe/lastMatSet persist across lists (viewport changes between lists
-    // don't disturb pipeline/descriptor bindings — both are dynamic / separate).
+    // don't disturb pipeline/descriptor bindings â€” both are dynamic / separate).
     static void DrawSkinnedList(VkCommandBuffer cmd, const xr_vector<SkelUpload>& list,
                                 const Fmatrix& viewProj, u32& nDraw,
                                 VkPipeline& lastPipe, VkDescriptorSet& lastMatSet, VkDescriptorSet lightSet,
@@ -705,9 +731,14 @@ namespace {
                 if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
 
                 // Collimator/red-dot marks: additive unlit pipeline (R4
-                // hud_reddotsight) instead of the lit opaque one.
+                // hud_reddotsight). Glass panes (kinematics furniture/doors,
+                // OGF "glass" shader / glas\ texture): lit blended, no z-write.
+                // Lightplanes beams: SAME blend states as glass (variant 2),
+                // the fragment picks the R4 model_def_lq formula via bit 64.
                 const bool emissive = child->m_bEmissiveAdd;
-                VkPipeline pipe = GetPipeline(mesh->vStride, emissive);
+                const bool glass    = child->m_bModelGlass;
+                const bool litblend = child->m_bLitBlend;
+                VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : ((glass || litblend) ? 2u : 0u));
                 if (pipe == VK_NULL_HANDLE) continue;
 
                 if (pipe != lastPipe) {
@@ -715,13 +746,13 @@ namespace {
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &s_set, 0, nullptr);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 2, 1, &lightSet, 0, nullptr);  // set2 = env lighting (per-frame)
                     lastPipe = pipe;
-                    lastMatSet = VK_NULL_HANDLE;   // pipeline change disturbs set bindings — rebind material
+                    lastMatSet = VK_NULL_HANDLE;   // pipeline change disturbs set bindings â€” rebind material
                 }
 
                 // Diffuse texture (set 1) from the leaf's WorldMaterial; fall back to default white.
                 WorldMaterial* mat = child->m_pWorldMaterial ? child->m_pWorldMaterial : WorldMaterialCache::GetDefault();
                 VkDescriptorSet matSet = (mat && mat->set != VK_NULL_HANDLE) ? mat->set : VK_NULL_HANDLE;
-                if (matSet == VK_NULL_HANDLE) continue;   // no texture descriptor → can't sample, skip
+                if (matSet == VK_NULL_HANDLE) continue;   // no texture descriptor â†’ can't sample, skip
                 if (matSet != lastMatSet) {
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 1, 1, &matSet, 0, nullptr);
                     lastMatSet = matSet;
@@ -729,9 +760,12 @@ namespace {
 
                 // RenderMode enum -> skinMode: RM_SINGLE(1)/RM_SKINNING_1B(2)->1, 2B(3)->2, 3B(4)->3, 4B(5)->4.
                 // Bit 4 (16) = emissive-add flag for the fragment (unlit output);
-                // the vertex shader masks it off before the skinning switch.
+                // bit 5 (32) = glass (skip the alpha test, cap the blend alpha);
+                // the vertex shader masks them off before the skinning switch.
                 u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
                 if (emissive) skinMode |= 16u;
+                if (glass)    skinMode |= 32u;
+                if (litblend) skinMode |= 64u;   // lightplanes: R4 model_def_lq formula
                 SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, hudMode, u.hemi };
                 vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
@@ -754,6 +788,41 @@ namespace {
         vkCmdSetViewport(cmd, 0, 1, &vp);
     }
 }  // anon namespace
+
+// GLASS refraction, kinematics half: re-draw this frame's glass leaves (cabinet
+// panes etc.) into the ALREADY-BEGUN heat-haze distortion pass with the variant-3
+// pipeline (GPU skinning + procedural wobble). Called by Pass_Particles phase 3;
+// s_uploads (bones incl.) is still this frame's data there. strength rides the
+// SkinPush hemi slot. HUD list excluded (no world positions, never refracts).
+void Skinned_RenderGlassDistort(VkCommandBuffer cmd, const Fmatrix& viewProj, float strength)
+{
+    if (s_uploads.empty() || s_set == VK_NULL_HANDLE) return;
+    VkPipeline lastPipe = VK_NULL_HANDLE;
+    for (const SkelUpload& u : s_uploads)
+    {
+        for (auto* child : u.K->children)
+        {
+            VK_Render_Mesh* mesh = nullptr; u16 rmode = 0;
+            if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+            if (!child->m_bModelGlass) continue;
+            VkPipeline pipe = GetPipeline(mesh->vStride, 3u);
+            if (pipe == VK_NULL_HANDLE) continue;
+            if (pipe != lastPipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &s_set, 0, nullptr);   // set0 = bones
+                lastPipe = pipe;
+            }
+            u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+            SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, 0.0f, strength };
+            vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+            VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
+            VkDeviceSize vbOff = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+            vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
+            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+        }
+    }
+}
 
 void Skinned_UploadBones()
 {
@@ -785,14 +854,14 @@ void Skinned_UploadBones()
             // path, r__dsgraph_build.cpp pV->CalculateBones(TRUE)). With FALSE the
             // shared CKinematics::CalculateBones takes its "slow update" early-out
             // (Device.dwTimeGlobal < UCalc_Time + UCalc_Interval) and leaves bones
-            // STALE for UCalc_Interval ms → visibly jerky animation. The
+            // STALE for UCalc_Interval ms â†’ visibly jerky animation. The
             // dwTimeGlobal==UCalc_Time guard inside still prevents double-advance.
             K->CalculateBones(TRUE);
             const u16 bc = K->LL_BoneCount();
             if (bc == 0) continue;
             if (cursor + bc > limit) break;   // this frame's SSBO region full
 
-            // Store bone·xform (model→WORLD): S*pos in the shaders is then world-
+            // Store boneÂ·xform (modelâ†’WORLD): S*pos in the shaders is then world-
             // space, the main pass pushes plain viewProj, the shadow pass plain
             // lightVP, and normals get the object rotation they previously missed.
             const u32 base = cursor;
@@ -806,7 +875,7 @@ void Skinned_UploadBones()
     uploadList(g_HudVisuals,     s_uploadsHud);
 
     // Record this frame's world-skeleton slots so NEXT frame's MV pass can find the
-    // previous pose (HUD excluded — it never enters the MV pass).
+    // previous pose (HUD excluded â€” it never enters the MV pass).
     for (const SkelUpload& u : s_uploads)
         s_curBoneMap[u.K] = { u.baseBone, (u32)u.boneCount };
 }
@@ -826,6 +895,101 @@ void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet)
         // (thrown bolt/grenade) leave a ground trail in mid-air.
         if (lf != BI_NONE && lf < u.boneCount) { out.push_back(s_boneMapped[u.baseBone + lf].c); if (out.size() >= maxFeet) return; }
         if (rf != BI_NONE && rf < u.boneCount) { out.push_back(s_boneMapped[u.baseBone + rf].c); if (out.size() >= maxFeet) return; }
+    }
+}
+
+// DISCRETE footstep detection: a walking foot alternates SWING (fast in world space)
+// and STANCE (planted, ~zero world velocity). Track each foot across frames and emit
+// ONE event on the transition into stance away from its previous plant â€” separate
+// boot prints per step instead of the dragged trench that per-frame stamping made.
+namespace {
+    struct FootTrack {
+        Fvector lastPos{};      // world pos last frame
+        Fvector lastPlant{};    // where this foot last printed
+        int     settle  = -1;   // frames until the pending print is emitted (-1 = none)
+        bool    planted = false;
+        bool    init    = false;
+        u32     frame   = 0;    // last seen (prune)
+    };
+    xr_map<const void*, FootTrack> s_footTracks;
+}
+
+void Skinned_CollectFootsteps(xr_vector<Footstep>& out, u32 maxSteps)
+{
+    out.clear();
+    if (!s_inited || !s_boneMapped) return;
+    const float dt = (Device.fTimeDelta > 1e-4f) ? Device.fTimeDelta : 1e-4f;
+    constexpr float kPlantSpeed  = 0.45f;   // stance foot is ~stationary in world space (m/s)
+    constexpr float kLiftSpeed   = 0.90f;   // swing foot moves fast -> re-arm for the next plant
+    constexpr float kReplantDist = 0.28f;   // min XZ travel from the previous print (no idle pile-up)
+
+    for (const SkelUpload& u : s_uploads) {
+        if (!u.K) continue;
+        u16 lf = u.K->LL_BoneID("bip01_l_foot"); if (lf == BI_NONE) lf = u.K->LL_BoneID("l_foot");
+        u16 rf = u.K->LL_BoneID("bip01_r_foot"); if (rf == BI_NONE) rf = u.K->LL_BoneID("r_foot");
+        u16 lt = u.K->LL_BoneID("bip01_l_toe0"); if (lt == BI_NONE) lt = u.K->LL_BoneID("l_toe");
+        u16 rt = u.K->LL_BoneID("bip01_r_toe0"); if (rt == BI_NONE) rt = u.K->LL_BoneID("r_toe");
+        Fvector fwd = u.xform.k; fwd.y = 0.f;   // body facing (fallback boot orientation)
+        if (fwd.square_magnitude() > 1e-4f) fwd.normalize(); else fwd.set(0.f, 0.f, 1.f);
+        const u16 feet[2] = { lf, rf };
+        const u16 toes[2] = { lt, rt };
+        for (int s = 0; s < 2; ++s) {
+            const u16 id = feet[s];
+            if (id == BI_NONE || id >= u.boneCount) continue;
+            const Fvector pos = s_boneMapped[u.baseBone + id].c;
+            FootTrack& t = s_footTracks[(const void*)(((uintptr_t)u.K << 1) | (uintptr_t)s)];
+            t.frame = Device.dwFrame;
+            if (!t.init) { t.init = true; t.planted = true; t.lastPos = pos; t.lastPlant = pos; continue; }
+            const float dx = pos.x - t.lastPos.x, dz = pos.z - t.lastPos.z;
+            const float speed = sqrtf(dx * dx + dz * dz) / dt;
+            if (speed > kLiftSpeed) {
+                t.planted = false; t.settle = -1;        // swinging -> armed, cancel any pending print
+            } else if (speed < kPlantSpeed) {
+                if (!t.planted) {
+                    // Heel-strike detected — but the foot is still decelerating/rotating
+                    // down for a few cm. Don't print yet: let it fully SETTLE and stamp
+                    // at the rested position a few frames later.
+                    const float px = pos.x - t.lastPlant.x, pz = pos.z - t.lastPlant.z;
+                    if (px * px + pz * pz > kReplantDist * kReplantDist) t.settle = 3;
+                    t.planted = true;
+                } else if (t.settle > 0) {
+                    --t.settle;
+                } else if (t.settle == 0) {
+                    t.settle = -1;
+                    if (out.size() < maxSteps) {
+                        // The foot bone pivot is the ANKLE — above the boot rear, off the
+                        // sole centre. Centre the print on the actual BOOT via the toe
+                        // bone: sole centre ≈ ankle↔toe midpoint, ankle→toe = this foot's
+                        // TRUE facing (feet splay while walking, not the body's k).
+                        Fvector p = pos; float fx = fwd.x, fz = fwd.z;
+                        const u16 tid = toes[s];
+                        const bool haveToe = (tid != BI_NONE && tid < u.boneCount);
+                        if (haveToe) {
+                            const Fvector toe = s_boneMapped[u.baseBone + tid].c;
+                            const float tx = toe.x - pos.x, tz = toe.z - pos.z;
+                            const float tl = sqrtf(tx * tx + tz * tz);
+                            if (tl > 0.04f) { fx = tx / tl; fz = tz / tl; }
+                            p.x = 0.5f * (pos.x + toe.x); p.z = 0.5f * (pos.z + toe.z);
+                        } else {
+                            p.x += fx * 0.06f; p.z += fz * 0.06f;   // no toe bone: nudge ahead of the ankle
+                        }
+                        static int s_plantLog = 0;   // one-shot diag: is the toe bone actually found?
+                        if (s_plantLog < 6) { ++s_plantLog;
+                            Msg("[VK Steps] plant %s toe=%s ankle=(%.2f,%.2f) print=(%.2f,%.2f) dir=(%.2f,%.2f)",
+                                s ? "R" : "L", haveToe ? "yes" : "NO", pos.x, pos.z, p.x, p.z, fx, fz);
+                        }
+                        out.push_back({ p, fx, fz });
+                        t.lastPlant = pos;
+                    }
+                }
+            }
+            t.lastPos = pos;
+        }
+    }
+    // Prune stale skeletons (despawn / level change) so the map doesn't grow forever.
+    if (s_footTracks.size() > 160) {
+        for (auto it = s_footTracks.begin(); it != s_footTracks.end(); )
+            it = (Device.dwFrame - it->second.frame > 600) ? s_footTracks.erase(it) : ++it;
     }
 }
 
@@ -873,7 +1037,7 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
             VK_Render_Mesh* mesh = nullptr;
             u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
-            if (child->m_bEmissiveAdd) continue;   // collimator marks don't cast shadows
+            if (child->m_bEmissiveAdd || child->m_bModelGlass || child->m_bLitBlend) continue;   // marks/glass don't cast shadows
 
             VkPipeline pipe = GetShadowPipeline(mesh->vStride);
             if (pipe == VK_NULL_HANDLE) continue;
@@ -905,9 +1069,9 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
     if (!s_diag && nDraw) { s_diag = true; Msg("[VK Skinned] first shadow render: skeletons=%zu draws=%u", s_uploads.size(), nDraw); }
 }
 
-// NPCs into the scene depth PREPASS (camera VP): they become GTAO occluders —
+// NPCs into the scene depth PREPASS (camera VP): they become GTAO occluders â€”
 // contact darkening on the ground under characters, like R4 where skinned
-// geometry is in the gbuffer — and the world color pass gets early-Z behind
+// geometry is in the gbuffer â€” and the world color pass gets early-Z behind
 // them. Alpha-tested (a < 0.25, same as skinned.frag) so hair/strap cutouts
 // don't punch holes into the early-Z'd background. HUD never enters (s_uploads
 // only). Caller owns render begin/end and viewport (Pass_World prepass).
@@ -915,7 +1079,7 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
 // G-buffer differ only by which pipeline they bind, picked via `getPipe`).
 static void RenderSkinnedCasters(VkCommandBuffer cmd, const Fmatrix& viewProj, VkPipeline (*getPipe)(u32))
 {
-    // AO is short-range — only NPCs near the camera matter as occluders.
+    // AO is short-range â€” only NPCs near the camera matter as occluders.
     constexpr float kPrepassRange = 60.f;
 
     VkPipeline      lastPipe   = VK_NULL_HANDLE;
@@ -936,7 +1100,7 @@ static void RenderSkinnedCasters(VkCommandBuffer cmd, const Fmatrix& viewProj, V
             VK_Render_Mesh* mesh = nullptr;
             u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
-            if (child->m_bEmissiveAdd) continue;   // collimator marks: blended, no depth
+            if (child->m_bEmissiveAdd || child->m_bModelGlass || child->m_bLitBlend) continue;   // marks/glass: blended, no depth
 
             VkPipeline pipe = getPipe(mesh->vStride);
             if (pipe == VK_NULL_HANDLE) continue;
@@ -952,7 +1116,7 @@ static void RenderSkinnedCasters(VkCommandBuffer cmd, const Fmatrix& viewProj, V
                 boundBones = true;
             }
 
-            // Diffuse (set 1) for the alpha test — default white (a=1) never discards.
+            // Diffuse (set 1) for the alpha test â€” default white (a=1) never discards.
             WorldMaterial* mat = child->m_pWorldMaterial ? child->m_pWorldMaterial : WorldMaterialCache::GetDefault();
             VkDescriptorSet matSet = (mat && mat->set != VK_NULL_HANDLE) ? mat->set : VK_NULL_HANDLE;
             if (matSet == VK_NULL_HANDLE) continue;
@@ -998,7 +1162,7 @@ void Skinned_RenderNormalPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
 // NPC MOTION VECTORS (MV Phase 2a): re-draw the world skinned leaves into the
 // motion target, skinning the CURRENT and PREVIOUS pose so each pixel carries its
 // true screen motion (camera + animation + body travel). Depth-tested against the
-// complete scene depth (LEQUAL, no write) → only visible NPC pixels overwrite the
+// complete scene depth (LEQUAL, no write) â†’ only visible NPC pixels overwrite the
 // camera/static field. Caller owns render begin/end + the negative-height viewport
 // (MotionVec::ExecuteDynamic). HUD excluded. prevVP = last frame's view-proj.
 void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP)
@@ -1016,8 +1180,8 @@ void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatr
     for (const SkelUpload& u : s_uploads)
     {
         // Previous pose: same skeleton last frame. Its SSBO region is still live
-        // (FRAMES_IN_FLIGHT≥2). New skeletons (not seen last frame, or whose bone
-        // count changed) fall back to the current base → camera-only motion.
+        // (FRAMES_IN_FLIGHTâ‰¥2). New skeletons (not seen last frame, or whose bone
+        // count changed) fall back to the current base â†’ camera-only motion.
         u32 prevBase = u.baseBone;
         auto it = s_prevBoneMap.find(u.K);
         if (it != s_prevBoneMap.end() && it->second.second == (u32)u.boneCount)
@@ -1028,7 +1192,7 @@ void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatr
             VK_Render_Mesh* mesh = nullptr;
             u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
-            if (child->m_bEmissiveAdd) continue;   // collimator marks: no depth, skip
+            if (child->m_bEmissiveAdd || child->m_bModelGlass || child->m_bLitBlend) continue;   // marks/glass: no depth, skip
 
             VkPipeline pipe = GetMotionPipeline(mesh->vStride);
             if (pipe == VK_NULL_HANDLE) continue;
@@ -1041,7 +1205,7 @@ void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatr
                 boundBones = true;
             }
 
-            // Diffuse (set 1) for the alpha-test — default white (a=1) never discards.
+            // Diffuse (set 1) for the alpha-test â€” default white (a=1) never discards.
             WorldMaterial* mat = child->m_pWorldMaterial ? child->m_pWorldMaterial : WorldMaterialCache::GetDefault();
             VkDescriptorSet matSet = (mat && mat->set != VK_NULL_HANDLE) ? mat->set : VK_NULL_HANDLE;
             if (matSet == VK_NULL_HANDLE) continue;
@@ -1079,9 +1243,9 @@ bool Skinned_AnyCasterInSphere(const Fvector& pos, float range)
     return false;
 }
 
-// VSM skinned casters — one entry per visible world skinned leaf, for vk_vsm to bin +
+// VSM skinned casters â€” one entry per visible world skinned leaf, for vk_vsm to bin +
 // rasterize into the virtual shadow atlas. Coarse skeleton world sphere per leaf (the
-// binner over-covers slightly, which is harmless — extra pages just clip). HUD excluded.
+// binner over-covers slightly, which is harmless â€” extra pages just clip). HUD excluded.
 void Skinned_CollectCasters(xr_vector<VsmSkinnedCaster>& out)
 {
     if (!Init()) return;
@@ -1092,9 +1256,9 @@ void Skinned_CollectCasters(xr_vector<VsmSkinnedCaster>& out)
         const Fsphere& bs = u.K->vis.sphere;
         Fvector c; u.xform.transform_tiny(c, bs.P);
         const float r = (bs.R > 0.f) ? bs.R : 1.f;
-        // Distant NPCs cast a few-texel shadow → skip the whole skeleton: saves the per-leaf
+        // Distant NPCs cast a few-texel shadow â†’ skip the whole skeleton: saves the per-leaf
         // skinning + VSM binning AND keeps us under kMaxSkinned so NEAR NPCs are never dropped
-        // when a crowd would otherwise overflow the cap. (Collect had NO cull before → it
+        // when a crowd would otherwise overflow the cap. (Collect had NO cull before â†’ it
         // saturated at 256 leaves; log showed only ~40 actually cast.)
         if (npcDist > 0.f) {
             const float rr = npcDist + r;
@@ -1133,7 +1297,7 @@ void Pass_Skinned(FrameContext& ctx)
     if (ctx.cmd == VK_NULL_HANDLE || !ctx.viewProj) return;
     if (!Init()) return;
 
-    // Normally a no-op — Pass_SunShadow already uploaded this frame's bones.
+    // Normally a no-op â€” Pass_SunShadow already uploaded this frame's bones.
     Skinned_UploadBones();
 
     VkCommandBuffer cmd = ctx.cmd;
@@ -1147,12 +1311,12 @@ void Pass_Skinned(FrameContext& ctx)
     if (EnvLight::GetCurrentSet() == VK_NULL_HANDLE) EnvLight::Update(CommandManager.GetCurrentFrame());
     VkDescriptorSet lightSet = EnvLight::GetCurrentSet();
 
-    // World dynamics: bones are world-space → push plain viewProj.
+    // World dynamics: bones are world-space â†’ push plain viewProj.
     DrawSkinnedList(cmd, s_uploads, *ctx.viewProj, nDraw, lastPipe, lastMatSet, lightSet, 0.0f);
 
     // First-person HUD: HUD-FOV projection (camera at origin) + near depth range so
     // hands/weapon render on top of the world. Restore the normal range afterwards.
-    // hudMode=1 → fragment uses flat, sun-direction-independent lighting (view-space bones).
+    // hudMode=1 â†’ fragment uses flat, sun-direction-independent lighting (view-space bones).
     if (!s_uploadsHud.empty()) {
         SetViewportDepth(cmd, ctx.extent, 0.0f, 0.02f);
         DrawSkinnedList(cmd, s_uploadsHud, Device.mFullTransform_hud, nHud, lastPipe, lastMatSet, lightSet, 1.0f);
@@ -1166,9 +1330,11 @@ void Pass_Skinned(FrameContext& ctx)
 
 void Skinned_Destroy()
 {
+    s_footTracks.clear();   // keys are IKinematics* â€” drop before pointers recycle
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     for (auto& kv : s_pipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
     s_pipelines.clear();
+    s_glassDistFS = VK_NULL_HANDLE;   // module owned by g_ShaderManager
     for (auto& kv : s_shadowPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
     s_shadowPipelines.clear();
     for (auto& kv : s_prepassPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
@@ -1186,7 +1352,7 @@ void Skinned_Destroy()
     if (s_layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_layout, nullptr); s_layout = VK_NULL_HANDLE; }
     if (s_pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_setLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }
-    // Set 2 (EnvLight) is owned by vk_env_light.cpp — destroyed separately in DevRender::Destroy.
+    // Set 2 (EnvLight) is owned by vk_env_light.cpp â€” destroyed separately in DevRender::Destroy.
     s_boneSSBO.Destroy();
     s_boneMapped = nullptr;
     s_set = VK_NULL_HANDLE;

@@ -27,7 +27,7 @@ layout(set = 0, binding = 0) uniform sampler2D uPrev;                 // previou
 layout(set = 0, binding = 1, r16f) writeonly uniform image2D uOut;    // new press field (scratch)
 layout(set = 0, binding = 2) uniform Stamps {
     vec4 sPos[64];   // xyz = world pos, w = radius (m)
-    vec4 sPar[64];   // x = press strength (1 foot .. ~0.34 item)
+    vec4 sPar[64];   // x = press strength (1 foot .. ~0.34 item), yz = facing (boot dir; 0,0 = round)
 };
 layout(set = 0, binding = 3) uniform sampler2D uRain;                 // terrain height (rain ortho depth)
 
@@ -101,19 +101,55 @@ void main() {
         float wob = (cNoise(wxz * 2.6) - 0.5) * 0.7
                   + (cNoise(wxz * 6.5) - 0.5) * 0.35
                   + (cNoise(wxz * 1.3 + vec2(3.7, 9.1)) - 0.5) * 0.5;
-        float nd = d / rEff + wob * rough;
-        nd = max(nd, 0.0);
-        if (nd < 1.0) {
-            float bell = 0.5 + 0.5 * cos(3.14159265 * nd);       // 1 centre .. 0 rim
-            dent = max(dent, press * bell);
+
+        vec2 fdir = sPar[i].yz;
+        if (dot(fdir, fdir) > 0.25) {
+            // ---- BOOT print (RDR2-style): an oriented rounded-rect SOLE in the foot
+            // frame with a TREAD (transverse lug bars), a deeper HEEL block and a
+            // shallow ARCH between heel and forefoot. The rounded-rect SDF also drives
+            // the displaced-soil berm right against the sole edge.
+            vec2  fwd  = normalize(fdir);
+            vec2  sideV = vec2(-fwd.y, fwd.x);
+            float u = dot(o, fwd), v = dot(o, sideV);
+            float halfL = rEff * 0.72, halfW = rEff * 0.30;      // ~30x13 cm boot at r=0.22
+            float rc = halfW * 0.7;                              // rounded toe/heel corners
+            vec2  q  = abs(vec2(u, v)) - vec2(halfL, halfW) + rc;
+            float sd = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - rc
+                     + wob * rough * 0.035;                      // ragged sole edge
+            if (sd < 0.0) {
+                float shape = 1.0 - smoothstep(-0.018, 0.0, sd); // sharp-ish wall, soft floor
+                // Tread: lug bars across the sole (deep groove between raised soil strips)
+                float bars = 0.78 + 0.22 * cos(u * 6.2831853 / 0.075);
+                // Heel deeper (weight lands there), arch barely touches.
+                float arch = mix(0.35, 1.0, smoothstep(0.06 * halfL, 0.30 * halfL, abs(u + 0.12 * halfL)));
+                float heel = 1.0 + 0.15 * smoothstep(-0.35 * halfL, -0.75 * halfL, u);
+                dent = max(dent, press * shape * bars * arch * heel);
+            } else {
+                // Berm: soil squeezed out around the sole; bigger ahead of movement.
+                float dirW  = moving ? dot(o / max(d, 1e-4), md) : 0.0;
+                float scale = mix(0.45, 1.4, clamp(dirW * 0.5 + 0.5, 0.0, 1.0)) * mix(1.0, 0.55 + 0.9 * wv, rough);
+                float reach = rEff * 0.38 * (1.0 + 0.5 * max(dirW, 0.0));
+                if (sd < reach) {
+                    float hump = sin(clamp(sd / reach, 0.0, 1.0) * 3.14159265);
+                    berm = min(berm, -hump * bermMax * scale * press);
+                }
+            }
         } else {
-            float dir   = moving ? dot(o / max(d, 1e-4), md) : 0.0;
-            float scale = mix(0.40, 1.5, clamp(dir * 0.5 + 0.5, 0.0, 1.0)) * mix(1.0, 0.55 + 0.9 * wv, rough);
-            float rOutN = 1.22 + 0.55 * max(dir, 0.0);           // berm reach (normalised)
-            if (nd < rOutN) {
-                float t    = (nd - 1.0) / max(rOutN - 1.0, 1e-4);
-                float hump = sin(t * 3.14159265);
-                berm = min(berm, -hump * bermMax * scale * press);
+            // ---- ROUND contact (dropped items / legacy): cosine-bell basin + ring berm.
+            float nd = d / rEff + wob * rough;
+            nd = max(nd, 0.0);
+            if (nd < 1.0) {
+                float bell = 0.5 + 0.5 * cos(3.14159265 * nd);   // 1 centre .. 0 rim
+                dent = max(dent, press * bell);
+            } else {
+                float dirW  = moving ? dot(o / max(d, 1e-4), md) : 0.0;
+                float scale = mix(0.40, 1.5, clamp(dirW * 0.5 + 0.5, 0.0, 1.0)) * mix(1.0, 0.55 + 0.9 * wv, rough);
+                float rOutN = 1.22 + 0.55 * max(dirW, 0.0);      // berm reach (normalised)
+                if (nd < rOutN) {
+                    float t    = (nd - 1.0) / max(rOutN - 1.0, 1e-4);
+                    float hump = sin(t * 3.14159265);
+                    berm = min(berm, -hump * bermMax * scale * press);
+                }
             }
         }
     }

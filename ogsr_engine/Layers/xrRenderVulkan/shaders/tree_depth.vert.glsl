@@ -52,7 +52,7 @@ void main()
     float tc_y  = aUV.y * pc.uvScale;
     worldPos.xyz += ssfxTreeWind(t._p0, worldPos.xyz, H, tc_y, wdir, spd, baseY,
                                  pc.wind_anim.xyz, pc.wsetup_trees.x, pc.wsetup_trees.y,
-                                 pc.wsetup_trees.z, pc.wind_anim.w);
+                                 pc.wsetup_trees.z, pc.wind_anim.w, pc.wind_params.w);
 
     gl_Position = pc.mViewProj * worldPos;
     vUV = aUV * pc.uvScale;

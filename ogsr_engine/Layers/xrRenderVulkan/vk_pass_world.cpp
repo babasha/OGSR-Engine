@@ -77,6 +77,10 @@ void Pass_World(FrameContext& ctx)
 
     VkCommandBuffer cmd = ctx.cmd;
 
+    // New frame: drop last frame's late-glass list (normally consumed by
+    // Pass_WorldGlass; this also covers frames where that pass didn't run).
+    g_RenderQueue.ClearGlass();
+
     // (The shared depth pipelines are baked for D32 — if the driver fell back to
     // another depth format, skip the prepass rather than mismatch formats.)
     const bool prepass = PipelineCache::GetDepthLayout() != VK_NULL_HANDLE
@@ -564,6 +568,26 @@ void Pass_World(FrameContext& ctx)
     VK::Prof::ZoneEnd(cmd, zColor);
     // No exit transition: the image stays in COLOR_ATTACHMENT for the next pass.
     // ExecutePasses inserts the inter-pass barrier; End brings it to PRESENT.
+}
+
+// Late translucent pass: GLASS panes (WorldMaterial::isGlass) accumulated by
+// RenderQueue::Push across the statics/dynamics flushes draw HERE — after the
+// whole opaque world (GPU statics, trees, grass, LODs, sky). They blend without
+// z-write, so drawing them inside the normal flush let everything rendered
+// after them overwrite the blended pixels: level windows looked missing, prop
+// panes opaque. Registered between "Shafts" and "Wallmarks" (CRender_Vulkan).
+void Pass_WorldGlass(FrameContext& ctx)
+{
+    if (ctx.cmd == VK_NULL_HANDLE) return;
+    if (!g_RenderQueue.HasGlass()) return;
+    VkCommandBuffer cmd = ctx.cmd;
+    const int z = VK::Prof::ZoneBegin(cmd, "World/Glass");
+    // LOAD colour+depth, depth test vs the finished opaque scene, no depth write
+    // (the glass pipelines are the wmark variants — no z-write by construction).
+    BeginOverlayRendering(cmd, ctx, VK_ATTACHMENT_STORE_OP_DONT_CARE);
+    g_RenderQueue.FlushGlass(ctx);
+    vkCmdEndRendering(cmd);
+    VK::Prof::ZoneEnd(cmd, z);
 }
 
 }  // namespace VK

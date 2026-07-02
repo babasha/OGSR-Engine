@@ -107,6 +107,33 @@ struct GpuTreeMeta
 static_assert(sizeof(GpuTreeMeta) == 32, "GpuTreeMeta must be 32 B");
 
 // ============================================================================
+// Meshlet cluster (Phase A — per-page VSM meshlet culling, r_vsm_meshlet).
+// One cluster ≈ kMeshletTris triangles of a UNIQUE tree mesh (shared across all
+// instances of that species). center/radius are LOCAL (pre-xform) mesh space —
+// the bin transforms them per instance. first_index/index_count point into the
+// dedicated meshlet index buffer (m_MeshletIndexBuffer), index values still
+// relative to the mesh's vBase so vertexOffset = first_vertex works unchanged.
+// ============================================================================
+struct GpuMeshlet
+{
+    Fvector center;       // 12 B  local mesh-space sphere center
+    float   radius;       //  4 B  local sphere radius
+    u32     first_index;  //  4 B  offset into m_MeshletIndexBuffer
+    u32     index_count;  //  4 B  tris * 3
+    u32     _pad0;        //  4 B
+    u32     _pad1;        //  4 B  std430 (vec3+float+4u = 32 B)
+};
+static_assert(sizeof(GpuMeshlet) == 32, "GpuMeshlet must be 32 B");
+
+// Per-tree meshlet slice into GpuMeshlet[] (instances of one mesh share a slice).
+struct GpuTreeMeshletRange
+{
+    u32 base;    // first meshlet index in m_MeshletBuffer
+    u32 count;   // meshlet count
+};
+static_assert(sizeof(GpuTreeMeshletRange) == 8, "GpuTreeMeshletRange must be 8 B");
+
+// ============================================================================
 // One contiguous (vb, ib, tcOffset, descSetIdx) span in m_TreeMetadataBuffer.
 // CullCompute writes its indirect-cmds into m_TreeIndirectBuffer at offset
 // `groupIndex * m_MaxGroupMeshCount * sizeof(VkDrawIndexedIndirectCommand)`,
@@ -163,12 +190,28 @@ public:
                      const CFrustum* frustum = nullptr,
                      float minDist = 0.0f, float maxDist = 1e9f);
 
-    // VSM caster path (trees are static → temporal-friendly). vk_vsm provides the page
-    // buffers (its own pageTable/pageList + this frame's clipmap UBO). VsmBin runs the
-    // per-tree page binning (compute, before the atlas pass); VsmRender rasterizes the
-    // trees into the bound atlas pages (call INSIDE vk_vsm's RenderAtlas pass).
-    void VsmBin(VkCommandBuffer cmd, VkBuffer pageTable, VkBuffer slotDirty, VkBuffer clipmapUBO);
+    // VSM caster path. vk_vsm provides the page buffers (its own pageTable/pageList +
+    // this frame's clipmap UBO). VsmBin/VsmBinDyn run the per-tree page binning (compute,
+    // before the atlas pass); VsmRender/VsmRenderDyn rasterize the trees into the bound
+    // atlas pages (call INSIDE vk_vsm's RenderAtlas static/dynamic pass respectively).
+    // Near/far wind hybrid: VsmUpdateNearSet refreshes the CPU near set (call BEFORE the
+    // residency dispatch, with this frame's world->light sun view — the near metric is the
+    // LIGHT-SPACE lateral distance to the tree's shadow column, not trunk distance);
+    // VsmPopTransitions hands out boundary-crossing tree spheres for the residency
+    // invalidation circles (≤maxOut per call, rest stay queued).
+    void VsmUpdateNearSet(const Fmatrix& sunView);
+    u32  VsmPopTransitions(Fvector4* out, u32 maxOut);
+    // pageList (slot -> level,page) is finalized by the residency/alloc passes BEFORE the
+    // bin runs; the meshlet-cull stage 2 (r_vsm_meshlet) needs it, so it's threaded through
+    // VsmBin/VsmBinDyn even though the per-tree stage 1 ignores it.
+    // pageMax = shadow-HZB per-static-slot occluder max (r_vsm_hzb); occlusion is applied only in the
+    // STATIC pass (far trees vs cached walls/terrain). VsmBinDyn binds it for layout parity but never culls.
+    void VsmBin(VkCommandBuffer cmd, VkBuffer pageTable, VkBuffer slotDirty, VkBuffer dynUsed, VkBuffer clipmapUBO, VkBuffer pageList, VkBuffer pageMax);
+    // staticPageTable (Option A): lets the DYNAMIC near-tree bin look up the STATIC occluder for each
+    // world page (virtual page -> static slot -> pageMax) → cull near-tree pages hidden behind walls.
+    void VsmBinDyn(VkCommandBuffer cmd, VkBuffer dynPageTable, VkBuffer dynUsed, VkBuffer clipmapUBO, VkBuffer dynPageList, VkBuffer pageMax, VkBuffer staticPageTable);
     void VsmRender(VkCommandBuffer cmd, VkBuffer pageList, VkBuffer clipmapUBO);
+    void VsmRenderDyn(VkCommandBuffer cmd, VkBuffer dynPageList, VkBuffer clipmapUBO);
 
     bool IsBuilt() const { return m_bBuilt; }
     bool IsReady() const;
@@ -184,6 +227,16 @@ private:
 
     void UploadMetadata(const xr_vector<GpuTreeMeta>& meta);
     void UploadTransforms(const xr_vector<GpuTreeInstance>& xforms);
+
+    // Phase A: build per-mesh meshlet clusters for the VSM meshlet-cull path.
+    // GPU-reads back each unique tree mesh's positions + indices (pools carry
+    // TRANSFER_SRC), Morton-slices them into GpuMeshlet clusters, and uploads the
+    // dedicated meshlet IB + GpuMeshlet[] + per-tree range SSBOs. Best-effort:
+    // on any failure the meshlet path just stays unavailable (old path unaffected).
+    // meta is index-aligned with trees (holds the real drawn ib_first/index_count/
+    // first_vertex, incl. the MT_TREE_PM sw[0] window).
+    void BuildMeshlets(const xr_vector<::vkFTreeVisual*>& trees,
+                       const xr_vector<GpuTreeMeta>& meta);
     void CreateIndirectBuffers();
     void CreateTextureDescriptors(const xr_vector<VkImageView>& uniqueViews);
 
@@ -244,23 +297,85 @@ private:
     VkPipeline       m_DepthPipeline28   = VK_NULL_HANDLE;
     xr_vector<GpuTreeMeta> m_MetaCPU;
 
+    // ----- Phase A meshlet clusters (r_vsm_meshlet) — built in Build(), consumed by
+    // the two-stage VSM bin (Phase B). Device-local, owned; freed in Destroy().
+    bool           m_MeshletsReady    = false;
+    u32            m_MeshletTotal     = 0;   // GpuMeshlet[] entries
+    u32            m_MeshletIndexTotal = 0;  // u16 indices in the dedicated meshlet IB
+    CVulkanBuffer* m_MeshletBuffer      = nullptr;   // GpuMeshlet[]        (m_MeshletTotal)
+    CVulkanBuffer* m_MeshletIndexBuffer = nullptr;   // u16 dedicated IB    (m_MeshletIndexTotal)
+    CVulkanBuffer* m_TreeMeshletRangeBuffer = nullptr;   // GpuTreeMeshletRange[] (m_TotalCount)
+
     // ----- VSM caster path (lazy; built on first VsmBin once Session B is up) -----
+    // Near/far WIND HYBRID (r_vsm_tree_wind): NEAR trees (< r_vsm_tree_wind_dist, CPU set
+    // with hysteresis) cast into the DYNAMIC atlas every frame WITH wind → smooth coherent
+    // sway; FAR trees stay in the toroidal STATIC cache, rigid. Boundary crossings emit
+    // invalidation spheres (VsmPopTransitions) that the residency pass turns into dirty
+    // static pages — the rigid shadow is added/removed the same frame (no ghosts).
     void CreateVsmResources();
     void DestroyVsm();
+    // Phase B (r_vsm_meshlet): build the stage-2 meshlet-bin pipeline + meshlet page
+    // pipelines + command/group buffers. Called from CreateVsmResources once meshlets exist.
+    void CreateMeshletVsmResources();
+    // Stage 2 dispatch (mode 0 = static / 1 = dynamic). pageList = slot->page for that atlas.
+    void DispatchMeshletBin(VkCommandBuffer cmd, u32 mode, VkBuffer pageList, VkBuffer clipmapUBO);
+    // Meshlet render for one atlas (mode 0 = static / 1 = dynamic). Reuses set2 (m_Vsm[Dyn]PageSet).
+    void DrawMeshlets(VkCommandBuffer cmd, u32 mode, VkDescriptorSet pageSet, bool wind);
+    bool IsMeshletMode() const;   // r_vsm_meshlet on + resources ready
+
     bool                  m_VsmReady      = false;
-    VkPipeline            m_VsmBinPipe    = VK_NULL_HANDLE;   // vsm_tree_bin.comp (skinned-bin + slotDirty cache filter; STATIC atlas)
+    VkPipeline            m_VsmBinPipe    = VK_NULL_HANDLE;   // vsm_tree_bin.comp (mode 0 = static+dirty filter, mode 1 = dynamic+dynUsed)
     VkPipelineLayout      m_VsmBinLayout  = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_VsmBinSetL    = VK_NULL_HANDLE;
     VkDescriptorPool      m_VsmDescPool   = VK_NULL_HANDLE;
-    VkDescriptorSet       m_VsmBinSet[VK_FRAMES_IN_FLIGHT]  = {};
+    VkDescriptorSet       m_VsmBinSet[VK_FRAMES_IN_FLIGHT]    = {};   // static pass
+    VkDescriptorSet       m_VsmDynBinSet[VK_FRAMES_IN_FLIGHT] = {};   // dynamic pass
     VkDescriptorSetLayout m_VsmPageSetL   = VK_NULL_HANDLE;   // set 2: pageList + casterPages + clipmap UBO
-    VkDescriptorSet       m_VsmPageSet[VK_FRAMES_IN_FLIGHT] = {};
+    VkDescriptorSet       m_VsmPageSet[VK_FRAMES_IN_FLIGHT]    = {};
+    VkDescriptorSet       m_VsmDynPageSet[VK_FRAMES_IN_FLIGHT] = {};
     VkPipelineLayout      m_VsmPageLayout = VK_NULL_HANDLE;
-    VkPipeline            m_VsmPagePipe24 = VK_NULL_HANDLE;
+    VkPipeline            m_VsmPagePipe24 = VK_NULL_HANDLE;      // STATIC atlas variant (rigid)
     VkPipeline            m_VsmPagePipe28 = VK_NULL_HANDLE;
-    CVulkanBuffer* m_VsmCasterPages = nullptr;   // m_TotalCount * kVsmTreeCap u32
-    CVulkanBuffer* m_VsmIndirect    = nullptr;   // m_TotalCount VkDrawIndexedIndirectCommand
+    VkPipeline            m_VsmPageDynPipe24 = VK_NULL_HANDLE;   // DYNAMIC atlas variant (wind)
+    VkPipeline            m_VsmPageDynPipe28 = VK_NULL_HANDLE;
+    CVulkanBuffer* m_VsmCasterPages = nullptr;   // m_TotalCount * kVsmTreeCap u32 (shared: near/far slices disjoint)
+    CVulkanBuffer* m_VsmIndirect    = nullptr;   // m_TotalCount cmds — STATIC pass (near trees carry instanceCount 0)
+    CVulkanBuffer* m_VsmDynIndirect = nullptr;   // m_TotalCount cmds — DYNAMIC pass (far trees carry instanceCount 0)
+
+    // ----- Phase B meshlet-cull path (r_vsm_meshlet). Stage 2 refines the per-tree page
+    // list into per-(meshlet,page) draws pooled into each tree's GROUP command section.
+    bool                  m_MeshletVsmReady = false;
+    VkPipeline            m_MeshletBinPipe   = VK_NULL_HANDLE;   // vsm_tree_meshlet_bin.comp
+    VkPipelineLayout      m_MeshletBinLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_MeshletBinSetL   = VK_NULL_HANDLE;
+    VkDescriptorPool      m_MeshletDescPool  = VK_NULL_HANDLE;
+    VkDescriptorSet       m_MeshletBinSet[VK_FRAMES_IN_FLIGHT]    = {};   // static stage 2
+    VkDescriptorSet       m_MeshletDynBinSet[VK_FRAMES_IN_FLIGHT] = {};   // dynamic stage 2
+    VkPipeline            m_MeshletPagePipe24    = VK_NULL_HANDLE;   // STATIC atlas meshlet VS
+    VkPipeline            m_MeshletPagePipe28    = VK_NULL_HANDLE;
+    VkPipeline            m_MeshletPageDynPipe24 = VK_NULL_HANDLE;   // DYNAMIC atlas meshlet VS
+    VkPipeline            m_MeshletPageDynPipe28 = VK_NULL_HANDLE;
+    CVulkanBuffer* m_VsmMeshletCmd        = nullptr;   // m_TotalCount*kCmdPerTree cmds (STATIC)
+    CVulkanBuffer* m_VsmMeshletCmdDyn     = nullptr;   // m_TotalCount*kCmdPerTree cmds (DYNAMIC)
+    CVulkanBuffer* m_VsmMeshletGroupCount = nullptr;   // per-group append counter / draw count (STATIC)
+    CVulkanBuffer* m_VsmMeshletGroupCountDyn = nullptr;// (DYNAMIC)
+    CVulkanBuffer* m_TreeGroupBuffer      = nullptr;   // u32/tree -> group index
+    CVulkanBuffer* m_GroupInfoBuffer      = nullptr;   // uvec2/group -> (cmdBase, cmdCap)
+    xr_vector<u32> m_MeshletGroupBase;                 // CPU copy for the render (cmd offset per group)
+    xr_vector<u32> m_MeshletGroupCap;                  // CPU copy for the render (maxDrawCount per group)
+    CVulkanBuffer* m_MeshletStats         = nullptr;   // [0]=commands [1]=overflow (both passes accumulate)
+    CVulkanBuffer* m_MeshletStatsRB       = nullptr;
+    u32*           m_MeshletStatsPtr      = nullptr;
+
     CVulkanBuffer* m_VsmStats       = nullptr;
+    CVulkanBuffer* m_VsmStatsRB     = nullptr;   // host readback (r_vsm_debug diagnostics)
+    u32*           m_VsmStatsPtr    = nullptr;
+    CVulkanBuffer* m_VsmNearFlags[VK_FRAMES_IN_FLIGHT] = {};   // host-visible u32/tree: 1 = near (dynamic wind) set
+    void*          m_VsmNearPtr[VK_FRAMES_IN_FLIGHT]   = {};
+    xr_vector<u8>       m_VsmNearCPU;        // current near set (CPU truth, hysteresis)
+    xr_vector<Fvector4> m_VsmPendingInval;   // world spheres of boundary-crossing trees (→ residency)
+    u32            m_VsmNearCount   = 0;     // CPU near-set size this frame (diagnostic)
+    u32            m_VsmLastLog     = 0;
     u32            m_VsmSlot        = 0;          // frame-in-flight ring for the descriptor sets
 };
 

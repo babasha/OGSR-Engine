@@ -12,6 +12,8 @@
 
 #include <algorithm>
 
+extern int ps_r_light_debug;   // r_light_debug — log the collected light set every ~2 s
+
 namespace VK {
 
 namespace {
@@ -86,6 +88,7 @@ const FrameLights& CollectFrame(const Fvector& eye)
     {
         const vkLight* l = c.l;
         const u32 i = s_frame.count++;
+        s_frame.volFlag[i] = l->volumetric ? 1 : 0;
         GpuLight& g = s_frame.gpu[i];
         g.pos[0] = l->pos.x; g.pos[1] = l->pos.y; g.pos[2] = l->pos.z; g.pos[3] = l->range;
         g.color[0] = l->color.r; g.color[1] = l->color.g; g.color[2] = l->color.b;
@@ -118,6 +121,34 @@ const FrameLights& CollectFrame(const Fvector& eye)
     }
     s_frame.spotIdx  = spotBest;
     s_frame.pointIdx = pointBest;
+
+    // r_light_debug 1: dump the whole registry + the collected set every ~2 s.
+    // Diagnoses "a lamp in R4 doesn't light here" — if the light is absent from
+    // the REGISTRY the game never created/activated it (game-side); if it's in
+    // the registry but not collected, look at the cull; if collected, shading-side.
+    if (ps_r_light_debug) {
+        static u32 s_lastLog = 0;
+        if (Device.dwTimeGlobal - s_lastLog > 2000) {
+            s_lastLog = Device.dwTimeGlobal;
+            Msg("[VK Light] registry=%zu collected=%u (eye %.0f,%.0f,%.0f) spotShadow=%d pointShadow=%d",
+                s_registry.size(), s_frame.count, eye.x, eye.y, eye.z, spotBest, pointBest);
+            if (spotBest >= 0)
+                Msg("[VK Light] spot pick: pos=(%.0f,%.0f,%.0f) dir=(%.2f,%.2f,%.2f) range=%.1f cone=%.0f tex=%s",
+                    s_frame.spotPos.x, s_frame.spotPos.y, s_frame.spotPos.z,
+                    s_frame.spotDir.x, s_frame.spotDir.y, s_frame.spotDir.z,
+                    s_frame.spotRange, rad2deg(s_frame.spotCone),
+                    s_frame.spotTexture.c_str() ? s_frame.spotTexture.c_str() : "-");
+            u32 li = 0;
+            for (vkLight* l : s_registry) {
+                const float d = eye.distance_to(l->pos);
+                Msg("[VK Light]  #%u %s%s%s type=%u pos=(%.0f,%.0f,%.0f) d=%.0f range=%.1f cone=%.0f deg dir=(%.2f,%.2f,%.2f) rgb=(%.2f,%.2f,%.2f) tex=%s",
+                    li++, l->active ? "ON " : "off", l->shadow ? "+sh" : "   ", l->volumetric ? "+v" : "  ", l->type,
+                    l->pos.x, l->pos.y, l->pos.z, d, l->range, rad2deg(l->cone),
+                    l->dir.x, l->dir.y, l->dir.z,
+                    l->color.r, l->color.g, l->color.b, l->texture.c_str() ? l->texture.c_str() : "-");
+            }
+        }
+    }
     return s_frame;
 }
 

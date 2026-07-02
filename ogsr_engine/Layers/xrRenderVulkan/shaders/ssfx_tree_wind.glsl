@@ -39,14 +39,21 @@ vec3 ssfxBranches(vec3 pos, float H, float tc_y, vec2 dir, float speed, float ph
 }
 
 // windClass: 2 = foliage (bend + flutter), 1 = trunk (gentle bend only),
-// 0 = rigid. Returns the world-space displacement to add to worldPos.
+// 0 = rigid. crownH (r_wind_tree_crown, wind_params.w in every tree push): height (m)
+// over which the leaf flutter fades in from the tree base — the low trunk/undergrowth
+// stays still; <= 0 = no gate (default). Lives here so ALL passes (forward, cascade
+// caster, VSM page/meshlet) gate identically — a shadow must flutter like its crown.
+// Returns the world-space displacement to add to worldPos.
 vec3 ssfxTreeWind(uint windClass, vec3 worldPos, float H, float tc_y, vec2 dir,
                   float speed, float phase, vec3 anim,
-                  float branchAnimSpeed, float trunkAnimSpeed, float bend, float flutterAmp)
+                  float branchAnimSpeed, float trunkAnimSpeed, float bend, float flutterAmp,
+                  float crownH)
 {
-    if (windClass == 2u)
+    if (windClass == 2u) {
+        if (crownH > 0.0) flutterAmp *= clamp(H / crownH, 0.0, 1.0);
         return ssfxBranches(worldPos, H, tc_y, dir, speed, phase, anim.xy, anim.z,
                             branchAnimSpeed, trunkAnimSpeed, bend, flutterAmp);
+    }
     if (windClass == 1u) {
         vec3 tr = ssfxTrunk(worldPos, H, dir, speed, phase, anim.z, trunkAnimSpeed, bend);
         return vec3(tr.x, 0.0, tr.y);

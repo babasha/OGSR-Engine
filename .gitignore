@@ -10,6 +10,12 @@
 # Build intermediaries (MSBuild ObjectFileName="obj\")
 **/obj/
 
+# Stray nested MSBuild output (xrCore built into a nested _TEMP tree)
+**/_TEMP/
+
+# Codex agent scaffolding (not engine code)
+/.codex/
+
 # Precompiled Headers
 *.ipch
 

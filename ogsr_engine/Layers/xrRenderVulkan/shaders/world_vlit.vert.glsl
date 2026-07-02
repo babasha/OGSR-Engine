@@ -19,6 +19,11 @@ layout(push_constant) uniform PushConstants {
     vec2  uvScale;
     float alphaRef;
     float detailScale;
+    // dynHemi < -0.5 = DYNAMIC visual; model matrix rows follow (see world_lmap.vert).
+    float dynHemi;
+    float dmi0, dmi1, dmi2;   // model row i (X basis, carries uniform scale)
+    float dmj0, dmj1, dmj2;   // model row j (Y basis)
+    float dmc0, dmc1, dmc2;   // model translation
 } pc;
 
 layout(location = 0) out vec2 vUV;
@@ -31,8 +36,19 @@ layout(location = 5) out vec3 vNormal;       // world-space normal (dynamic ligh
 void main()
 {
     gl_Position = pc.mvp * vec4(inPos, 1.0);
-    vWorldPos   = inPos;
-    vNormal     = inNormal.bgr * 2.0 - 1.0;   // D3DCOLOR BGRA -> xyz
+    vec3 pos = inPos;
+    vec3 nrm = inNormal.bgr * 2.0 - 1.0;   // D3DCOLOR BGRA -> xyz
+    // Dynamic props: model -> world for the lighting-space outputs (fog/sun/dyn
+    // lights/wetness read vWorldPos/vNormal). See world_lmap.vert for the full note.
+    if (pc.dynHemi < -0.5) {
+        vec3 mi = vec3(pc.dmi0, pc.dmi1, pc.dmi2);
+        vec3 mj = vec3(pc.dmj0, pc.dmj1, pc.dmj2);
+        vec3 mk = cross(mi, mj) / max(length(mi), 1e-6);
+        pos = pos.x * mi + pos.y * mj + pos.z * mk + vec3(pc.dmc0, pc.dmc1, pc.dmc2);
+        nrm = normalize(nrm.x * mi + nrm.y * mj + nrm.z * mk);
+    }
+    vWorldPos   = pos;
+    vNormal     = nrm;
 
     vec2 uv     = inUV_short + vec2(inTangent.a, inBinormal.a);
     vUV         = uv * pc.uvScale;

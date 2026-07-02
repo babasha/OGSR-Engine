@@ -20,6 +20,10 @@ namespace VK
 {
     void Pass_World(FrameContext& ctx);
 
+    // Late translucent glass flush (see Pass_WorldGlass in vk_pass_world.cpp) —
+    // registered after Sky/Shafts so panes blend over the finished opaque scene.
+    void Pass_WorldGlass(FrameContext& ctx);
+
     // Dynamic (spawned) visuals — NPCs, weapons, items, HUD. CRender::add_Visual
     // pushes {visual, world-xform} here every frame during the object traversal;
     // Pass_World drains them (in the same render pass as the level statics) with a

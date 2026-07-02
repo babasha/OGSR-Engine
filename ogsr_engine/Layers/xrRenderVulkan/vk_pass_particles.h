@@ -48,6 +48,11 @@ namespace ParticlePass {
     // texture name. Returns VK_NULL_HANDLE if the texture can't be loaded.
     VkDescriptorSet  GetTextureSet(const char* texture_name);
 
+    // Like GetTextureSet but returns the raw sprite image view (loading + caching
+    // the texture if needed) — used by the GPU-particle bindless texture array.
+    // VK_NULL_HANDLE if the texture can't be loaded.
+    VkImageView      GetTextureView(const char* texture_name);
+
     // Heat-haze distortion buffer (PBM_DISTORT effects): full-res RGBA8, neutral
     // 0.5, written by Pass_Particles, consumed by the tonemap composite which
     // offsets the scene UVs by (rg - 0.5) * kDistortAmount. Created lazily the

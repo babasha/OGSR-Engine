@@ -31,6 +31,13 @@ namespace VK
     // for snow footprint deformation. Valid after Skinned_UploadBones().
     void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet = 24);
 
+    // DISCRETE footstep events: one entry per foot PLANT (heel-strike), not per frame —
+    // gives separate boot prints instead of a dragged trench. dir = the body's facing
+    // (world XZ) so the print can be boot-shaped/oriented. Valid after Skinned_UploadBones();
+    // call ONCE per frame (it advances per-foot stance state).
+    struct Footstep { Fvector pos; float dirX, dirZ; };
+    void Skinned_CollectFootsteps(xr_vector<Footstep>& out, u32 maxSteps = 48);
+
     // World roots of skeleton-less skinned props/items (thrown/dropped bolts, grenades,
     // debris) — caller gates by ground proximity + prints them SHALLOW.
     void Skinned_CollectProps(xr_vector<Fvector>& out, u32 maxProps = 8);
@@ -63,6 +70,10 @@ namespace VK
     // scene depth. Caller owns render begin/end + the negative-height viewport
     // (VK::MotionVec::ExecuteDynamic). prevVP = previous frame's view-proj.
     void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP);
+
+    // Glass refraction, kinematics half (r_glass_refr): re-draw this frame's glass
+    // leaves into the heat-haze distortion pass (called by Pass_Particles phase 3).
+    void Skinned_RenderGlassDistort(VkCommandBuffer cmd, const Fmatrix& viewProj, float strength);
 
     // --- VSM skinned casters (vk_vsm consumes these to render NPC shadows into the
     // virtual shadow atlas). One entry per visible world skinned leaf this frame.

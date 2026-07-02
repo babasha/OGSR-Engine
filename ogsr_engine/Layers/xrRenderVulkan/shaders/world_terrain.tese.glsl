@@ -13,6 +13,8 @@
 
 layout(triangles, fractional_odd_spacing, ccw) in;
 
+layout(set = 0, binding = 1) uniform sampler2D uMask;   // splat weights: soil softness for the mud carve
+
 layout(location = 0) in vec2 tUV[];
 layout(location = 1) in vec2 tDetailUV[];
 layout(location = 2) in vec2 tLmapUV[];
@@ -52,12 +54,34 @@ void main() {
 
     // Footprint carve (fine detail on top of the coarse snow surface). Faded by
     // distance. Carve ALL verts INCLUDING patch borders: the carve is a pure function
-    // of world XZ and neighbouring patches generate identical shared-edge verts (same
-    // endpoints, same symmetric edge factor, same interpolated normal) -> identical
-    // carve there, so it stays crack-free. Pinning borders flat while the interior
-    // dipped was what produced the sliver SPIKES where a print straddled a patch edge.
+    // of world XZ (mask is macro-res, identical along a shared edge) and neighbouring
+    // patches generate identical shared-edge verts -> crack-free. Pinning borders flat
+    // while the interior dipped was what produced the sliver SPIKES.
     // MESH mode (deform_tex.x>=2): the dense snow mesh owns the dents -> terrain flat.
-    if (L.deform_tex.x < 1.5) {
+    if (L.deform_tex.x > 0.5 && L.deform_tex.x < 1.5) {
+        // Texture path: REAL geometric deformation for snow AND bare-ground mud.
+        float d    = distance(wp, L.eye_pos.xyz);
+        float fade = clamp((SNOW_TESS_FAR - d) / max(SNOW_TESS_FAR - 1.0, 0.01), 0.0, 1.0);
+        float pb   = SnowDeformPressBroad(wp);
+        if (abs(pb) > 1e-3 && fade > 0.0) {
+            float dentP   = max(pb, 0.0);
+            float bermP   = max(-pb, 0.0);
+            float snowCov = clamp(L.sf_params.w, 0.0, 1.0);
+            float snowD   = (snowCov > 0.01 && L.deform_count.w > 0.5) ? L.deform_tex.z : 0.0;
+            // Mud: the SOIL itself is pressed in — depth scales with the splat
+            // softness (earth/grass deep, gravel shallow, asphalt none) and rain
+            // loosens it. Berm boosted: displaced soil piles visibly at the rim.
+            vec4  m  = textureLod(uMask, vUV, 0.0);
+            float ws = dot(m, vec4(1.0));
+            m = (ws > 1e-4) ? (m / ws) : vec4(1.0, 0.0, 0.0, 0.0);
+            float wet  = clamp(L.rain_params.y, 0.0, 1.0);
+            float soft = dot(m, vec4(0.85, 0.0, 1.0, 0.35)) * (1.0 + wet * 0.8);
+            float mudD = (1.0 - snowCov) * soft * (0.12 * L.pom_params7.z) * min(L.pom_params5.z, 2.0);
+            float depthM = max(snowD, mudD);
+            wp += N * ((bermP * 2.4 - dentP) * depthM * fade);
+        }
+    } else if (L.deform_tex.x < 0.5) {
+        // Analytic stamp path (legacy, r_snow_deform_tex 0).
         float d    = distance(wp, L.eye_pos.xyz);
         float fade = clamp((SNOW_TESS_FAR - d) / max(SNOW_TESS_FAR - 1.0, 0.01), 0.0, 1.0);
         wp += N * (SnowFootprintCarve(wp.xz) * fade);

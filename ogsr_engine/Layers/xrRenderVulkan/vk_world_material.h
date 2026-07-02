@@ -65,12 +65,37 @@ struct WorldMaterial
     // wallmark*): geometry coplanar with the surface beneath. Rendered last,
     // alpha-blended, no depth write, negative depth bias (else z-fight).
     bool            isWmark    = false;
+
+    // Translucent glass pane (glas\ textures / "glass" shaders; marked by
+    // alphaRef == -2 at GetOrCreate). Uses the wmark blend pipeline BUT draws
+    // in the LATE glass flush (Pass_WorldGlass) — after the whole opaque world,
+    // else later-drawn geometry behind the pane overwrites the blended pixels.
+    bool            isGlass    = false;
+
+    // Emissive-additive (level `effects\glow` halos, `selflight` model parts;
+    // marked by alphaRef == -3): additive blend, unlit FS output, drawn in the
+    // late flush like glass. The lamp/projector "shining" look in R4.
+    bool            isEmisAdd  = false;
+
+    // Lit-blend (lightplanes beams; alphaRef == -4): R4 model_def_lq — LIT
+    // colour, plain srcalpha blend (the wmark pipeline), alpha = tex.a·fog².
+    bool            isLitBlend = false;
 };
 
 namespace WorldMaterialCache {
 
 bool Init();
 void Destroy();
+
+// Call on level_Load with a per-level tag (the resolved $level$ path). Lightmap
+// names (lmap#01…) REPEAT across levels while the .dds behind them differ, and
+// this cache deliberately survives level changes (persistent visuals hold raw
+// WorldMaterial* — see the level-transition memory) — so lightmap textures and
+// lmap-bearing material keys are namespaced by this tag; without it a level
+// change binds the PREVIOUS level's lightmaps ("baked" light/dark patches that
+// ignore the sun). Materials WITHOUT a lightmap (weapons/NPC/props) stay
+// globally keyed and shared across levels.
+void SetLevelTag(const char* tag);
 
 // Lazy: loads `<diffuse>.dds` (and `<lmap_name>.dds` if non-null) from
 // $game_textures$/$level$ on first call. Returns the cache's default

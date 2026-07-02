@@ -41,12 +41,69 @@ void RenderQueue::Push(const DrawItem& item)
 {
     DrawItem it = item;
     it.hemi = m_SubmitHemi;   // stamp the current submit-hemi (1.0 for statics)
-    m_Items.push_back(it);
+    // Glass panes defer to the LATE translucent flush (Pass_WorldGlass): they
+    // blend without z-write, so drawing them in the normal flush let everything
+    // rendered after (GPU-world statics, trees, grass, sky) overwrite the
+    // blended pixels — glass looked missing or opaque.
+    (it.lateGlass ? m_GlassItems : m_Items).push_back(it);
 }
 
 void RenderQueue::Clear()
 {
     m_Items.clear();
+    // m_GlassItems intentionally NOT cleared: Clear() runs mid-frame (between the
+    // statics and dynamics flushes) while glass accumulates for the late pass.
+}
+
+void RenderQueue::ClearGlass()
+{
+    m_GlassItems.clear();
+}
+
+void RenderQueue::FlushGlass(FrameContext& ctx)
+{
+    if (m_GlassItems.empty()) return;
+    // The CPU world walk double-submits hierarchy children (~3.7×, see
+    // DedupExclude) — glass diverts at Push time and so skipped that dedup.
+    // For OPAQUE that's just redundant draws; for BLENDED glass it's STACKED
+    // alpha (three 0.6 blends ≈ 0.94 = the pane reads opaque). One per visual.
+    {
+        std::unordered_set<const void*> seen;
+        seen.reserve(m_GlassItems.size());
+        xr_vector<DrawItem> out;
+        out.reserve(m_GlassItems.size());
+        for (const DrawItem& it : m_GlassItems)
+            if (seen.insert(it.vis).second) out.push_back(it);
+        m_GlassItems.swap(out);
+    }
+    static u32 s_lastLog = 0;
+    if (Device.dwTimeGlobal - s_lastLog > 3000) {
+        s_lastLog = Device.dwTimeGlobal;
+        string1024 names{ "" };
+        u32 shown = 0;
+        for (const DrawItem& gi : m_GlassItems) {
+            if (shown >= 6) break;
+            if (gi.vis && gi.vis->dbg_name.c_str()) {
+                xr_strcat(names, gi.vis->dbg_name.c_str());
+                xr_strcat(names, "; ");
+                ++shown;
+            }
+        }
+        Msg("[VK Glass] late flush: %zu panes [%s]", m_GlassItems.size(), names);
+    }
+    // Reuse the whole Flush machinery on the glass list: swap it in, sort
+    // (groups by pipeline/material), draw, drop the drawn items, restore
+    // whatever stale list m_Items held (it was already flushed this frame).
+    std::swap(m_Items, m_GlassItems);
+    SortByKey();
+    const bool tess = m_AllowTess;
+    m_AllowTess = false;   // glass dynamics carry model xforms — never tessellate
+    Flush(ctx);
+    m_AllowTess = tess;
+    // The (deduped, sorted) glass list is KEPT: the particles pass re-draws it
+    // into the distortion RT for the refraction (r_glass_refr); ClearGlass at
+    // the next frame's Pass_World start owns the cleanup.
+    std::swap(m_Items, m_GlassItems);
 }
 
 void RenderQueue::DedupExclude(bool (*inGpuSet)(vkRender_Visual*))
@@ -159,6 +216,7 @@ void RenderQueue::Flush(FrameContext& ctx)
             k.fs        = lmap ? PipelineCache::WorldLmapFS() : PipelineCache::WorldVlitFS();
             k.depthTest = true;
             k.wmark     = mat && mat->isWmark;   // baked decal: blend + bias + no z-write
+            k.emis      = mat && mat->isEmisAdd; // glow/selflight: ADDITIVE + unlit (aref -3)
             // Heightmap tessellation: only for opted-in materials (bump# in
             // the .thm) whose bounds reach inside the tess range — beyond
             // tessFar the factors would all be 1, so a flat pipeline is free.
@@ -202,10 +260,24 @@ void RenderQueue::Flush(FrameContext& ctx)
         // Per-item MVP (push-constant offset 0). Dynamic visuals carry their own
         // world matrix in it.xform; level statics submit identity, giving
         // mvp == *viewProj. Push only when the xform changes.
+        const bool dynXform = 0 != memcmp(&it.xform, &Fidentity, sizeof(Fmatrix));
         if (ctx.viewProj && (!haveXform || 0 != memcmp(&it.xform, &lastXform, sizeof(Fmatrix)))) {
             Fmatrix mvp;
             mvp.mul(*ctx.viewProj, it.xform);   // = it.xform · viewProj (model->clip)
             vkCmdPushConstants(cmd, layout, kStages, 0, sizeof(Fmatrix), &mvp);
+            // Dynamic visuals also hand the VS the model rows (i, j, c; k = i×j in
+            // the shader) so vWorldPos/vNormal leave in WORLD space — without this,
+            // fog/cascade-shadow/dyn-lights/wetness read MODEL coords (props "glowed"
+            // with the level-origin fog and rotated ones were sun-lit from the wrong
+            // side). Written into the tess push region: the dynamics flush never
+            // tessellates (SetAllowTess(false)) and statics never read it (their
+            // dynHemi tail float stays >= 0, see the encode below).
+            if (dynXform) {
+                const float rows[9] = { it.xform.i.x, it.xform.i.y, it.xform.i.z,
+                                        it.xform.j.x, it.xform.j.y, it.xform.j.z,
+                                        it.xform.c.x, it.xform.c.y, it.xform.c.z };
+                vkCmdPushConstants(cmd, layout, kStages, kTessOffset, sizeof(rows), rows);
+            }
             lastXform = it.xform;
             haveXform = true;
         }
@@ -226,16 +298,19 @@ void RenderQueue::Flush(FrameContext& ctx)
             ++nMatBind;
         }
         // Per-material/-item tail at offset 72: { alphaRef, detailScale, dynHemi }.
-        // dynHemi gates the sky ambient per object (1.0 = statics/open sky).
+        // dynHemi gates the sky ambient per object (1.0 = statics/open sky). For
+        // dynamic (non-identity xform) items it is sign-ENCODED as -(1+hemi): the
+        // negative flags "model rows follow" to the VS; the frag decodes -x-1.
         const float aref        = mat ? mat->alphaRef    : -1.0f;
         const float detailScale = mat ? mat->detailScale :  0.0f;
-        if (aref != lastAref || detailScale != lastDetailScale || it.hemi != lastHemi) {
+        const float hemiEnc     = dynXform ? -(1.0f + it.hemi) : it.hemi;
+        if (aref != lastAref || detailScale != lastDetailScale || hemiEnc != lastHemi) {
             constexpr u32 kTailOffset = sizeof(Fmatrix) + 2 * sizeof(float);
-            float tail[3] = { aref, detailScale, it.hemi };
+            float tail[3] = { aref, detailScale, hemiEnc };
             vkCmdPushConstants(cmd, layout, kStages, kTailOffset, sizeof(tail), tail);
             lastAref        = aref;
             lastDetailScale = detailScale;
-            lastHemi        = it.hemi;
+            lastHemi        = hemiEnc;
             ++nTailPush;
         }
 
@@ -288,6 +363,7 @@ void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool s
     VkPipeline      lastPipe   = VK_NULL_HANDLE;
     VkPipelineLayout lastLayout = VK_NULL_HANDLE;
     VkDescriptorSet lastMatSet = VK_NULL_HANDLE;
+    VkDescriptorSet lastTerrSet0 = VK_NULL_HANDLE;   // terrain material set 0 (uMask read by the TES mud carve)
     float           lastAref   = -999.f;
     VkBuffer    lastVB   = VK_NULL_HANDLE;
     VkBuffer    lastIB   = VK_NULL_HANDLE;
@@ -311,16 +387,24 @@ void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool s
         // SnowDisplace -> the prepass depth matches the color -> no z-fight/see-
         // through). Needs the EnvLight set at set 1 (sf_params.w). Only when asked
         // (prepass); shadows/rain pass displaceTerrain=false (undisplaced is fine).
-        if (displaceTerrain && mat && mat->isTerrain) {
+        if (displaceTerrain && mat && mat->isTerrain && mat->terrainSet != VK_NULL_HANDLE) {
             VkPipeline       tpipe = PipelineCache::GetTerrainDepthPipeline();
             VkPipelineLayout tlay  = PipelineCache::GetTerrainLayout();
             VkDescriptorSet  eset  = EnvLight::GetCurrentSet();
             if (tpipe == VK_NULL_HANDLE || tlay == VK_NULL_HANDLE || eset == VK_NULL_HANDLE) continue;
-            if (tlay != lastLayout) { lastLayout = tlay; lastMatSet = VK_NULL_HANDLE; lastAref = -999.f; haveXform = false; }
+            if (tlay != lastLayout) { lastLayout = tlay; lastMatSet = VK_NULL_HANDLE; lastTerrSet0 = VK_NULL_HANDLE; lastAref = -999.f; haveXform = false; }
             if (tpipe != lastPipe)  { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tpipe); lastPipe = tpipe; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE; }
             if (eset != lastMatSet) { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tlay, 1, 1, &eset, 0, nullptr); lastMatSet = eset; }   // set 1 = EnvLight
+            // Set 0 = terrain material: the tessellation eval samples uMask (soil
+            // softness for the mud carve) — unbound set 0 here was a device-lost.
+            if (mat->terrainSet != lastTerrSet0) { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tlay, 0, 1, &mat->terrainSet, 0, nullptr); lastTerrSet0 = mat->terrainSet; }
             struct TPush { Fmatrix mvp; float uv[2]; float aref; float ds; } tp{};
             tp.mvp.mul(lightVP, it.xform);   // terrain xform = identity -> = lightVP (matches color's pc.mvp)
+            // uvScale MUST match the color pass (1/1024 statics quant): the TES samples
+            // uMask at vUV for the mud carve — zero uvScale carved a DIFFERENT surface
+            // in the prepass -> z-fight (flickering black triangles along the trail).
+            tp.uv[0] = tp.uv[1] = 1.0f / 1024.0f;
+            tp.ds = mat->detailScale;
             vkCmdPushConstants(cmd, tlay, PipelineCache::GetPushStages(), 0, sizeof(TPush), &tp);
             VkBuffer vbT = fv->m_mesh.p_rm_Vertices->GetHandle();
             if (vbT != lastVB) { VkDeviceSize o = 0; vkCmdBindVertexBuffers(cmd, 0, 1, &vbT, &o); lastVB = vbT; }

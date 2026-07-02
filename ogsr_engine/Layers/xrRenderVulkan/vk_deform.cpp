@@ -29,7 +29,7 @@ namespace VK { namespace Deform {
 namespace {
     bool          s_inited = false, s_failed = false, s_first = true;
     constexpr u32   kSize = 2048;     // 2048² R16F (~8 MB each) — sharp prints
-    constexpr float kHalf = 40.f;     // ±40 m around the camera (~3.9 cm/texel)
+    constexpr float kHalf = 28.f;     // ±28 m around the camera (~2.7 cm/texel — enough for boot TREAD bars)
     constexpr float kEyeUp = 100.f;
     constexpr float kZNear = 1.f;
     constexpr float kZFar  = 350.f;
@@ -127,7 +127,11 @@ namespace {
         cp.extent = { kSize, kSize, 1 };
         vkCmdCopyImage(cmd, s_scratch.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
         barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                    | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
+                    | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT     // TCS press-gates the mud tess
+                    | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,                  // snow mesh VS samples it
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         barrier(cmd, s_scratch.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
@@ -292,7 +296,9 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
         su->sPos[i][2] = stamps[i].pos.z;
         su->sPos[i][3] = stamps[i].radius;
         su->sPar[i][0] = stamps[i].pressDepth;
-        su->sPar[i][1] = su->sPar[i][2] = su->sPar[i][3] = 0.f;
+        su->sPar[i][1] = stamps[i].dirX;      // boot facing (0,0 = round item contact)
+        su->sPar[i][2] = stamps[i].dirZ;
+        su->sPar[i][3] = 0.f;
     }
 
     PushConstants pc{};
