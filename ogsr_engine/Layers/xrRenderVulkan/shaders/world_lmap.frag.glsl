@@ -278,19 +278,9 @@ void main()
     // just a faint sky sheen; dirt streaks (a≈1) show the lit texture. The R4
     // "glassiness" IS the reflection, not a milky opacity cap.
     float outA = base.a;
-    if (pc.alphaRef < -3.5) {
-        // LIGHTPLANES light beams (R4 model_def_lq VERBATIM): light·base·2 with
-        // the SIMPLE model light (calc_model_lq_lighting: ambient + hemi·max(N.y,0)
-        // + sun·N·L) — NOT the full `lighting`: its VSM shadow / GTAO terms are
-        // screen-space samples of the geometry BEHIND this no-z-write blend and
-        // painted the beam planes as patchy matte sheets. No detail tex (the grey
-        // fallback halved base), no angle fade — the soft beam IS the texture.
-        vec3 lq = L.ambient.rgb + L.hemi_color.rgb * max(geomN.y, 0.0)
-                + L.sun_color.rgb * max(dot(geomN, normalize(-L.sun_dir.xyz)), 0.0);
-        col  = mix(base.rgb * 2.0 * lq, L.fog_color.rgb, fog);
-        outA = base.a * (1.0 - fog) * (1.0 - fog);
-    }
-    else if (pc.alphaRef < -1.5) {
+    // (aref -4 lit-blend lightplanes sheets are never drawn — the render queue
+    // drops them; Pass_LightCones draws real volumetric beams instead.)
+    if (pc.alphaRef < -1.5) {
         // GLASS — R4 base (env reflection + texture alpha) upgraded past R4:
         //  * r_glass_opacity (pom_params5.y) ceiling — mod DDS sanity clamp;
         //  * FRESNEL (Schlick): head-on the pane is at its most transparent,

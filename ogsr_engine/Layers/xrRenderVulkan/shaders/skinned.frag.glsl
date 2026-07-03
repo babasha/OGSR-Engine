@@ -305,10 +305,8 @@ void main()
     // GLASS pane (skinMode bit 32 — kinematics furniture/door panes, blended
     // pipeline): keep the lit shading but skip the cutout test (semi-transparent
     // glass texels would all be discarded) and cap the blend alpha at the end.
-    // Bit 64 = LIGHTPLANES beams (same blended pipeline, R4 model_def_lq formula).
     bool isGlass = (pc.skinMode & 32u) != 0u;
-    bool isLB    = (pc.skinMode & 64u) != 0u;
-    if (!isGlass && !isLB && base.a < 0.25)   // alpha-tested skinned parts (straps, hair, foliage)
+    if (!isGlass && base.a < 0.25)   // alpha-tested skinned parts (straps, hair, foliage)
         discard;
 
     // r_ssao_debug 1: NPCs draw the raw AO map too (never the HUD hands).
@@ -400,19 +398,9 @@ void main()
     // GLASS pane (kinematics furniture/doors/vehicle windows, NPC glasses) —
     // R4 model_env_lq.ps: colour = light × lerp(ENV REFLECTION, texture, a),
     // blend alpha = the texture's own alpha. Clean glass ≈ invisible + sheen.
-    // LIGHTPLANES beams (R4 model_def_lq verbatim): lit colour, srcalpha blend
-    // rides the pipeline, alpha = texture alpha (fog² fade below).
-    if (isLB) {
-        // R4 model_def_lq: light·base·2 with the SIMPLE model light (ambient +
-        // hemi·max(N.y,0) + raw sun N·L) — the body `light` carries VSM shadow /
-        // background GTAO and painted the beam planes as matte sheets. Also
-        // restores R4's ×2 (was missing here entirely).
-        vec3 lq = L.ambient.rgb + L.hemi_color.rgb * max(N.y, 0.0)
-                + L.sun_color.rgb * max(dot(N, toSun), 0.0);
-        col  = base.rgb * 2.0 * lq;
-        outA = base.a;
-    }
-    else if (isGlass) {
+    // (Lit-blend lightplanes leaves are never drawn — Pass_LightCones replaces
+    // them with real volumetric beams; DrawSkinnedList skips the draw.)
+    if (isGlass) {
         // GLASS: R4 base + fresnel + sun glint — see world_lmap.frag for the note.
         float aG   = min(base.a, L.pom_params5.y);
         vec3  V    = normalize(v_wpos - L.eye_pos.xyz);
@@ -437,7 +425,7 @@ void main()
     if (pc.hudMode < 0.5) {
         float fog = clamp(length(v_wpos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
         col = mix(col, L.fog_color.rgb, fog);
-        if (isGlass || isLB) outA *= (1.0 - fog) * (1.0 - fog);   // R4: alpha fades with fog²
+        if (isGlass) outA *= (1.0 - fog) * (1.0 - fog);   // R4: alpha fades with fog²
     }
 
     o_color = vec4(col, outA);

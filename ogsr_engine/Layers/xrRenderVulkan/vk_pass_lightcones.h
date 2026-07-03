@@ -13,8 +13,9 @@
 // the light's real position/direction/cone/range/colour. Runs right after
 // Pass_SunShafts (same depth-sampled additive-fullscreen shape).
 //
-// cvars: r_light_cones (master), r_light_cone_density, r_light_cone_len
-// (beam length = range × this), r_lightplanes (1 = also draw the old planes).
+// cvars: r_light_cones (master, 2 = marched-cone debug), r_light_cone_density,
+// r_light_cone_len (beam length = range × this), r_light_cone_soft (penumbra),
+// + the r_light_cone_synth family for lightplanes-derived beams.
 #pragma once
 #include "vk_pass_context.h"
 
@@ -27,8 +28,8 @@ namespace VK {
     // Frame registry of lightplanes carriers (car headlights, searchlights…)
     // whose beam cone was synthesized from the fan geometry (vkSynthBeam).
     // RenderQueue::Push submits every lit-blend item here; Pass_LightCones
-    // raymarches these next to the real volumetric spots — the carriers keep
-    // a beam even with the fake sheets hidden (r_lightplanes 0).
+    // raymarches these next to the real volumetric spots — the fake sheets
+    // themselves are never drawn, the synthesized beam replaces them.
     namespace SynthCones {
         void Submit(const vkRender_Visual* vis, const Fmatrix& xform);
         // Explicit OFF: the carrier is drawn but the beam's bone is hidden

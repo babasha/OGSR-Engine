@@ -31,7 +31,7 @@ extern float ps_r_light_cone_density;   // in-scatter strength
 extern float ps_r_light_cone_len;       // beam length = light range × this
 extern float ps_r_light_cone_glare;     // looking-into-the-beam flare boost
 extern float ps_r_light_cone_narrow;    // visible-beam angle as a share of the lit cone
-extern int   ps_r_light_cone_flipy;     // diagnostic: mirror the ray basis vertically
+extern int   ps_r_light_debug;          // r_light_debug — gates the cone triage log below
 extern float ps_r_light_cone_lum;       // beam luminance in HDR units (day visibility)
 extern int   ps_r_light_cone_synth;     // beams synthesized from lightplanes geometry
 extern float ps_r_light_cone_lift;      // vertical apex lift for synthesized beams (m)
@@ -354,7 +354,7 @@ void Pass_LightCones(FrameContext& ctx)
     // lamp but nothing on screen = the GPU side (vUV/ray/depth binding);
     // "miss" while aiming straight at it = the ray basis itself is wrong.
     static u32 s_lastLog = 0;
-    if (Device.dwTimeGlobal - s_lastLog > 3000) {
+    if (ps_r_light_debug && Device.dwTimeGlobal - s_lastLog > 3000) {
         s_lastLog = Device.dwTimeGlobal;
         const Fvector camDir = Device.vCameraDirection;
         Msg("[VK Cones] basis: pt.dir=(%.2f,%.2f,%.2f) camDir=(%.2f,%.2f,%.2f) dot=%.3f tan=(%.2f,%.2f) p33=%.4f p43=%.4f",
@@ -435,10 +435,7 @@ void Pass_LightCones(FrameContext& ctx)
     push.camDir[0] = pt.dir.x; push.camDir[1] = pt.dir.y; push.camDir[2] = pt.dir.z; push.camDir[3] = pt.p43;
     push.camRightT[0] = pt.right.x * pt.tanX; push.camRightT[1] = pt.right.y * pt.tanX; push.camRightT[2] = pt.right.z * pt.tanX;
     push.camRightT[3] = ps_r_light_cone_density;
-    // flipy diagnostic: negating the top vector mirrors the per-pixel rays
-    // vertically — equivalent to flipping the shader's ndc.y sign, no SPIRV edit.
-    const float topSign = ps_r_light_cone_flipy ? -pt.tanY : pt.tanY;
-    push.camTopT[0] = pt.top.x * topSign; push.camTopT[1] = pt.top.y * topSign; push.camTopT[2] = pt.top.z * topSign;
+    push.camTopT[0] = pt.top.x * pt.tanY; push.camTopT[1] = pt.top.y * pt.tanY; push.camTopT[2] = pt.top.z * pt.tanY;
     push.camTopT[3] = ps_r_light_cone_glare;
 
     for (u32 i = 0; i < nCones; ++i) {

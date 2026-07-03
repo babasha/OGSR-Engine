@@ -12,7 +12,9 @@
 // clipped to the cone's bounding sphere (early discard for pixels that miss)
 // and to the scene depth, then N jittered steps accumulate a radial+axial
 // falloff density. Forward-scattering glare boosts the beam when looking into
-// the light. No per-step shadowing in v1 — scene depth clips the beam at walls.
+// the light. The budget-owning beam is also cut per step by the spot+grass
+// shadow map (fences / crowns / grass carve the visible cone), with a
+// golden-angle disc jitter as an area-light penumbra (r_light_cone_soft).
 
 layout(location = 0) in  vec2 vUV;
 layout(location = 0) out vec4 outColor;
@@ -152,7 +154,7 @@ void main()
     // false-colour the MARCHED cone itself, boosted and depth-clamped — a
     // bright solid cone must sit exactly on the lamp/headlight. Nothing shown
     // at a listed light = the march/geometry side; right shape wrong place =
-    // ray-basis side (try r_light_cone_flipy 1).
+    // ray-basis side (compare against the r_light_debug centre-ray self-test).
     if (pc.lightCol.w >= 99.5) {
         const vec3 dbgCol[8] = vec3[8](
             vec3(1,0,0), vec3(0,1,0), vec3(0.2,0.4,1), vec3(1,1,0),

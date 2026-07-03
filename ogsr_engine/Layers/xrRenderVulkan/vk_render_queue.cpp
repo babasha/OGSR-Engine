@@ -21,7 +21,7 @@
 
 // Console cvar at GLOBAL scope (block-scope extern inside namespace VK can
 // mangle as VK::* → LNK2001, see vk_pass_skinned.cpp).
-extern int ps_r_lightplanes;   // 1 = draw the old R4 lightplanes fake sheets
+extern int ps_r_light_debug;   // r_light_debug — gates the glass-flush triage log
 
 namespace VK {
 
@@ -47,8 +47,8 @@ void RenderQueue::Push(const DrawItem& item)
     DrawItem it = item;
     it.hemi = m_SubmitHemi;   // stamp the current submit-hemi (1.0 for statics)
     // Lightplanes carriers register their synthesized beam for Pass_LightCones
-    // every frame (the xform tracks moving carriers). The cone draws whether or
-    // not the fake sheets themselves do (r_lightplanes).
+    // every frame (the xform tracks moving carriers). The fake sheets themselves
+    // are never drawn — the cone replaces them (see FlushGlass).
     if (it.lateGlass && it.vis && it.vis->m_SynthBeams.count
         && it.vis->m_pWorldMaterial && it.vis->m_pWorldMaterial->isLitBlend)
         SynthCones::Submit(it.vis, it.xform);
@@ -79,21 +79,21 @@ void RenderQueue::FlushGlass(FrameContext& ctx)
     // For OPAQUE that's just redundant draws; for BLENDED glass it's STACKED
     // alpha (three 0.6 blends ≈ 0.94 = the pane reads opaque). One per visual.
     {
-        // r_lightplanes 0 (default): drop the R4 lightplanes texture-sheet beams —
+        // Lightplanes texture-sheet beams (lit-blend) are never drawn —
         // Pass_LightCones draws the REAL volumetric cone from the light instead.
         std::unordered_set<const void*> seen;
         seen.reserve(m_GlassItems.size());
         xr_vector<DrawItem> out;
         out.reserve(m_GlassItems.size());
         for (const DrawItem& it : m_GlassItems) {
-            if (!ps_r_lightplanes && it.vis && it.vis->m_pWorldMaterial && it.vis->m_pWorldMaterial->isLitBlend)
+            if (it.vis && it.vis->m_pWorldMaterial && it.vis->m_pWorldMaterial->isLitBlend)
                 continue;
             if (seen.insert(it.vis).second) out.push_back(it);
         }
         m_GlassItems.swap(out);
     }
     static u32 s_lastLog = 0;
-    if (Device.dwTimeGlobal - s_lastLog > 3000) {
+    if (ps_r_light_debug && Device.dwTimeGlobal - s_lastLog > 3000) {
         s_lastLog = Device.dwTimeGlobal;
         string1024 names{ "" };
         u32 shown = 0;

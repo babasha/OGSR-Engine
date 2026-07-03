@@ -150,8 +150,8 @@ namespace VK {
 // ============================================================================
 // Synthesized light beams, derived from a `models\lightplanes` leaf's geometry
 // at load (MODEL space). R4 bakes fake beam-plane fans into carrier models
-// (car headlights, searchlights, halogen lamps) with NO dynamic light —
-// hiding the fans (r_lightplanes 0) left those carriers beam-less. Each fan is
+// (car headlights, searchlights, halogen lamps) with NO dynamic light — we
+// never draw the fans, so without synthesis the carriers were beam-less. Each fan is
 // elongated along the beam and widens away from the lamp, so PCA recovers a
 // real cone (apex/dir/len/half-angle) that Pass_LightCones raymarches like a
 // genuine volumetric spot. A leaf often holds SEVERAL fans (both headlights in
@@ -257,7 +257,7 @@ public:
     bool                m_bLitBlend = false;
 
     // Cones synthesized from the lightplanes fan geometry (see vkSynthBeams) —
-    // give the carrier REAL volumetric beams with r_lightplanes 0.
+    // the fans are never drawn; these REAL volumetric beams replace them.
     vkSynthBeams        m_SynthBeams;
 
     // Debug name

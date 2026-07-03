@@ -37,7 +37,6 @@
 // Console cvar at GLOBAL scope â€” a block-scope extern inside namespace VK would mangle as
 // VK::ps_r_vsm_npc_dist -> LNK2001 (same trick as vk_pass_shadow's externs).
 extern float ps_r_vsm_npc_dist;   // VSM NPC shadow cull distance (m); 0 = no cull
-extern int   ps_r_lightplanes;    // 1 = draw the old R4 lightplanes fake sheets (cones replace them)
 
 namespace VK {
 
@@ -735,8 +734,8 @@ namespace {
                 // Collimator/red-dot marks: additive unlit pipeline (R4
                 // hud_reddotsight). Glass panes (kinematics furniture/doors,
                 // OGF "glass" shader / glas\ texture): lit blended, no z-write.
-                // Lightplanes beams: SAME blend states as glass (variant 2),
-                // the fragment picks the R4 model_def_lq formula via bit 64.
+                // Lightplanes leaves are never drawn — they only register their
+                // synthesized beam (Pass_LightCones draws the real cone).
                 const bool emissive = child->m_bEmissiveAdd;
                 const bool glass    = child->m_bModelGlass;
                 const bool litblend = child->m_bLitBlend;
@@ -765,11 +764,11 @@ namespace {
                         if (visible) SynthCones::Submit(child, xf);
                         else         SynthCones::Revoke(child);   // torch off — kill the beam now
                     }
-                    // r_lightplanes 0 (default): the fake sheets themselves are
-                    // replaced by the volumetric cone — skip drawing them.
-                    if (!ps_r_lightplanes) continue;
+                    // The fake sheets themselves are never drawn — Pass_LightCones
+                    // draws the REAL volumetric cone from the synthesized light.
+                    continue;
                 }
-                VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : ((glass || litblend) ? 2u : 0u));
+                VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : (glass ? 2u : 0u));
                 if (pipe == VK_NULL_HANDLE) continue;
 
                 if (pipe != lastPipe) {
@@ -796,7 +795,6 @@ namespace {
                 u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
                 if (emissive) skinMode |= 16u;
                 if (glass)    skinMode |= 32u;
-                if (litblend) skinMode |= 64u;   // lightplanes: R4 model_def_lq formula
                 SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, hudMode, u.hemi };
                 vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
