@@ -76,6 +76,13 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
     float inv = inversesqrt(max(dot(T, T), dot(B, B)));
     T *= inv; B *= inv;
 
+    // r_pom_height = WORLD metres → this material's UV units via the UV→world
+    // Jacobian; stretched cliff/rock UVs no longer explode into metre-deep
+    // "spike" shreds (see world_lmap.frag for the full note).
+    float uvArea = abs(du1.x * du2.y - du1.y * du2.x);
+    float wPerUV = sqrt(length(cross(dp1, dp2)) / max(uvArea, 1e-12));
+    amp = min(amp / max(wPerUV, 1e-3), 0.035);
+
     vec3 V   = normalize(L.eye_pos.xyz - wp);
     vec3 Vts = vec3(dot(V, T), dot(V, B), dot(V, N));
     vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.3)) * amp;
@@ -147,6 +154,16 @@ void main()
     vec4 base   = texture(uTexDiffuse, pUV);
     if (pc.alphaRef >= 0.0 && base.a < pc.alphaRef) discard;
 
+    // EMISSIVE-ADDITIVE (aref == -3 ONLY: glow halos / selflight) — unlit
+    // additive + angle fade, see world_lmap.frag. Lightplanes = aref -4, below.
+    if (pc.alphaRef < -2.5 && pc.alphaRef > -3.5) {
+        vec3  Vv   = normalize(L.eye_pos.xyz - vWorldPos);
+        float face = abs(dot(normalize(vNormal), Vv));
+        float w    = face * face;
+        outColor = vec4(base.rgb * 2.0 * w, base.a * w);
+        return;
+    }
+
     // r_ssao_debug 1: show the raw AO map.
     if (L.ao_params.w > 0.5) {
         outColor = vec4(vec3(textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r), base.a);
@@ -211,7 +228,9 @@ void main()
     // (occlusion for static vlit geometry). Small floor keeps open outdoor vlit lit.
     float bakeOcc = clamp(dot(vBakedColor, vec3(0.299, 0.587, 0.114)) * 2.5, 0.15, 1.0);
     vec3  occ      = coloredAO(gtaoVis(), albedo) * pomAO * ssilBoost();   // GTAO x POM AO x SSIL bounce (ambient only)
-    float dynHemiL = pc.dynHemi;
+    // dynHemi < -0.5 = dynamic visual (sign = "model xform follows" flag for the VS);
+    // real ray-traced sky visibility is -dynHemi-1.
+    float dynHemiL = (pc.dynHemi < -0.5) ? (-pc.dynHemi - 1.0) : pc.dynHemi;
     if (L.pom_params3.y > 0.5) { occ = vec3(1.0); dynHemiL = 1.0; bakeOcc = 1.0; }   // r_ao_flat debug
     vec3 lighting = vBakedColor * 1.5
                   + L.sun_color.rgb  * sunMask
@@ -227,5 +246,37 @@ void main()
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 
-    outColor = vec4(col, base.a);
+    // GLASS (alphaRef == -2, late blended pass) — R4 model_env_lq formula:
+    // lerp(env reflection, texture, texture.a), blend alpha = texture alpha × fog².
+    // See world_lmap.frag for the full note.
+    float outA = base.a;
+    if (pc.alphaRef < -3.5) {
+        // LIGHTPLANES light beams (R4 model_def_lq): light·base·2 with the simple
+        // model light, NOT the full `lighting` — see world_lmap.frag for why.
+        vec3 lq = L.ambient.rgb + L.hemi_color.rgb * max(geomN.y, 0.0)
+                + L.sun_color.rgb * max(dot(geomN, normalize(-L.sun_dir.xyz)), 0.0);
+        col  = mix(base.rgb * 2.0 * lq, L.fog_color.rgb, fog);
+        outA = base.a * (1.0 - fog) * (1.0 - fog);
+    }
+    else if (pc.alphaRef < -1.5) {
+        // GLASS: R4 base + fresnel + sun glint — see world_lmap.frag for the note.
+        float aG   = min(base.a, L.pom_params5.y);
+        vec3  V    = normalize(vWorldPos - L.eye_pos.xyz);
+        vec3  Rv   = reflect(V, geomN);
+        float NoV  = clamp(dot(geomN, -V), 0.0, 1.0);
+        float fres = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+        float xf   = clamp(L.sky_params.x, 0.0, 1.0);
+        vec3  env  = textureLod(uSky0, Rv, 1.0).rgb;
+        if (xf > 0.01) env = mix(env, textureLod(uSky1, Rv, 1.0).rgb, xf);
+        vec3 glint   = L.sun_color.rgb * (pow(max(dot(Rv, normalize(-L.sun_dir.xyz)), 0.0), 128.0) * 2.0 * sunMask);
+        // Reflection modulated by the LOCAL lighting; fresnel coverage weighted by
+        // reflection brightness (no dark "tint" film indoors) — see world_lmap.frag.
+        vec3 reflCol = env * lighting * (0.5 + fres) + glint;
+        float fCov = fres * clamp(dot(reflCol, vec3(0.6)), 0.0, 1.0);
+        float aOut = clamp(aG + fCov * (1.0 - aG), 1e-4, 1.0);
+        vec3  gcol = (albedo * lighting * aG + reflCol * fCov * (1.0 - aG)) / aOut;
+        col  = mix(gcol, L.fog_color.rgb, fog);
+        outA = aOut * (1.0 - fog) * (1.0 - fog);
+    }
+    outColor = vec4(col, outA);
 }

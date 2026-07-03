@@ -65,14 +65,15 @@ layout(set = 1, binding = 0) uniform Lighting {
 } L;
 layout(set = 1, binding = 9)  uniform sampler2D uRainMap; // top-down rain occlusion
 layout(set = 1, binding = 11) uniform sampler2D uWater;   // water depth (flow sim, metres)
+layout(set = 1, binding = 14) uniform sampler2D uVsmMask; // VSM screen mask (B = dyn-atlas occlusion, r_vsm_debug_dyn overlay)
 
 layout(push_constant) uniform PC {
     vec4 p0;   // x=whitePoint, y=topMipLOD, z=middleGray, w=lowLum
     vec4 p1;   // x=expMin, y=expMax, z=expComp, w=bloomIntensity
     vec4 p2;   // x=cdlSlope, y=cdlSaturation, z=invGamma, w=distortAmount (0 = off)
-    vec4 p3;   // xyz=cdlPower (2*(1-cg)), w=unused
+    vec4 p3;   // xyz=cdlPower (2*(1-cg)), w=r_dither (output-dither amplitude in 8-bit LSBs, 0=off)
     vec4 p4;   // x=vol mode (0 off / 1 composite / 2 debug), y=near, z=far, w=log2(far/near)
-    vec4 p5;   // SSIL: x=strength, y=debug (show only bounce), z=enable (0 = skip)
+    vec4 p5;   // SSIL: x=strength, y=debug (show only bounce), z=enable (0 = skip); w = VSM dyn-shadow debug (r_vsm_debug_dyn: red overlay)
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -320,6 +321,33 @@ void main()
 
     // 5. Gamma (img_corrections).
     c = pow(max(c, vec3(0.0)), vec3(pc.p2.z));
+
+    // ---- VSM dyn-shadow debug (r_vsm_debug_dyn): pixels shadowed by the DYNAMIC
+    // atlas (NPC/grass casters) tint RED. mask.B is written raw by vsm_resolve,
+    // UNGATED by r_vsm_dyn_gate — it shows the dyn atlas's actual content, so
+    // "red blob under the NPC" = casters render+bin fine (any shadow loss is the
+    // resolve gate), "no red at all" = casters never reach the dyn atlas.
+    if (pc.p5.w > 0.5) {
+        float dyn = textureLod(uVsmMask, uv, 0.0).b;
+        c = mix(c, vec3(1.0, 0.03, 0.03), 0.7 * clamp(dyn, 0.0, 1.0));
+    }
+
+    // 6. Output dither (r_dither). The swapchain is 8-bit UNORM, so any SLOW
+    // gradient — AO-modulated ambient on flat asphalt, sky-ambient on distant
+    // slopes, dusk sky — quantizes into visible contour STRIPES ("полосы"). The
+    // AO-side data is smooth (offline-verified, _parked/gtao_band_repro.js); the
+    // bands are born HERE, at the 8-bit write. This is why every geometric AO
+    // bias was a no-op while forcing AO to a CONSTANT (grazing fade, strength 0,
+    // debug 4) "fixed" them: a constant has no gradient to contour. TPDF dither
+    // (difference of two decorrelated IGNs → triangular ±1 LSB) linearizes the
+    // quantizer: steps become imperceptible per-pixel grain, mean is unchanged.
+    // Monochrome (same offset per channel) to avoid chroma noise. Static pattern
+    // — no temporal shimmer, and it must NOT depend on scene state.
+    if (pc.p3.w > 0.0) {
+        float dA = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float dB = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 23.14069, vec2(0.06711056, 0.00583715))));
+        c += vec3((dA - dB) * (pc.p3.w / 255.0));
+    }
 
     outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }

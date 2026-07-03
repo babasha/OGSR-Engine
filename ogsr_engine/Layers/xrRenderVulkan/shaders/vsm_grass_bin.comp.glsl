@@ -17,6 +17,7 @@ layout(set = 0, binding = 2) uniform VsmParams { mat4 view; vec4 level[VSM_LEVEL
 layout(set = 0, binding = 3) readonly buffer PageTable { uint pageTable[]; };
 layout(set = 0, binding = 4) buffer GrassSlot { uint grassSlot[]; };               // global instance idx -> slot / UNMAPPED
 layout(set = 0, binding = 5) buffer Stats     { uint stats[]; };                   // [0]=casting instances
+layout(set = 0, binding = 6) buffer DynUsed   { uint dynUsed[]; };                 // dyn slot -> 1 if any dynamic caster binned into it (the resolve skips untouched dyn pages)
 
 layout(push_constant) uniform Push {
     uint sectionSize;   // per-type stride in VisibleSSBO (instances)
@@ -46,5 +47,5 @@ void main()
     ivec2 page = ivec2(floor(t * float(VSM_PAGES_AXIS)));
     uint slot = pageTable[vsmPageIndex(0, page)];
     grassSlot[g] = slot;                            // UNMAPPED → VS culls
-    if (slot != VSM_UNMAPPED) atomicAdd(stats[0], 1u);
+    if (slot != VSM_UNMAPPED) { atomicOr(dynUsed[slot], 1u); atomicAdd(stats[0], 1u); }
 }

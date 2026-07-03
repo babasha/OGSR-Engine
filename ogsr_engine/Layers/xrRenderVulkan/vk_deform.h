@@ -17,7 +17,9 @@
 namespace VK { namespace Deform {
 
 // One foot/contact stamp this frame (world space). pressDepth 0..1 = how hard.
-struct Stamp { Fvector pos; float radius; float pressDepth; };
+// dirX/dirZ = facing (world XZ, normalized) -> BOOT-shaped oriented print with a
+// tread pattern; (0,0) = round contact (dropped items).
+struct Stamp { Fvector pos; float radius; float pressDepth; float dirX, dirZ; };
 
 bool Init();        // idempotent; lazily created on first Dispatch
 void Destroy();

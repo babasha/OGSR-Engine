@@ -83,6 +83,17 @@ vec2 parallaxUV(vec2 uv, vec3 N, vec3 wp, out vec3 outN, out float outShadow, ou
     float inv = inversesqrt(max(dot(T, T), dot(B, B)));
     T *= inv; B *= inv;
 
+    // r_pom_height is WORLD metres, converted to THIS material's UV units via
+    // the UV→world Jacobian (sqrt of world-area per UV-area). A fixed UV
+    // amplitude looked right on densely-mapped brick but on cliffs/rocks —
+    // whose UVs stretch metres per texel — the same 0.02 UV meant METRE-deep
+    // relief: the march shredded them into "spikes". World-normalized depth
+    // keeps walls as tuned and collapses on stretched mappings by itself.
+    // The cap bounds tiny-density UVs (decal-scale) to the old-look ballpark.
+    float uvArea = abs(du1.x * du2.y - du1.y * du2.x);
+    float wPerUV = sqrt(length(cross(dp1, dp2)) / max(uvArea, 1e-12));
+    amp = min(amp / max(wPerUV, 1e-3), 0.035);
+
     vec3 V   = normalize(L.eye_pos.xyz - wp);
     vec3 Vts = vec3(dot(V, T), dot(V, B), dot(V, N));
     vec2 Pmax = (Vts.xy / max(abs(Vts.z), 0.3)) * amp;   // total UV shift at full depth
@@ -163,6 +174,17 @@ void main()
     vec4 base   = texture(uTexDiffuse, pUV);
     if (pc.alphaRef >= 0.0 && base.a < pc.alphaRef) discard;
 
+    // EMISSIVE-ADDITIVE (aref == -3 ONLY: effects\glow halos, selflight): unlit
+    // texture ADDS over the scene; lighting/fog don't apply. ANGLE FADE for the
+    // crossed halo quads (edge-on quad → 0). Lightplanes are aref -4, below.
+    if (pc.alphaRef < -2.5 && pc.alphaRef > -3.5) {
+        vec3  Vv   = normalize(L.eye_pos.xyz - vWorldPos);
+        float face = abs(dot(normalize(vNormal), Vv));
+        float w    = face * face;
+        outColor = vec4(base.rgb * 2.0 * w, base.a * w);
+        return;
+    }
+
     // r_ssao_debug 1: show the raw AO map.
     if (L.ao_params.w > 0.5) {
         outColor = vec4(vec3(textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r), base.a);
@@ -233,7 +255,9 @@ void main()
     // Hemisphere sky fill (R4 hmodel) replaces the flat hemi term.
     vec3  occ      = coloredAO(gtaoVis(), albedo) * pomAO * ssilBoost();   // GTAO x POM AO x SSIL bounce (ambient only)
     float hemiOccL = hemiOcc;
-    float dynHemiL = pc.dynHemi;
+    // dynHemi < -0.5 = dynamic visual (sign carries the "model xform follows" flag
+    // for the VS); the real ray-traced sky visibility is -dynHemi-1.
+    float dynHemiL = (pc.dynHemi < -0.5) ? (-pc.dynHemi - 1.0) : pc.dynHemi;
     if (L.pom_params3.y > 0.5) { occ = vec3(1.0); hemiOccL = 1.0; dynHemiL = 1.0; }   // r_ao_flat debug
     vec3 lighting = skyAmbient(gtaoBentN(geomN)) * (hemiOccL * L.sky_params.y * dynHemiL) * occ
                   + L.sun_color.rgb  * sunMask
@@ -248,5 +272,50 @@ void main()
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 
-    outColor = vec4(col, base.a);
+    // GLASS (alphaRef == -2, late blended pass) — R4 model_env_lq.ps verbatim:
+    // colour = light × lerp(ENV REFLECTION, texture, texture.a), BLEND alpha =
+    // the texture's own alpha × fog². Clean glass (a≈0) is nearly invisible —
+    // just a faint sky sheen; dirt streaks (a≈1) show the lit texture. The R4
+    // "glassiness" IS the reflection, not a milky opacity cap.
+    float outA = base.a;
+    if (pc.alphaRef < -3.5) {
+        // LIGHTPLANES light beams (R4 model_def_lq VERBATIM): light·base·2 with
+        // the SIMPLE model light (calc_model_lq_lighting: ambient + hemi·max(N.y,0)
+        // + sun·N·L) — NOT the full `lighting`: its VSM shadow / GTAO terms are
+        // screen-space samples of the geometry BEHIND this no-z-write blend and
+        // painted the beam planes as patchy matte sheets. No detail tex (the grey
+        // fallback halved base), no angle fade — the soft beam IS the texture.
+        vec3 lq = L.ambient.rgb + L.hemi_color.rgb * max(geomN.y, 0.0)
+                + L.sun_color.rgb * max(dot(geomN, normalize(-L.sun_dir.xyz)), 0.0);
+        col  = mix(base.rgb * 2.0 * lq, L.fog_color.rgb, fog);
+        outA = base.a * (1.0 - fog) * (1.0 - fog);
+    }
+    else if (pc.alphaRef < -1.5) {
+        // GLASS — R4 base (env reflection + texture alpha) upgraded past R4:
+        //  * r_glass_opacity (pom_params5.y) ceiling — mod DDS sanity clamp;
+        //  * FRESNEL (Schlick): head-on the pane is at its most transparent,
+        //    grazing angles turn it into a mirror (coverage AND reflection rise);
+        //  * SUN GLINT: mirror flash of the sun in the pane, shadow-gated.
+        float aG   = min(base.a, L.pom_params5.y);
+        vec3  V    = normalize(vWorldPos - L.eye_pos.xyz);
+        vec3  Rv   = reflect(V, geomN);
+        float NoV  = clamp(dot(geomN, -V), 0.0, 1.0);
+        float fres = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+        float xf   = clamp(L.sky_params.x, 0.0, 1.0);
+        vec3  env  = textureLod(uSky0, Rv, 1.0).rgb;
+        if (xf > 0.01) env = mix(env, textureLod(uSky1, Rv, 1.0).rgb, xf);
+        vec3 glint   = L.sun_color.rgb * (pow(max(dot(Rv, normalize(-L.sun_dir.xyz)), 0.0), 128.0) * 2.0 * sunMask);
+        // Reflection is modulated by the LOCAL lighting (R4: light*base*2) — a pane
+        // in a dark room reflects dimly; skipping this washed indoor panes WHITE.
+        vec3 reflCol = env * lighting * (0.5 + fres) + glint;
+        // The fresnel term only ADDS coverage when the reflection is actually
+        // BRIGHT — a dark indoor reflection must not lay a dark film over the
+        // pane (read as "tinted glass"). Composite dirt + reflection weights.
+        float fCov = fres * clamp(dot(reflCol, vec3(0.6)), 0.0, 1.0);
+        float aOut = clamp(aG + fCov * (1.0 - aG), 1e-4, 1.0);
+        vec3  gcol = (albedo * lighting * aG + reflCol * fCov * (1.0 - aG)) / aOut;
+        col  = mix(gcol, L.fog_color.rgb, fog);
+        outA = aOut * (1.0 - fog) * (1.0 - fog);
+    }
+    outColor = vec4(col, outA);
 }

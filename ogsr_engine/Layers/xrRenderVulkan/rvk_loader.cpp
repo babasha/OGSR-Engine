@@ -27,6 +27,8 @@
 #include "vk_LODManager.h"      // VK::CLODManager (LOD imposters)
 #include "vk_shadow_gpu.h"      // VK::ShadowGPU (GPU-driven sun shadow casters)
 #include "vk_world_gpu.h"       // VK::WorldGPU (GPU-driven world forward pass)
+#include "vk_vsm.h"             // VK::VSM::InvalidateCache (world-anchored page cache vs level change)
+#include "vk_world_material.h"  // VK::WorldMaterialCache::SetLevelTag (per-level lightmap namespacing)
 #include "HW_Vulkan.h"          // VulkanHW (vkDeviceWaitIdle in level_Unload)
 #include "vk_command_buffer.h"  // CommandManager.FlushUploadsAndWait (drain async uploads)
 
@@ -50,6 +52,16 @@ void CRender::level_Load(IReader* fs)
 
     Msg("[Vulkan] CRender::level_Load() started");
     pApp->LoadBegin();
+
+    // Namespace the material cache's lightmap keys by THIS level ($level$ is
+    // already mounted here): lmap names repeat across levels, and the cache
+    // survives level changes — without the tag the new level binds the previous
+    // level's lightmaps ("baked" light/dark patches that ignore the sun).
+    {
+        string_path lp;
+        FS.update_path(lp, "$level$", "");
+        VK::WorldMaterialCache::SetLevelTag(lp);
+    }
 
     IReader* chunk;
 
@@ -227,6 +239,12 @@ void CRender::level_Unload()
     VK::ShadowGPU::Destroy();
     VK::WorldGPU::Destroy();
 
+    // VSM's toroidal page cache is WORLD-anchored — the next level reuses the
+    // same coordinates, so resident pages would keep serving THIS level's depth
+    // (stale light/dark page squares on the new level's walls). Mark it empty;
+    // the first frame re-renders the atlas from the new casters.
+    VK::VSM::InvalidateCache();
+
     if (LODs) {
         LODs->Destroy();
         xr_delete(LODs);
@@ -292,7 +310,8 @@ void CRender::LoadBuffers(CStreamReader* base_fs, BOOL _alternative)
             fs->r(pData, vCount * vSize);
 
             VkBufferUsageFlags vbUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // CTreeManager meshlet readback (positions)
             _VB[i] = xr_new<VK::CVulkanBuffer>();
             _VB[i]->Create(vCount * vSize, vbUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
             _VB[i]->Upload(pData, vCount * vSize);
@@ -324,7 +343,8 @@ void CRender::LoadBuffers(CStreamReader* base_fs, BOOL _alternative)
             fs->r(pData, iSize);
 
             VkBufferUsageFlags ibUsage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // CTreeManager meshlet readback (indices)
             _IB[i] = xr_new<VK::CVulkanBuffer>();
             _IB[i]->Create(iSize, ibUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
             _IB[i]->Upload(pData, iSize);

@@ -541,7 +541,7 @@ void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrai
         // world_terrain.vert as color -> matching displacement -> no z-fight). Set 1
         // = EnvLight (sf_params.w). Only in the prepass (displaceTerrain); shadows
         // pass false. Terrain groups sort first (group key isTerrain?0:1).
-        if (displaceTerrain && mat->isTerrain) {
+        if (displaceTerrain && mat->isTerrain && mat->terrainSet != VK_NULL_HANDLE) {
             VkPipeline       tpipe = PipelineCache::GetTerrainDepthPipeline();
             VkPipelineLayout tlay  = PipelineCache::GetTerrainLayout();
             VkDescriptorSet  eset  = EnvLight::GetCurrentSet();
@@ -549,7 +549,14 @@ void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrai
             if (tlay != lastLayout) { lastLayout = tlay; lastMatSet = VK_NULL_HANDLE; lastPipe = VK_NULL_HANDLE; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE; }
             if (tpipe != lastPipe)  { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tpipe); lastPipe = tpipe; lastVB = VK_NULL_HANDLE; lastIB = VK_NULL_HANDLE; }
             if (eset != lastMatSet) { vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tlay, 1, 1, &eset, 0, nullptr); lastMatSet = eset; }   // set 1 = EnvLight
+            // Set 0 = terrain material: the tessellation eval samples uMask (soil
+            // softness for the mud carve) — unbound set 0 here was a device-lost.
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tlay, 0, 1, &mat->terrainSet, 0, nullptr);
             struct TPush { Fmatrix mvp; float uv[2]; float aref; float ds; } tp{}; tp.mvp = vp;
+            // uvScale must match the color pass (1/1024): the TES samples uMask at vUV
+            // for the mud carve — zero uvScale = different carve = prepass z-fight.
+            tp.uv[0] = tp.uv[1] = 1.0f / 1024.0f;
+            tp.ds = mat->detailScale;
             vkCmdPushConstants(cmd, tlay, PipelineCache::GetPushStages(), 0, sizeof(TPush), &tp);
             if (grp.vb != lastVB) { VkDeviceSize z = 0; vkCmdBindVertexBuffers(cmd, 0, 1, &grp.vb, &z); lastVB = grp.vb; }
             if (grp.ib != lastIB || grp.iType != lastIType) { vkCmdBindIndexBuffer(cmd, grp.ib, 0, grp.iType); lastIB = grp.ib; lastIType = grp.iType; }

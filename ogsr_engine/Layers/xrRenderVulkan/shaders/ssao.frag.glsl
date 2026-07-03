@@ -20,7 +20,7 @@
 // gathered in the SAME horizon march (the occluder that raises the horizon is the
 // surface that bounces light at us) from the PREVIOUS frame's lit colour — there
 // is no lit colour in the prepass, and prev-frame is the temporal foundation.
-layout(location = 0) out vec4 outAO;   // r = AO visibility, gba = world-space bent normal *0.5+0.5
+layout(location = 0) out vec4 outAO;   // r = AO visibility (target is R16F — gba dropped with the retired bent normal)
 layout(location = 1) out vec4 outIL;   // rgb = indirect radiance (HDR, pre-exposure), a = 1
 
 layout(set = 0, binding = 0) uniform sampler2D uDepth;     // full-res scene depth (D32, prepass)
@@ -52,11 +52,20 @@ float fast_acos(float v)
 }
 
 // Camera-relative world position + view depth from the scene depth at uv.
+// The reconstruction ray is built at the CENTER of the full-res depth texel the
+// NEAREST sampler picks — not at the query uv. The prepass rasterized that depth
+// at the texel center, so center-ray × depth lands exactly ON the surface; a
+// query-uv ray would slide the point off it by the sub-texel mismatch, a snap-
+// phase staircase on grazing ground that ends up as STRIPES in the reconstructed
+// normal → in the AO of partially occluded areas (the fully-open integral is
+// horizon-saturated and hides N noise, which is why open floors stayed clean).
 vec4 fetchPos(vec2 uv)
 {
-    float zndc  = texture(uDepth, uv).r;
+    vec2 fs = vec2(textureSize(uDepth, 0));
+    vec2 tc = (clamp(floor(uv * fs), vec2(0.0), fs - 1.0) + 0.5) / fs;   // CLAMP_TO_EDGE-consistent
+    float zndc  = texture(uDepth, tc).r;
     float zview = clamp(pc.zp.y / (zndc - pc.zp.x), 0.0, 10000.0);
-    vec2  ndc   = vec2(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y);   // D3D ndc (y up)
+    vec2  ndc   = vec2(tc.x * 2.0 - 1.0, 1.0 - 2.0 * tc.y);   // D3D ndc (y up)
     vec3  ray   = pc.camDir.xyz + pc.camRightT.xyz * ndc.x + pc.camTopT.xyz * ndc.y;
     return vec4(ray * zview, zview);
 }
@@ -98,7 +107,7 @@ void main()
     // there are the 4-slice visibility integral amplifying a quantization-banded
     // normal (a flat floor's TRUE normal is constant, so any N variation = noise).
     // Costs a touch of N sharpness at small features — fine at half-res.
-    const float NB = 2.0;
+    const float NB = 3.0;   // wider baseline shrinks the RELATIVE depth quantization in the smooth-case N
     vec4 R = fetchPos(uv + vec2(NB * pc.res.z, 0.0));
     vec4 L = fetchPos(uv - vec2(NB * pc.res.z, 0.0));
     vec4 U = fetchPos(uv + vec2(0.0, NB * pc.res.w));
@@ -164,6 +173,8 @@ void main()
     ivec2 ip = ivec2(gl_FragCoord.xy);
     // IGN (interleaved-gradient-noise) magic constants, named to this build's
     // provenance (mirror of ogsr::sig) — identical values, just author-bound.
+    // (An R2 low-discrepancy alternative was A/B'd 2026-07-01: no visible
+    // difference — IGN is also the pattern the 3×3 blur cancels best. Keep IGN.)
     const float IGN_MARIA    = 52.9829189;
     const vec2  IGN_BLUMENAU = vec2(0.06711056, 0.00583715);
     float noiseOffset    = fract(IGN_MARIA * fract(dot(vec2(ip) + 5.588238, IGN_BLUMENAU)));
@@ -182,7 +193,6 @@ void main()
     float pi_by_slices  = PI / float(SLICES);
 
     float visibility = 0.0;
-    vec3  bentNormal = vec3(0.0);
 
     // SSIL: accumulate the colour of horizon-raising occluders (the surfaces that
     // actually bounce light at this pixel), read from the PREVIOUS frame's lit
@@ -208,7 +218,6 @@ void main()
         float n     = sgnN * fast_acos(cosN);
         float sinN2 = 2.0 * sin(n);
 
-        float hSide[2];
         for (int side = 0; side < 2; ++side)
         {
             float sideSign = -1.0 + 2.0 * float(side);
@@ -246,19 +255,7 @@ void main()
             }
 
             float h = n + clamp(sideSign * fast_acos(cHorizonCos) - n, -PI * 0.5, PI * 0.5);
-            hSide[side] = h;
             visibility += projNormalLength * (cosN + h * sinN2 - cos(2.0 * h - n)) * 0.25;
-        }
-
-        // Bent normal (Jimenez 2016): the unoccluded-arc bisector in this slice's
-        // plane (view dir + in-slice tangent), weighted like the visibility term.
-        // Fully open → bentAngle = n → reconstructs the projected normal; occluded
-        // on one side → tilts toward the open side. Summed over slices = world bentN.
-        float bentAngle = (hSide[0] + hSide[1]) * 0.5;
-        float tl = length(orthoDirectionV);
-        if (tl > 1e-4) {
-            vec3 sliceTan = orthoDirectionV / tl;
-            bentNormal += (cos(bentAngle) * viewV + sin(bentAngle) * sliceTan) * projNormalLength;
         }
     }
 
@@ -277,8 +274,10 @@ void main()
     float grazeFade = smoothstep(pc.camDir.w, pc.camDir.w + 0.25, ndv);
     aoOut = mix(1.0, aoOut, grazeFade);
 
-    vec3  bn    = (dot(bentNormal, bentNormal) > 1e-6) ? normalize(bentNormal) : N;
-    outAO = vec4(aoOut, bn * 0.5 + 0.5);
+    // No bent normal anymore: it was retired (env_common gtaoBentN → geomN, see
+    // the полосы saga) and the target is R16F now — dropping its per-slice
+    // arc-bisector math and the RGBA payload is the free perf half of that call.
+    outAO = vec4(aoOut, 0.0, 0.0, 0.0);
 
     // IL = weighted AVERAGE of the occluders' colour (the light bouncing toward
     // this pixel). No occlusion gate here — gating by (1-AO) concentrated the

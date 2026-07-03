@@ -973,6 +973,31 @@ struct CCC_SetCmdEnabled : public IConsole_Command
     }
 };
 
+// Force-run a console command IGNORING its bEnabled flag. cmd_enable only flips the
+// flag, which the mod re-clears every tick/level-load, so `cmd_enable jump_to_level`
+// races and loses. This forwards to ExecuteCommand(..., allow_disabled=true) so the
+// inner command runs regardless: `cmd_force jump_to_level l10_radar`.
+struct CCC_CmdForce : public IConsole_Command
+{
+    CCC_CmdForce(LPCSTR N) : IConsole_Command(N) { bLowerCaseArgs = false; }
+
+    virtual void Execute(LPCSTR args)
+    {
+        if (!args || !args[0])
+        {
+            Msg("~ usage: cmd_force <command> [args]");
+            return;
+        }
+        Console->ExecuteCommand(args, false, true);   // allow_disabled = true → bypass bEnabled
+    }
+
+    virtual void fill_tips(vecTips& tips, u32 mode)
+    {
+        for (CConsole::vecCMD_IT it = Console->Commands.begin(); it != Console->Commands.end(); ++it)
+            tips.push_back(it->first);
+    }
+};
+
 class CCC_Spawn : public IConsole_Command
 {
 public:
@@ -1637,6 +1662,7 @@ void CCC_RegisterCommands()
     //#ifndef MASTER_GOLD
     CMD2(CCC_SetCmdEnabled, "cmd_enable", true);    // re-enable a mod-disabled console command
     CMD2(CCC_SetCmdEnabled, "cmd_disable", false);
+    CMD1(CCC_CmdForce, "cmd_force");                // run a command bypassing bEnabled (mod re-disables race-free)
     CMD1(CCC_JumpToLevel, "jump_to_level");
     CMD1(CCC_Spawn, "g_spawn");
     CMD1(CCC_SpawnToInventory, "g_spawn_to_inventory");

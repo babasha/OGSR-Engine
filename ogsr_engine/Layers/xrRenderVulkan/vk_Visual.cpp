@@ -16,6 +16,9 @@
 #include "vk_render_queue.h" // RenderQueue / DrawItem (phase-3 submission)
 #include "vk_world_material.h"  // WorldMaterialCache (phase-5)
 
+#include <string>
+#include <unordered_set>     // glass triage dedup (LoadTexture)
+
 // ============================================================================
 // VK_Render_Mesh implementation
 // ============================================================================
@@ -92,6 +95,11 @@ void vkRender_Visual::Copy(vkRender_Visual* from)
     m_pMaterial = from->m_pMaterial;
     m_fAlphaRef = from->m_fAlphaRef;
     m_bEmissiveAdd = from->m_bEmissiveAdd;
+    // Pool instances lost the glass flag → the kinematics (skinned) path drew
+    // furniture/door panes with the OPAQUE variant while the flag lived only on
+    // the pool base. THE "cabinet glass ignores everything" bug (2026-07-02).
+    m_bModelGlass = from->m_bModelGlass;
+    m_bLitBlend   = from->m_bLitBlend;
     // Pool instances are built via Copy(); without this the instance's diffuse
     // descriptor stays null and it renders white (the base had it from LoadTexture).
     // (Same latent class as the Update_Callback ctor bug.) WorldMaterial* is a shared
@@ -137,6 +145,8 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // items). Level statics have no OGF_TEXTURE — they resolve via shader_id below.
     string256 ogf_diffuse;
     ogf_diffuse[0] = 0;
+    string256 ogf_shader;   // kept for the glass-triage log below
+    ogf_shader[0] = 0;
 
     // Read texture chunk (optional - present in standalone OGF models)
     if (data->find_chunk(OGF_TEXTURE))
@@ -148,6 +158,17 @@ void vkRender_Visual::LoadTexture(IReader* data)
         data->r_stringZ(shader_name, sizeof(shader_name));
 
         xr_strcpy(ogf_diffuse, texture_name);
+        xr_strcpy(ogf_shader, shader_name);
+
+        // One-time map of every unique OGF (shader, texture) pair — glass triage:
+        // the wardrobe pane matched NO glass pattern (absent from [VK Glass?]),
+        // so log the full model-shader map once to identify what it actually uses.
+        {
+            static std::unordered_set<std::string> s_ogfPairs;
+            std::string k = std::string(shader_name) + "|" + texture_name;
+            if (s_ogfPairs.size() < 256 && s_ogfPairs.insert(k).second)
+                Msg("[VK OGF] shader='%s' tex='%s' (visual '%s')", shader_name, texture_name, dbg_name.c_str());
+        }
 
         // Create material from texture name (loads DDS, creates descriptor set)
         if (g_MaterialManager && texture_name[0])
@@ -166,12 +187,29 @@ void vkRender_Visual::LoadTexture(IReader* data)
             {
                 m_fAlphaRef = 200.0f / 255.0f;  // DX11 def_aref uses oAREF=200
             }
+            // Model glass panes: the OGF shaders "models\window" / *glass*
+            // (= R4 CBlender_Model_EbB with blend: vehicle windows, furniture
+            // panes, NPC glasses) or a glas\ texture — must BLEND with the R4
+            // env-reflection formula; the opaque/alpha-test path made them
+            // invisible or solid.
+            xr_string tn_lower = texture_name;
+            std::transform(tn_lower.begin(), tn_lower.end(), tn_lower.begin(), ::tolower);
+            if (sn_lower.find("glass")  != xr_string::npos ||
+                sn_lower.find("window") != xr_string::npos ||
+                tn_lower.find("glas\\") != xr_string::npos ||
+                tn_lower.rfind("glas", 0) == 0)
+                m_bModelGlass = true;
             // Collimator / red-dot sight marks (R4 hud_reddotsight*.s: additive
             // blend(srcalpha, one), unlit). Through the regular lit skinned path
             // they rendered as a dark, barely visible smudge on the sight glass.
-            if (sn_lower.find("reddot")     != xr_string::npos ||
-                sn_lower.find("collimator") != xr_string::npos ||
-                sn_lower.find("holo")       != xr_string::npos)
+            // Fake light-beam planes (headlights/searchlights/weapon torches):
+            // R4 renders these LIT + srcalpha-BLENDED (model_def_lq), NOT additive.
+            if (sn_lower.find("lightplanes") != xr_string::npos)
+                m_bLitBlend = true;
+            if (sn_lower.find("reddot")      != xr_string::npos ||
+                sn_lower.find("collimator")  != xr_string::npos ||
+                sn_lower.find("holo")        != xr_string::npos ||
+                sn_lower.find("selflight")   != xr_string::npos)   // lamp/projector self-lit faces
             {
                 m_bEmissiveAdd = true;
                 static int s_diag = 0;
@@ -203,12 +241,18 @@ void vkRender_Visual::LoadTexture(IReader* data)
     const char* diffuse_name = nullptr;
     const char* lmap_name    = nullptr;
     bool wmark = false;
+    bool glass = m_bModelGlass;   // OGF "glass" shader (model/lamp panes)
+    bool emis  = m_bEmissiveAdd;  // OGF selflight/reddot parts (world-path rigid models)
     if (shader_id < (u16)RImplementation.Shaders.size()) {
         VK::CVulkanShader* pShader = RImplementation.Shaders[shader_id];
         if (pShader) {
             if (pShader->m_TexDiffuse.size() > 0) diffuse_name = pShader->m_TexDiffuse.c_str();
             if (pShader->m_TexLmap.size()    > 0) lmap_name    = pShader->m_TexLmap.c_str();
             wmark = pShader->m_bWmark;   // baked level decal (effects\wallmark*)
+            if (!ogf_diffuse[0]) {
+                glass |= pShader->m_bGlass;      // level windows (def_trans + glas\/wnd)
+                emis  |= pShader->m_bEmissive;   // level glow billboards (effects\glow — lamp halos)
+            }
         }
     }
     // Dynamic models (NPCs/weapons/items) carry their diffuse in OGF_TEXTURE, not in
@@ -216,6 +260,59 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // OGF's own texture is authoritative, so prefer it whenever present; level statics
     // (no OGF_TEXTURE) keep the shader-table diffuse.
     if (ogf_diffuse[0]) diffuse_name = ogf_diffuse;
+    // GLASS renders through the wallmark pipeline variant: src-alpha blend, no
+    // z-write, skips the depth prepass and the shadow-caster bins — exactly what a
+    // translucent pane needs. The alpha-test is dropped (aref 0.78 discarded every
+    // semi-transparent glass texel = the "no glass anywhere" bug); the texture's
+    // alpha feeds the blend instead. aref = -2 is the GLASS marker the frags read:
+    // they cap the blend alpha so a pane whose texture alpha saturates (glas_dirt
+    // panes looked fully opaque in-game) still stays see-through.
+    if (glass) { wmark = true; m_fAlphaRef = -2.0f; }
+    // EMISSIVE-ADDITIVE (aref = -3): level `effects\glow` halos (the headlight's
+    // "shine" — previously drawn OPAQUE = the broken orange disc) + selflight
+    // parts. Additive pipeline + unlit FS, late flush like glass.
+    if (emis)  { wmark = true; m_fAlphaRef = -3.0f; }
+    // LIT-BLEND (aref = -4): lightplanes light beams — R4 model_def_lq verbatim
+    // (lit colour, srcalpha blend, alpha = tex.a·fog²). Late flush like glass.
+    if (m_bLitBlend) { wmark = true; m_fAlphaRef = -4.0f; }
+    // Glass triage: log every glass-candidate visual (glassy texture OR flagged)
+    // with the exact shader/texture names + the routing decision — one in-game run
+    // then tells which shader the visible-but-wrong panes actually use.
+    if (diffuse_name) {
+        xr_string dl = diffuse_name;
+        std::transform(dl.begin(), dl.end(), dl.begin(), ::tolower);
+        if (glass || dl.find("glas") != xr_string::npos || dl.find("wnd") != xr_string::npos ||
+            dl.find("stekl") != xr_string::npos) {
+            // One line per UNIQUE (shader, texture) pair — the per-visual cap
+            // flooded on the 40+ brkbl windows and hid the interesting entries.
+            static std::unordered_set<std::string> s_seen;
+            const char* lvl_shader = "";
+            if (!ogf_diffuse[0] && shader_id < (u16)RImplementation.Shaders.size() && RImplementation.Shaders[shader_id])
+                lvl_shader = RImplementation.Shaders[shader_id]->m_Name.c_str() ? RImplementation.Shaders[shader_id]->m_Name.c_str() : "";
+            std::string pairKey = std::string(ogf_shader) + "|" + lvl_shader + "|" + diffuse_name;
+            if (s_seen.size() < 128 && s_seen.insert(pairKey).second)
+                Msg("[VK Glass?] visual='%s' ogf_shader='%s' lvl_shader='%s' tex='%s' aref=%.2f -> %s",
+                    dbg_name.c_str(), ogf_shader, lvl_shader, diffuse_name, m_fAlphaRef,
+                    glass ? "GLASS(blend)" : "OPAQUE/aref");
+        }
+    }
+    // Targeted probe: EVERY leaf of the village cabinet (no dedup) — the pane
+    // ignored r_glass_opacity, so either it has no glass leaf (pane painted in
+    // the wood texture) or the leaf routes somewhere unexpected.
+    if (strstr(dbg_name.c_str() ? dbg_name.c_str() : "", "cabinet"))
+        Msg("[VK Cabinet] leaf='%s' ogf_shader='%s' lvl_shader_id=%u tex='%s' aref=%.2f glass=%d",
+            dbg_name.c_str(), ogf_shader, (u32)shader_id, diffuse_name ? diffuse_name : "-", m_fAlphaRef, glass ? 1 : 0);
+    // Glow probe: every visual touching a glow texture/shader — the headlight's
+    // orange disc didn't route to the emissive path, find where it goes instead.
+    {
+        const char* lvl_shader = "";
+        if (!ogf_diffuse[0] && shader_id < (u16)RImplementation.Shaders.size() && RImplementation.Shaders[shader_id])
+            lvl_shader = RImplementation.Shaders[shader_id]->m_Name.c_str() ? RImplementation.Shaders[shader_id]->m_Name.c_str() : "";
+        if ((diffuse_name && strstr(diffuse_name, "glow")) || strstr(lvl_shader, "glow") || strstr(ogf_shader, "glow") || emis)
+            Msg("[VK Glow?] visual='%s' ogf_shader='%s' lvl_shader='%s' tex='%s' Type=%u aref=%.2f emis=%d",
+                dbg_name.c_str() ? dbg_name.c_str() : "(null)", ogf_shader, lvl_shader,
+                diffuse_name ? diffuse_name : "-", (u32)Type, m_fAlphaRef, emis ? 1 : 0);
+    }
     m_pWorldMaterial = VK::WorldMaterialCache::GetOrCreate(diffuse_name, lmap_name, m_fAlphaRef, wmark);
 }
 
@@ -296,9 +393,10 @@ void vkFVisual::Submit(VK::RenderQueue& q, const Fmatrix& xform, float LOD)
     if (m_mesh.vStride < m_mesh.tcOffset + 4)         return;
 
     VK::DrawItem it{};
-    it.vis     = this;
-    it.xform   = xform;
-    it.lod     = LOD;
+    it.vis       = this;
+    it.xform     = xform;
+    it.lod       = LOD;
+    it.lateGlass = m_pWorldMaterial && (m_pWorldMaterial->isGlass || m_pWorldMaterial->isEmisAdd || m_pWorldMaterial->isLitBlend);
     it.sortKey = VK::makeSortKey(m_mesh.vStride, m_mesh.tcOffset,
                                  /*depthTest*/ true,
                                  m_pWorldMaterial,
@@ -634,6 +732,7 @@ void vkFProgressive::Submit(VK::RenderQueue& q, const Fmatrix& xform, float LOD)
     it.vis            = this;
     it.xform          = xform;
     it.lod            = LOD;
+    it.lateGlass      = m_pWorldMaterial && (m_pWorldMaterial->isGlass || m_pWorldMaterial->isEmisAdd || m_pWorldMaterial->isLitBlend);
     it.iBaseOverride  = m_mesh.iBase + sw_offsets[lod_idx];
     it.iCountOverride = sw_counts[lod_idx];
     it.sortKey        = VK::makeSortKey(m_mesh.vStride, m_mesh.tcOffset,

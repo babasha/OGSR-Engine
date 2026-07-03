@@ -40,6 +40,10 @@ struct DrawItem
     // Stamped by Push() from the queue's current submit-hemi; Flush feeds it to
     // the world shader so indoor dynamics don't glow. See CRender::add_Visual.
     float            hemi           = 1.0f;
+
+    // Translucent glass pane (WorldMaterial::isGlass): Push routes it to the
+    // LATE glass list, drawn by Pass_WorldGlass after the whole opaque world.
+    bool             lateGlass      = false;
 };
 
 class RenderQueue
@@ -49,6 +53,16 @@ public:
     void Clear();
     void SortByKey();
     void Flush(FrameContext& ctx);
+
+    // Late translucent (glass) list — accumulated by Push across the statics AND
+    // dynamics flushes, drawn once by Pass_WorldGlass after the opaque world
+    // (GPU statics/trees/grass/sky), cleared there. ClearGlass() at frame start.
+    void FlushGlass(FrameContext& ctx);
+    void ClearGlass();
+    bool HasGlass() const { return !m_GlassItems.empty(); }
+    // Post-FlushGlass view (deduped): the particles pass re-draws these panes
+    // into the heat-haze distortion RT = glass refraction (r_glass_refr).
+    const xr_vector<DrawItem>& GlassItems() const { return m_GlassItems; }
 
     // Sky-ambient occlusion stamped onto every subsequently-pushed item (until
     // changed). Set per dynamic object before its Submit; reset to 1.0 for
@@ -87,6 +101,7 @@ public:
 
 private:
     xr_vector<DrawItem> m_Items;
+    xr_vector<DrawItem> m_GlassItems;   // late translucent panes (see FlushGlass)
     float               m_SubmitHemi = 1.0f;
     bool                m_AllowTess  = true;
 };

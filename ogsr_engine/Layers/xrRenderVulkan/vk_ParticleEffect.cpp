@@ -38,6 +38,14 @@ using namespace PS;
 extern PS::CPEDef* VK_FindPED(const char* name);
 extern PS::CPGDef* VK_FindPGD(const char* name);
 
+// GPU-driven particles (Phase 3 #3) — forward-declared to avoid pulling the GP
+// module headers into this PS-heavy TU.
+namespace VK { namespace GPUParticles {
+    bool Enabled();
+    int  ResolveProgram(const char* name);
+    bool ProgramRoutable(int slot);
+} }
+
 // ============================================================================
 // Birth / death callbacks (same as R4 OnEffectParticleBirth/Dead).
 // ============================================================================
@@ -297,9 +305,30 @@ VkDescriptorSet vkCParticleEffect::ResolveTextureSet()
     return m_TextureSet;
 }
 
+// Routed to the GPU particle path? Lazily resolve + cache the program slot.
+// Only alpha-blended world smoke is eligible (additive fire/sparks stay on the
+// CPU billboard path; the GPU draw is alpha-only and has no textures yet).
+bool vkCParticleEffect::GpuClaimed()
+{
+    if (!VK::GPUParticles::Enabled())               return false;
+    if (m_BlendMode != PBM_BLEND || GetHudMode())   return false;
+    if (m_GpuProgram == -2) {
+        int s = VK::GPUParticles::ResolveProgram(Name().c_str());
+        // Area fog / persistent fields would saturate the shared GPU pool and
+        // starve everything else → keep them on the CPU billboard path.
+        if (s >= 0 && !VK::GPUParticles::ProgramRoutable(s)) {
+            Msg("~[VK GP] '%s' too large for shared GPU pool — kept on CPU", Name().c_str());
+            s = -1;
+        }
+        m_GpuProgram = s;
+    }
+    return m_GpuProgram >= 0;
+}
+
 u32 vkCParticleEffect::BuildVertices(FVF::LIT* dst, u32 maxVerts)
 {
     if (!dst || !m_Def) return 0;
+    if (GpuClaimed())   return 0;   // GPU path emits + draws this smoke instead
 
     Particle* particles;
     u32 p_cnt;

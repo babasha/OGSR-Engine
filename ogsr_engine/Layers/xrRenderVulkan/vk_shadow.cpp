@@ -454,7 +454,12 @@ void ComputeSpotVP(const Fvector& pos, const Fvector& dirIn, float range, float 
     const float fov = _min(cone * 1.1f + 0.1f, deg2rad(170.f));
     Fvector eye = pos;
     Fmatrix view; view.build_camera_dir(eye, dir, up);
-    Fmatrix proj; proj.build_projection(fov, 1.f, kPointNear, _max(range, 1.f));
+    // Near plane 0.5 m, NOT kPointNear (0.1): when a scene lamp wins the spot
+    // budget, its own FIXTURE (headlight housing/glass, lamp shade — all within
+    // ~0.3 m of the emitter) rasterizes into the map and shadows the entire
+    // beam to black. Nothing legit casts within 0.5 m of the flashlight either
+    // (HUD never casts), so this only clips fixture shells.
+    Fmatrix proj; proj.build_projection(fov, 1.f, 0.5f, _max(range, 1.f));
     s_spotVP.mul(proj, view);
 }
 

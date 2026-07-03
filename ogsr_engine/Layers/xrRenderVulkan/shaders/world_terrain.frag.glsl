@@ -56,12 +56,19 @@ layout(location = 0) out vec4 outColor;
 // shaded like pure normal mapping. Off by default (r_pom_terrain 0). The splat
 // mask is the macro weight (≈constant over the tiny parallax offset) - sampled
 // once and passed in. depth = 1 - height (white = raised).
+// MUD deformation (r_mud_deform): a constant per-fragment press bias sunk into the
+// POM heightfield, so foot prints get REAL parallax depth in the volumetric ground
+// (berm rim = negative press = raised). Constant along the march -> it cancels in
+// the self-shadow/AO differences and costs nothing per step.
+float g_mudBias = 0.0;
+
 float detailH(vec2 duv, vec4 mask, float lod)
 {
-    return textureLod(uDhR, duv, lod).r * mask.r
-         + textureLod(uDhG, duv, lod).r * mask.g
-         + textureLod(uDhB, duv, lod).r * mask.b
-         + textureLod(uDhA, duv, lod).r * mask.a;
+    float h = textureLod(uDhR, duv, lod).r * mask.r
+            + textureLod(uDhG, duv, lod).r * mask.g
+            + textureLod(uDhB, duv, lod).r * mask.b
+            + textureLod(uDhA, duv, lod).r * mask.a;
+    return clamp(h - g_mudBias, 0.0, 1.0);
 }
 
 // Returns the parallax-offset DETAIL uv; outputs sun self-shadow, contact AO and
@@ -204,6 +211,33 @@ void main()
     float wsum = dot(mask, vec4(1.0));
     mask = (wsum > 1e-4) ? (mask / wsum) : vec4(1.0, 0.0, 0.0, 0.0);
 
+    // ---- MUD footprints (r_mud_deform): read the persistent press field (vk_deform,
+    // stamped once per foot PLANT — boot-shaped, treaded) on SOFT splat channels and
+    // sink it into the POM heightfield below. Soil softness varies per material
+    // (earth deep, gravel shallow, asphalt none) and rain SOFTENS it (deeper prints
+    // on wet ground). Wet asphalt still SHOWS prints (muddy boots track grime) but
+    // never carves. Snow owns the prints once it covers the ground.
+    float mudPress = 0.0;   // signed: + dent, - berm
+    float mudCarve = 0.0;   // print geometry amount (soft ground only)
+    float mudGrime = 0.0;   // tracked-on grime amount (wet asphalt, shading only)
+    float mudWater = 0.0;   // water gathered in the dent (fed into pud below)
+    float mudWet   = clamp(L.rain_params.y, 0.0, 1.0);
+    if (L.pom_params5.z > 0.0 && SnowDeformOn()) {
+        float soft  = dot(mask, vec4(0.85, 0.0, 1.0, 0.35))   // R grass, G asphalt, B earth, A gravel
+                    * (1.0 + mudWet * 0.8);                   // rain loosens the soil
+        float grime = mask.g * mudWet * 0.7;                  // wet mud tracked onto asphalt (shading only)
+        float gate  = (1.0 - clamp(L.sf_params.w, 0.0, 1.0))
+                    * (1.0 - smoothstep(45.0, 60.0, distance(L.eye_pos.xyz, vWorldPos)));
+        if (max(soft, grime) * gate > 0.003) {
+            mudPress  = SnowDeformPress(vWorldPos);
+            mudCarve  = soft * gate * L.pom_params5.z;
+            mudGrime  = grime * gate * L.pom_params5.z;
+            // POM carve: dent sinks, BERM boosted x2.4 so the squeezed-out rim reads.
+            float biasP = (mudPress > 0.0) ? mudPress : mudPress * 2.4;
+            g_mudBias = clamp(clamp(biasP, -1.0, 1.0) * mudCarve * L.pom_params7.z, -0.9, 0.9);
+        }
+    }
+
     // Real-heightfield terrain POM in DETAIL space (the volumetric ground). Base/
     // mask stay at vUV (macro is low-freq -> not parallaxed -> stable at grazing).
     float pomShadow, pomAO, detH;
@@ -307,11 +341,43 @@ void main()
     float microAO = 1.0 - aoStr * clamp(occlT, 0.0, 1.0);
     albedo *= microAO;
 
+    // Mud print shading. The soil is PRESSED IN, not painted over: the print reads
+    // through geometry (POM carve + tessellation), the gradient-normal dimple and
+    // micro-AO; albedo only gets a subtle packed-moisture darkening (more when wet).
+    // The berm is the same soil pushed up — normals/geometry carry it, no tint.
+    // Wet ASPHALT is the exception: tracked-on grime IS a dark film on top.
+    if ((mudCarve > 0.0 || mudGrime > 0.0) && abs(mudPress) > 0.004) {
+        float ew  = L.deform_tex.w;              // world metres per deform texel
+        float pXp = SnowDeformPress(vWorldPos + vec3(ew, 0.0, 0.0));
+        float pXm = SnowDeformPress(vWorldPos - vec3(ew, 0.0, 0.0));
+        float pZp = SnowDeformPress(vWorldPos + vec3(0.0, 0.0, ew));
+        float pZm = SnowDeformPress(vWorldPos - vec3(0.0, 0.0, ew));
+        vec2 slope = vec2(pXp - pXm, pZp - pZm) * (0.05 * min(mudCarve, 1.2) / (2.0 * ew));
+        Nw = normalize(Nw + vec3(slope.x, 0.0, slope.y));
+        float dent  = clamp(mudPress, 0.0, 1.0);
+        float packD = dent * min(mudCarve, 1.2) * (0.18 + 0.42 * mudWet);   // packed moisture only
+        albedo *= 1.0 - min(packD, 0.55);
+        glossT  = max(glossT, dent * min(mudCarve, 1.2) * (0.15 + 0.55 * mudWet));   // wet compaction sheen
+        albedo  = mix(albedo, albedo * vec3(0.55, 0.52, 0.50), min(dent * mudGrime, 0.6));   // asphalt grime
+        // GRADUAL water fill: the field decays 1 -> 0, so the local MAX press is an
+        // AGE proxy — a fresh print (max≈1) is dry, water seeps in as it ages and
+        // drains away before the print itself fades. Deepest parts fill first.
+        float maxP = max(max(max(pXp, pXm), max(pZp, pZm)), mudPress);
+        float age  = (1.0 - smoothstep(0.60, 0.88, maxP)) * smoothstep(0.10, 0.28, maxP);
+        mudWater   = age * smoothstep(0.35, 0.75, mudPress / max(maxP, 1e-3))
+                   * (0.2 + 0.8 * mudWet) * min(mudCarve, 1.0);
+    }
+
     // PUDDLE COVERAGE (0..1). SSS procedural placement default; flow sim is parked.
     float microH = min(detH, 1.0 - cav);
     float pud = (L.pom_params7.x > 0.5) ? sssPuddle(geomN, vWorldPos)
               : (L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(vWorldPos))
               : 0.0;
+    // Water gathered in footprint dents (computed above with the print's AGE — it
+    // seeps in gradually, not on the first frame): full wet shading, reflections +
+    // ripples. applyWetnessTerrain gates by global wetness, so dry weather keeps
+    // prints as damp mud only.
+    pud = max(pud, mudWater);
 
     // r_puddle_debug: 1 = coverage; 2 = per-pixel detail micro-height.
     int pdbg = int(L.pom_params5.w + 0.5);
@@ -321,11 +387,20 @@ void main()
         return;
     }
 
-    // r_terrain_debug: 1 world normal, 2 micro-AO, 3 detail height.
+    // r_terrain_debug: 1 world normal, 2 micro-AO, 3 detail height, 4 mud field.
     int tdbg = int(L.pom_params4.w + 0.5);
     if (tdbg == 1) { outColor = vec4(Nw * 0.5 + 0.5, base.a); return; }
     if (tdbg == 2) { outColor = vec4(vec3(microAO),  base.a); return; }
     if (tdbg == 3) { outColor = vec4(vec3(detH),     base.a); return; }
+    if (tdbg == 4) {   // deform-field overlay at TRUE world position (bypasses POM —
+                       // if this sits under the boot but the visible dent doesn't,
+                       // the shift is the POM parallax, not the stamp position)
+        float p = SnowDeformOn() ? SnowDeformPress(vWorldPos) : 0.0;
+        vec3  c = mix(vec3(0.35), (p >= 0.0) ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.3, 1.0),
+                      clamp(abs(p) * 1.5, 0.0, 1.0));
+        outColor = vec4(c, base.a);
+        return;
+    }
 
     // SNOW (Surface Field consumer, r_snow): whiten by surface type x slope x sky
     // exposure - flat up-facing ground accumulates, steep/under-cover none.

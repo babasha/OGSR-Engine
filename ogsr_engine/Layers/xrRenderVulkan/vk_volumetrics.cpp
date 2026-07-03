@@ -577,6 +577,10 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
             memcpy(ub.lights[i].pos,   FL.gpu[i].pos,   sizeof(float) * 4);
             memcpy(ub.lights[i].color, FL.gpu[i].color, sizeof(float) * 4);
             memcpy(ub.lights[i].dir,   FL.gpu[i].dir,   sizeof(float) * 4);
+            // Volumetric-flagged lamps (R4 renders a visible BEAM for these —
+            // pole lamps, car headlights): +2 on the spot flag, the inject
+            // boosts their fog in-scatter so the shaft actually reads.
+            if (FL.volFlag[i]) ub.lights[i].color[3] += 2.0f;
         }
     }
     memcpy(ub.spot_vp, &ShadowMap::GetSpotVP(), sizeof(ub.spot_vp));

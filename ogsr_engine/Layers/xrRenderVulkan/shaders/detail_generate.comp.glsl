@@ -355,7 +355,13 @@ void main()
 
     float hmU = (rx - gen.hmParams.x) * gen.hmParams.z; // (rx - originX) * invScaleX
     float hmV = (rz - gen.hmParams.y) * gen.hmParams.w; // (rz - originZ) * invScaleZ
-    float hmY = texture(u_Heightmap, vec2(hmU, hmV)).r;
+    // Conservative ground height: bilinear blends an ELEVATED neighbour texel
+    // in at ledges/foundations and floats the grass mid-air — take the MIN of
+    // the 2x2 footprint instead (slight root sinking on slopes is invisible,
+    // floating tufts are not). Also keeps one sentinel(9000) neighbour from
+    // poisoning the sample at heightmap hole borders.
+    vec4 hmG = textureGather(u_Heightmap, vec2(hmU, hmV), 0);
+    float hmY = min(min(hmG.x, hmG.y), min(hmG.z, hmG.w));
 
     float terrainY;
     if (hmY < 9000.0 && hmY > -9000.0)
@@ -368,6 +374,14 @@ void main()
         // No data — fall back to slot.y_base
         terrainY = slot.y_base;
     }
+
+    // R4 parity: cache_Decompress rejects hits below the slot's authored Y
+    // range (y < vis.box.min.y). The min-Y heightmap lands on INTERIOR floors
+    // below the painted terrain (bar/basement interiors) — reject so grass
+    // never grows inside buildings. 1 m epsilon covers the 0.2 m y_base
+    // quantisation plus bilinear heightmap error on slopes.
+    if (terrainY < slot.y_base - 1.0)
+        return;
 
     vec3 worldPos = vec3(rx, terrainY, rz);
 

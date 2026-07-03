@@ -71,7 +71,7 @@ struct LightUBO {
     float pom_params2[4];   // x = blur (extra mip LOD), y = normal, z = self-shadow, w = contact AO
     float pom_params3[4];   // x = debug view, y = ao_flat, z = ceil strength, w = floor strength
     float pom_params4[4];   // x = terrain POM enable, y = detail-normal strength, z = micro-AO, w = debug view
-    float pom_params5[4];   // x = terrain dry gloss strength, y/z = RESERVED (was geo-puddle radius/depth, removed; zeroed on fill), w = puddle debug
+    float pom_params5[4];   // x = terrain dry gloss strength, y = glass opacity ceiling, z = mud footprint strength (r_mud_deform), w = puddle debug
     float pom_params6[4];   // x = water-sim enable (puddles come from the flow sim), y = murk, z = refract, w unused
     // SSS per-pixel puddles (SSFX deffer_terrain_high_flat port): water as a rising
     // LEVEL vs the detail micro-height — terrain texture relief (ruts) pools first.

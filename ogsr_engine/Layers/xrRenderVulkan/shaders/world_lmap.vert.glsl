@@ -22,6 +22,13 @@ layout(push_constant) uniform PushConstants {
     vec2  uvScale;
     float alphaRef;
     float detailScale;
+    // dynHemi < -0.5 = DYNAMIC visual (spawned prop: urn/bed/item). Real hemi is
+    // -dynHemi-1 (frag decodes); the model matrix rows follow (pushed by Flush into
+    // the tess region — dynamics never tessellate). Statics stay on the plain path.
+    float dynHemi;
+    float dmi0, dmi1, dmi2;   // model row i (X basis, carries uniform scale)
+    float dmj0, dmj1, dmj2;   // model row j (Y basis)
+    float dmc0, dmc1, dmc2;   // model translation
 } pc;
 
 layout(location = 0) out vec2 vUV;
@@ -33,9 +40,23 @@ layout(location = 4) out vec3 vNormal;     // world-space normal (dynamic lights
 void main()
 {
     gl_Position = pc.mvp * vec4(inPos, 1.0);
-    vWorldPos   = inPos;
+    vec3 pos = inPos;
     // D3DCOLOR memory order is BGRA -> real (x,y,z) = .bgr; unpack [0,1] -> [-1,1].
-    vNormal     = inNormal.bgr * 2.0 - 1.0;
+    vec3 nrm = inNormal.bgr * 2.0 - 1.0;
+    // Dynamic props reuse this static pipeline but carry a real model matrix —
+    // without this transform every world-space consumer (fog distance, cascade sun
+    // shadow, dynamic lights, wetness/snow) read MODEL-space coords: props got the
+    // fog of the LEVEL ORIGIN (washed-out "glow" that ignores the surroundings) and
+    // rotated objects were sun-lit from the wrong side (unrotated normals).
+    if (pc.dynHemi < -0.5) {
+        vec3 mi = vec3(pc.dmi0, pc.dmi1, pc.dmi2);
+        vec3 mj = vec3(pc.dmj0, pc.dmj1, pc.dmj2);
+        vec3 mk = cross(mi, mj) / max(length(mi), 1e-6);   // det=+1 rotation ⇒ k = i×j (scale folded)
+        pos = pos.x * mi + pos.y * mj + pos.z * mk + vec3(pc.dmc0, pc.dmc1, pc.dmc2);
+        nrm = normalize(nrm.x * mi + nrm.y * mj + nrm.z * mk);
+    }
+    vWorldPos   = pos;
+    vNormal     = nrm;
 
     // Sub-pixel UV: 8 extra bits of fractional du/dv from packed tangent/binormal alphas.
     vec2 uv     = inUV_short + vec2(inTangent.a, inBinormal.a);

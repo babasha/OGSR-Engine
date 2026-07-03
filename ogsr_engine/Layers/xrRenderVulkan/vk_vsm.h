@@ -27,6 +27,7 @@ namespace VK { namespace VSM {
 
 bool Init();                 // idempotent; lazy (needs VulkanHW + shader)
 void Destroy();
+void InvalidateCache();      // drop the toroidal page cache. MUST be called on level unload: pages are WORLD-anchored, and a new level reuses the same coordinates — resident pages would sample the PREVIOUS level's depth (light/dark page squares on walls).
 bool Ready();                // resources created, not dead
 bool Wanted();               // r_vsm on (cheap, NO Init dependency) — gate the Pass_World call
 bool Enabled();              // Ready() && r_vsm (post-Init; checked inside MarkPages)

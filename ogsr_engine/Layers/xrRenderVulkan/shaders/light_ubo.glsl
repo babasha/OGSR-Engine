@@ -49,9 +49,9 @@ layout(set = ENV_SET, binding = 0) uniform Lighting {
     vec4 pom_params2;    // x=blur, y=normal, z=self-shadow, w=contact AO
     vec4 pom_params3;    // x=debug view, y=ao_flat, z=ceil strength, w=floor strength
     vec4 pom_params4;    // x=terrain POM enable, y=detail-normal, z=micro-AO, w=terrain debug
-    vec4 pom_params5;    // x=terrain gloss, y/z=unused (removed), w=puddle debug
+    vec4 pom_params5;    // x=terrain gloss, y=glass opacity, z=mud footprint strength (r_mud_deform), w=puddle debug
     vec4 pom_params6;    // x=water-sim enable, y=murk, z=refract
-    vec4 pom_params7;    // SSS puddles: x=enable, y=level (coverage), z=unused (removed), w=macro scale
+    vec4 pom_params7;    // SSS puddles: x=enable, y=level (coverage), z=mud print POM carve depth (r_mud_depth), w=macro scale
     vec4 cluster_params; // x=sliceScale, y=sliceBias, z=near, w=enable (0 off, 1 on, 2 debug)
     vec4 cluster_params2;// x=gridX, y=gridY, z=gridZ, w=maxLightsPerCluster
     vec4 light_occ;      // x=enable, y=bury bias, z=march bias, w=strength (terrain/static light occlusion)

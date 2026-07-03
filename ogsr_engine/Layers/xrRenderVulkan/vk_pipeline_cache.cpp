@@ -125,11 +125,14 @@ namespace {
     //   float tessFar     — offset 92   (factor-1 / flat distance, m)
     //   vec4  eyeHeight   — offset 96   (xyz camera pos, w displacement amplitude)
     //   float pnScale     — offset 112  (PN-triangle curvature; TCS/TES only)
-    // The 84..116 tail is owned by RenderQueue::Flush (re-pushed on layout
-    // flips); FS/VS shaders only declare the first 84 bytes. The range MUST
+    // The 84..120 tail is owned by RenderQueue::Flush (re-pushed on layout
+    // flips); FS shaders only declare the first 84 bytes. The range MUST
     // cover pnScale (116) — the TCS/TES read it, so a 112-byte range left it
     // outside the layout and the shader sampled uninitialized memory.
-    constexpr u32 kPushSize = 116;
+    // DYNAMIC visuals overlay 84..120 with the model rows {i,j,c} (9 floats) —
+    // the VS rebuilds world-space vWorldPos/vNormal from them (dynHemi < -0.5
+    // flags it); dynamics never tessellate, statics never read the overlay.
+    constexpr u32 kPushSize = 120;
 }
 
 // Defined below; GetTerrainPipeline() (right after Init) needs it forward.
@@ -821,7 +824,7 @@ static VkPipeline CreatePipeline(const Key& k)
     rs.cullMode    = VK_CULL_MODE_NONE;     // no winding info yet → don't drop faces
     rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth   = 1.0f;
-    if (k.wmark) {
+    if (k.wmark && !k.emis) {   // emissive billboards float free — no decal bias
         // Baked level decals (newspapers/dirt) lie exactly on the surface
         // beneath — pull them towards the camera (LESS_OR_EQUAL: smaller
         // depth = closer → bias NEGATIVE) so they pass the depth test
@@ -856,7 +859,18 @@ static VkPipeline CreatePipeline(const Key& k)
     ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     ba.blendEnable    = VK_FALSE;
-    if (k.wmark) {
+    if (k.emis) {
+        // Emissive-additive (glow billboards / selflight parts): the texture ADDS
+        // light over the scene — never darkens, alpha shapes the halo.
+        ba.blendEnable         = VK_TRUE;
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.colorBlendOp        = VK_BLEND_OP_ADD;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+    }
+    else if (k.wmark) {
         // Alpha-blend the decal over the lit surface (the texture alpha masks
         // the sheet/stain shape).
         ba.blendEnable         = VK_TRUE;

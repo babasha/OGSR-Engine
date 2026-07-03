@@ -17,6 +17,7 @@
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
 #include "vk_env_light.h"          // EnvLight set (set 1) — rain map/VP + camera terms for SSR puddles
+#include "vk_vsm.h"                // VSM::MaskReady — dyn-shadow red debug overlay (set 1 binding 14)
 #include "vk_volumetrics.h"        // VK::Vol — integrated froxel volume (binding 4) + exp-Z params
 #include "vk_exposure.h"           // VK::Exposure — shared auto-exposure constants (also used by bloom)
 #include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline
@@ -31,6 +32,8 @@ extern int ps_r_vol_debug;
 extern int   ps_r_ssil_enable;
 extern int   ps_r_ssil_debug;
 extern float ps_r_ssil_strength;
+extern float ps_r_dither;   // final 8-bit output dither amplitude (LSBs; 0 = off)
+extern int   ps_r_vsm_debug_dyn;   // red overlay of VSM dyn-atlas (NPC/grass) shadows
 
 namespace VK {
 
@@ -297,6 +300,7 @@ void Pass_TonemapComposite(FrameContext& ctx)
     push.p3[0] = 2.0f * (1.0f - ps_r2_img_cg.x);
     push.p3[1] = 2.0f * (1.0f - ps_r2_img_cg.y);
     push.p3[2] = 2.0f * (1.0f - ps_r2_img_cg.z);
+    push.p3[3] = ps_r_dither;   // output TPDF dither (LSBs) — de-bands the 8-bit swapchain write
     // Volumetric composite (r_vol): mode + the exp-Z grid params from the LAST
     // Vol::Execute (the EXACT inverse vol_inject used). 0 off / 1 composite / 2 debug.
     const Vol::GridZParams gz = Vol::GetGridZ();
@@ -315,6 +319,9 @@ void Pass_TonemapComposite(FrameContext& ctx)
     push.p5[0] = 0.0f;
     push.p5[1] = (ilReady && ps_r_ssil_debug) ? 1.0f : 0.0f;
     push.p5[2] = 0.0f;
+    // r_vsm_debug_dyn: red-tint pixels shadowed by the VSM dynamic atlas (mask.B,
+    // set 1 binding 14 — the EnvLight set is already bound; dummy-safe when off).
+    push.p5[3] = (ps_r_vsm_debug_dyn && VSM::MaskReady()) ? 1.0f : 0.0f;
     vkCmdPushConstants(cmd, s_PipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
     vkCmdDraw(cmd, 3, 1, 0, 0);

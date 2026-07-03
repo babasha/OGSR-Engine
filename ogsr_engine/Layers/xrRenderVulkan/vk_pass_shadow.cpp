@@ -33,6 +33,7 @@
 extern int ps_r_rain_enable;
 extern int   ps_r_snow_deform;        // snow footprint deformation enable
 extern int   ps_r_snow_deform_tex;    // use the dense deform texture (vk_deform)
+extern float ps_r_mud_deform;         // mud footprints (same deform texture, active without snow)
 extern int   ps_r_snow_mesh;          // dense snow surface mesh (needs the ground-height map)
 extern float ps_r_snow_deform_radius; // print radius (m)
 extern float ps_r_snow;               // TARGET snow coverage (gate the deform dispatch)
@@ -440,7 +441,8 @@ void Pass_SunShadow(FrameContext& ctx)
         // The snow deform compute samples the RAIN map (binding 9 — the ground map came
         // out empty) for the snow-mesh base height AND the stamp ground-gate, so force
         // the rain map to render + stay fresh whenever deform is active.
-        const bool wantDeform = ps_r_snow_deform && ps_r_snow_deform_tex && ps_r_snow > 0.f;
+        const bool wantDeform = ps_r_snow_deform_tex &&
+            ((ps_r_snow_deform && ps_r_snow > 0.f) || ps_r_mud_deform > 0.f);   // mud prints need the field year-round
         const bool wantMap    = wantRain || occWanted || wantGround || wantDeform;
         // Occlusion-only (no rain) tolerates a much larger redraw step: the map covers
         // ±120 m and terrain is static, so redrawing every 48 m (vs 16 m for wetness)
@@ -578,28 +580,47 @@ void Pass_SunShadow(FrameContext& ctx)
             VK::WaterSim::Dispatch(cmd, rd);
         }
 
-        // ---- Snow deform texture: stamp foot contacts into the dense persistent
-        // player-centred press field (vk_deform). Read by the terrain shaders
-        // (r_snow_deform_tex) for sharp, persistent, non-faceted footprints.
-        if (ps_r_snow_deform && ps_r_snow_deform_tex && ps_r_snow > 0.f) {
+        // ---- Snow/mud deform texture: stamp foot contacts into the dense persistent
+        // player-centred press field (vk_deform). Read by the terrain shaders for
+        // sharp, persistent, non-faceted footprints (snow prints + mud prints).
+        if (wantDeform) {
             xr_vector<VK::Deform::Stamp> stamps;
             const Fvector& camp = Device.vCameraPosition;
-            Fvector fwd = Device.vCameraDirection; fwd.y = 0.f;
-            if (fwd.square_magnitude() > 1e-4f) fwd.normalize(); else fwd.set(0.f, 0.f, 1.f);
-            const Fvector perp = { -fwd.z, 0.f, fwd.x };
             const float r = ps_r_snow_deform_radius;
-            // Player feet ~at ground (≈1.65 m below the camera) so the compute's terrain
-            // ground-gate passes them (it compares the stamp Y to the real terrain height).
-            const float footY = camp.y - 1.65f;
-            stamps.push_back({ { camp.x - perp.x * 0.13f, footY, camp.z - perp.z * 0.13f }, r, 1.f });
-            stamps.push_back({ { camp.x + perp.x * 0.13f, footY, camp.z + perp.z * 0.13f }, r, 1.f });
-            // Landed items/props: shallow print (~1/3 depth, smaller). The COMPUTE
-            // ground-gates each stamp against the real terrain height, so flying items
-            // don't stamp (no camera heuristic) and it's robust on uneven terrain.
+            // PLAYER (first-person, no body skeleton): synthesize a STRIDE — one boot
+            // print per ~0.68 m of horizontal travel, alternating left/right, oriented
+            // along the movement. Standing still prints nothing (no trench, no pile-up).
+            {
+                static Fvector s_pCam{}; static bool s_pInit = false;
+                static float s_stride = 0.f; static float s_side = 1.f;
+                const float dx = camp.x - s_pCam.x, dz = camp.z - s_pCam.z;
+                const float dmove = sqrtf(dx * dx + dz * dz);
+                if (!s_pInit || dmove > 3.f) {                       // first frame / teleport
+                    s_pInit = true; s_stride = 0.f;
+                } else if (dmove > 1e-4f) {
+                    s_stride += dmove;
+                    if (s_stride >= 0.68f) {
+                        s_stride = 0.f; s_side = -s_side;
+                        const float inv = 1.f / dmove;
+                        const float fx = dx * inv, fz = dz * inv;    // stride direction
+                        const float px = -fz, pz = fx;               // perpendicular (foot offset)
+                        // Foot ~at ground (≈1.65 m below the camera) so the compute's
+                        // terrain ground-gate passes it.
+                        stamps.push_back({ { camp.x + px * 0.13f * s_side, camp.y - 1.65f,
+                                             camp.z + pz * 0.13f * s_side }, r, 1.f, fx, fz });
+                    }
+                }
+                s_pCam = camp;
+            }
+            // Landed items/props: shallow ROUND print (~1/3 depth, smaller, no dir). The
+            // COMPUTE ground-gates each stamp against the real terrain height, so flying
+            // items don't stamp and it's robust on uneven terrain.
             xr_vector<Fvector> props; Skinned_CollectProps(props, 16);
-            for (const Fvector& p : props) stamps.push_back({ p, r * 0.6f, 0.34f });
-            xr_vector<Fvector> npc; Skinned_CollectFeet(npc, 48);
-            for (const Fvector& f : npc) stamps.push_back({ f, r, 1.f });
+            for (const Fvector& p : props) stamps.push_back({ p, r * 0.6f, 0.34f, 0.f, 0.f });
+            // NPCs: DISCRETE footstep events (one per foot PLANT — separate boot prints,
+            // not the per-frame trench), oriented by the body's facing.
+            xr_vector<VK::Footstep> steps; Skinned_CollectFootsteps(steps, 48);
+            for (const auto& f : steps) stamps.push_back({ f.pos, r, 1.f, f.dirX, f.dirZ });
             VK::Deform::Dispatch(cmd, stamps.data(), (u32)stamps.size());
         }
     }

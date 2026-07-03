@@ -28,6 +28,7 @@ public:
     bool    active = false;
     bool    hud    = false;
     bool    shadow = false;       // game asked for a shadow-casting light (flashlight etc.)
+    bool    volumetric = false;   // game asked for a visible beam (R4 lamp shafts) — stored for diagnostics/future
     Fvector pos{ 0.f, 0.f, 0.f };
     Fvector dir{ 0.f, 0.f, 1.f };
     float   range  = 8.f;
@@ -43,8 +44,8 @@ public:
     bool  get_active()                      override { return active; }
     void  set_shadow(bool b)                override { shadow = b; }
     bool  get_shadow()                      override { return shadow; }
-    void  set_volumetric(bool)              override {}
-    bool  get_volumetric()                  override { return false; }
+    void  set_volumetric(bool b)            override { volumetric = b; }
+    bool  get_volumetric()                  override { return volumetric; }
     void  set_volumetric_intensity(float)   override {}
     void  set_volumetric_distance(float)    override {}
     void  set_flare(bool)                   override {}
@@ -83,6 +84,10 @@ struct GpuLight {
 // indices into this same array, so they're valid for both paths.
 struct FrameLights {
     GpuLight gpu[kMaxClusterLights];
+    // CPU-side parallel flags (NOT uploaded — GpuLight layout is shared with the
+    // UBO/cluster SSBO): 1 = the game flagged the light volumetric (R4 renders a
+    // visible beam for these). The fog inject encodes it into ITS OWN light copy.
+    u8       volFlag[kMaxClusterLights] = {};
     u32      count    = 0;
     int      spotIdx  = -1;   // gpu[] index of the spot-shadowed light (flashlight), -1 = none
     int      pointIdx = -1;   // gpu[] index of the point-shadowed light (campfire),  -1 = none

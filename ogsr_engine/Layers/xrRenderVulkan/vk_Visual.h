@@ -218,6 +218,15 @@ public:
     // no depth write, excluded from depth prepass + shadow casting.
     bool                m_bEmissiveAdd = false;
 
+    // OGF shader "glass" (model/lamp panes): routed to the blended wallmark
+    // pipeline variant in LoadTexture (see the GLASS note there).
+    bool                m_bModelGlass = false;
+
+    // OGF shader "lightplanes" (fake light-beam planes: headlights, searchlights,
+    // weapon torches). R4 (CBlender_deffer_model, oBlend + aref<16 → forward
+    // model_def_lq): LIT colour, srcalpha/invsrcalpha blend, alpha = tex.a·fog².
+    bool                m_bLitBlend = false;
+
     // Debug name
     shared_str          dbg_name;
 

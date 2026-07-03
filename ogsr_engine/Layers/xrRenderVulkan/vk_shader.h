@@ -76,6 +76,7 @@ public:
     bool m_bLandscape;    // Landscape shader (multi-pass)
     bool m_bWmark;        // Wallmark shader (decals)
     bool m_bAlphaRef;     // Alpha-reference shader (discard in fragment shader)
+    bool m_bGlass;        // Translucent glass (engine "glass" shader / trans shader on a glas\/wnd texture) — must BLEND, not alpha-test
 
 public:
     CVulkanShader();

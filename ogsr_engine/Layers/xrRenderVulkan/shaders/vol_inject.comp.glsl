@@ -293,15 +293,23 @@ vec3 localLights(vec3 world, vec3 viewDir)
         vec3  Ld    = toL / max(dist, 1e-3);
         float atten = 1.0 - dist / range;
         atten *= atten;                                   // smooth falloff
-        if (V.lights[i].color.w > 0.5) {                  // spot (flashlight) cone
+        // color.w: bit0 = spot, bit1 = VOLUMETRIC-flagged lamp (R4 shows a beam
+        // for these — pole lamps / headlights); boost their in-scatter so the
+        // shaft reads even in light haze.
+        int   lw    = int(V.lights[i].color.w + 0.5);
+        if ((lw & 1) == 1) {                              // spot cone
             float cosCone = V.lights[i].dir.w;
             float d = dot(-Ld, V.lights[i].dir.xyz);
             if (d < cosCone) continue;
             atten *= smoothstep(cosCone, mix(cosCone, 1.0, 0.5), d);
         }
+        if (lw >= 2) atten *= 3.0;                        // volumetric lamp beam boost
         if (i == spotIdx)        atten *= spotShadowF(world);
         else if (i == pointIdx)  atten *= pointShadowF(world, V.lights[i].pos.xyz, range);
-        else                     atten *= lightTerrainOcc(world, V.lights[i].pos.xyz);  // un-shadowed lamp → no leak through roof/floor
+        // Un-shadowed OMNI lamp → no leak through roof/floor. SPOTS exempt (matches
+        // light_shade.glsl): a fixture above the emitter (car hood over a headlight)
+        // reads as "buried" in the top-down map and killed the whole beam.
+        else if (V.lights[i].color.w < 0.5) atten *= lightTerrainOcc(world, V.lights[i].pos.xyz);
         float ph = hgPhase(dot(viewDir, Ld), V.fog.w);    // scatter toward the camera
         acc += V.lights[i].color.rgb * (atten * ph);
     }

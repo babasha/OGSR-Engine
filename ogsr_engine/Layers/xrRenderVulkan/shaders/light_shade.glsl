@@ -56,7 +56,12 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
         }
     }
     else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
-    else att *= lightTerrainOcc(wp, lpos.xyz);   // UNshadowed lamps: heightfield terrain occlusion
+    // UNshadowed OMNI lamps: heightfield terrain occlusion (stops basement lamps
+    // lighting through the ground). SPOTS are exempt: the top-down map sees any
+    // fixture above them (a car hood over its headlight, a lamp shade) and calls
+    // the light "buried" → aimed projector beams were silently killed. A spot's
+    // own cone already bounds where it can leak.
+    else if (lcol.w < 0.5) att *= lightTerrainOcc(wp, lpos.xyz);
     return tint * (att * max(dot(N, ld), 0.0));
 }
 

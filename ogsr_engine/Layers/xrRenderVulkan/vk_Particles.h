@@ -88,6 +88,13 @@ public:
     VkDescriptorSet m_TextureSet = VK_NULL_HANDLE;
     bool            m_TextureResolved = false;
 
+    // GPU-driven particles (Phase 3 #3): when r_gpu_particles routes this smoke
+    // effect onto the GPU path, m_GpuProgram caches its program-registry slot
+    // (-2 = unresolved, -1 = unsupported → CPU fallback, >=0 = slot) and
+    // m_GpuAccum carries the fractional emit count between frames.
+    int   m_GpuProgram = -2;
+    float m_GpuAccum   = 0.0f;
+
 public:
     vkCParticleEffect();
     virtual ~vkCParticleEffect();
@@ -100,6 +107,11 @@ public:
 
     // Resolve (lazily) and return the shared texture descriptor set.
     VkDescriptorSet ResolveTextureSet();
+
+    // True when r_gpu_particles routes this smoke effect onto the GPU path
+    // (lazily resolves + caches m_GpuProgram). GPU draws it → CPU BuildVertices
+    // skips it (returns 0) so the smoke isn't drawn twice.
+    bool GpuClaimed();
 
     // Build camera-facing billboards into `dst` (FVF::LIT). Returns vertex count
     // written (6 per particle), clamped to `maxVerts`.

@@ -46,6 +46,7 @@ extern float ps_current_detail_density; // 0..1, default 0.6 (lower = denser)
 extern float ps_current_detail_scale;   // r__detail_scale, 0.7..1.5 — per-item size multiplier
 extern float ps_r_sun_boost;            // r_sun_boost — global sun multiplier (see vk_env_light)
 extern float ps_r_grass_aref;           // r_grass_aref — grass alpha-test cutoff (lower = fatter blades)
+extern float ps_r_grass_asharp;         // r_grass_asharp — mip alpha compensation (far grass keeps coverage)
 extern int   ps_r_grass_nowave;         // r_grass_nowave — respect DO_NO_WAVING (1) or wind everything (0)
 
 namespace VK
@@ -175,7 +176,7 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     m_GfxConstants.wind_params.set(windDirAngle, windVel, 0.0f, 1.0f);   // .w = wind scale, overridden per detail type in the draw loop (DO_NO_WAVING → 0)
     m_GfxConstants.wsetup_grass.set(9.5f, 1.4f, 1.5f, 0.4f);
     m_GfxConstants.wind_anim.set(windAnim.x, windAnim.y, windAnim.z, 0.1f);
-    m_GfxConstants.vConsts.set(ps_r_grass_aref, 1.0f, sun_dir.y, 0.2f);   // x = grass alpha cutoff; sun.y feeds shader hemi calc
+    m_GfxConstants.vConsts.set(ps_r_grass_aref, ps_r_grass_asharp, sun_dir.y, 0.2f);   // x = grass alpha cutoff, y = mip alpha sharpen; sun.y feeds shader hemi calc
 
     // Character interaction: vInteractors[0] = player, [1..3] = nearest 3 NPCs
     // within 15 m. Empty slots have radius=0 so the shader skips them. Mirrors

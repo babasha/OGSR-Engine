@@ -31,6 +31,7 @@
 #include "../../Include/xrRender/ParticleCustom.h"
 #include "vk_Particles.h"        // vkCreateParticle (real particle visuals)
 #include "vk_pass_particles.h"   // VK::Pass_Particles registration
+#include "vk_gpu_particles.h"    // VK::GPUParticles — GPU-driven particles (Phase 0)
 #include "vk_wallmarks.h"        // VK::Wallmarks — bullet holes / decals on level geometry
 #include "vk_rain.h"             // VK::Pass_Rain — rain drops/splashes + thunderbolt
 #include "vk_pass_shadow.h"      // VK::Pass_SunShadow (sun shadow caster, before World)
@@ -597,12 +598,19 @@ void CRender::Render()
         // Volumetric sun shafts (god rays): fullscreen raymarch vs the sun shadow
         // map, additive over the lit scene. After Sky so rays glow against it too.
         VK::RegisterPass("Shafts", [](VK::FrameContext& c) { VK::Pass_SunShafts(c); });
+        // Translucent GLASS panes — late flush AFTER the whole opaque world + sky
+        // (they blend without z-write; anything drawn after them behind the pane
+        // would overwrite the blended pixels). Before wallmarks/particles.
+        VK::RegisterPass("Glass", [](VK::FrameContext& c) { VK::Pass_WorldGlass(c); });
         // Particles last: camera-facing billboards composited over the scene
         // (depth-tested vs world, additive/alpha blend, no depth write).
         // Wallmarks (bullet holes / scorch decals) over the lit world, before
         // particles so impact smoke composites on top of the fresh hole.
         VK::RegisterPass("Wallmarks", [](VK::FrameContext& c) { VK::Wallmarks::Render(c); });
         VK::RegisterPass("Particles", [](VK::FrameContext& c) { VK::Pass_Particles(c); });
+        // GPU-driven particles (Phase 1): one hardcoded effect simulated +
+        // drawn entirely on the GPU when r_gpu_particles=1 (off by default).
+        VK::RegisterPass("GPUParticles", [](VK::FrameContext& c) { VK::GPUParticles::DispatchComputeAndDraw(c); });
         // Weather: rain drop streaks + ground splashes + thunderbolt, drawn
         // over everything (alpha/additive, depth-tested). Also ticks the rain
         // simulation (CEffect_Rain::Calculate) — the engine's RenderLast path
