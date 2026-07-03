@@ -75,6 +75,8 @@ extern int   ps_r_snow_deform_tex;    // r_snow_deform_tex — use the dense def
 extern float ps_r_mud_deform;         // r_mud_deform — mud footprints on soft terrain (same deform texture, no snow needed)
 extern float ps_r_mud_depth;          // r_mud_depth — mud print POM carve depth (fraction of the detail height range)
 extern int   ps_r_snow_mesh;          // r_snow_mesh — dense snow surface mesh (VHM-style)
+extern int   ps_r_spot_grass;         // r_spot_grass — grass casters into the spot beam map
+extern float ps_r_spot_grass_shadow;  // r_spot_grass_shadow — grass shadow strength on SURFACES (0..1)
 
 namespace VK { namespace EnvLight {
 
@@ -188,7 +190,7 @@ bool Init()
     // water-sim (r_water_sim, off by default); the SSS puddle path doesn't use them
     // but they stay bound (harmless) so the sim can be switched on without relayout.
     // All FRAGMENT.
-    VkDescriptorSetLayoutBinding b[22]{};
+    VkDescriptorSetLayoutBinding b[23]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     // Also visible to VS/TES: snow geometric displacement reads sf_params.w (coverage).
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
@@ -217,20 +219,24 @@ bool Init()
     // receivers (ssilBoost multiplies the ambient term). All FRAGMENT.
     b[21].binding = 21; b[21].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[21].descriptorCount = 1;
     b[21].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Spot BEAM map (binding 22): spot map + grass casters. spotShadowF blends it
+    // with the clean spot map so grass shadows surfaces PARTIALLY (r_spot_grass_shadow).
+    b[22].binding = 22; b[22].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[22].descriptorCount = 1;
+    b[22].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     // The snow MESH (vk_pass_snow) vertex shader samples the RAIN map (9, base height)
     // + deform field (20) to place + displace its dense grid -> need VERTEX visibility.
     b[9].stageFlags  |= VK_SHADER_STAGE_VERTEX_BIT;
     b[13].stageFlags |= VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 22; slci.pBindings = b;
+    slci.bindingCount = 23; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
     VkDescriptorPoolSize ps[3]{
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight * 2 },    // LightUBO + VSM clipmap UBO
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 16 },   // 13 shadow/sky/ao + VSM atlas + deform + SSIL
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 17 },   // 13 shadow/sky/ao + VSM atlas + deform + SSIL + spot beam
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kFramesInFlight * 4 },    // VSM page table + 3 cluster SSBOs
     };
     VkDescriptorPoolCreateInfo pci{};
@@ -315,6 +321,11 @@ bool Init()
         si[4].sampler = ShadowMap::GetSampler(); si[4].imageView = ShadowMap::GetCascadeView(1);   // 5: sun cascade 1
         for (auto& s : si) s.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+        // Binding 22: spot BEAM map (spot + grass casters) — partial grass
+        // shadowing on surfaces (spotShadowF blend, r_spot_grass_shadow).
+        VkDescriptorImageInfo beamI{ ShadowMap::GetSampler(), ShadowMap::GetSpotBeamView(),
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+
         // Binding 9: rain occlusion map (white border sampler — outside = open sky).
         VkDescriptorImageInfo rainI{ ShadowMap::GetSampler(), ShadowMap::GetRainView(),
                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -367,7 +378,7 @@ bool Init()
             { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
         };
 
-        VkWriteDescriptorSet w[19]{};
+        VkWriteDescriptorSet w[20]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
@@ -417,6 +428,12 @@ bool Init()
         w[count].dstSet = s_set[i]; w[count].dstBinding = 13; w[count].descriptorCount = 1;
         w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &gdI;
         ++count;
+        if (beamI.imageView != VK_NULL_HANDLE) {
+            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[count].dstSet = s_set[i]; w[count].dstBinding = 22; w[count].descriptorCount = 1;
+            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &beamI;
+            ++count;
+        }
         for (u32 k = 0; k < 3; ++k) {
             w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[count].dstSet = s_set[i]; w[count].dstBinding = 17 + k; w[count].descriptorCount = 1;
@@ -908,6 +925,11 @@ void Update(u32 slot)
         ub.deform_tex[2] = ps_r_snow_deform_depth;               // max dent depth (m)
         ub.deform_tex[3] = (2.f * Deform::Half()) / dsize;       // world metres per texel
     }
+    // Grass shadow strength on surfaces (spotShadowF blends clean vs beam map).
+    // Zero when grass casters are off — the beam map then equals the clean map
+    // anyway, but skipping the 9 extra taps is free.
+    ub.spot_params[0] = ps_r_spot_grass ? _min(_max(ps_r_spot_grass_shadow, 0.f), 1.f) : 0.f;
+    ub.spot_params[1] = ub.spot_params[2] = ub.spot_params[3] = 0.f;
     // Periodic state log while debugging wetness (pairs with the mask view).
     if (ps_r_wet_debug) {
         static u32 s_wetLogCd = 0;

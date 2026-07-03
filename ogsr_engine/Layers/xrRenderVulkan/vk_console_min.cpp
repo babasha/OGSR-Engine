@@ -273,6 +273,75 @@ float ps_r_glass_refr    = 0.5f;   // user-tuned default (2026-07-02)
 // created it; in registry but not collected = cull; collected = shading side).
 int   ps_r_light_debug   = 0;
 
+// REAL volumetric light cones (vk_pass_lightcones): every volumetric-flagged
+// SPOT light gets an analytic raymarched beam built from its true pos/dir/
+// cone/range/colour — replaces the R4 `models\lightplanes` texture-sheet fakes.
+int   ps_r_light_cones        = 1;      // master
+float ps_r_light_cone_density = 1.2f;   // in-scatter strength (live)
+float ps_r_light_cone_len     = 2.5f;   // beam length = light range × this (live)
+float ps_r_light_cone_glare   = 2.0f;   // extra flare looking into the beam (live)
+float ps_r_light_cone_narrow  = 0.55f;  // visible beam = lit cone × this (bright core look)
+
+// Diagnostic: vertically mirror the cone pass's ray basis (negates the pushed
+// top vector). If debug blobs (r_light_cones 2) sit in the sky/underground
+// instead of AT the lamps, the winning value of this tells us the fullscreen
+// ndc convention is flipped vs the scene.
+int   ps_r_light_cone_flipy = 0;
+
+// Beam luminance in HDR scene units (2.2 ≈ sun-lit level). The honest media
+// model makes beams physically vanish against a daylit background — raise
+// this for the R4-style "always visible" look, lower for realism.
+float ps_r_light_cone_lum = 2.2f;
+
+// Beams synthesized from `models\lightplanes` fan geometry (car headlights,
+// searchlights, halogen lamps — carriers R4 gives NO dynamic light, the beam
+// is baked into the model). See vkSynthBeam / SynthCones.
+int   ps_r_light_cone_synth = 1;
+
+// Vertical lift (m) for the synthesized beam apex: the fan quads hang a few
+// centimetres BELOW the lamp centre, so the cone started just under the
+// headlight. Live-tunable.
+float ps_r_light_cone_lift = 0.11f;   // user-tuned on the zaz headlight
+
+// Lamp-face radius multiplier for synthesized beams. The frustum base radius
+// comes from the fan's own width at the lamp — 1.0 = as authored; raise for
+// a fatter "whole headlight glows" look, 0 → point cone.
+float ps_r_light_cone_base = 0.2f;   // user-tuned on the zaz headlight
+
+// Synthesized beams are REAL lights: reach = fan length × this (a headlight
+// shines tens of metres, not the 5 m fan the artist modelled) — drives both
+// the spot light range and the visible beam length (depth still cuts it at
+// geometry). power = surface-light intensity (0 = visual beam only).
+float ps_r_light_cone_reach = 6.0f;   // user: 4.0 felt short for a headlight
+float ps_r_light_cone_power = 1.0f;
+
+// Synth beams draw only a short lamp-face glow: full within ~15 cm of the lamp,
+// then exp(-d/this) to fully transparent — the LONG beam shape comes from the
+// froxel fog / particles (like the flashlight and sun shafts), not from a
+// painted-on milk cone.
+float ps_r_light_cone_fade = 0.8f;
+
+// The old R4 lightplanes texture sheets (aref -4 lit-blend path). Default OFF —
+// the real cones above replace them; 1 restores the R4-faithful fake planes.
+int   ps_r_lightplanes   = 0;
+
+// Per-step shadow-tap disc radius (texels) in the visible-beam raymarch — an
+// area-light penumbra. The spot map resolves grass blades at mm texels, so a
+// hard point tap paints razor "threads" through a grass field; the 24 march
+// steps integrate the jittered disc into a soft penumbra (no temporal needed).
+float ps_r_light_cone_soft = 6.0f;
+
+// Grass casters into the SPOT shadow map: blades cut a beam's light pool and
+// its visible volumetric cone (headlight/searchlight/flashlight through a
+// grass field). Same 1-frame-stale GPU instance buffer the VSM grass uses.
+int   ps_r_spot_grass    = 1;
+
+// Grass shadow strength on SURFACES (spotShadowF blends the clean spot map
+// with the spot+grass beam map). 0 = grass never shadows surfaces (sterile
+// pool), 1 = full blanket (dense grass eats the headlight's ground pool);
+// mid = translucent dapples — light scatters through grass IRL.
+float ps_r_spot_grass_shadow = 0.55f;
+
 // Respect the DO_NO_WAVING detail flag (1) or force SSFX wind on every detail type
 // (0, the old behaviour). R4 keeps flagged micro-plants (tiny shoots in asphalt)
 // static; without this they stretched under the tree/grass wind.
@@ -1302,6 +1371,23 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_grass_aref", &ps_r_grass_aref, 0.05f, 0.9f);
     CMD4(CCC_Float, "r_grass_asharp", &ps_r_grass_asharp, 0.0f, 2.0f);   // mip alpha compensation (far grass density)
     CMD4(CCC_Integer, "r_light_debug", &ps_r_light_debug, 0, 1);         // dump dynamic lights to the log (~2 s)
+    CMD4(CCC_Integer, "r_light_cones",        &ps_r_light_cones,        0, 2);          // real volumetric beams for volumetric spots (2 = bounding-sphere debug)
+    CMD4(CCC_Float,   "r_light_cone_density", &ps_r_light_cone_density, 0.0f, 5.0f);    // beam in-scatter strength
+    CMD4(CCC_Float,   "r_light_cone_len",     &ps_r_light_cone_len,     0.5f, 10.0f);   // beam length = range × this
+    CMD4(CCC_Float,   "r_light_cone_glare",   &ps_r_light_cone_glare,   0.0f, 8.0f);    // looking-into-the-beam flare
+    CMD4(CCC_Float,   "r_light_cone_narrow",  &ps_r_light_cone_narrow,  0.1f, 1.0f);    // visible beam vs lit cone angle
+    CMD4(CCC_Integer, "r_light_cone_flipy",   &ps_r_light_cone_flipy,   0, 1);          // diagnostic: mirror the cone ray basis vertically
+    CMD4(CCC_Float,   "r_light_cone_lum",     &ps_r_light_cone_lum,     0.1f, 12.0f);   // beam luminance (HDR units; raise for day visibility)
+    CMD4(CCC_Integer, "r_light_cone_synth",   &ps_r_light_cone_synth,   0, 1);          // beams synthesized from lightplanes model geometry
+    CMD4(CCC_Float,   "r_light_cone_lift",    &ps_r_light_cone_lift,    0.0f, 0.5f);    // vertical apex lift for synthesized beams (m)
+    CMD4(CCC_Float,   "r_light_cone_base",    &ps_r_light_cone_base,    0.0f, 4.0f);    // lamp-face radius multiplier (frustum base)
+    CMD4(CCC_Float,   "r_light_cone_reach",   &ps_r_light_cone_reach,   1.0f, 10.0f);   // beam/light reach = fan length × this
+    CMD4(CCC_Float,   "r_light_cone_power",   &ps_r_light_cone_power,   0.0f, 10.0f);   // synthesized-light surface intensity (0 = beam only)
+    CMD4(CCC_Float,   "r_light_cone_fade",    &ps_r_light_cone_fade,    0.05f, 10.0f);  // synth lamp-face glow fade length (m)
+    CMD4(CCC_Integer, "r_spot_grass",         &ps_r_spot_grass,         0, 1);          // grass casters into the spot shadow map (beam cutouts)
+    CMD4(CCC_Float,   "r_light_cone_soft",    &ps_r_light_cone_soft,    0.0f, 32.0f);   // beam shadow penumbra radius (spot-map texels)
+    CMD4(CCC_Float,   "r_spot_grass_shadow",  &ps_r_spot_grass_shadow,  0.0f, 1.0f);    // grass shadow strength on surfaces (0 off, 1 full blanket)
+    CMD4(CCC_Integer, "r_lightplanes",        &ps_r_lightplanes,        0, 1);          // old R4 texture-sheet beams (off = cones replace them)
     CMD4(CCC_Float,   "r_glass_opacity", &ps_r_glass_opacity, 0.05f, 1.0f); // glass opacity ceiling (1 = texture alpha as in R4)
     CMD4(CCC_Float,   "r_glass_refr",    &ps_r_glass_refr,    0.0f,  3.0f); // glass refraction wobble strength (0 = off)
     CMD4(CCC_Integer, "r_grass_nowave", &ps_r_grass_nowave, 0, 1);

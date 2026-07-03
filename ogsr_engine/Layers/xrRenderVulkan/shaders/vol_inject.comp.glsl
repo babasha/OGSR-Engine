@@ -291,8 +291,16 @@ vec3 localLights(vec3 world, vec3 viewDir)
         float range = V.lights[i].pos.w;
         if (range <= 0.0 || dist >= range) continue;
         vec3  Ld    = toL / max(dist, 1e-3);
-        float atten = 1.0 - dist / range;
-        atten *= atten;                                   // smooth falloff
+        // Narrow beams get the windowed falloff (far half of the beam still
+        // glows in the fog) — matches the surface shaders (light_shade.glsl).
+        float atten;
+        if (V.lights[i].dir.w > 0.87 && (int(V.lights[i].color.w + 0.5) & 1) == 1) {
+            atten = 1.0 - (dist * dist) / (range * range);
+            atten *= atten;
+        } else {
+            atten = 1.0 - dist / range;
+            atten *= atten;                               // smooth falloff
+        }
         // color.w: bit0 = spot, bit1 = VOLUMETRIC-flagged lamp (R4 shows a beam
         // for these — pole lamps / headlights); boost their in-scatter so the
         // shaft reads even in light haze.

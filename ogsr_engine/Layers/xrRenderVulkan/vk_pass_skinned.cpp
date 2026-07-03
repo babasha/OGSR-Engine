@@ -29,6 +29,7 @@
 #include "vk_pipeline_cache.h"        // PipelineCache::GetCacheObject() â€” shared disk-backed cache
 #include "vk_env_light.h"             // EnvLight â€” shared per-frame sun/hemi/ambient UBO (set 2)
 #include "vk_shadow.h"                // ShadowMap::SphereVisible â€” caster culling
+#include "vk_pass_lightcones.h"       // SynthCones::Submit â€” lightplanes-derived beam cones
 #include "../../xr_3da/device.h"      // Device.mFullTransform_hud (HUD projection), dwFrame
 
 #include <unordered_map>
@@ -36,6 +37,7 @@
 // Console cvar at GLOBAL scope â€” a block-scope extern inside namespace VK would mangle as
 // VK::ps_r_vsm_npc_dist -> LNK2001 (same trick as vk_pass_shadow's externs).
 extern float ps_r_vsm_npc_dist;   // VSM NPC shadow cull distance (m); 0 = no cull
+extern int   ps_r_lightplanes;    // 1 = draw the old R4 lightplanes fake sheets (cones replace them)
 
 namespace VK {
 
@@ -738,6 +740,35 @@ namespace {
                 const bool emissive = child->m_bEmissiveAdd;
                 const bool glass    = child->m_bModelGlass;
                 const bool litblend = child->m_bLitBlend;
+                if (litblend)
+                {
+                    // Register the synthesized beam cone (Pass_LightCones draws
+                    // it later this frame). Single-bone fans follow their bone —
+                    // hidden bone (torch off: X-Ray zeroes it) = no beam, and a
+                    // rotating searchlight carries its cone. HUD skipped: a
+                    // camera-apex beam is milk (the real flashlight spot covers it).
+                    if (hudMode < 0.5f && child->m_SynthBeams.count)
+                    {
+                        bool    visible = true;
+                        Fmatrix xf      = u.xform;
+                        u32     boneId  = u32(-1);
+                        if (auto* st = dynamic_cast<vkSkeletonX_ST*>(child)) {
+                            if (st->RenderMode == vkSkeletonX_ST::RM_SINGLE) boneId = st->RMS_boneid;
+                        } else if (auto* pm = dynamic_cast<vkSkeletonX_PM*>(child)) {
+                            if (pm->RenderMode == vkSkeletonX_PM::RM_SINGLE) boneId = pm->RMS_boneid;
+                        }
+                        if (boneId != u32(-1) && u.K) {
+                            visible = !!u.K->LL_GetBoneVisible((u16)boneId);
+                            if (visible)
+                                xf.mul_43(u.xform, u.K->LL_GetBoneInstance((u16)boneId).mRenderTransform);
+                        }
+                        if (visible) SynthCones::Submit(child, xf);
+                        else         SynthCones::Revoke(child);   // torch off — kill the beam now
+                    }
+                    // r_lightplanes 0 (default): the fake sheets themselves are
+                    // replaced by the volumetric cone — skip drawing them.
+                    if (!ps_r_lightplanes) continue;
+                }
                 VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : ((glass || litblend) ? 2u : 0u));
                 if (pipe == VK_NULL_HANDLE) continue;
 

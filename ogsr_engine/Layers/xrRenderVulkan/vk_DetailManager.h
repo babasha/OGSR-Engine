@@ -189,6 +189,10 @@ public:
     bool     Vsm_TypeMesh(u32 i, VkBuffer& vb, VkBuffer& ib, u32& indexCount) const;
     VkDescriptorSetLayout Vsm_GfxSetLayout() const;    // diffuse-sampler set layout (for the grass-page alpha test)
     VkDescriptorSet       Vsm_TypeDiffuseSet(u32 i) const;
+    // Wind push block for external grass casters (spot shadow map): last
+    // PrepareFrame's values — 1 frame stale, same as the instance buffer.
+    void  Vsm_WindPush(Fvector4& wind, Fvector4& wsetup, Fvector4& anim) const;
+    float Vsm_TypeWindScale(u32 i) const;   // 0 for DO_NO_WAVING types (r_grass_nowave), else 1
 
 private:
     // ----- Session B per-frame state ---------------------------------------

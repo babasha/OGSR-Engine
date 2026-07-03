@@ -62,6 +62,13 @@ namespace {
     VkImage       s_spotImage = VK_NULL_HANDLE;     // spot (flashlight) map
     VmaAllocation s_spotAlloc = VK_NULL_HANDLE;
     VkImageView   s_spotView  = VK_NULL_HANDLE;
+    // Spot BEAM map = copy of the spot map + grass casters on top. The visible
+    // volumetric cone / fog sample THIS (blades cut the beam); surfaces sample
+    // the clean spot map — dense grass in one shared map blanketed the ground
+    // and ate the headlight's light pool (light scatters through grass IRL).
+    VkImage       s_spotBeamImage = VK_NULL_HANDLE;
+    VmaAllocation s_spotBeamAlloc = VK_NULL_HANDLE;
+    VkImageView   s_spotBeamView  = VK_NULL_HANDLE;
     Fmatrix       s_spotVP;
     VkImage       s_pointImage = VK_NULL_HANDLE;    // point cube (campfire), 6 layers
     VmaAllocation s_pointAlloc = VK_NULL_HANDLE;
@@ -177,6 +184,8 @@ VkSampler   GetSampler()  { return s_sampler; }
 u32         Size()        { return kSize; }
 VkImage     GetSpotImage()    { return s_spotImage; }
 VkImageView GetSpotView()     { return s_spotView; }
+VkImage     GetSpotBeamImage(){ return s_spotBeamImage; }
+VkImageView GetSpotBeamView() { return s_spotBeamView; }
 u32         SpotSize()        { return kSpotSize; }
 const Fmatrix& GetSpotVP()    { return s_spotVP; }
 VkImage     GetPointImage()   { return s_pointImage; }
@@ -253,8 +262,10 @@ bool Init()
         s_failed = true; return false;
     }
     s_fogVP.identity();
-    if (!CreateDepthImageEx(kSpotSize, 1, 0, dynUsage, s_spotImage, s_spotAlloc) ||
+    if (!CreateDepthImageEx(kSpotSize, 1, 0, dynUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, s_spotImage, s_spotAlloc) ||
         !CreateDepthView(s_spotImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_spotView) ||
+        !CreateDepthImageEx(kSpotSize, 1, 0, dynUsage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s_spotBeamImage, s_spotBeamAlloc) ||
+        !CreateDepthView(s_spotBeamImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_spotBeamView) ||
         !CreateDepthImageEx(kPointSize, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, dynUsage, s_pointImage, s_pointAlloc) ||
         !CreateDepthView(s_pointImage, VK_IMAGE_VIEW_TYPE_CUBE, 0, 6, s_pointCubeView)) {
         s_failed = true; return false;
@@ -288,6 +299,7 @@ bool Init()
     Prof::NameImage(s_rainImage,   "Shadow.RainOcclusion");
     Prof::NameImage(s_groundImage, "Shadow.GroundHeight");
     Prof::NameImage(s_spotImage,   "Shadow.Spot");
+    Prof::NameImage(s_spotBeamImage, "Shadow.SpotBeam");
     Prof::NameImage(s_pointImage,  "Shadow.PointCube");
 
     Msg("[VK Shadow] init OK (%ux%u D32)", kSize, kSize);
@@ -506,6 +518,8 @@ void Destroy()
     if (s_groundImage){ vmaDestroyImage(VulkanHW.m_Allocator, s_groundImage, s_groundAlloc); s_groundImage = VK_NULL_HANDLE; s_groundAlloc = VK_NULL_HANDLE; }
     if (s_spotView)   { vkDestroyImageView(VulkanHW.m_Device, s_spotView, nullptr); s_spotView = VK_NULL_HANDLE; }
     if (s_spotImage)  { vmaDestroyImage(VulkanHW.m_Allocator, s_spotImage, s_spotAlloc); s_spotImage = VK_NULL_HANDLE; s_spotAlloc = VK_NULL_HANDLE; }
+    if (s_spotBeamView)  { vkDestroyImageView(VulkanHW.m_Device, s_spotBeamView, nullptr); s_spotBeamView = VK_NULL_HANDLE; }
+    if (s_spotBeamImage) { vmaDestroyImage(VulkanHW.m_Allocator, s_spotBeamImage, s_spotBeamAlloc); s_spotBeamImage = VK_NULL_HANDLE; s_spotBeamAlloc = VK_NULL_HANDLE; }
     for (u32 f = 0; f < 6; ++f)
         if (s_pointFaceView[f]) { vkDestroyImageView(VulkanHW.m_Device, s_pointFaceView[f], nullptr); s_pointFaceView[f] = VK_NULL_HANDLE; }
     if (s_pointCubeView) { vkDestroyImageView(VulkanHW.m_Device, s_pointCubeView, nullptr); s_pointCubeView = VK_NULL_HANDLE; }

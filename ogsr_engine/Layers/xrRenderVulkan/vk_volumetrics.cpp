@@ -399,7 +399,9 @@ bool Init()
         VkDescriptorBufferInfo vPtI{ s_dummySSBO.GetHandle(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo vUboI{ s_ubo.GetHandle(), kUboStride * i, 192 };
         VkDescriptorImageInfo  fogShI{ ShadowMap::GetSampler(), ShadowMap::GetFogShadowView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorImageInfo  spotShI{ ShadowMap::GetSampler(), ShadowMap::GetSpotView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        // Fog beam samples the spot+GRASS map (blades cut the beam); surfaces keep
+        // the clean spot map so grass doesn't blanket the ground's light pool.
+        VkDescriptorImageInfo  spotShI{ ShadowMap::GetSampler(), ShadowMap::GetSpotBeamView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  pointShI{ ShadowMap::GetSampler(), ShadowMap::GetPointCubeView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  smokeI{ s_sampler, s_smokeView, VK_IMAGE_LAYOUT_GENERAL };   // Stage-1 smoke media (sampled from GENERAL)
 

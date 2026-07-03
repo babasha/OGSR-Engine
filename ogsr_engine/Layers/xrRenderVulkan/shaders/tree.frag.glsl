@@ -81,11 +81,26 @@ vec3 dynLightsFoliage(vec3 wp)
         float d2 = dot(dv, dv);
         if (d2 >= r * r) continue;
         float d   = sqrt(max(d2, 1e-6));
-        float att = 1.0 - d / r;
-        att *= att;
-        if (L.lights[i].color.w > 0.5)
-            att *= clamp((dot(-dv / d, L.lights[i].dir.xyz) - L.lights[i].dir.w)
-                         / max(1.0 - L.lights[i].dir.w, 1e-3), 0.0, 1.0);
+        // Narrow beams: windowed falloff (far half still lights) — light_shade.glsl.
+        float att;
+        if (L.lights[i].color.w > 0.5 && L.lights[i].dir.w > 0.87) {
+            att = 1.0 - (d2 / (r * r));
+            att *= att;
+        } else {
+            att = 1.0 - d / r;
+            att *= att;
+        }
+        if (L.lights[i].color.w > 0.5) {
+            // Narrow beams: full inside the cone + spill to 2x the angle — see
+            // light_shade.glsl (axis-peaked ramp left beam-lit foliage dark).
+            float ca = dot(-dv / d, L.lights[i].dir.xyz);
+            float ci = L.lights[i].dir.w;
+            if (ci > 0.87) {
+                float co = 2.0 * ci * ci - 1.0;
+                att *= clamp((ca - co) / max(ci - co, 1e-3), 0.0, 1.0);
+            } else
+                att *= clamp((ca - ci) / max(1.0 - ci, 1e-3), 0.0, 1.0);
+        }
         acc += L.lights[i].color.rgb * (att * 0.7);
     }
     return acc;

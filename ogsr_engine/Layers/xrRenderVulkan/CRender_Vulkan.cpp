@@ -36,6 +36,7 @@
 #include "vk_rain.h"             // VK::Pass_Rain — rain drops/splashes + thunderbolt
 #include "vk_pass_shadow.h"      // VK::Pass_SunShadow (sun shadow caster, before World)
 #include "vk_pass_sunshafts.h"   // VK::Pass_SunShafts (volumetric god rays, after Sky)
+#include "vk_pass_lightcones.h"  // VK::Pass_LightCones (per-light volumetric beams)
 #include "vk_light.h"            // VK::vkLight (dynamic point/spot lights, STEP 3)
 #include "../../xrCDB/ISpatial.h"      // g_SpatialSpace, ISpatial, STYPE_RENDERABLE (dynamic collection)
 #include "../../xrCDB/Frustum.h"       // CFrustum
@@ -598,6 +599,10 @@ void CRender::Render()
         // Volumetric sun shafts (god rays): fullscreen raymarch vs the sun shadow
         // map, additive over the lit scene. After Sky so rays glow against it too.
         VK::RegisterPass("Shafts", [](VK::FrameContext& c) { VK::Pass_SunShafts(c); });
+        // Per-light volumetric cones: real raymarched beams for the volumetric
+        // spots (headlights/searchlights/pole lamps) — replaces the R4
+        // lightplanes texture-sheet fakes. Additive over the lit scene.
+        VK::RegisterPass("LightCones", [](VK::FrameContext& c) { VK::Pass_LightCones(c); });
         // Translucent GLASS panes — late flush AFTER the whole opaque world + sky
         // (they blend without z-write; anything drawn after them behind the pane
         // would overwrite the blended pixels). Before wallmarks/particles.

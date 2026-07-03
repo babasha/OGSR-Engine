@@ -551,4 +551,17 @@ bool CDetailManager::Vsm_TypeMesh(u32 i, VkBuffer& vb, VkBuffer& ib, u32& indexC
 VkDescriptorSetLayout CDetailManager::Vsm_GfxSetLayout() const { return m_GfxDescLayout; }
 VkDescriptorSet       CDetailManager::Vsm_TypeDiffuseSet(u32 i) const { return (i < m_GfxDescSets.size()) ? m_GfxDescSets[i] : VK_NULL_HANDLE; }
 
+void CDetailManager::Vsm_WindPush(Fvector4& wind, Fvector4& wsetup, Fvector4& anim) const
+{
+    wind   = m_GfxConstants.wind_params;
+    wsetup = m_GfxConstants.wsetup_grass;
+    anim   = m_GfxConstants.wind_anim;
+}
+
+float CDetailManager::Vsm_TypeWindScale(u32 i) const
+{
+    if (i >= objects.size() || !objects[i]) return 1.f;
+    return (ps_r_grass_nowave && (objects[i]->m_Flags & DO_NO_WAVING)) ? 0.f : 1.f;
+}
+
 }  // namespace VK

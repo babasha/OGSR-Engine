@@ -64,6 +64,9 @@ layout(set = ENV_SET, binding = 0) uniform Lighting {
     // player-centred ortho box (vk_deform), sampled instead of the stamp loop.
     mat4 deform_vp;          // world -> deform-texture NDC (straight-down ortho)
     vec4 deform_tex;         // x=enable, y=1/size, z=max depth (m), w=world metres per texel
+    // Spot-light extras. x = grass shadow strength on surfaces (r_spot_grass_shadow):
+    // spotShadowF blends the clean spot map (b2) with the spot+grass beam map (b22).
+    vec4 spot_params;
 } L;
 
 layout(set = ENV_SET, binding = 1)  uniform sampler2D   uShadow;       // far sun map (cached)
@@ -85,5 +88,8 @@ layout(set = ENV_SET, binding = 20) uniform sampler2D   uDeform;       // snow d
 // via ssilBoost() in env_common.glsl / the local copies (which use gl_FragCoord,
 // so the FUNCTION cannot live in this stage-shared header).
 layout(set = ENV_SET, binding = 21) uniform sampler2D   uIL;
+// Spot BEAM map: the spot map + grass casters (see vk_pass_shadow). spotShadowF
+// blends it with the clean uSpotShadow so grass shadows surfaces partially.
+layout(set = ENV_SET, binding = 22) uniform sampler2D   uSpotShadowGrass;
 
 #endif // LIGHT_UBO_GLSL

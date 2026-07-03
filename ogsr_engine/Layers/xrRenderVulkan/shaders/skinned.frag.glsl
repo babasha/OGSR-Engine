@@ -121,7 +121,14 @@ vec3 skyAmbient(vec3 N)
 }
 
 // Spot/point shadow + dynamic lights - same model as world_lmap.frag.
-float spotShadowF(vec3 wp)
+// LINEAR-depth compare with a world epsilon (see shadow_common.glsl — a
+// constant NDC bias leaked light through fences near the spot's far plane).
+float spotLinZ(float zndc, float f)
+{
+    const float n = 0.5;   // ComputeSpotVP near plane
+    return n * f / max(f - zndc * (f - n), 1e-4);
+}
+float spotShadowF(vec3 wp, float range)
 {
     vec4 c = L.spot_vp * vec4(wp, 1.0);
     if (c.w <= 0.0) return 1.0;
@@ -129,12 +136,13 @@ float spotShadowF(vec3 wp)
     vec2 uv = ndc.xy * 0.5 + 0.5;
     uv.y = 1.0 - uv.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.002;
+    float f    = max(range, 1.0);
+    float zRef = spotLinZ(ndc.z, f) - 0.08;
     vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += (ref <= texture(uSpotShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
+            sum += (zRef <= spotLinZ(texture(uSpotShadow, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
     return sum * (1.0 / 9.0);
 }
 
@@ -157,13 +165,29 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
     if (d2 >= r * r) return vec3(0.0);
     float d   = sqrt(max(d2, 1e-6));
     vec3  ld  = dv / d;
-    float att = 1.0 - d / r;
-    att *= att;
-    if (lcol.w > 0.5)
-        att *= clamp((dot(-ld, ldir.xyz) - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    // Narrow beams: windowed falloff (far half of the beam still lights) —
+    // see light_shade.glsl.
+    float att;
+    if (lcol.w > 0.5 && ldir.w > 0.87) {
+        att = 1.0 - (d2 / (r * r));
+        att *= att;
+    } else {
+        att = 1.0 - d / r;
+        att *= att;
+    }
+    if (lcol.w > 0.5) {
+        // Narrow beams: full inside the cone + spill to 2x the angle — see
+        // light_shade.glsl (the axis-peaked ramp left beam-lit ground/NPCs dark).
+        float ca = dot(-ld, ldir.xyz);
+        if (ldir.w > 0.87) {
+            float co = 2.0 * ldir.w * ldir.w - 1.0;
+            att *= clamp((ca - co) / max(ldir.w - co, 1e-3), 0.0, 1.0);
+        } else
+            att *= clamp((ca - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    }
     vec3 tint = lcol.rgb;
     if (gi == sIdx) {
-        att *= spotShadowF(wp);
+        att *= spotShadowF(wp, r);
         if (L.shadow_params.z > 0.5) {
             vec4 cc = L.spot_vp * vec4(wp, 1.0);
             if (cc.w > 0.0) {
@@ -174,7 +198,11 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
         }
     }
     else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
-    return tint * (att * max(dot(N, ld), 0.0));
+    float ndl = dot(N, ld);
+    // Narrow-beam wrap diffuse — same as light_shade.glsl (grazing headlight
+    // beams painted no light pool at plain Lambert).
+    if (lcol.w > 0.5 && ldir.w > 0.87) ndl = (ndl + 0.4) * (1.0 / 1.4);
+    return tint * (att * max(ndl, 0.0));
 }
 
 // Clustered (r_clustered): only this froxel's lights from the SSBO; fallback:

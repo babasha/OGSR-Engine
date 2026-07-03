@@ -18,6 +18,8 @@
 
 #include <string>
 #include <unordered_set>     // glass triage dedup (LoadTexture)
+#include <unordered_map>     // fan clustering (vk_ComputeSynthBeams)
+#include <algorithm>         // std::clamp/min/max (vk_BeamFromPoints)
 
 // ============================================================================
 // VK_Render_Mesh implementation
@@ -100,6 +102,7 @@ void vkRender_Visual::Copy(vkRender_Visual* from)
     // the pool base. THE "cabinet glass ignores everything" bug (2026-07-02).
     m_bModelGlass = from->m_bModelGlass;
     m_bLitBlend   = from->m_bLitBlend;
+    m_SynthBeams  = from->m_SynthBeams;   // pool clones must keep the synthesized beams
     // Pool instances are built via Copy(); without this the instance's diffuse
     // descriptor stays null and it renders white (the base had it from LoadTexture).
     // (Same latent class as the Update_Callback ctor bug.) WorldMaterial* is a shared
@@ -205,7 +208,18 @@ void vkRender_Visual::LoadTexture(IReader* data)
             // Fake light-beam planes (headlights/searchlights/weapon torches):
             // R4 renders these LIT + srcalpha-BLENDED (model_def_lq), NOT additive.
             if (sn_lower.find("lightplanes") != xr_string::npos)
+            {
                 m_bLitBlend = true;
+                // Beam colour for the synthesized cones — the fan textures are
+                // glow_<colour> (glow_orange headlights, glow_yellow torches…).
+                Fvector& bc = m_SynthBeams.rgb;
+                if      (tn_lower.find("orange") != xr_string::npos) bc.set(1.00f, 0.55f, 0.25f);
+                else if (tn_lower.find("yellow") != xr_string::npos) bc.set(1.00f, 0.90f, 0.55f);
+                else if (tn_lower.find("red")    != xr_string::npos) bc.set(1.00f, 0.30f, 0.15f);
+                else if (tn_lower.find("blue")   != xr_string::npos) bc.set(0.45f, 0.70f, 1.00f);
+                else if (tn_lower.find("green")  != xr_string::npos) bc.set(0.50f, 1.00f, 0.55f);
+                else                                                 bc.set(0.88f, 0.94f, 1.00f);   // cool white (flashlight-like)
+            }
             if (sn_lower.find("reddot")      != xr_string::npos ||
                 sn_lower.find("collimator")  != xr_string::npos ||
                 sn_lower.find("holo")        != xr_string::npos ||
@@ -503,6 +517,162 @@ static void ConvertFVFToLevelFormat(const u8* src, u8* dst, u32 vertCount, u32 f
     }
 }
 
+// Fit ONE beam cone to a point cluster (model space). The fan is elongated
+// along the beam (principal axis via power-iterated covariance) and WIDENS
+// away from the lamp — the narrow end is the apex. See vkSynthBeam.
+static bool vk_BeamFromPoints(const Fvector* pts, u32 count, vkSynthBeam& sb)
+{
+    if (!pts || count < 4) return false;
+
+    Fvector c{ 0.f, 0.f, 0.f };
+    for (u32 i = 0; i < count; ++i) c.add(pts[i]);
+    c.div(float(count));
+
+    float xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+    for (u32 i = 0; i < count; ++i) {
+        Fvector d; d.sub(pts[i], c);
+        xx += d.x * d.x; xy += d.x * d.y; xz += d.x * d.z;
+        yy += d.y * d.y; yz += d.y * d.z; zz += d.z * d.z;
+    }
+    Fvector a = (xx >= yy && xx >= zz) ? Fvector{ 1, 0, 0 }
+              : (yy >= zz)             ? Fvector{ 0, 1, 0 } : Fvector{ 0, 0, 1 };
+    for (int it = 0; it < 16; ++it) {
+        Fvector n{ xx * a.x + xy * a.y + xz * a.z,
+                   xy * a.x + yy * a.y + yz * a.z,
+                   xz * a.x + yz * a.y + zz * a.z };
+        const float m = n.magnitude();
+        if (m < 1e-9f) return false;
+        n.div(m); a = n;
+    }
+
+    float tmin = 1e9f, tmax = -1e9f;
+    for (u32 i = 0; i < count; ++i) {
+        Fvector d; d.sub(pts[i], c);
+        const float t = d.dotproduct(a);
+        tmin = std::min(tmin, t); tmax = std::max(tmax, t);
+    }
+    const float span = tmax - tmin;
+    if (span < 0.25f) return false;   // degenerate/tiny fan — not a beam
+
+    // Radial spread in the 30% end slabs decides which end is the lamp.
+    float rNear = 0, rFar = 0, rMax = 0; u32 nNear = 0, nFar = 0;
+    for (u32 i = 0; i < count; ++i) {
+        Fvector d; d.sub(pts[i], c);
+        const float t = d.dotproduct(a);
+        Fvector rad; rad.mad(d, a, -t);
+        const float r = rad.magnitude();
+        rMax = std::max(rMax, r);
+        if      (t < tmin + 0.3f * span) { rNear += r; ++nNear; }
+        else if (t > tmax - 0.3f * span) { rFar  += r; ++nFar;  }
+    }
+    if (!nNear || !nFar) return false;
+    float nearAvg = rNear / float(nNear), farAvg = rFar / float(nFar);
+    if (nearAvg > farAvg) {   // widens toward tmin → flip
+        a.invert();
+        const float t0 = tmin; tmin = -tmax; tmax = -t0;
+        std::swap(nearAvg, farAvg);
+    }
+    // A real beam WIDENS away from the lamp. A symmetric spread (the zaz keeps
+    // a single near-glow fan strung ACROSS the hood: its long axis runs between
+    // the lamps, near/far spreads equal) is not a beam — reject it, the glow
+    // billboard covers that look.
+    if (farAvg < nearAvg * 1.6f + 0.02f) return false;
+
+    sb.apex.mad(c, a, tmin);
+    sb.dir  = a;
+    sb.len  = span;
+    sb.tanH = std::clamp(rMax / span, 0.08f, 1.2f);
+    // Lamp-face radius: the fan's spread AT the lamp — the beam is a frustum
+    // ("the whole headlight glows"), not a cone from a single point.
+    sb.apexR = std::clamp(nearAvg * 1.2f, 0.05f, 0.6f);
+    return true;
+}
+
+// Cluster a lightplanes leaf into connected fans, then fit a beam per fan.
+// One leaf often holds SEVERAL fans (the zaz keeps BOTH headlights in one
+// leaf: a merged PCA gave a cone in the middle of the hood pointing SIDEWAYS
+// — the axis between the lamps, not along the beam). Components connect via
+// shared triangle indices + a 1 cm positional weld (fans use unwelded quads).
+static void vk_ComputeSynthBeams(const xr_vector<Fvector>& pos, const u16* idx, u32 idxCount,
+                                 vkSynthBeams& out, const char* dbgName)
+{
+    out.count = 0;
+    const u32 n = (u32)pos.size();
+    if (n < 4) return;
+
+    xr_vector<u32> parent(n);
+    for (u32 i = 0; i < n; ++i) parent[i] = i;
+    auto find = [&](u32 x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    auto unite = [&](u32 a, u32 b) { a = find(a); b = find(b); if (a != b) parent[b] = a; };
+
+    if (idx && idxCount >= 3) {
+        for (u32 t = 0; t + 2 < idxCount; t += 3) {
+            const u32 a = idx[t], b = idx[t + 1], c = idx[t + 2];
+            if (a >= n || b >= n || c >= n) continue;
+            unite(a, b); unite(a, c);
+        }
+        // Positional weld: quads of one fan are often unwelded (same position,
+        // separate vertices) — merge components sharing a 1 cm cell.
+        std::unordered_map<u64, u32> cell;
+        cell.reserve(n);
+        for (u32 i = 0; i < n; ++i) {
+            const Fvector& p = pos[i];
+            const u64 k = (u64(u32(s32(p.x * 100.f + 0.5f)) & 0x1FFFFF) << 42)
+                        | (u64(u32(s32(p.y * 100.f + 0.5f)) & 0x1FFFFF) << 21)
+                        |  u64(u32(s32(p.z * 100.f + 0.5f)) & 0x1FFFFF);
+            auto it = cell.find(k);
+            if (it == cell.end()) cell.emplace(k, i); else unite(it->second, i);
+        }
+    }
+    // No indices available → single cluster (whole leaf), the old behaviour.
+
+    std::unordered_map<u32, xr_vector<u32>> comps;
+    for (u32 i = 0; i < n; ++i) comps[find(i)].push_back(i);
+    xr_vector<const xr_vector<u32>*> order;
+    for (auto& kv : comps)
+        if (kv.second.size() >= 4) order.push_back(&kv.second);
+    std::sort(order.begin(), order.end(),
+              [](const xr_vector<u32>* a, const xr_vector<u32>* b) { return a->size() > b->size(); });
+
+    xr_vector<Fvector> tmp;
+    for (const xr_vector<u32>* comp : order) {
+        if (out.count >= vkSynthBeams::kMax) break;
+        tmp.clear(); tmp.reserve(comp->size());
+        for (u32 vi : *comp) tmp.push_back(pos[vi]);
+        vkSynthBeam sb{};
+        if (!vk_BeamFromPoints(tmp.data(), (u32)tmp.size(), sb)) continue;
+        out.b[out.count++] = sb;
+    }
+
+    // Merge near-duplicate beams: ONE lamp is often modelled as 2+ crossed
+    // quads ~0.2-0.3 m apart (the zaz headlight came out as TWO parallel
+    // beams) — same direction + close apexes collapse into one bright beam.
+    // Distinct headlights (tr13: left/right pairs ~1 m apart) stay separate.
+    for (u32 i = 0; i < out.count; ++i)
+        for (u32 j = i + 1; j < out.count; ) {
+            vkSynthBeam& A = out.b[i];
+            const vkSynthBeam& B = out.b[j];
+            // 0.6 m: crossed quads of ONE lamp sit 0.2-0.3 m apart, distinct
+            // headlights ~1 m — a len-scaled radius merged the truck's pair.
+            const float mergeR = 0.6f;
+            if (A.dir.dotproduct(B.dir) > 0.9f && A.apex.distance_to(B.apex) < mergeR) {
+                A.apex.add(B.apex); A.apex.mul(0.5f);
+                A.dir.add(B.dir);   A.dir.normalize_safe();
+                A.len   = std::max(A.len, B.len);
+                A.tanH  = std::max(A.tanH, B.tanH);
+                A.apexR = std::max(A.apexR, B.apexR);
+                out.b[j] = out.b[--out.count];
+            } else ++j;
+        }
+
+    for (u32 i = 0; i < out.count; ++i) {
+        const vkSynthBeam& sb = out.b[i];
+        Msg("[VK Cones] synth beam '%s' #%u: apex=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f,%.2f) len=%.2f tanH=%.2f (%u verts total)",
+            dbgName ? dbgName : "?", i, sb.apex.x, sb.apex.y, sb.apex.z,
+            sb.dir.x, sb.dir.y, sb.dir.z, sb.len, sb.tanH, n);
+    }
+}
+
 void vkFVisual::LoadGeometry(IReader* data, u32 flags)
 {
     BOOL bNoVertices = (flags & VLOAD_NOVERTICES) != 0;
@@ -574,6 +744,10 @@ void vkFVisual::LoadGeometry(IReader* data, u32 flags)
         return;
     }
 
+    // Lightplanes leaf: keep the positions until the indices are read below —
+    // the beam synthesis clusters fans via the triangle list (vkSynthBeams).
+    xr_vector<Fvector> lpPos;
+
     // Try inline vertices (OGF_VERTICES + OGF_INDICES) - standalone models (weapons, etc.)
     if (!bNoVertices && data->find_chunk(OGF_VERTICES))
     {
@@ -617,6 +791,14 @@ void vkFVisual::LoadGeometry(IReader* data, u32 flags)
             m_mesh.vCount = vert_count;
             m_mesh.vBase = 0;
 
+            // Lightplanes leaf (LoadTexture already set m_bLitBlend): stash the
+            // positions for the beam synthesis after the indices are read.
+            if (m_bLitBlend && !m_SynthBeams.count) {
+                lpPos.reserve(vert_count);
+                for (u32 i = 0; i < vert_count; ++i)
+                    lpPos.push_back(*(const Fvector*)(converted.data() + size_t(i) * level_stride));
+            }
+
             // Create and upload converted vertex buffer
             u32 data_size = vert_count * level_stride;
             m_mesh.p_rm_Vertices = xr_new<VK::CVulkanBuffer>();
@@ -652,6 +834,9 @@ void vkFVisual::LoadGeometry(IReader* data, u32 flags)
         xr_vector<u16> idata(idx_count);
         data->r(idata.data(), data_size);
         m_mesh.p_rm_Indices->Upload(idata.data(), data_size);
+
+        if (!lpPos.empty())
+            vk_ComputeSynthBeams(lpPos, idata.data(), idx_count, m_SynthBeams, dbg_name.c_str());
     }
 }
 
@@ -1117,6 +1302,26 @@ struct vertBoned3W { u16 m[3]; Fvector P; Fvector N; Fvector T; Fvector B; float
 struct vertBoned4W { u16 m[4]; Fvector P; Fvector N; Fvector T; Fvector B; float w[3]; float u, v; };
 #pragma pack(pop)
 
+// Boned-vertex synth-beam variant: extract bind-pose MODEL-space positions
+// (vertBoned*W stores P in model space — mRenderTransform includes the bind
+// inverse) and run the same clustered fit as the FVF path. Skinned lightplanes
+// carriers: physics vehicles' headlights (veh_zaz), searchlights, halogen lamps.
+static void vk_ComputeSynthBeamsBoned(u32 dwVertType, const void* _verts_, u32 count,
+                                      const u16* idx, u32 idxCount,
+                                      vkSynthBeams& out, const char* dbgName)
+{
+    xr_vector<Fvector> pos;
+    pos.reserve(count);
+    switch (dwVertType) {
+    case OGF_VERTEXFORMAT_FVF_1L: case 1: { auto* v = (const vertBoned1W*)_verts_; for (u32 i = 0; i < count; ++i) pos.push_back(v[i].P); } break;
+    case OGF_VERTEXFORMAT_FVF_2L: case 2: { auto* v = (const vertBoned2W*)_verts_; for (u32 i = 0; i < count; ++i) pos.push_back(v[i].P); } break;
+    case OGF_VERTEXFORMAT_FVF_3L: case 3: { auto* v = (const vertBoned3W*)_verts_; for (u32 i = 0; i < count; ++i) pos.push_back(v[i].P); } break;
+    case OGF_VERTEXFORMAT_FVF_4L: case 4: { auto* v = (const vertBoned4W*)_verts_; for (u32 i = 0; i < count; ++i) pos.push_back(v[i].P); } break;
+    default: return;
+    }
+    vk_ComputeSynthBeams(pos, idx, idxCount, out, dbgName);
+}
+
 static void vkUploadConvertedVertices(VK_Render_Mesh& mesh, void* dst, u32 vStride, u32 vertCount)
 {
     mesh.p_rm_Vertices = xr_new<VK::CVulkanBuffer>();
@@ -1337,6 +1542,14 @@ void vkSkeletonX_ST::Load(const char* name, IReader* data, u32 flags)
     m_mesh.vCount = dwVertCount;
     _Load_hw_VK(_verts_, dwVertType, dwVertCount);
     wmCPU = vk_skinned_retain_cpu(dwVertType, _verts_, dwVertCount, data);
+    // Lightplanes fan on a skinned leaf (headlights on physics vehicles,
+    // searchlights, weapon torches) → synthesize the real beam cones (the
+    // wallmark CPU copy supplies the triangle list for fan clustering).
+    if (m_bLitBlend && !m_SynthBeams.count)
+        vk_ComputeSynthBeamsBoned(dwVertType, _verts_, dwVertCount,
+                                  wmCPU ? wmCPU->indices.data() : nullptr,
+                                  wmCPU ? (u32)wmCPU->indices.size() : 0,
+                                  m_SynthBeams, dbg_name.c_str());
 }
 void vkSkeletonX_ST::_Load_hw_VK(void* verts, u32 /*vertType*/, u32 vertCount) { vkLoadSkinnedVertices(m_mesh, RenderMode, verts, vertCount, "SKL-ST"); }
 void vkSkeletonX_ST::Copy(vkRender_Visual* from)
@@ -1363,6 +1576,11 @@ void vkSkeletonX_PM::Load(const char* name, IReader* data, u32 flags)
     // NOTE: progressive leaves keep the FULL index chunk (all LOD windows) —
     // wallmark faces may overlap across LODs; visually negligible (alpha decal).
     wmCPU = vk_skinned_retain_cpu(dwVertType, _verts_, dwVertCount, data);
+    if (m_bLitBlend && !m_SynthBeams.count)
+        vk_ComputeSynthBeamsBoned(dwVertType, _verts_, dwVertCount,
+                                  wmCPU ? wmCPU->indices.data() : nullptr,
+                                  wmCPU ? (u32)wmCPU->indices.size() : 0,
+                                  m_SynthBeams, dbg_name.c_str());
 }
 void vkSkeletonX_PM::_Load_hw_VK(void* verts, u32 /*vertType*/, u32 vertCount) { vkLoadSkinnedVertices(m_mesh, RenderMode, verts, vertCount, "SKL-PM"); }
 void vkSkeletonX_PM::Copy(vkRender_Visual* from)

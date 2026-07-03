@@ -13,4 +13,5 @@
 
 namespace VK {
 void Pass_SunShadow(FrameContext& ctx);
+void SunShadow_Destroy();   // grass-spot caster pipeline teardown (device shutdown)
 }
