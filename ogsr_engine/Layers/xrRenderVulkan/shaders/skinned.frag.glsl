@@ -121,7 +121,14 @@ vec3 skyAmbient(vec3 N)
 }
 
 // Spot/point shadow + dynamic lights - same model as world_lmap.frag.
-float spotShadowF(vec3 wp)
+// LINEAR-depth compare with a world epsilon (see shadow_common.glsl — a
+// constant NDC bias leaked light through fences near the spot's far plane).
+float spotLinZ(float zndc, float f)
+{
+    const float n = 0.5;   // ComputeSpotVP near plane
+    return n * f / max(f - zndc * (f - n), 1e-4);
+}
+float spotShadowF(vec3 wp, float range)
 {
     vec4 c = L.spot_vp * vec4(wp, 1.0);
     if (c.w <= 0.0) return 1.0;
@@ -129,12 +136,13 @@ float spotShadowF(vec3 wp)
     vec2 uv = ndc.xy * 0.5 + 0.5;
     uv.y = 1.0 - uv.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.002;
+    float f    = max(range, 1.0);
+    float zRef = spotLinZ(ndc.z, f) - 0.08;
     vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += (ref <= texture(uSpotShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
+            sum += (zRef <= spotLinZ(texture(uSpotShadow, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
     return sum * (1.0 / 9.0);
 }
 
@@ -157,13 +165,29 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
     if (d2 >= r * r) return vec3(0.0);
     float d   = sqrt(max(d2, 1e-6));
     vec3  ld  = dv / d;
-    float att = 1.0 - d / r;
-    att *= att;
-    if (lcol.w > 0.5)
-        att *= clamp((dot(-ld, ldir.xyz) - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    // Narrow beams: windowed falloff (far half of the beam still lights) —
+    // see light_shade.glsl.
+    float att;
+    if (lcol.w > 0.5 && ldir.w > 0.87) {
+        att = 1.0 - (d2 / (r * r));
+        att *= att;
+    } else {
+        att = 1.0 - d / r;
+        att *= att;
+    }
+    if (lcol.w > 0.5) {
+        // Narrow beams: full inside the cone + spill to 2x the angle — see
+        // light_shade.glsl (the axis-peaked ramp left beam-lit ground/NPCs dark).
+        float ca = dot(-ld, ldir.xyz);
+        if (ldir.w > 0.87) {
+            float co = 2.0 * ldir.w * ldir.w - 1.0;
+            att *= clamp((ca - co) / max(ldir.w - co, 1e-3), 0.0, 1.0);
+        } else
+            att *= clamp((ca - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    }
     vec3 tint = lcol.rgb;
     if (gi == sIdx) {
-        att *= spotShadowF(wp);
+        att *= spotShadowF(wp, r);
         if (L.shadow_params.z > 0.5) {
             vec4 cc = L.spot_vp * vec4(wp, 1.0);
             if (cc.w > 0.0) {
@@ -174,7 +198,11 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
         }
     }
     else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
-    return tint * (att * max(dot(N, ld), 0.0));
+    float ndl = dot(N, ld);
+    // Narrow-beam wrap diffuse — same as light_shade.glsl (grazing headlight
+    // beams painted no light pool at plain Lambert).
+    if (lcol.w > 0.5 && ldir.w > 0.87) ndl = (ndl + 0.4) * (1.0 / 1.4);
+    return tint * (att * max(ndl, 0.0));
 }
 
 // Clustered (r_clustered): only this froxel's lights from the SSBO; fallback:
@@ -277,10 +305,8 @@ void main()
     // GLASS pane (skinMode bit 32 — kinematics furniture/door panes, blended
     // pipeline): keep the lit shading but skip the cutout test (semi-transparent
     // glass texels would all be discarded) and cap the blend alpha at the end.
-    // Bit 64 = LIGHTPLANES beams (same blended pipeline, R4 model_def_lq formula).
     bool isGlass = (pc.skinMode & 32u) != 0u;
-    bool isLB    = (pc.skinMode & 64u) != 0u;
-    if (!isGlass && !isLB && base.a < 0.25)   // alpha-tested skinned parts (straps, hair, foliage)
+    if (!isGlass && base.a < 0.25)   // alpha-tested skinned parts (straps, hair, foliage)
         discard;
 
     // r_ssao_debug 1: NPCs draw the raw AO map too (never the HUD hands).
@@ -372,19 +398,9 @@ void main()
     // GLASS pane (kinematics furniture/doors/vehicle windows, NPC glasses) —
     // R4 model_env_lq.ps: colour = light × lerp(ENV REFLECTION, texture, a),
     // blend alpha = the texture's own alpha. Clean glass ≈ invisible + sheen.
-    // LIGHTPLANES beams (R4 model_def_lq verbatim): lit colour, srcalpha blend
-    // rides the pipeline, alpha = texture alpha (fog² fade below).
-    if (isLB) {
-        // R4 model_def_lq: light·base·2 with the SIMPLE model light (ambient +
-        // hemi·max(N.y,0) + raw sun N·L) — the body `light` carries VSM shadow /
-        // background GTAO and painted the beam planes as matte sheets. Also
-        // restores R4's ×2 (was missing here entirely).
-        vec3 lq = L.ambient.rgb + L.hemi_color.rgb * max(N.y, 0.0)
-                + L.sun_color.rgb * max(dot(N, toSun), 0.0);
-        col  = base.rgb * 2.0 * lq;
-        outA = base.a;
-    }
-    else if (isGlass) {
+    // (Lit-blend lightplanes leaves are never drawn — Pass_LightCones replaces
+    // them with real volumetric beams; DrawSkinnedList skips the draw.)
+    if (isGlass) {
         // GLASS: R4 base + fresnel + sun glint — see world_lmap.frag for the note.
         float aG   = min(base.a, L.pom_params5.y);
         vec3  V    = normalize(v_wpos - L.eye_pos.xyz);
@@ -409,7 +425,7 @@ void main()
     if (pc.hudMode < 0.5) {
         float fog = clamp(length(v_wpos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
         col = mix(col, L.fog_color.rgb, fog);
-        if (isGlass || isLB) outA *= (1.0 - fog) * (1.0 - fog);   // R4: alpha fades with fog²
+        if (isGlass) outA *= (1.0 - fog) * (1.0 - fog);   // R4: alpha fades with fog²
     }
 
     o_color = vec4(col, outA);

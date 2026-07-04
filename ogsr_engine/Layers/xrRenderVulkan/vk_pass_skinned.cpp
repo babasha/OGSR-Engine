@@ -29,6 +29,7 @@
 #include "vk_pipeline_cache.h"        // PipelineCache::GetCacheObject() â€” shared disk-backed cache
 #include "vk_env_light.h"             // EnvLight â€” shared per-frame sun/hemi/ambient UBO (set 2)
 #include "vk_shadow.h"                // ShadowMap::SphereVisible â€” caster culling
+#include "vk_pass_lightcones.h"       // SynthCones::Submit â€” lightplanes-derived beam cones
 #include "../../xr_3da/device.h"      // Device.mFullTransform_hud (HUD projection), dwFrame
 
 #include <unordered_map>
@@ -733,12 +734,41 @@ namespace {
                 // Collimator/red-dot marks: additive unlit pipeline (R4
                 // hud_reddotsight). Glass panes (kinematics furniture/doors,
                 // OGF "glass" shader / glas\ texture): lit blended, no z-write.
-                // Lightplanes beams: SAME blend states as glass (variant 2),
-                // the fragment picks the R4 model_def_lq formula via bit 64.
+                // Lightplanes leaves are never drawn — they only register their
+                // synthesized beam (Pass_LightCones draws the real cone).
                 const bool emissive = child->m_bEmissiveAdd;
                 const bool glass    = child->m_bModelGlass;
                 const bool litblend = child->m_bLitBlend;
-                VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : ((glass || litblend) ? 2u : 0u));
+                if (litblend)
+                {
+                    // Register the synthesized beam cone (Pass_LightCones draws
+                    // it later this frame). Single-bone fans follow their bone —
+                    // hidden bone (torch off: X-Ray zeroes it) = no beam, and a
+                    // rotating searchlight carries its cone. HUD skipped: a
+                    // camera-apex beam is milk (the real flashlight spot covers it).
+                    if (hudMode < 0.5f && child->m_SynthBeams.count)
+                    {
+                        bool    visible = true;
+                        Fmatrix xf      = u.xform;
+                        u32     boneId  = u32(-1);
+                        if (auto* st = dynamic_cast<vkSkeletonX_ST*>(child)) {
+                            if (st->RenderMode == vkSkeletonX_ST::RM_SINGLE) boneId = st->RMS_boneid;
+                        } else if (auto* pm = dynamic_cast<vkSkeletonX_PM*>(child)) {
+                            if (pm->RenderMode == vkSkeletonX_PM::RM_SINGLE) boneId = pm->RMS_boneid;
+                        }
+                        if (boneId != u32(-1) && u.K) {
+                            visible = !!u.K->LL_GetBoneVisible((u16)boneId);
+                            if (visible)
+                                xf.mul_43(u.xform, u.K->LL_GetBoneInstance((u16)boneId).mRenderTransform);
+                        }
+                        if (visible) SynthCones::Submit(child, xf);
+                        else         SynthCones::Revoke(child);   // torch off — kill the beam now
+                    }
+                    // The fake sheets themselves are never drawn — Pass_LightCones
+                    // draws the REAL volumetric cone from the synthesized light.
+                    continue;
+                }
+                VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : (glass ? 2u : 0u));
                 if (pipe == VK_NULL_HANDLE) continue;
 
                 if (pipe != lastPipe) {
@@ -765,7 +795,6 @@ namespace {
                 u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
                 if (emissive) skinMode |= 16u;
                 if (glass)    skinMode |= 32u;
-                if (litblend) skinMode |= 64u;   // lightplanes: R4 model_def_lq formula
                 SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, hudMode, u.hemi };
                 vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 

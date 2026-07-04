@@ -250,15 +250,9 @@ void main()
     // lerp(env reflection, texture, texture.a), blend alpha = texture alpha × fog².
     // See world_lmap.frag for the full note.
     float outA = base.a;
-    if (pc.alphaRef < -3.5) {
-        // LIGHTPLANES light beams (R4 model_def_lq): light·base·2 with the simple
-        // model light, NOT the full `lighting` — see world_lmap.frag for why.
-        vec3 lq = L.ambient.rgb + L.hemi_color.rgb * max(geomN.y, 0.0)
-                + L.sun_color.rgb * max(dot(geomN, normalize(-L.sun_dir.xyz)), 0.0);
-        col  = mix(base.rgb * 2.0 * lq, L.fog_color.rgb, fog);
-        outA = base.a * (1.0 - fog) * (1.0 - fog);
-    }
-    else if (pc.alphaRef < -1.5) {
+    // (aref -4 lit-blend lightplanes sheets are never drawn — the render queue
+    // drops them; Pass_LightCones draws real volumetric beams instead.)
+    if (pc.alphaRef < -1.5) {
         // GLASS: R4 base + fresnel + sun glint — see world_lmap.frag for the note.
         float aG   = min(base.a, L.pom_params5.y);
         vec3  V    = normalize(vWorldPos - L.eye_pos.xyz);

@@ -17,6 +17,8 @@
 #include "vk_pass_skinned.h"               // Skinned_UploadBones / Skinned_RenderShadow
 #include "vk_light.h"                      // Lights::CollectFrame (shadowed spot/point picks)
 #include "vk_TreeManager.h"                // Trees->RenderDepth (leafy crown casters)
+#include "vk_DetailManager.h"              // CDetailManager Vsm_* getters — grass casters into the spot map
+#include "vk_shaders.h"                    // g_ShaderManager (grass_spot_depth.{vert,frag}.spv)
 #include "vk_shadow_gpu.h"                 // ShadowGPU::Cull/Draw (GPU-driven opaque casters)
 #include "vk_vsm.h"                        // VSM::MaskReady (skip the redundant sun cascade/far raster under VSM)
 #include "vk_cull.h"                       // VK::ExtractFrustumPlanes (light frustum → cull planes)
@@ -46,6 +48,7 @@ extern float ps_r_shadow_lod_dist; // metres from camera beyond which casters go
 extern int   ps_r_shadow_casc_cache; // cascade static-map cache (0 = re-raster every frame)
 extern float ps_r_shadow_casc_sun;   // sun-rotation degrees that forces a cascade static redraw
 extern float ps_r_wind_shadow_dist;  // tree-shadow wind radius: near (< dist) per-frame, far cached; 0 = all static
+extern int   ps_r_spot_grass;        // grass casters into the spot shadow map (beam cutouts through a grass field)
 extern int   ps_r_vsm;               // VSM on → its mask drives ALL sun receivers, so the cascade/far sun maps are redundant
 extern int   ps_r_vol;               // froxel volumetrics: samples the cascade for froxel SUN occlusion → keep it rendered even under VSM
 extern int   ps_r_vol_debug;
@@ -58,6 +61,7 @@ namespace {
     bool        s_firstUse = true;        // static map starts UNDEFINED, TRANSFER_SRC thereafter
     bool        s_combinedFirst = true;   // combined map starts UNDEFINED, SHADER_READ thereafter
     bool        s_spotFirst     = true;   // spot map: UNDEFINED on first use
+    bool        s_spotBeamFirst = true;   // spot BEAM map (spot copy + grass): UNDEFINED on first use
     bool        s_pointFirst    = true;   // point cube: UNDEFINED on first use
 
     // Cached static-caster queues for the shadowed dynamic lights. Rebuilding
@@ -80,6 +84,146 @@ namespace {
     // Depth bias to fight self-shadow acne (tunable). Constant + slope-scaled.
     constexpr float kBiasConst = 1.5f;
     constexpr float kBiasSlope = 2.5f;
+
+    // ── Grass casters into the SPOT map (r_spot_grass) ─────────────────────
+    // A beam crossing a grass field shone straight through it: the spot map
+    // held statics + NPCs + trees but no grass. Re-draw the detail manager's
+    // GPU-driven instance buffer (1 frame stale — same trick as the VSM grass
+    // casters) depth-only with the spot VP; blades then cut BOTH the surface
+    // light (spotShadowF) and the visible volumetric cone (per-step tap).
+    VkPipeline            s_grassSpotPipe   = VK_NULL_HANDLE;
+    VkPipelineLayout      s_grassSpotLayout = VK_NULL_HANDLE;
+    VkShaderModule        s_grassSpotVS     = VK_NULL_HANDLE;
+    VkShaderModule        s_grassSpotFS     = VK_NULL_HANDLE;
+    bool                  s_grassSpotTried  = false;   // load the SPV once; missing = feature off
+
+    struct GrassSpotPush {
+        Fmatrix  vp;              // spot light view-proj
+        Fvector4 lightPosRange;   // xyz light pos, w range (whole-instance cull)
+        Fvector4 wind_params;     // SSFX wind (w = PER-TYPE wind scale, re-pushed per draw)
+        Fvector4 wsetup_grass;
+        Fvector4 wind_anim;
+    };   // 128 B — the guaranteed push-constant minimum, VS-only range
+    static_assert(sizeof(GrassSpotPush) == 128, "grass spot push must fit 128 B");
+
+    // Lazy: needs the detail manager's mesh stride + diffuse set layout (level-load).
+    VkPipeline EnsureGrassSpotPipeline()
+    {
+        if (s_grassSpotPipe != VK_NULL_HANDLE) return s_grassSpotPipe;
+        CDetailManager* dm = RImplementation.Details;
+        if (!dm) return VK_NULL_HANDLE;
+        const u32 vstride = dm->Vsm_VertexStride();
+        VkDescriptorSetLayout diffuseL = dm->Vsm_GfxSetLayout();
+        if (vstride == 0 || diffuseL == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+        if (!s_grassSpotTried) {
+            s_grassSpotTried = true;
+            s_grassSpotVS = g_ShaderManager->Load("grass_spot_depth.vert.spv");
+            s_grassSpotFS = g_ShaderManager->Load("grass_spot_depth.frag.spv");
+            if (!s_grassSpotVS || !s_grassSpotFS)
+                Msg("![VK Shadow] grass_spot_depth.{vert,frag}.spv missing - grass spot shadows disabled");
+        }
+        if (s_grassSpotVS == VK_NULL_HANDLE || s_grassSpotFS == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+        if (s_grassSpotLayout == VK_NULL_HANDLE) {
+            VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GrassSpotPush) };
+            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            plci.setLayoutCount = 1; plci.pSetLayouts = &diffuseL;   // set 0 = per-type diffuse (FS alpha test)
+            plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+            if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_grassSpotLayout) != VK_SUCCESS)
+                return VK_NULL_HANDLE;
+        }
+        VkVertexInputBindingDescription vibd[2] = {
+            { 0, vstride, VK_VERTEX_INPUT_RATE_VERTEX },
+            { 1, (u32)sizeof(DetailInstance), VK_VERTEX_INPUT_RATE_INSTANCE },
+        };
+        VkVertexInputAttributeDescription via[6] = {
+            { 0, 0, VK_FORMAT_R32G32B32_SFLOAT,    0  },   // aPos
+            { 1, 0, VK_FORMAT_R32G32_SFLOAT,       12 },   // aUV (alpha test)
+            { 2, 0, VK_FORMAT_R32_SFLOAT,          20 },   // aHeight (wind stiffness)
+            { 3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0  },   // aInstRow0
+            { 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 16 },   // aInstRow1
+            { 5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32 },   // aInstRow2
+        };
+        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = vibd;
+        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = via;
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_grassSpotVS; stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_grassSpotFS; stages[1].pName = "main";
+        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        rs.depthBiasEnable = VK_TRUE;
+        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        cb.attachmentCount = 0;
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = stages;
+        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
+        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
+        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_grassSpotLayout;
+        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &s_grassSpotPipe) != VK_SUCCESS)
+            Msg("![VK Shadow] grass spot pipeline create failed (stride=%u)", vstride);
+        return s_grassSpotPipe;
+    }
+
+    // Draw all grass types into the current depth target (viewport/scissor/bias
+    // already set by the caller). Reads last frame's instance buffer — the same
+    // 1-frame-stale convention the VSM grass casters use.
+    void DrawGrassSpotCasters(VkCommandBuffer cmd, const Fmatrix& vp,
+                              const Fvector& lightPos, float lightRange)
+    {
+        if (!ps_r_spot_grass) return;
+        CDetailManager* dm = RImplementation.Details;
+        if (!dm) return;
+        VkBuffer vis = dm->Vsm_VisibleSSBO();
+        VkBuffer ind = dm->Vsm_IndirectBuf();
+        const u32 types   = dm->Vsm_TypeCount();
+        const u32 section = dm->Vsm_SectionSize();
+        if (vis == VK_NULL_HANDLE || ind == VK_NULL_HANDLE || types == 0 || section == 0) return;
+        VkPipeline pipe = EnsureGrassSpotPipeline();
+        if (pipe == VK_NULL_HANDLE) return;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        GrassSpotPush push{};
+        push.vp = vp;
+        push.lightPosRange.set(lightPos.x, lightPos.y, lightPos.z, lightRange);
+        // Same SSFX wind the colour pass used (1 frame stale, like the instances)
+        // so a swaying blade carries its beam cutout with it.
+        dm->Vsm_WindPush(push.wind_params, push.wsetup_grass, push.wind_anim);
+        vkCmdPushConstants(cmd, s_grassSpotLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+        for (u32 i = 0; i < types; ++i) {
+            VkBuffer mvb, mib; u32 ic;
+            if (!dm->Vsm_TypeMesh(i, mvb, mib, ic)) continue;
+            VkDescriptorSet diffuse = dm->Vsm_TypeDiffuseSet(i);
+            if (diffuse == VK_NULL_HANDLE) continue;
+            // Per-type wind scale (DO_NO_WAVING micro-plants stay static) —
+            // 4-byte push update at wind_params.w, same convention as the draw.
+            const float windScale = dm->Vsm_TypeWindScale(i);
+            vkCmdPushConstants(cmd, s_grassSpotLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                               offsetof(GrassSpotPush, wind_params) + 3u * sizeof(float),
+                               sizeof(float), &windScale);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_grassSpotLayout, 0, 1, &diffuse, 0, nullptr);
+            VkBuffer vbs[2] = { mvb, vis };
+            VkDeviceSize off[2] = { 0, (VkDeviceSize)i * section * sizeof(DetailInstance) };
+            vkCmdBindVertexBuffers(cmd, 0, 2, vbs, off);
+            vkCmdBindIndexBuffer(cmd, mib, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexedIndirect(cmd, ind, (VkDeviceSize)i * sizeof(VkDrawIndexedIndirectCommand),
+                                     1, sizeof(VkDrawIndexedIndirectCommand));
+        }
+    }
 
     // Static-map cache: static casters + the box tracking the camera only go
     // stale when the camera or the sun actually moves. Redraw when the camera
@@ -929,8 +1073,11 @@ void Pass_SunShadow(FrameContext& ctx)
     // One depth render into a dynamic shadow target (spot map or a cube face).
     // statics == nullptr → skinned casters only (point cube: NPC shadows are the
     // point; statics there cost terrain×6 faces for near-zero visual gain).
+    // withTrees: also rasterize tree/bush casters (spot map only — headlight and
+    // flashlight beams must be cut by crowns; the cube's 6 faces aren't worth it).
     auto renderDepthTarget = [&](VkImageView view, u32 size, const Fmatrix& vp, RenderQueue* statics,
-                                 const Fvector& lightPos, float lightRange, bool drawCasters) {
+                                 const Fvector& lightPos, float lightRange, bool drawCasters,
+                                 bool withTrees = false) {
         VkRenderingAttachmentInfo dAtt{};
         dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         dAtt.imageView               = view;
@@ -954,6 +1101,14 @@ void Pass_SunShadow(FrameContext& ctx)
             vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
             if (statics) statics->FlushDepth(cmd, vp);
             Skinned_RenderShadow(cmd, vp, &lightPos, lightRange);
+            if (withTrees && RImplementation.Trees && RImplementation.Trees->IsReady()) {
+                // Frustum override path of RenderDepth: culls trees against the
+                // SPOT frustum instead of the sun boxes.
+                CFrustum fr;
+                Fmatrix vpCopy = vp;   // CreateFromMatrix takes a non-const ref
+                fr.CreateFromMatrix(vpCopy, FRUSTUM_P_ALL);
+                RImplementation.Trees->RenderDepth(cmd, vp, -1, &fr);
+            }
         }
         vkCmdEndRendering(cmd);
     };
@@ -977,10 +1132,56 @@ void Pass_SunShadow(FrameContext& ctx)
             s_spotQValid = false;
         }
         renderDepthTarget(ShadowMap::GetSpotView(), ShadowMap::SpotSize(),
-                          ShadowMap::GetSpotVP(), &s_SpotQueue, FL.spotPos, FL.spotRange, haveSpot);
+                          ShadowMap::GetSpotVP(), &s_SpotQueue, FL.spotPos, FL.spotRange, haveSpot,
+                          /*withTrees=*/true);
 
-        ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+        // --- Spot BEAM map: clean spot map copy + grass casters on top. The
+        // visible cone / fog sample THIS ONE (blades cut the beam); surfaces
+        // keep the clean map — one shared map let dense grass blanket the
+        // ground and eat the headlight's light pool.
+        {
+            const u32 sz = ShadowMap::SpotSize();
+            ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(),
+                         s_spotBeamFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            s_spotBeamFirst = false;
+            VkImageCopy region{};
+            region.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+            region.extent         = { sz, sz, 1 };
+            vkCmdCopyImage(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            VkRenderingAttachmentInfo dAtt{};
+            dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            dAtt.imageView               = ShadowMap::GetSpotBeamView();
+            dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            dAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_LOAD;   // grass ON TOP of the copy
+            dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo ri{};
+            ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.extent = { sz, sz };
+            ri.layerCount        = 1;
+            ri.pDepthAttachment  = &dAtt;
+            vkCmdBeginRendering(cmd, &ri);
+            if (haveSpot) {
+                VkViewport vp2{ 0.f, (float)sz, (float)sz, -(float)sz, 0.f, 1.f };
+                vkCmdSetViewport(cmd, 0, 1, &vp2);
+                VkRect2D sc{ {0,0}, { sz, sz } };
+                vkCmdSetScissor(cmd, 0, 1, &sc);
+                vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
+                DrawGrassSpotCasters(cmd, ShadowMap::GetSpotVP(), FL.spotPos, FL.spotRange);
+            }
+            vkCmdEndRendering(cmd);
+            ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
     }
 
     // --- POINT (campfire / lamp) cube: STATIC occluders + skinned casters. The
@@ -1024,6 +1225,18 @@ void Pass_SunShadow(FrameContext& ctx)
         s_pointHadSkinned = anySkinned;
     }
     VK::Prof::ZoneEnd(cmd, zDyn);
+}
+
+// Grass-spot caster pipeline teardown (device shutdown). Survives level swaps:
+// the vertex stride is sizeof(CDetail::Vertex) (compile-time) and the next
+// level's diffuse set layout is created from the same bindings (compatible).
+void SunShadow_Destroy()
+{
+    if (s_grassSpotPipe   != VK_NULL_HANDLE) { vkDestroyPipeline(VulkanHW.m_Device, s_grassSpotPipe, nullptr);        s_grassSpotPipe   = VK_NULL_HANDLE; }
+    if (s_grassSpotLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_grassSpotLayout, nullptr); s_grassSpotLayout = VK_NULL_HANDLE; }
+    // Shader modules are owned by g_ShaderManager (shared cache) — not ours.
+    s_grassSpotVS = s_grassSpotFS = VK_NULL_HANDLE;
+    s_grassSpotTried = false;
 }
 
 }  // namespace VK

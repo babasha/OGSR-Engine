@@ -88,7 +88,8 @@ const FrameLights& CollectFrame(const Fvector& eye)
     {
         const vkLight* l = c.l;
         const u32 i = s_frame.count++;
-        s_frame.volFlag[i] = l->volumetric ? 1 : 0;
+        s_frame.volFlag[i]   = l->volumetric ? 1 : 0;
+        s_frame.synthFlag[i] = l->synthBeam  ? 1 : 0;
         GpuLight& g = s_frame.gpu[i];
         g.pos[0] = l->pos.x; g.pos[1] = l->pos.y; g.pos[2] = l->pos.z; g.pos[3] = l->range;
         g.color[0] = l->color.r; g.color[1] = l->color.g; g.color[2] = l->color.b;
@@ -104,7 +105,12 @@ const FrameLights& CollectFrame(const Fvector& eye)
             // Spots get the budget ONLY when the game flagged them shadow=true
             // (flashlight). No fallback — a random lamp shouldn't cost a map.
             if (!l->shadow) continue;
-            if (c.d2 < spotBestD2) { spotBest = int(i); spotBestD2 = c.d2;
+            // Narrow beams (headlights/searchlights/synth cones, <60°) are the
+            // shadows the player actually SEES — 4× distance advantage over
+            // wide 120° utility lamps, so walking away from a car doesn't flip
+            // the map to a downward pole lamp whose shadow barely reads.
+            const float eff = c.d2 * (l->cone < deg2rad(60.f) ? 0.25f : 1.f);
+            if (eff < spotBestD2) { spotBest = int(i); spotBestD2 = eff;
                           s_frame.spotPos = l->pos; s_frame.spotDir = d;
                           s_frame.spotRange = l->range; s_frame.spotCone = l->cone;
                           s_frame.spotTexture = l->texture; }

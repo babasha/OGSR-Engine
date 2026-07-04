@@ -96,8 +96,13 @@ struct LightUBO {
     // player-centred ortho box (vk_deform, EnvLight binding 20). Appended last.
     float deform_vp[16];       // world -> deform-texture NDC (straight-down ortho)
     float deform_tex[4];       // x = enable, y = 1/size, z = max depth (m), w = world metres per texel
+    // Spot-light extras. x = grass shadow strength on SURFACES
+    // (r_spot_grass_shadow): spotShadowF blends the clean spot map with the
+    // spot+grass beam map — 0 = grass never shadows surfaces (sterile pool),
+    // 1 = the old one-map full blanket that ate the headlight's ground pool.
+    float spot_params[4];
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
 // Per-field offset guards. The size-only assert above still passes if two equal-
 // sized fields are swapped; these pin the layout at structural anchors and across

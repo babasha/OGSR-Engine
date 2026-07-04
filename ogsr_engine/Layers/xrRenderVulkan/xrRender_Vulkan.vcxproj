@@ -116,6 +116,7 @@
     <ClInclude Include="vk_shadow.h" />
     <ClInclude Include="vk_pass_shadow.h" />
     <ClInclude Include="vk_pass_sunshafts.h" />
+    <ClInclude Include="vk_pass_lightcones.h" />
     <ClInclude Include="vk_pass_sky.h" />
     <ClInclude Include="vk_scene_color.h" />
     <ClInclude Include="vk_pass_tonemap.h" />
@@ -197,6 +198,7 @@
     <ClCompile Include="vk_shadow.cpp" />
     <ClCompile Include="vk_pass_shadow.cpp" />
     <ClCompile Include="vk_pass_sunshafts.cpp" />
+    <ClCompile Include="vk_pass_lightcones.cpp" />
     <ClCompile Include="vk_pipeline_cache.cpp" />
     <ClCompile Include="vk_render_queue.cpp" />
     <ClCompile Include="vk_world_material.cpp" />

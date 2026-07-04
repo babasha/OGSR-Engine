@@ -29,6 +29,8 @@ public:
     bool    hud    = false;
     bool    shadow = false;       // game asked for a shadow-casting light (flashlight etc.)
     bool    volumetric = false;   // game asked for a visible beam (R4 lamp shafts) — stored for diagnostics/future
+    bool    synthBeam  = false;   // OUR lightplanes-derived beam light (SynthCones): the fog
+                                  // boost applies, but the FL cone path must NOT double-draw it
     Fvector pos{ 0.f, 0.f, 0.f };
     Fvector dir{ 0.f, 0.f, 1.f };
     float   range  = 8.f;
@@ -88,6 +90,9 @@ struct FrameLights {
     // UBO/cluster SSBO): 1 = the game flagged the light volumetric (R4 renders a
     // visible beam for these). The fog inject encodes it into ITS OWN light copy.
     u8       volFlag[kMaxClusterLights] = {};
+    // 1 = SynthCones beam-backing light: fog boost YES, FL-path analytic cone NO
+    // (SynthCones draws its own geometry-derived cone for these).
+    u8       synthFlag[kMaxClusterLights] = {};
     u32      count    = 0;
     int      spotIdx  = -1;   // gpu[] index of the spot-shadowed light (flashlight), -1 = none
     int      pointIdx = -1;   // gpu[] index of the point-shadowed light (campfire),  -1 = none

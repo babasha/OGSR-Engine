@@ -103,6 +103,10 @@ bool           RainSphereVisible(const Fvector& center, float radius);
 // Spot (flashlight): perspective map along the light cone.
 VkImage        GetSpotImage();
 VkImageView    GetSpotView();
+// Spot map copy + grass casters on top — sampled by the visible beam / fog
+// only (surfaces keep the clean map so grass doesn't blanket the light pool).
+VkImage        GetSpotBeamImage();
+VkImageView    GetSpotBeamView();
 u32            SpotSize();                    // 1024
 const Fmatrix& GetSpotVP();
 void           ComputeSpotVP(const Fvector& pos, const Fvector& dir, float range, float cone);

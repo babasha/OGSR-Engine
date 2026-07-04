@@ -6,7 +6,16 @@
 #define SHADOW_COMMON_GLSL
 
 // Spot shadow: project by spot_vp, 3x3 PCF manual compare (flashlight quality).
-float spotShadowF(vec3 wp)
+// Compared in LINEAR depth with a WORLD-space epsilon: a constant NDC bias on
+// the perspective spot projection is worth centimetres near the lamp but
+// METRES near the far plane — light leaked straight through fences standing a
+// few metres past a parked headlight.
+float spotLinZ(float zndc, float f)
+{
+    const float n = 0.5;   // ComputeSpotVP near plane
+    return n * f / max(f - zndc * (f - n), 1e-4);
+}
+float spotShadowF(vec3 wp, float range)
 {
     vec4 c = L.spot_vp * vec4(wp, 1.0);
     if (c.w <= 0.0) return 1.0;
@@ -14,13 +23,28 @@ float spotShadowF(vec3 wp)
     vec2 uv = ndc.xy * 0.5 + 0.5;
     uv.y = 1.0 - uv.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.002;
+    float f    = max(range, 1.0);
+    float zRef = spotLinZ(ndc.z, f) - 0.08;   // 8 cm world bias, range-independent
     vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += (ref <= texture(uSpotShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
-    return sum * (1.0 / 9.0);
+            sum += (zRef <= spotLinZ(texture(uSpotShadow, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
+    float vis = sum * (1.0 / 9.0);
+    // Grass shadows surfaces PARTIALLY: a second tap set against the spot+grass
+    // beam map (b22), blended by L.spot_params.x. The beam map is a superset of
+    // the clean one, so its visibility is <= clean — the mix darkens the pool
+    // with translucent grass dapples instead of the binary blanket (which ate
+    // the headlight's ground pool at full strength) or nothing (sterile pool).
+    float k = L.spot_params.x;
+    if (k > 0.001) {
+        float sumG = 0.0;
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+                sumG += (zRef <= spotLinZ(texture(uSpotShadowGrass, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
+        vis = mix(vis, sumG * (1.0 / 9.0), k);
+    }
+    return vis;
 }
 
 // Point (cube) shadow: 1-tap, compare D3D-style perspective depth along the major

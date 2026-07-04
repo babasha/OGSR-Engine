@@ -37,13 +37,33 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
     if (d2 >= r * r) return vec3(0.0);
     float d   = sqrt(max(d2, 1e-6));
     vec3  ld  = dv / d;
-    float att = 1.0 - d / r;
-    att *= att;
-    if (lcol.w > 0.5)   // spot cone
-        att *= clamp((dot(-ld, ldir.xyz) - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    // Distance falloff. NARROW beams (headlights/searchlights): windowed
+    // (1-(d/r)^2)^2 — (1-d/r)^2 is basically dead past 60% range, so a 35 m
+    // headlight painted nothing beyond ~20 m. Wide lamps keep the classic curve.
+    float att;
+    if (lcol.w > 0.5 && ldir.w > 0.87) {
+        att = 1.0 - (d2 / (r * r));
+        att *= att;
+    } else {
+        att = 1.0 - d / r;
+        att *= att;
+    }
+    if (lcol.w > 0.5) {   // spot cone
+        float ca = dot(-ld, ldir.xyz);
+        // NARROW beams (headlights/searchlights, cos(half) > 0.87): full strength
+        // anywhere INSIDE the cone + a spill fade out to 2x the cone angle (real
+        // fixtures spill well past the bright core). The default ramp peaks only
+        // ON the axis, so the ground pool a headlight visibly paints sat at the
+        // cone edge at ~0 and terrain/grass read as "not reacting" to the beam.
+        if (ldir.w > 0.87) {
+            float co = 2.0 * ldir.w * ldir.w - 1.0;   // cos(2*half)
+            att *= clamp((ca - co) / max(ldir.w - co, 1e-3), 0.0, 1.0);
+        } else
+            att *= clamp((ca - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
+    }
     vec3 tint = lcol.rgb;
     if (gi == sIdx) {
-        att *= spotShadowF(wp);
+        att *= spotShadowF(wp, r);
         // Flashlight cookie (R4 projective light texture): the beam pattern
         // projected through the SAME spot_vp the shadow lookup uses.
         if (L.shadow_params.z > 0.5) {
@@ -62,7 +82,13 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
     // the light "buried" → aimed projector beams were silently killed. A spot's
     // own cone already bounds where it can leak.
     else if (lcol.w < 0.5) att *= lightTerrainOcc(wp, lpos.xyz);
-    return tint * (att * max(dot(N, ld), 0.0));
+    float ndl = dot(N, ld);
+    // NARROW beams (headlights/searchlights, cone < ~30°: cos(half) > 0.87):
+    // wrap the diffuse — a near-horizontal beam grazes the ground at N·L ≈ 0.05
+    // and painted no light pool where it visibly lands. Wide spots (flashlight
+    // 70°, pole lamps 120°) keep plain Lambert.
+    if (lcol.w > 0.5 && ldir.w > 0.87) ndl = (ndl + 0.4) * (1.0 / 1.4);
+    return tint * (att * max(ndl, 0.0));
 }
 
 // Dynamic light accumulation. Clustered (r_clustered): iterate only the froxel's

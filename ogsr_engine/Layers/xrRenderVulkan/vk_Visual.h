@@ -148,6 +148,35 @@ namespace VK {
 }
 
 // ============================================================================
+// Synthesized light beams, derived from a `models\lightplanes` leaf's geometry
+// at load (MODEL space). R4 bakes fake beam-plane fans into carrier models
+// (car headlights, searchlights, halogen lamps) with NO dynamic light — we
+// never draw the fans, so without synthesis the carriers were beam-less. Each fan is
+// elongated along the beam and widens away from the lamp, so PCA recovers a
+// real cone (apex/dir/len/half-angle) that Pass_LightCones raymarches like a
+// genuine volumetric spot. A leaf often holds SEVERAL fans (both headlights in
+// one leaf: a merged PCA pointed SIDEWAYS across the hood) — the vertices are
+// clustered into connected components first and each fan gets its own beam.
+// ============================================================================
+struct vkSynthBeam
+{
+    Fvector apex{};                          // narrow end = the lamp (model space)
+    Fvector dir{};                           // unit axis toward the wide end
+    float   len   = 0.f;                     // beam length (m)
+    float   tanH  = 0.f;                     // tan(half angle) at the wide end
+    float   apexR = 0.08f;                   // lamp-face radius (fan width at the narrow end)
+};
+
+struct vkSynthBeams
+{
+    static constexpr u32 kMax = 4;
+    vkSynthBeam b[kMax];
+    u32     count = 0;
+    Fvector rgb { 0.88f, 0.94f, 1.00f };     // from the glow texture name (LoadTexture);
+                                             // default = cool white (flashlight-like)
+};
+
+// ============================================================================
 // Vulkan Mesh Data - replaces IRender_Mesh from DX11
 // Contains VkBuffer handles instead of D3D buffers
 // ============================================================================
@@ -226,6 +255,10 @@ public:
     // weapon torches). R4 (CBlender_deffer_model, oBlend + aref<16 → forward
     // model_def_lq): LIT colour, srcalpha/invsrcalpha blend, alpha = tex.a·fog².
     bool                m_bLitBlend = false;
+
+    // Cones synthesized from the lightplanes fan geometry (see vkSynthBeams) —
+    // the fans are never drawn; these REAL volumetric beams replace them.
+    vkSynthBeams        m_SynthBeams;
 
     // Debug name
     shared_str          dbg_name;
