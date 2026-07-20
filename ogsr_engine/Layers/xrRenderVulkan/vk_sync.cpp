@@ -8,6 +8,7 @@
 #include "stdafx.h"
 #include "vk_sync.h"
 #include "HW_Vulkan.h"
+#include "vk_profiler.h"   // VK::Prof::DumpCheckpoints — GPU-hang post-mortem
 
 // Глобальный экземпляр
 CVulkanSync Sync;
@@ -67,8 +68,12 @@ bool CVulkanSync::WaitForFence(u32 frameIndex)
             Msg("!Vulkan DEVICE LOST in WaitForFence");
             g_bDeviceLost = true;
         }
+        VK::Prof::DumpCheckpoints("WaitForFence");
     } else if (res == VK_TIMEOUT) {
+        // 2 s with the fence unsignaled = the GPU is almost certainly hung
+        // (TDR fires moments later) — grab the checkpoints while we can.
         Msg("!Vulkan WaitForFence timeout (frame %u)", frameIndex);
+        VK::Prof::DumpCheckpoints("WaitForFenceTimeout");
     } else {
         Msg("!Vulkan WaitForFence error: %d", res);
     }

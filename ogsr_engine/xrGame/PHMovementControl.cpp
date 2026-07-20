@@ -941,6 +941,10 @@ void CPHMovementControl::PHReleaseObject()
 
 void CPHMovementControl::DestroyCharacter()
 {
+    // [mod-compat diag] actor frozen in mcFall — who tears the capsule down?
+    if (pObject && !!pObject->cName() && 0 == xr_strcmp(*pObject->cName(), "single_player"))
+        Msg("[CharPhys] actor DestroyCharacter (was exist=%d)", (int)CharacterExist());
+
     // Remove Grass bender if PHCharacter is not NULL
     if (m_character->PhysicsRefObject())
         g_pGamePersistent->GrassBendersRemoveById(m_character->PhysicsRefObject()->ID());

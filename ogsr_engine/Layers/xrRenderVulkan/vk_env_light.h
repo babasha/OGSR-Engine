@@ -101,8 +101,56 @@ struct LightUBO {
     // spot+grass beam map — 0 = grass never shadows surfaces (sterile pool),
     // 1 = the old one-map full blanket that ate the headlight's ground pool.
     float spot_params[4];
+    // Spot shadow POOL (vk_pass_shadow): per-collected-light atlas tile and the
+    // per-tile view·proj. spot_assign packs 4 lights per vec4 (value = tile+1,
+    // 0 = the light has no tile) — shaders: spot_assign[gi>>2][gi&3].
+    float spot_assign[4][4];
+    float spot_pool_vp[Lights::kMaxShadowSpots][16];
+    // Point shadow POOL: per-collected-light cube-array index (+1, packed
+    // 4/vec4, 0 = no cube). pointShadowF samples uPointShadow[cube].
+    float point_assign[4][4];
+    // Sky specular IBL (vk_ibl, binding 26 = prefiltered cube). x = enable+ready
+    // (0 off / no probe yet), y = spec strength (r_ibl_spec), z = max roughness
+    // mip, w = debug view (r_ibl_debug). Appended last (prefix-safe).
+    float ibl_params[4];
+    // Sun-beam ground recovery (r_sun_beam): surfaces re-sample the crisp VSM atlas
+    // at their own world pos and max() it with the smeared screen mask so a thin sun
+    // gap through a crown lands on the ground instead of dissolving. x = recovery
+    // strength (0 = off), y = max distance (m), z = extra-sun boost in the recovered
+    // gap, w = atlas self-bias (m). Appended last (prefix-safe).
+    float beam_params[4];
+    // Sun-beam GROUND DEPOSIT (r_sun_beam_ground): x = froxel nearZ, y = log2(far/near)
+    // (exp-Z terms for Froxel_SliceFromViewZ), z = deposit strength (0 = off / r_vol off),
+    // w = in-scatter luminance threshold. Paired with binding 27 (integrated volume).
+    float beam2[4];
+    // Per-tile FLASHLIGHT grass-shadow strength (r_flashlight_grass): x = 8-bit mask
+    // (bit t → pooled tile t's owner is a handheld torch), y = flashlight grass strength.
+    // Flashlight tiles paint crisp grass dapples in their ground pool (night wow); wide
+    // fixtures keep the subtle spot_params.x blend. Appended last (prefix-safe).
+    float spot_flash[4];
+    // Terrain DEPTH OFFSET (r_pom_zoff, SSFX port): x = strength (0 = off, 1 = SSFX
+    // 0.11 m along the view ray). y/z/w reserved. Appended last (prefix-safe).
+    float zoff_params[4];
+    // TERRAIN COMPOSITE CACHE (r_terra_cache, vk_terrain_cache): detail-uv ->
+    // cache-uv transform (cuv = duv*xy + zw) + x = cache live flag. Appended last.
+    float tcache_xform[4];
+    float tcache_params[4];
+    // Per-level terrain channel depth offsets (SSFX ssfx_terrain_offset):
+    // R/G/B/A detail heights shift by these before the POM march, so e.g. the
+    // asphalt channel sits sunken below the soil. Read per level from
+    // gamedata\config\terrain_details.ltx. Appended last (prefix-safe).
+    float ch_off[4];
+    // BAKED terrain splat mask (mask-less maps, VK::TerrainMask): world XZ ->
+    // mask UV affine (ox, oz, 1/sx, 1/sz); z == 0 -> no bake. Appended last.
+    float tmask_params[4];
+    // Diffuse sky irradiance via SH9 (vk_ibl + sky_sh_project.comp), read by
+    // skyAmbient() in sky_ambient.glsl. x = r_sky_sh × "coefficients projected"
+    // (0 = fall back to the prefiltered probe's top mip), y = sky_rotation (rad,
+    // used only by the raw-cube last resort), z = probe top mip, w reserved.
+    // Appended last (prefix-safe).
+    float sh_params[4];
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16 + 64 + 64 * Lights::kMaxShadowSpots + 64 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
 // Per-field offset guards. The size-only assert above still passes if two equal-
 // sized fields are swapped; these pin the layout at structural anchors and across
@@ -122,5 +170,6 @@ void                  Destroy();
 VkDescriptorSetLayout GetSetLayout();          // the shared set layout (binding 0 = UBO, FRAGMENT)
 void                  Update(u32 slot);        // fill slot's UBO from env; remember it as the current set
 VkDescriptorSet       GetCurrentSet();         // set chosen by the last Update() this frame
+const float*          TerrainChOff();          // per-level SSFX channel depth offsets (terrain_details.ltx), float[4]
 
 }}  // namespace VK::EnvLight

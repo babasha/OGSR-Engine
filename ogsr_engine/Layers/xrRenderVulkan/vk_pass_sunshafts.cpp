@@ -24,6 +24,10 @@
 #include "../../xr_3da/IGame_Persistent.h"
 #include "../../xr_3da/Environment.h"   // CEnvDescriptorMixer (sun gate)
 
+// VKEditor has no header — consumers forward-declare what they need (see
+// vk_imgui.cpp:20). >0 means a host pushed a scene.
+namespace VKEditor { int HostModelCount(); }
+
 namespace VK {
 
 namespace {
@@ -117,7 +121,11 @@ namespace {
 void Pass_SunShafts(FrameContext& ctx)
 {
     if (ctx.cmd == VK_NULL_HANDLE)  return;
-    if (!RImplementation.b_loaded)  return;
+    // b_loaded is set only by level_Load, so this bailed out in a host-driven editor
+    // scene even though everything the pass consumes is present there: the sun
+    // cascade maps (Pass_SunShadow runs), the EnvLight set and the scene depth.
+    // Gate on "is there something to shaft", not on "is a level loaded".
+    if (!RImplementation.b_loaded && VKEditor::HostModelCount() == 0) return;
     if (!g_pGamePersistent)         return;
     auto* E = g_pGamePersistent->Environment().CurrentEnv;
     if (!E) return;

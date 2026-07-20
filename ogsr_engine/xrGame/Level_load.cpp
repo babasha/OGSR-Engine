@@ -58,6 +58,11 @@ BOOL CLevel::Load_GameSpecific_After()
         for (IReader* OBJ = F->open_chunk_iterator(chunk); OBJ; OBJ = F->open_chunk_iterator(chunk, OBJ))
         {
             OBJ->r_stringZ(ref_name, sizeof(ref_name));
+            // Guard against foreign level.ps_static layout (e.g. Living Zone) — don't read the
+            // transform past the chunk end (would trip IReader 'Pos + cnt <= Size'). Static
+            // particles are cosmetic, so skipping a malformed entry is harmless.
+            if (OBJ->elapsed() < sizeof(Fmatrix))
+                continue;
             OBJ->r(&transform, sizeof(Fmatrix));
             transform.c.y += 0.01f;
 
@@ -137,6 +142,10 @@ void CLevel::Load_GameSpecific_CFORM(CDB::TRI* tris, const size_t count)
     translator.reserve(GMLib.CountMaterial());
     u16 default_id = (u16)GMLib.GetMaterialIdx("default");
     translator.push_back(translation_pair(u32(-1), default_id));
+    // Foreign levels (e.g. Living Zone) can reference game materials absent from this
+    // gamemtl.xr. Fall back to "default" instead of a fatal — game material only affects
+    // footstep sounds / decals / ricochet, not geometry or rendering.
+    SGameMtl* const default_mtl = GMLib.GetMaterialByIdx(default_id);
 
     u16 index = 0, static_mtl_count = 1;
     int max_ID = 0;
@@ -172,7 +181,9 @@ void CLevel::Load_GameSpecific_CFORM(CDB::TRI* tris, const size_t count)
                 continue;
             }
 
-            Debug.fatal(DEBUG_INFO, "Game material '%d' not found", (*I).material);
+            (*I).material = default_id;
+            (*I).suppress_shadows = default_mtl->Flags.is(SGameMtl::flSuppressShadows);
+            (*I).suppress_wm = default_mtl->Flags.is(SGameMtl::flSuppressWallmarks);
         }
         return;
     }
@@ -193,7 +204,9 @@ void CLevel::Load_GameSpecific_CFORM(CDB::TRI* tris, const size_t count)
                 continue;
             }
 
-            Debug.fatal(DEBUG_INFO, "Game material '%d' not found", (*I).material);
+            (*I).material = default_id;
+            (*I).suppress_shadows = default_mtl->Flags.is(SGameMtl::flSuppressShadows);
+            (*I).suppress_wm = default_mtl->Flags.is(SGameMtl::flSuppressWallmarks);
         }
     }
 }

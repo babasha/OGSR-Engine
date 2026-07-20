@@ -22,6 +22,7 @@ layout(set = 0, binding = 4) buffer SlotDirty          { uint  slotDirty[]; };  
 layout(set = 0, binding = 5) buffer DirtyList          { uint  dirtyList[]; };  // compact dirty slots (clear quad + diagnostics)
 layout(set = 0, binding = 6) buffer DrawClear          { uint  drawClear[]; };  // VkDrawIndirectCommand: [0]=vtx(6) [1]=instanceCount=dirtyCount [2]=0 [3]=0
 layout(set = 0, binding = 7) buffer PriorValid         { uint  priorValid[]; }; // slot -> 1 if its CACHED depth is this world tile's (physTile matched) → valid shadow-HZB occluder (r_vsm_hzb)
+layout(set = 0, binding = 8) readonly buffer Hits      { uint  pageHits[]; };   // per-page sampled-pixel count from the mark (r_vsm_gaze)
 
 layout(push_constant) uniform Push {
     ivec4 pageBase[3];   // per-level window first-page absolute index: [L>>1].xy if L even, .zw if odd
@@ -33,6 +34,13 @@ layout(push_constant) uniform Push {
                          // [0].w = L0 page width (m) → pw(L) = [0].w * 2^L. Fed by tree near/far
                          // transitions (r_vsm_tree_wind): pages a crossing tree overlaps re-render
                          // so the static atlas adds/removes its rigid shadow the SAME frame.
+                         // [1].w = dirty budget (r_vsm_dirty_budget, pages/frame, 0 = unlimited):
+                         // scrolled-in (wrong-tile) pages over budget DEFER to a later frame — the
+                         // UE5 DeferredInvalidationBudget idea against the toroidal-scroll redraw
+                         // spikes. The push is at the 128 B limit, so the knob rides a free .w.
+                         // [2].w = GAZE budget (r_vsm_gaze_pages, pages/frame, 0 = gaze OFF).
+                         // [3].w = GAZE full-rate hits (r_vsm_gaze_px): pages sampled by >= this
+                         // many mark samples re-render EVERY frame; cadence scales inversely below.
 } pc;
 
 ivec2 pageBaseOf(int L) { ivec4 v = pc.pageBase[L >> 1]; return ((L & 1) == 0) ? v.xy : v.zw; }
@@ -60,6 +68,28 @@ void main()
     priorValid[slot] = wrong ? 0u : 1u;
     bool  refresh = (pc.sunMoving != 0u) && (pc.refreshN != 0u) &&
                     ((uint(slot) % pc.refreshN) == (pc.frame % pc.refreshN));
+    // GAZE refresh (r_vsm_gaze): while the sun moves, pages the player is actually
+    // looking at re-render on a cadence ∝ their on-screen footprint (pageHits from
+    // the mark). A page filling >= [3].w samples refreshes EVERY frame (its shadow
+    // glides as smoothly as the dynamic atlas); smaller/farther pages refresh every
+    // ceil(H1/hits) frames (slot-staggered phase); beyond 16 frames the plain
+    // round-robin above is the better owner. Distant shadows self-deprioritize:
+    // perspective shrinks their footprint, and their coarse-level texels quantize
+    // the motion anyway. Budget-capped by a second dirtyList tail counter
+    // (index MAX+1; the wrong-tile counter owns MAX).
+    if (!refresh && pc.sunMoving != 0u && pc.inval[2].w > 0.0) {
+        uint h = pageHits[vp];
+        if (h > 0u) {
+            float pF = ceil(max(pc.inval[3].w, 1.0) / float(h));
+            if (pF <= 16.0) {
+                uint period = uint(max(pF, 1.0));
+                if (((pc.frame + uint(slot)) % period) == 0u) {
+                    uint g = atomicAdd(dirtyList[uint(VSM_MAX_PHYS_S) + 1u], 1u);
+                    if (g < uint(pc.inval[2].w + 0.5)) refresh = true;
+                }
+            }
+        }
+    }
     // Invalidation circles (tree near/far transitions): the page's world-anchored
     // light-space rect vs each circle → force a re-render.
     bool inval = false;
@@ -74,6 +104,23 @@ void main()
                 if (dot(d, d) <= r * r) { inval = true; break; }
             }
         }
+    }
+    // DIRTY BUDGET (r_vsm_dirty_budget): the 7+ ms VSMrender spikes are toroidal-scroll
+    // eviction bursts — dozens of wrong-tile pages all re-rendering the same frame. Cap
+    // them: wrong-tile pages over the per-frame budget DEFER (page stays UNMAPPED this
+    // frame → receivers fall back to the next coarser mapped level, vsm_resolve; physTile
+    // keeps the OLD tile so the page competes again next frame until it wins a slot).
+    // NOT budgeted: inval circles (tree static↔dyn transitions MUST land the same frame —
+    // ghosts/double shadows otherwise), forceDirty (cache-off baseline), and round-robin
+    // refresh (already rate-limited by refreshN; its content stays valid, just staler).
+    // Counter = the TAIL dword of dirtyList (index VSM_MAX_PHYS_S; appends below are
+    // guarded < VSM_MAX_PHYS_S so they never touch it; zeroed in the frame-start fill,
+    // read back for the throttle/dirty telemetry). NOT drawClear[2]/[3] — those are the
+    // live clear draw's firstVertex/firstInstance. Counted even with the budget off (diag).
+    if (wrong && !inval && pc.forceDirty == 0u) {
+        uint budget = uint(pc.inval[1].w + 0.5);
+        uint n = atomicAdd(dirtyList[uint(VSM_MAX_PHYS_S)], 1u);
+        if (budget != 0u && n >= budget) { pageTable[vp] = VSM_UNMAPPED; return; }
     }
     if (wrong || refresh || inval || pc.forceDirty != 0u) {
         physTile[slot]  = tile;

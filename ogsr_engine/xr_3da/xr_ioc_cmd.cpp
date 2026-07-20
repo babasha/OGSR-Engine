@@ -552,6 +552,14 @@ void CCC_Register()
     CMD4(CCC_Integer, "snd_targets", &psSoundTargets, 128, 1024);
     CMD4(CCC_Integer, "snd_cache_size", &psSoundCacheSizeMB, 32, 128);
 
+    // Tiled CDB collision streaming (streaming-world Stage C); cdb_tiles takes effect on level load
+    {
+        extern int psCDB_Tiles, psCDB_TileBudget, psCDB_TileRadius;
+        CMD4(CCC_Integer, "cdb_tiles", &psCDB_Tiles, 0, 2);
+        CMD4(CCC_Integer, "cdb_tile_budget_mb", &psCDB_TileBudget, 64, 4096);
+        CMD4(CCC_Integer, "cdb_tile_radius", &psCDB_TileRadius, 64, 2000);
+    }
+
     CMD3(CCC_Mask, "snd_stats", &g_stats_flags, st_sound);
     CMD3(CCC_Mask, "snd_stats_min_dist", &g_stats_flags, st_sound_min_dist);
     CMD3(CCC_Mask, "snd_stats_max_dist", &g_stats_flags, st_sound_max_dist);

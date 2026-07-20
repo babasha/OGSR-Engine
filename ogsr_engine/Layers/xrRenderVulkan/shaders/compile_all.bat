@@ -56,7 +56,9 @@ exit /b 0
 
 :one
 REM %1 = source .glsl (quoted), %2 = shader stage; output = name-without-.glsl + .spv
-"%GLSLC%" -fshader-stage=%2 "%~1" -o "%~n1.spv"
+REM --target-env=vulkan1.3: the engine requires a VK 1.3 device (HWCaps_Vulkan.h),
+REM and vsm_mark.comp subgroup ops need SPIR-V >= 1.3 (default target is vulkan1.0).
+"%GLSLC%" --target-env=vulkan1.3 -fshader-stage=%2 "%~1" -o "%~n1.spv"
 if errorlevel 1 (
     echo   FAILED: %~1
     set /a ERR+=1

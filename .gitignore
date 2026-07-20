@@ -7,6 +7,18 @@
 /ogsr_engine/_TEMP
 /bin*
 
+# 3rd-party upstream payloads — NOT vendored, same policy as every other dependency
+# (most of them nest the clone in a subdir and ignore it via their own
+# 3rd_party/Src/<dep>/.gitignore, e.g. NVIDIA_DLSS/.gitignore). These two unpack
+# straight into their dep folder instead of a nested one, so the rule lives here —
+# and meshoptimizer ships its OWN .gitignore, which must not be clobbered.
+#   NVIDIA_Streamline — ~67 MB prebuilt binary drop (bin/include/lib), SL 2.12.0
+#   meshoptimizer     — upstream repo root (src/, tools/…), v1.2
+# Both are consumed by 3rd_party/Src/vulkan_renderer.props + xrRender_Vulkan.vcxproj
+# (vk_sl.cpp / vk_dlss.cpp / vk_meshopt.cpp). See Update_Components.cmd to refetch.
+/3rd_party/Src/NVIDIA_Streamline/
+/3rd_party/Src/meshoptimizer/
+
 # Build intermediaries (MSBuild ObjectFileName="obj\")
 **/obj/
 
@@ -15,6 +27,23 @@
 
 # Codex agent scaffolding (not engine code)
 /.codex/
+# AGENTS.md only points at /.codex/memory/, which is ignored above — committing it
+# would publish a dangling reference to a directory that is not in the repository.
+/AGENTS.md
+
+# Personal working notes / roadmaps — thinking-in-progress, not engine source.
+/aiUp.md
+/gpu_npc_ai_roadmap.md
+/gpu_npc_render_milestone1.md
+/gpu_particles_roadmap.md
+
+# Local build helper (machine-specific paths; the canonical build is Engine.sln)
+/_build_vk_dll.bat
+
+# Content-extraction toolchain for the Anomaly/GAMMA archives. Kept out of the
+# engine repo deliberately: it is an authoring-side utility, not something the
+# engine builds or links, and it exists to read third-party mod distributions.
+/tools/
 
 # Precompiled Headers
 *.ipch

@@ -48,10 +48,12 @@ layout(location = 0) out vec2 vUV;
 layout(location = 1) out vec3 vLight;    // hemi + floor (shadow-independent part)
 layout(location = 2) out vec3 vSunLit;   // sun part — attenuated by the shadow map in frag
 layout(location = 3) out vec3 vWPos;     // world-space position (shadow lookup)
+layout(location = 4) flat out uint vTreeIdx;   // global tree index (visible-set diag, tree.frag)
 
 void main()
 {
     TreeInstance t = inst[gl_InstanceIndex];
+    vTreeIdx = uint(gl_InstanceIndex);
 
     vec4 worldPos = t.xform * vec4(aPos, 1.0);
     // SSFX tree wind (trunk sway + crown flutter). baseY = tree origin world Y

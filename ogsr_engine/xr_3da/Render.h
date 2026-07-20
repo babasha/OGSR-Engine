@@ -49,6 +49,12 @@ public:
     virtual void set_volumetric_intensity(float) = 0;
     virtual void set_volumetric_distance(float) = 0;
 
+    // Handheld/worn flashlight (CTorch head-lamp, weapon light) as opposed to a
+    // fixture (hanging lamp, searchlight, campfire). Lets the renderer treat a
+    // torch shone AT the camera differently from an overhead lamp. Non-pure so
+    // the DX path (which ignores it) needs no change; default = not a flashlight.
+    virtual void set_flashlight(bool) {}
+
     virtual void set_flare(bool b) = 0;
     virtual bool get_flare() = 0;
 

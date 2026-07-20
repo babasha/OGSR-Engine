@@ -38,6 +38,14 @@ void        BuildFromDepth(VkCommandBuffer cmd, u32 frameIndex, VkImageView dept
 VkImageView GetView();                        // current frame's SRI view (null if not built)
 VkExtent2D  TexelSize();                      // SRI tile size (device-queried)
 void        CmdSetRate(VkCommandBuffer cmd);  // vkCmdSetFragmentShadingRateKHR (combiner=REPLACE)
+// Per-draw coarse pipeline rate (combiners KEEP/KEEP = use this rate, ignore SRI/primitive).
+// For pipelines built with a dynamic FRAGMENT_SHADING_RATE state. No-op unless pipeline-rate VRS.
+void        CmdSetPipelineRate(VkCommandBuffer cmd, u32 w, u32 h);
+// Diag: FS-invocation pipeline-stats query around the world color pass. Begin
+// outside the rendering scope (resets + begins the slot's query, harvests the
+// N-frames-old result into the log), End after vkCmdEndRendering.
+void        StatsBegin(VkCommandBuffer cmd, u32 frameIndex);
+void        StatsEnd(VkCommandBuffer cmd, u32 frameIndex);
 void        Destroy();
 
 }} // namespace VK::VRS

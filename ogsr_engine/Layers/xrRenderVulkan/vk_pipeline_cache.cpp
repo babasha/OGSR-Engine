@@ -16,6 +16,13 @@
 
 #include <unordered_map>
 
+// Terrain POM depth offset (SSFX port): the getters pick the zoff pipeline
+// variants (FS depth export) when both are on, so call sites stay unchanged.
+extern int   ps_r_pom_terrain;   // r_pom_terrain (vk_console_min.cpp)
+extern float ps_r_pom_zoff;      // r_pom_zoff — depth-offset strength (0 = off)
+extern int   ps_r_vrs_static;    // r_vrs_static — diag: bake a static 2x2 rate into world pipelines
+extern int   ps_r_uber_variants; // r_uber_variants — A/B: 0 forces the old monolithic world uber-FS (WS_ALL)
+
 namespace VK { namespace PipelineCache {
 
 namespace {
@@ -25,7 +32,20 @@ namespace {
     VkShaderModule                         s_WorldLmapFS = VK_NULL_HANDLE;
     VkShaderModule                         s_WorldVlitVS = VK_NULL_HANDLE;
     VkShaderModule                         s_WorldVlitFS = VK_NULL_HANDLE;
+    // Cluster-LOD crossfade variants (r_cluster_fade): same shaders + a flat
+    // fade varying decoded from gl_InstanceIndex and a Bayer screen-door discard.
+    // Used ONLY by the GPU-driven world path — the shared modules above must not
+    // change (their interface is also consumed by the tess/wmark pipelines).
+    VkShaderModule                         s_WorldLmapInstVS = VK_NULL_HANDLE;   // instanced host scene
+    VkShaderModule                         s_WorldVlitInstVS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldLmapFadeVS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldLmapFadeFS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldVlitFadeVS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldVlitFadeFS = VK_NULL_HANDLE;
     std::unordered_map<Key, VkPipeline>    s_Pipelines;
+    // Frame-global world variant bits (WS_FRAME subset), stamped once per frame by
+    // Pass_World via SetFrameSpecMask(). Default = full path until first stamp.
+    u8                                     s_FrameSpecMask = WorldSpec::WS_FRAME;
 
     // World heightmap tessellation (R4 TESS_HM): TCS/TES pair per sub-layout.
     // All four must load (and the device feature be enabled) for tess keys.
@@ -40,14 +60,28 @@ namespace {
     VkShaderModule                         s_TerrainVS       = VK_NULL_HANDLE;
     VkShaderModule                         s_TerrainFS       = VK_NULL_HANDLE;
     VkPipelineLayout                       s_TerrainLayout   = VK_NULL_HANDLE;
-    VkPipeline                             s_TerrainPipeline = VK_NULL_HANDLE;
+    // Terrain COLOR pipelines keyed by (zoff<<8 | world-variant mask) — the uber-FS
+    // spec variants (Inc 1) apply to terrain too. Depth-prepass variants stay single.
+    std::unordered_map<u32, VkPipeline>    s_TerrainColorPipelines;
     VkPipeline                             s_TerrainDepthPipeline = VK_NULL_HANDLE;   // snow-displaced depth-prepass variant
+    // Terrain POM DEPTH OFFSET variants (r_pom_zoff, SSFX port): color FS that
+    // exports the displaced gl_FragDepth + a prepass FS writing the same depth
+    // (so GTAO / VSM resolve see the carved surface). Getters switch on the cvar.
+    VkShaderModule                         s_TerrainFSZoff        = VK_NULL_HANDLE;
+    VkShaderModule                         s_TerrainDepthFS       = VK_NULL_HANDLE;
+    VkPipeline                             s_TerrainDepthPipelineZoff = VK_NULL_HANDLE;
 
     // Sun shadow caster: depth-only VS (no FS), own layout (push: mat4 lightMVP),
     // per-stride lazily-built pipelines into the shadow map's D32 format.
     VkShaderModule                         s_DepthVS         = VK_NULL_HANDLE;
     VkPipelineLayout                       s_DepthLayout     = VK_NULL_HANDLE;
     std::unordered_map<u32, VkPipeline>    s_DepthPipelines;
+
+    // Depth-prepass dither variant for the cluster-LOD crossfade (vk_world_gpu
+    // DrawDepth when r_cluster_fade > 0). Same layout as the solid depth path.
+    VkShaderModule                         s_DepthFadeVS     = VK_NULL_HANDLE;
+    VkShaderModule                         s_DepthFadeFS     = VK_NULL_HANDLE;
+    std::unordered_map<u32, VkPipeline>    s_DepthFadePipelines;
 
     // Alpha-tested caster variant (foliage silhouettes): VS+FS, material set 0,
     // pipelines keyed by (stride << 8) | tcOffset.
@@ -140,12 +174,40 @@ static void BuildVertexInputForStride(u32 stride, u32 tcOffset,
                                       VkVertexInputBindingDescription&  binding,
                                       VkVertexInputAttributeDescription attrs[6]);
 
+// Fill a VkSpecializationInfo (+ its backing storage) for the 5 world uber-FS variant
+// bits. The caller owns vals/entries/info so they outlive vkCreateGraphicsPipelines.
+// Order MUST match the SpecId decorations in shaders/world_variants.glsl (POM=0 ..
+// DEBUG=4). Passed to the FRAGMENT stage only (VS/TCS/TES declare no spec constants).
+static void BuildWorldSpecInfo(u8 mask, VkBool32 vals[5],
+                               VkSpecializationMapEntry entries[5], VkSpecializationInfo& info)
+{
+    const u8 bits[5] = { WS_POM, WS_SNOW, WS_WET, WS_IBL, WS_DEBUG };
+    for (u32 i = 0; i < 5; ++i) {
+        vals[i]    = (mask & bits[i]) ? VK_TRUE : VK_FALSE;
+        entries[i] = { i, i * (u32)sizeof(VkBool32), sizeof(VkBool32) };
+    }
+    info = {};
+    info.mapEntryCount = 5;
+    info.pMapEntries   = entries;
+    info.dataSize      = 5 * sizeof(VkBool32);
+    info.pData         = vals;
+}
+
+void SetFrameSpecMask(u8 mask) { s_FrameSpecMask = mask & WS_FRAME; }
+u8   GetFrameSpecMask()        { return s_FrameSpecMask; }
+
 VkPipelineLayout GetLayout()      { return s_Layout; }
 VkPipelineCache  GetCacheObject() { return s_CacheObject; }
 VkShaderModule   WorldLmapVS() { return s_WorldLmapVS; }
 VkShaderModule   WorldLmapFS() { return s_WorldLmapFS; }
 VkShaderModule   WorldVlitVS() { return s_WorldVlitVS; }
 VkShaderModule   WorldVlitFS() { return s_WorldVlitFS; }
+VkShaderModule   WorldLmapInstVS() { return s_WorldLmapInstVS; }
+VkShaderModule   WorldVlitInstVS() { return s_WorldVlitInstVS; }
+VkShaderModule   WorldLmapFadeVS() { return s_WorldLmapFadeVS; }
+VkShaderModule   WorldLmapFadeFS() { return s_WorldLmapFadeFS; }
+VkShaderModule   WorldVlitFadeVS() { return s_WorldVlitFadeVS; }
+VkShaderModule   WorldVlitFadeFS() { return s_WorldVlitFadeFS; }
 
 bool TessAvailable()
 {
@@ -179,6 +241,18 @@ bool Init()
     s_WorldLmapFS = g_ShaderManager->Load("world_lmap.frag.spv");
     s_WorldVlitVS = g_ShaderManager->Load("world_vlit.vert.spv");
     s_WorldVlitFS = g_ShaderManager->Load("world_vlit.frag.spv");
+    s_WorldLmapFadeVS = g_ShaderManager->Load("world_lmap_fade.vert.spv");
+    s_WorldLmapFadeFS = g_ShaderManager->Load("world_lmap_fade.frag.spv");
+    s_WorldVlitFadeVS = g_ShaderManager->Load("world_vlit_fade.vert.spv");
+    s_WorldVlitFadeFS = g_ShaderManager->Load("world_vlit_fade.frag.spv");
+    if (!s_WorldLmapFadeVS || !s_WorldLmapFadeFS || !s_WorldVlitFadeVS || !s_WorldVlitFadeFS)
+        Msg("![VK PipelineCache] world *_fade shaders missing — cluster crossfade (r_cluster_fade) disabled");
+    // Instanced world VS variants (vk_instance_gpu, host/editor scenes). Optional:
+    // missing modules just keep the host scene on the CPU RenderQueue.
+    s_WorldLmapInstVS = g_ShaderManager->Load("world_lmap_inst.vert.spv");
+    s_WorldVlitInstVS = g_ShaderManager->Load("world_vlit_inst.vert.spv");
+    if (!s_WorldLmapInstVS || !s_WorldVlitInstVS)
+        Msg("![VK PipelineCache] world *_inst shaders missing — instanced host scenes stay on the CPU path");
     if (s_WorldLmapVS == VK_NULL_HANDLE || s_WorldLmapFS == VK_NULL_HANDLE ||
         s_WorldVlitVS == VK_NULL_HANDLE || s_WorldVlitFS == VK_NULL_HANDLE) {
         Msg("![VK PipelineCache] Failed to load world shaders (lmap/vlit, .vert.spv/.frag.spv)");
@@ -190,6 +264,11 @@ bool Init()
     s_TerrainFS = g_ShaderManager->Load("world_terrain.frag.spv");
     if (s_TerrainVS == VK_NULL_HANDLE || s_TerrainFS == VK_NULL_HANDLE)
         Msg("![VK PipelineCache] terrain splat shaders missing — terrain falls back to single-detail path");
+    // POM depth-offset variants (r_pom_zoff) — optional; absence keeps flat depth.
+    s_TerrainFSZoff  = g_ShaderManager->Load("world_terrain_zoff.frag.spv");
+    s_TerrainDepthFS = g_ShaderManager->Load("world_terrain_depth.frag.spv");
+    if (s_TerrainFSZoff == VK_NULL_HANDLE || s_TerrainDepthFS == VK_NULL_HANDLE)
+        Msg("![VK PipelineCache] terrain zoff shaders missing (world_terrain_zoff/_depth.frag.spv) — r_pom_zoff disabled");
 
     // World tessellation TCS/TES — optional; absence keeps the flat pipelines.
     if (VulkanHW.m_bTessellationSupported) {
@@ -207,6 +286,11 @@ bool Init()
     s_DepthVS = g_ShaderManager->Load("shadow_depth.vert.spv");
     if (s_DepthVS == VK_NULL_HANDLE)
         Msg("![VK PipelineCache] shadow_depth.vert.spv missing — sun shadow casting disabled");
+
+    s_DepthFadeVS = g_ShaderManager->Load("world_depth_fade.vert.spv");
+    s_DepthFadeFS = g_ShaderManager->Load("world_depth_fade.frag.spv");
+    if (s_DepthFadeVS == VK_NULL_HANDLE || s_DepthFadeFS == VK_NULL_HANDLE)
+        Msg("![VK PipelineCache] world_depth_fade.{vert,frag}.spv missing — cluster crossfade prepass disabled");
     // Alpha-tested caster pair — optional; absence keeps solid-quad shadows.
     s_DepthATVS = g_ShaderManager->Load("shadow_depth_at.vert.spv");
     s_DepthATFS = g_ShaderManager->Load("shadow_depth_at.frag.spv");
@@ -379,6 +463,74 @@ VkPipeline GetDepthPipeline(u32 stride)
     return h;
 }
 
+// Solid depth pipeline + the crossfade dither FS (cluster-LOD transitions).
+// Identical state to GetDepthPipeline — same layout, same D32 target — so
+// vk_world_gpu::DrawDepth can swap them per frame based on r_cluster_fade.
+VkPipeline GetDepthFadePipeline(u32 stride)
+{
+    if (s_DepthLayout == VK_NULL_HANDLE || s_DepthFadeVS == VK_NULL_HANDLE || s_DepthFadeFS == VK_NULL_HANDLE)
+        return VK_NULL_HANDLE;
+    auto it = s_DepthFadePipelines.find(stride);
+    if (it != s_DepthFadePipelines.end()) return it->second;
+
+    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
+    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &attr;
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_DepthFadeVS; stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_DepthFadeFS; stages[1].pName = "main";
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    rs.depthBiasEnable = VK_TRUE;
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
+    VkPipelineDynamicStateCreateInfo dynState{};
+    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo prci{};
+    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+    VkGraphicsPipelineCreateInfo pi{};
+    pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pi.pNext             = &prci;
+    pi.stageCount        = 2;    pi.pStages = stages;
+    pi.pVertexInputState = &vi;  pi.pInputAssemblyState = &ia;
+    pi.pViewportState    = &vp;  pi.pRasterizationState = &rs;
+    pi.pMultisampleState = &ms;  pi.pDepthStencilState  = &ds;
+    pi.pColorBlendState  = &cb;  pi.pDynamicState       = &dynState;
+    pi.layout            = s_DepthLayout;
+
+    VkPipeline h = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h) != VK_SUCCESS) {
+        Msg("![VK PipelineCache] depth fade pipeline failed stride=%u", stride); h = VK_NULL_HANDLE;
+    }
+    s_DepthFadePipelines.emplace(stride, h);
+    return h;
+}
+
 VkPipelineLayout GetDepthATLayout() { return s_DepthATLayout; }
 
 // Alpha-tested caster pipeline: position + UV attributes, VS+FS (FS discards
@@ -463,10 +615,27 @@ VkPipeline GetDepthATPipeline(u32 stride, u32 tcOffset)
 
 VkPipelineLayout GetTerrainLayout() { return s_TerrainLayout; }
 
+// True when the POM depth-offset variants should be used this frame (cvar pair
+// on + both variant shaders loaded). The zoff COLOR pipeline must run at full
+// shading rate: a VRS-coarsened gl_FragDepth would differ from the full-rate
+// prepass depth and fail the LEQUAL equality -> holes. So the zoff variant is
+// built WITHOUT the VRS dynamic state.
+static bool TerrainZoffActive()
+{
+    return ps_r_pom_terrain && ps_r_pom_zoff > 0.f
+        && s_TerrainFSZoff != VK_NULL_HANDLE && s_TerrainDepthFS != VK_NULL_HANDLE;
+}
+
 VkPipeline GetTerrainPipeline()
 {
-    if (s_TerrainPipeline != VK_NULL_HANDLE) return s_TerrainPipeline;
     if (s_TerrainLayout == VK_NULL_HANDLE)   return VK_NULL_HANDLE;
+    const bool zoff = TerrainZoffActive();
+    // Terrain uber-FS variant mask (Inc 1): frame-global bits + terrain POM (r_pom_terrain).
+    const u8  mask = (ps_r_uber_variants == 0) ? (u8)WS_ALL
+                     : (u8)((s_FrameSpecMask & WS_FRAME) | (ps_r_pom_terrain ? (u8)WS_POM : 0u));
+    const u32 pkey = ((zoff ? 1u : 0u) << 8) | mask;
+    if (auto it = s_TerrainColorPipelines.find(pkey); it != s_TerrainColorPipelines.end())
+        return it->second;
 
     // Terrain is always the lmap sub-layout: stride 32, tcOffset 24, depth on.
     VkVertexInputBindingDescription   binding{};
@@ -491,7 +660,14 @@ VkPipeline GetTerrainPipeline()
         stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;    stages[nStage++].module = s_WorldTerrainTCS;
         stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; stages[nStage++].module = s_WorldTerrainTES;
     }
-    stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT;   stages[nStage++].module = s_TerrainFS;
+    const u32 fsIdx = nStage;
+    stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT;   stages[nStage++].module = zoff ? s_TerrainFSZoff : s_TerrainFS;
+    // Bake the world-variant spec constants into the terrain FS (storage lives to the create).
+    VkBool32                 specVals[5];
+    VkSpecializationMapEntry specEntries[5];
+    VkSpecializationInfo     specInfo;
+    BuildWorldSpecInfo(mask, specVals, specEntries, specInfo);
+    stages[fsIdx].pSpecializationInfo = &specInfo;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -530,12 +706,14 @@ VkPipeline GetTerrainPipeline()
     cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cb.attachmentCount = 1; cb.pAttachments = &ba;
 
-    // VRS: world-color pipelines accept a dynamic fragment shading rate so the
-    // World pass can bind the shading-rate image (vkCmdSetFragmentShadingRateKHR).
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR };
+    // VRS: STATIC {1x1, KEEP, REPLACE} like the world pipelines (see CreatePipeline —
+    // a dynamic rate gets invalidated by unrelated binds). zoff variant: NO VRS
+    // (full-rate gl_FragDepth must equal the prepass depth) → no FSR state at all
+    // (implicit static 1x1, combiners KEEP/KEEP ignore the SRI).
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dynState{};
     dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = VulkanHW.m_bVRSSupported ? 3u : 2u; dynState.pDynamicStates = dyn;
+    dynState.dynamicStateCount = 2u; dynState.pDynamicStates = dyn;
 
     VkFormat colorFormat = VK::SceneColor::Format();
     VkPipelineRenderingCreateInfo prci{};
@@ -543,6 +721,12 @@ VkPipeline GetTerrainPipeline()
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFormat;
     prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
+    VkPipelineFragmentShadingRateStateCreateInfoKHR fsrState{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
+    fsrState.fragmentSize   = { 1, 1 };
+    fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;   // SRI attachment wins
+    if (ps_r_vrs_static > 0) { fsrState.fragmentSize = { 2, 2 }; fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR; }
+    if (VulkanHW.m_bVRSSupported && !zoff) prci.pNext = &fsrState;
 
     VkGraphicsPipelineCreateInfo pi{};
     pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -559,14 +743,21 @@ VkPipeline GetTerrainPipeline()
     pi.pColorBlendState    = &cb;
     pi.pDynamicState       = &dynState;
     pi.layout              = s_TerrainLayout;
+    // Same SRI pass as the world pipelines above → same create flag. The zoff
+    // variant keeps its static 1x1 rate (no dynamic state) but still needs the
+    // flag to be legally bound while the SRI is attached.
+    if (VulkanHW.m_bVRSSupported)
+        pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &s_TerrainPipeline) != VK_SUCCESS) {
-        Msg("![VK PipelineCache] terrain pipeline create failed");
-        s_TerrainPipeline = VK_NULL_HANDLE;
+    VkPipeline h = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h) != VK_SUCCESS) {
+        Msg("![VK PipelineCache] terrain pipeline create failed (zoff=%d mask=0x%02x)", zoff ? 1 : 0, mask);
+        s_TerrainColorPipelines.emplace(pkey, VK_NULL_HANDLE);
         return VK_NULL_HANDLE;
     }
-    Msg("[VK PipelineCache] Created terrain splat pipeline");
-    return s_TerrainPipeline;
+    Msg("[VK PipelineCache] Created terrain splat pipeline (zoff=%d mask=0x%02x)", zoff ? 1 : 0, mask);
+    s_TerrainColorPipelines.emplace(pkey, h);
+    return h;
 }
 
 // Terrain DEPTH-prepass variant: the SAME world_terrain.vert (so the snow vertex
@@ -576,7 +767,9 @@ VkPipeline GetTerrainPipeline()
 // Used by FlushDepth / WorldGPU::DrawDepth for terrain in the depth prepass only.
 VkPipeline GetTerrainDepthPipeline()
 {
-    if (s_TerrainDepthPipeline != VK_NULL_HANDLE) return s_TerrainDepthPipeline;
+    const bool  zoff = TerrainZoffActive();   // FS variant: sink depth into the POM cracks
+    VkPipeline& slot = zoff ? s_TerrainDepthPipelineZoff : s_TerrainDepthPipeline;
+    if (slot != VK_NULL_HANDLE) return slot;
     if (s_TerrainLayout == VK_NULL_HANDLE || s_TerrainVS == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
     VkVertexInputBindingDescription   binding{};
@@ -590,13 +783,16 @@ VkPipeline GetTerrainDepthPipeline()
     // Tessellated (snow footprints) when available - MUST match the color terrain
     // pipeline's displacement so the prepass depth lines up (no z-fight on prints).
     const bool tess = VulkanHW.m_bTessellationSupported && s_WorldTerrainTCS != VK_NULL_HANDLE && s_WorldTerrainTES != VK_NULL_HANDLE;
-    VkPipelineShaderStageCreateInfo stages[3]{};   // VS (+ TCS/TES); no FS (depth-only)
+    VkPipelineShaderStageCreateInfo stages[4]{};   // VS (+ TCS/TES) (+ zoff FS)
     for (auto& s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
     u32 nStage = 0;
     stages[nStage].stage = VK_SHADER_STAGE_VERTEX_BIT;     stages[nStage++].module = s_TerrainVS;
     if (tess) {
         stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;    stages[nStage++].module = s_WorldTerrainTCS;
         stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; stages[nStage++].module = s_WorldTerrainTES;
+    }
+    if (zoff) {   // prepass FS: same POM march as color -> displaced gl_FragDepth
+        stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[nStage++].module = s_TerrainDepthFS;
     }
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
@@ -654,13 +850,13 @@ VkPipeline GetTerrainDepthPipeline()
     pi.pColorBlendState    = &cb;      pi.pDynamicState       = &dynState;
     pi.layout              = s_TerrainLayout;
 
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &s_TerrainDepthPipeline) != VK_SUCCESS) {
-        Msg("![VK PipelineCache] terrain DEPTH pipeline create failed");
-        s_TerrainDepthPipeline = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &slot) != VK_SUCCESS) {
+        Msg("![VK PipelineCache] terrain DEPTH pipeline create failed (zoff=%d)", zoff ? 1 : 0);
+        slot = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
-    Msg("[VK PipelineCache] Created terrain depth (snow-displaced) pipeline");
-    return s_TerrainDepthPipeline;
+    Msg("[VK PipelineCache] Created terrain depth (snow-displaced) pipeline (zoff=%d)", zoff ? 1 : 0);
+    return slot;
 }
 
 void Destroy()
@@ -680,13 +876,16 @@ void Destroy()
     }
     s_Pipelines.clear();
 
-    if (s_TerrainPipeline) {
-        vkDestroyPipeline(VulkanHW.m_Device, s_TerrainPipeline, nullptr);
-        s_TerrainPipeline = VK_NULL_HANDLE;
-    }
+    for (auto& kv : s_TerrainColorPipelines)
+        if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+    s_TerrainColorPipelines.clear();
     if (s_TerrainDepthPipeline) {
         vkDestroyPipeline(VulkanHW.m_Device, s_TerrainDepthPipeline, nullptr);
         s_TerrainDepthPipeline = VK_NULL_HANDLE;
+    }
+    if (s_TerrainDepthPipelineZoff) {
+        vkDestroyPipeline(VulkanHW.m_Device, s_TerrainDepthPipelineZoff, nullptr);
+        s_TerrainDepthPipelineZoff = VK_NULL_HANDLE;
     }
     if (s_TerrainLayout) {
         vkDestroyPipelineLayout(VulkanHW.m_Device, s_TerrainLayout, nullptr);
@@ -694,6 +893,8 @@ void Destroy()
     }
     for (auto& kv : s_DepthPipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
     s_DepthPipelines.clear();
+    for (auto& kv : s_DepthFadePipelines) if (kv.second) vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+    s_DepthFadePipelines.clear();
     if (s_DepthLayout) {
         vkDestroyPipelineLayout(VulkanHW.m_Device, s_DepthLayout, nullptr);
         s_DepthLayout = VK_NULL_HANDLE;
@@ -714,6 +915,8 @@ void Destroy()
     // Shader modules are owned by g_ShaderManager — leave them.
     s_TerrainVS = VK_NULL_HANDLE;
     s_TerrainFS = VK_NULL_HANDLE;
+    s_TerrainFSZoff  = VK_NULL_HANDLE;
+    s_TerrainDepthFS = VK_NULL_HANDLE;
     s_WorldLmapVS = VK_NULL_HANDLE;
     s_WorldLmapFS = VK_NULL_HANDLE;
     s_WorldVlitVS = VK_NULL_HANDLE;
@@ -773,12 +976,28 @@ static VkPipeline CreatePipeline(const Key& k)
     VkVertexInputAttributeDescription attrs[6]{};
     BuildVertexInputForStride(k.stride, k.tcOffset, binding, attrs);
 
+    // Instanced host scene (Key::instanced): a SECOND binding at INSTANCE rate
+    // carries the model matrix as four vec4 rows on locations 6..9, matching the
+    // INSTANCED block in world_{lmap,vlit}_vert_body.glsl. Stride is sizeof(Fmatrix);
+    // the indirect draw's firstInstance selects the row, so one draw covers every
+    // instance of a mesh. The arrays must outlive vkCreateGraphicsPipelines, hence
+    // the full-size locals rather than a branch-local copy.
+    VkVertexInputBindingDescription   bindings[2]{};
+    VkVertexInputAttributeDescription attrsInst[10]{};
+    if (k.instanced) {
+        bindings[0] = binding;
+        bindings[1] = { 1, (u32)sizeof(Fmatrix), VK_VERTEX_INPUT_RATE_INSTANCE };
+        for (u32 i = 0; i < 6; ++i) attrsInst[i] = attrs[i];
+        for (u32 r = 0; r < 4; ++r)
+            attrsInst[6 + r] = { 6 + r, 1, VK_FORMAT_R32G32B32A32_SFLOAT, r * 16u };
+    }
+
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1;
-    vi.pVertexBindingDescriptions      = &binding;
-    vi.vertexAttributeDescriptionCount = 6;
-    vi.pVertexAttributeDescriptions    = attrs;
+    vi.vertexBindingDescriptionCount   = k.instanced ? 2u : 1u;
+    vi.pVertexBindingDescriptions      = k.instanced ? bindings : &binding;
+    vi.vertexAttributeDescriptionCount = k.instanced ? 10u : 6u;
+    vi.pVertexAttributeDescriptions    = k.instanced ? attrsInst : attrs;
 
     // Heightmap tessellation (R4 TESS_HM): the tess variant inserts the
     // TCS/TES pair (picked by sub-layout) and assembles patch lists. Guard
@@ -795,6 +1014,13 @@ static VkPipeline CreatePipeline(const Key& k)
     stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = k.fs; stages[1].pName = "main";
+    // World uber-FS variants (Inc 1): bake POM/SNOW/WET/IBL/DEBUG spec constants so the
+    // driver DCEs the unused features (and their VGPRs). Storage lives to the create call.
+    VkBool32                 specVals[5];
+    VkSpecializationMapEntry specEntries[5];
+    VkSpecializationInfo     specInfo;
+    BuildWorldSpecInfo(k.specMask, specVals, specEntries, specInfo);
+    stages[1].pSpecializationInfo = &specInfo;
     if (tess) {
         stages[2].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[2].stage  = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
@@ -887,11 +1113,18 @@ static VkPipeline CreatePipeline(const Key& k)
     cb.attachmentCount = 1;
     cb.pAttachments    = &ba;
 
-    // VRS: world-color pipelines accept a dynamic fragment shading rate (see GetTerrainPipeline).
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR };
+    // VRS: STATIC per-pipeline FSR state {1x1, KEEP, REPLACE} — the attachment
+    // (SRI) replaces the rate when Pass_World attaches one; passes without an SRI
+    // shade 1x1. Static, NOT the dynamic state: validation proved a dynamic rate
+    // can't survive this renderer's command buffers — any vkCmdBindPipeline of a
+    // pipeline WITHOUT the dynamic state (trees, VSM, shadow, debug...) legally
+    // INVALIDATES the previously set rate, so every draw after it fell back to
+    // 1x1 (VUID-...-pipelineFragmentShadingRate-09238, 18-07-2026).
+    // r_vrs_static diag: bake a hard 2x2 (KEEP/KEEP ignores the SRI) instead.
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipelineDynamicStateCreateInfo dynState{};
     dynState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = VulkanHW.m_bVRSSupported ? 3u : 2u;
+    dynState.dynamicStateCount = 2u;
     dynState.pDynamicStates    = dyn;
 
     VkFormat colorFormat = VK::SceneColor::Format();
@@ -904,6 +1137,17 @@ static VkPipeline CreatePipeline(const Key& k)
         // Stencil aspect lives in the same view for combined formats but the
         // pass doesn't read or write it; leave stencilAttachmentFormat = UNDEFINED.
     }
+    VkPipelineFragmentShadingRateStateCreateInfoKHR fsrState{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
+    if (k.vrsStatic) {
+        fsrState.fragmentSize   = { 2, 2 };                                        // diag: hard 2x2
+        fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;   // ignore attachment
+    } else {
+        fsrState.fragmentSize   = { 1, 1 };
+        fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;   // ignore primitive rate
+        fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;// SRI attachment wins
+    }
+    if (VulkanHW.m_bVRSSupported) prci.pNext = &fsrState;
 
     VkGraphicsPipelineCreateInfo pi{};
     pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -920,6 +1164,11 @@ static VkPipeline CreatePipeline(const Key& k)
     pi.pColorBlendState    = &cb;
     pi.pDynamicState       = &dynState;
     pi.layout              = s_Layout;
+    // VRS: these pipelines draw inside a dynamic-rendering pass that attaches the
+    // shading-rate image (Pass_World). Without this create flag the spec leaves the
+    // SRI's effect undefined — NVIDIA silently ignores it (draws stay 1x1).
+    if (VulkanHW.m_bVRSSupported)
+        pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
     VkPipeline handle = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &handle);
@@ -928,8 +1177,8 @@ static VkPipeline CreatePipeline(const Key& k)
             r, k.stride, k.tcOffset, (int)k.depthTest, (int)tess);
         return VK_NULL_HANDLE;
     }
-    Msg("[VK PipelineCache] Created pipeline stride=%u tcOff=%u depth=%d wmark=%d tess=%d",
-        k.stride, k.tcOffset, (int)k.depthTest, (int)k.wmark, (int)tess);
+    Msg("[VK PipelineCache] Created pipeline stride=%u tcOff=%u depth=%d wmark=%d tess=%d vrs2x2=%d",
+        k.stride, k.tcOffset, (int)k.depthTest, (int)k.wmark, (int)tess, (int)k.vrsStatic);
     return handle;
 }
 
@@ -937,12 +1186,68 @@ VkPipeline Get(const Key& key)
 {
     if (!s_Layout) return VK_NULL_HANDLE;
 
-    auto it = s_Pipelines.find(key);
+    // VRS diag: stamp the static-2x2 bit from the LIVE cvar so flipping
+    // r_vrs_static mid-game switches to (lazily created) 2x2 variants — no
+    // level reload needed for the A/B.
+    Key k = key;
+    k.vrsStatic = VulkanHW.m_bVRSSupported && ps_r_vrs_static > 0;
+    // r_uber_variants 0 = A/B the OLD monolithic uber (all features baked on). Else
+    // stamp the frame-global bits (WS_FRAME) from the per-frame mask; the caller supplied
+    // only the per-material POM bit. Flipping weather/debug (or this cvar) mid-game
+    // switches to (lazily created, disk-cached) variants — no level reload needed.
+    k.specMask = (ps_r_uber_variants == 0) ? (u8)WS_ALL
+                                           : (u8)((key.specMask & WS_POM) | s_FrameSpecMask);
+
+    auto it = s_Pipelines.find(k);
     if (it != s_Pipelines.end()) return it->second;
 
-    VkPipeline p = CreatePipeline(key);
-    s_Pipelines.emplace(key, p);
+    VkPipeline p = CreatePipeline(k);
+    s_Pipelines.emplace(k, p);
     return p;
+}
+
+namespace {
+    xr_vector<Key> s_prewarmWorld;       // pending world weather-variant keys
+    xr_vector<u8>  s_prewarmTerrainMask; // pending terrain frame-masks (WS_FRAME bits)
+    bool           s_prewarmBuilt = false;
+}
+
+bool PrewarmWeatherVariants(u32 budget)
+{
+    if (!s_Layout) return false;
+    // First call: snapshot the work list — the WET/SNOW/WET|SNOW flips of every world
+    // pipeline seen so far, plus the terrain weather masks. Nothing is created yet.
+    if (!s_prewarmBuilt) {
+        s_prewarmBuilt = true;
+        const u8 flips[3] = { WS_WET, WS_SNOW, (u8)(WS_WET | WS_SNOW) };
+        for (auto& kv : s_Pipelines)
+            for (u8 f : flips) {
+                Key k = kv.first;
+                k.specMask = (u8)(kv.first.specMask | f);
+                if (k.specMask != kv.first.specMask) s_prewarmWorld.push_back(k);
+            }
+        for (u8 f : flips)
+            s_prewarmTerrainMask.push_back((u8)((s_FrameSpecMask | f) & WS_FRAME));
+        Msg("[VK PipelineCache] prewarm queued %u world + %u terrain weather variants (%u/frame)",
+            (u32)s_prewarmWorld.size(), (u32)s_prewarmTerrainMask.size(), budget);
+    }
+    // Create up to `budget` this call — spread across frames so cold uber-FS compiles
+    // (~300ms each) don't freeze a whole frame.
+    u32 done = 0;
+    while (done < budget && !s_prewarmWorld.empty()) {
+        Key k = s_prewarmWorld.back(); s_prewarmWorld.pop_back();
+        if (s_Pipelines.find(k) == s_Pipelines.end()) {
+            s_Pipelines.emplace(k, CreatePipeline(k));
+            ++done;
+        }
+    }
+    while (done < budget && !s_prewarmTerrainMask.empty()) {
+        const u8 m = s_prewarmTerrainMask.back(); s_prewarmTerrainMask.pop_back();
+        const u8 saved = s_FrameSpecMask;   // GetTerrainPipeline reads the frame mask
+        s_FrameSpecMask = m; GetTerrainPipeline(); s_FrameSpecMask = saved;
+        ++done;
+    }
+    return !s_prewarmWorld.empty() || !s_prewarmTerrainMask.empty();
 }
 
 }}  // namespace VK::PipelineCache

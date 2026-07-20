@@ -18,6 +18,11 @@ public:
 private:
     VkCommandPool   m_CommandPools[FRAMES_IN_FLIGHT];
     VkCommandBuffer m_CommandBuffers[FRAMES_IN_FLIGHT];
+    // Second graphics segment per frame-in-flight (async frame-split): when the frame
+    // is split so compute overlaps graphics, the scene records into m_CommandBuffers
+    // and the post (tonemap+UI) into m_PostBuffers, submitted as two queue-ordered
+    // batches. Same per-slot pool; the frame fence gates reuse of BOTH.
+    VkCommandBuffer m_PostBuffers[FRAMES_IN_FLIGHT] = {};
     u32             m_CurrentFrame = 0;
 
     // Dedicated pool+buffer for one-shot immediate operations (uploads, layout transitions)
@@ -67,7 +72,16 @@ public:
     // Per-frame render command buffer (used by render loop only)
     VkCommandBuffer Begin();
     bool End(VkCommandBuffer cmd);
-    bool Submit(VkCommandBuffer cmd, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, VkFence fence);
+    // waitAsyncCompute: add the async-compute timeline to the wait list (default true
+    // for the single/last submit). The SCENE segment of a frame-split passes false so
+    // the async work overlaps it instead of blocking it — only the POST segment waits.
+    bool Submit(VkCommandBuffer cmd, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, VkFence fence,
+                bool waitAsyncCompute = true);
+
+    // Begin the frame's SECOND graphics segment (async frame-split). Call after
+    // submitting the scene segment; tonemap+UI record into the returned buffer, which
+    // End() submits with imageAvailable/renderFinished/fence. Same in-flight slot.
+    VkCommandBuffer BeginSecondSegment();
 
     // One-shot immediate command buffer (safe to call during rendering)
     VkCommandBuffer BeginImmediate();

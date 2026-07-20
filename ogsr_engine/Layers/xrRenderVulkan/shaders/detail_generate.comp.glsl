@@ -85,8 +85,9 @@ layout(push_constant) uniform PushConstants
     vec4 frustumPlanes[6];      // 96 bytes
     vec4 cameraPos;             // 16 bytes (xyz=pos, w=time)
     vec4 fadeParams;            // 16 bytes (fadeStartSq, fadeLimitSq, fadeRangeSq, density)
+    vec4 casterParams;          // 16 bytes (x>0 = CASTER pass: cull radiusSq, no frustum/HZB; y = output capacity override)
     ivec4 slotRange;            // 16 bytes (minSX, minSZ, countX, countZ)
-    // Total: 208 bytes
+    // Total: 224 bytes
 } pc;
 
 // ============================================================================
@@ -344,9 +345,14 @@ void main()
     rz += hashFloatS(hash(posSeed ^ 0xC200u)) * jitter;
 
     // ---- Distance culling (early out) ----
+    // CASTER pass (casterParams.x > 0): the shadow-caster radius replaces the
+    // visual fade limit — shadow casters only matter near the camera, and a
+    // blade past the visual fade shouldn't cast at all (min with fadeLimit).
+    float limSq = pc.casterParams.x > 0.0 ? min(pc.casterParams.x, pc.fadeParams.y)
+                                          : pc.fadeParams.y;
     vec3 delta = vec3(rx, 0.0, rz) - pc.cameraPos.xyz;
     float distSqXZ = delta.x * delta.x + delta.z * delta.z;
-    if (distSqXZ > pc.fadeParams.y * 1.5) // fadeLimitSq with some margin for Y
+    if (distSqXZ > limSq * 1.5) // limit with some margin for Y
         return;
 
     // ---- Get Y position ----
@@ -388,7 +394,7 @@ void main()
     // ---- Full distance culling with Y ----
     vec3 fullDelta = worldPos - pc.cameraPos.xyz;
     float distSq = dot(fullDelta, fullDelta);
-    if (distSq > pc.fadeParams.y) // fadeLimitSq
+    if (distSq > limSq)
         return;
 
     // ---- Scale ----
@@ -396,9 +402,11 @@ void main()
                       hashFloat01(hash(posSeed ^ 0xD100u)));
     scale *= gen.detailHeight; // ps_current_detail_height
 
-    // ---- Frustum culling ----
+    // ---- Frustum culling (VISIBLE pass only — a caster behind the camera can
+    // still throw its shadow INTO the view: campfire dapples on the wall you
+    // walk toward, sun shadows reaching into the frustum) ----
     float radius = obj.bvRadius * scale;
-    if (!frustumTestSphere(worldPos, radius))
+    if (pc.casterParams.x <= 0.0 && !frustumTestSphere(worldPos, radius))
         return;
 
     // ---- HZB occlusion culling ----
@@ -412,7 +420,7 @@ void main()
     const float HZB_NEAR_SKIP = 25.0;
     vec3  toCam   = pc.cameraPos.xyz - worldPos;
     float camDist = length(toCam);
-    if (camDist > HZB_NEAR_SKIP)
+    if (camDist > HZB_NEAR_SKIP && pc.casterParams.x <= 0.0)   // caster pass: occluded grass still casts
     {
         vec3 testPos = worldPos + (toCam / camDist) * radius;  // near face
         vec4 clipPos = pc.viewProj * vec4(testPos, 1.0);
@@ -477,7 +485,10 @@ void main()
     float c_hemi = float((slot.lighting >> 16) & 0xFFFFu) / 65535.0;
 
     // ---- Atomic append to per-obj-type section ----
-    uint outputCapacity = gen.genCounts.z;
+    // Caster pass writes into the (smaller) caster SSBO — its capacity comes
+    // via push (casterParams.y) since the UBO holds the visible pass's.
+    uint outputCapacity = pc.casterParams.y > 0.0 ? uint(pc.casterParams.y + 0.5)
+                                                  : gen.genCounts.z;
     uint numObjTypes = gen.genCounts.y;
     uint sectionSize = outputCapacity / max(numObjTypes, 1u);
 
@@ -486,8 +497,11 @@ void main()
     if (localIdx >= sectionSize)
     {
         // Over capacity — undo the increment so counter stays at sectionSize
-        // (prevents inflated instanceCount in indirect draw)
+        // (prevents inflated instanceCount in indirect draw). Count the drop:
+        // silent per-type overflow = whole grass regions missing (holes) —
+        // slots [64..127] (GPU_MAX_OBJ_TYPES + objId) are read back and logged.
         atomicAdd(atomics.counters[objId], 0xFFFFFFFFu); // -1
+        atomicAdd(atomics.counters[64u + objId], 1u);
         return;
     }
 

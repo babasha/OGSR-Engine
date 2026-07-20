@@ -25,7 +25,7 @@ ULONG actualResolution;
 } // namespace
 
 void xrCore::_initialize(LPCSTR _ApplicationName, LogCallback cb, BOOL init_fs,
-                         LPCSTR fs_fname)
+                         LPCSTR fs_fname, LPCSTR app_path_override, LPCSTR params_override)
 {
     strcpy_s(ApplicationName, _ApplicationName);
     if (0 == init_counter)
@@ -35,18 +35,34 @@ void xrCore::_initialize(LPCSTR _ApplicationName, LogCallback cb, BOOL init_fs,
         ZwSetTimerResolution(1, true, &actualResolution);
 #endif
 
-        strcpy_s(Params, sizeof(Params), GetCommandLine());
+        // Normally the process command line. The editor-host facade overrides it: when
+        // the engine is a DLL inside a foreign process, the host's flags are the HOST's
+        // (e.g. the SDK's `-nocache` would wreck the engine's FS) and must not leak in.
+        if (params_override && params_override[0])
+            strcpy_s(Params, sizeof(Params), params_override);
+        else
+            strcpy_s(Params, sizeof(Params), GetCommandLine());
 
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         if (strstr(Params, "-dbg"))
             ParamFlags.set(ParamFlag::dbg, TRUE);
 
-        // application path
-        string_path fn, dr, di;
-        GetModuleFileName(nullptr, fn, sizeof(fn));
-        _splitpath(fn, dr, di, nullptr, nullptr);
-        strconcat(sizeof(ApplicationPath), ApplicationPath, dr, di);
+        // application path — normally the host exe's directory; the editor-host
+        // facade overrides it with the xrEngine_VK.dll's own directory so the FS
+        // finds fsgame.ltx at fs_root (= ApplicationPath's parent) regardless of
+        // which process loaded the engine.
+        if (app_path_override && app_path_override[0])
+        {
+            strcpy_s(ApplicationPath, app_path_override);
+        }
+        else
+        {
+            string_path fn, dr, di;
+            GetModuleFileName(nullptr, fn, sizeof(fn));
+            _splitpath(fn, dr, di, nullptr, nullptr);
+            strconcat(sizeof(ApplicationPath), ApplicationPath, dr, di);
+        }
 
         // User/Comp Name
         DWORD sz_user = sizeof(UserName);

@@ -1,6 +1,9 @@
 #include "stdafx.h"
 
 #include "xrCDB.h"
+#include "xrCDB_tiled.h"
+
+#include <algorithm>
 
 using namespace CDB;
 using namespace Opcode;
@@ -291,11 +294,66 @@ public:
     }
 };
 
+// Tiled routing: visit the tiles overlapped by the query box (usually 1,
+// up to 4 on a boundary), pre-testing each tile's exact geometry bounds so
+// out-of-grid or above-roof boxes never page tiles in.
+template <bool bClass3, bool bFirst>
+static void box_query_tiled(COLLIDER* CL, TILE_GRID& G, Fvector* verts, TRI* tris, const Fvector& c, const Fvector& e)
+{
+    Fvector bmin, bmax;
+    bmin.sub(c, e);
+    bmax.add(c, e);
+    if (!_valid(bmin) || !_valid(bmax))
+        return;
+    const int ix0 = std::clamp(G.cell_x(bmin.x), 0, (int)G.nx - 1), ix1 = std::clamp(G.cell_x(bmax.x), 0, (int)G.nx - 1);
+    const int iz0 = std::clamp(G.cell_z(bmin.z), 0, (int)G.nz - 1), iz1 = std::clamp(G.cell_z(bmax.z), 0, (int)G.nz - 1);
+
+    box_collider<bClass3, bFirst> BC;
+    BC._init(CL, verts, tris, c, e);
+
+    u32 stabbed = 0;
+    for (int iz = iz0; iz <= iz1; ++iz)
+        for (int ix = ix0; ix <= ix1; ++ix)
+        {
+            TILE& t = G.cell(ix, iz);
+            if (!t.file_nodes)
+                continue;
+            if (bmax.x < t.bb_min.x || bmin.x > t.bb_max.x || bmax.y < t.bb_min.y || bmin.y > t.bb_max.y || bmax.z < t.bb_min.z || bmin.z > t.bb_max.z)
+                continue;
+            with_tile(G, t, [&](const AABBNoLeafNode* nodes) { BC._stab(nodes); });
+            ++stabbed;
+            if (bFirst && CL->r_count())
+                return;
+        }
+    if (!bFirst && stabbed > 1)
+        CL->r_dedup_by_id(); // boundary tris live in 2+ tiles — dup contacts would break ODE
+}
+
 void COLLIDER::box_query(u32 box_mode, const MODEL* m_def, const Fvector& b_center, const Fvector& b_dim)
 {
     ZoneScoped;
 
     m_def->syncronize();
+
+    if (TILE_GRID* G = m_def->tiled())
+    {
+        r_clear();
+        if (box_mode & OPT_FULL_TEST)
+        {
+            if (box_mode & OPT_ONLYFIRST)
+                box_query_tiled<true, true>(this, *G, m_def->verts, m_def->tris, b_center, b_dim);
+            else
+                box_query_tiled<true, false>(this, *G, m_def->verts, m_def->tris, b_center, b_dim);
+        }
+        else
+        {
+            if (box_mode & OPT_ONLYFIRST)
+                box_query_tiled<false, true>(this, *G, m_def->verts, m_def->tris, b_center, b_dim);
+            else
+                box_query_tiled<false, false>(this, *G, m_def->verts, m_def->tris, b_center, b_dim);
+        }
+        return;
+    }
 
     // Get nodes
     const AABBNoLeafTree* T = (const AABBNoLeafTree*)m_def->tree->GetTree();

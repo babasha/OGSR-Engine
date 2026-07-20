@@ -24,6 +24,12 @@ namespace VK
     // registered after Sky/Shafts so panes blend over the finished opaque scene.
     void Pass_WorldGlass(FrameContext& ctx);
 
+    // PHASE B (editor-on-Vulkan, chunk 2): draw add_Visual'd model(s) with NO level.
+    // Replicates Pass_World's dynamics block (rigid queue + Pass_Skinned) so the
+    // -vk_editor viewport can show a lit model on the grey backdrop. See
+    // vk_pass_world.cpp. Registered only in editor mode (VKEditor::Active()).
+    void Pass_EditorDynamics(FrameContext& ctx);
+
     // Dynamic (spawned) visuals — NPCs, weapons, items, HUD. CRender::add_Visual
     // pushes {visual, world-xform} here every frame during the object traversal;
     // Pass_World drains them (in the same render pass as the level statics) with a

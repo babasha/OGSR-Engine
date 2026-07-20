@@ -44,4 +44,38 @@ void MemoryBarrier(VkCommandBuffer cmd,
 // per-resource ones.
 void SceneAttachmentBarrier(VkCommandBuffer cmd);
 
+// ---------------------------------------------------------------------------
+// ImageState — per-image layout/stage/access tracker (the framegraph execute seam).
+//
+// The first brick of the render graph. Instead of every consumer hand-placing a
+// flip-to-READ / flip-back-to-ATTACHMENT round-trip, it calls Require(the state
+// it needs) and a barrier is emitted ONLY when the tracked state actually has to
+// change. A RUN of consumers that all need the SAME state (SSAO, VRS, VSM-mark,
+// VSM-resolve all sampling the prepass depth) coalesces to a single transition —
+// killing the depth-thrash (4 round-trips -> 1). A later write correctly waits on
+// the union of every intervening reader (stage/access are OR-accumulated on the
+// read-after-read no-op). Generalizes to every scene resource and, once it carries
+// a queue family, to cross-queue ownership for async compute.
+// ---------------------------------------------------------------------------
+struct ImageState
+{
+    VkImage               image  = VK_NULL_HANDLE;
+    VkImageAspectFlags    aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageLayout         layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkPipelineStageFlags2 stage  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    VkAccessFlags2        access = 0;
+
+    // Record the state the image is already known to be in — no barrier emitted.
+    void Seed(VkImage img, VkImageAspectFlags asp, VkImageLayout lay,
+              VkPipelineStageFlags2 stg, VkAccessFlags2 acc)
+    { image = img; aspect = asp; layout = lay; stage = stg; access = acc; }
+
+    // Make the image usable as (lay, stg, acc). Emits vkCmdPipelineBarrier2 only
+    // when the layout differs or a write hazard exists; a read-after-read at the
+    // same layout no-ops (the coalescing win) but is remembered for the next write.
+    void Require(VkCommandBuffer cmd, VkImageLayout lay,
+                 VkPipelineStageFlags2 stg, VkAccessFlags2 acc,
+                 u32 mipLevels = 1, u32 layerCount = 1);
+};
+
 } // namespace VK

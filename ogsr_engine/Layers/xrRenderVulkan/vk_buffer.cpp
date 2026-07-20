@@ -28,7 +28,7 @@ CVulkanBuffer::~CVulkanBuffer()
 }
 
 // Создание буфера
-void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage)
+void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage, bool gpuOnly)
 {
     if (m_Buffer != VK_NULL_HANDLE) {
         Msg("![Vulkan] Buffer already created, call Destroy first");
@@ -55,6 +55,14 @@ void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemor
     VmaAllocationCreateInfo allocInfo = {};
     allocInfo.usage = memUsage;
 
+    if (gpuOnly) {
+        // GPU-only: DEVICE_LOCAL is REQUIRED and no host access is requested. The
+        // default storage-buffer path below forces HOST_ACCESS_SEQUENTIAL_WRITE,
+        // which makes VMA pick HOST_VISIBLE memory — the 256MB BAR heap, or worse,
+        // SYSTEM RAM once BAR is full: every shader access then rides PCIe (the
+        // Pripyat tree-bin 20-30ms pathology). CPU writes go through Upload/Fill.
+        allocInfo.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    } else {
     // Для uniform/storage buffers включаем HOST_VISIBLE для persistent mapping
     // Storage buffers (e.g. bone SSBO) also need CPU write access for per-frame updates
     if (usage & (VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
@@ -65,6 +73,7 @@ void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemor
     // Для staging buffers (TRANSFER_SRC) или HOST memory - нужен host access
     if ((usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || memUsage == VMA_MEMORY_USAGE_AUTO_PREFER_HOST) {
         allocInfo.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    }
     }
 
     // ВАЖНО: Для VERTEX/INDEX буферов добавляем TRANSFER_DST для staging uploads
@@ -86,7 +95,7 @@ void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemor
         bufferInfo.pQueueFamilyIndices   = families;
     }
 
-    VK_CHECK(vmaCreateBuffer(VulkanHW.m_Allocator, &bufferInfo, &allocInfo,
+    VK_CHECK(VK::Vram::CreateBuffer(VulkanHW.m_Allocator, &bufferInfo, &allocInfo,
                              &m_Buffer, &m_Allocation, nullptr));
 
     // Tag the VMA allocation by usage so any leaked buffer is identifiable in the
@@ -121,12 +130,28 @@ void CVulkanBuffer::Destroy()
         Unmap();
     }
 
-    vmaDestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
+    VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
 
     m_Buffer = VK_NULL_HANDLE;
     m_Allocation = VK_NULL_HANDLE;
     m_Size = 0;
     m_Mapped = nullptr;
+}
+
+void CVulkanBuffer::AdoptFrom(CVulkanBuffer& other)
+{
+    if (this == &other) return;
+    Destroy();
+    m_Buffer     = other.m_Buffer;
+    m_Allocation = other.m_Allocation;
+    m_Size       = other.m_Size;
+    m_Mapped     = other.m_Mapped;
+    m_Usage      = other.m_Usage;
+    m_MemUsage   = other.m_MemUsage;
+    other.m_Buffer     = VK_NULL_HANDLE;
+    other.m_Allocation = VK_NULL_HANDLE;
+    other.m_Size       = 0;
+    other.m_Mapped     = nullptr;
 }
 
 // Upload данных

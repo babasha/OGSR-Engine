@@ -26,12 +26,24 @@ void CSE_Shape::cform_read(NET_Packet& tNetPacket)
 
     while (count)
     {
+        // Guard against corrupt/foreign STATE data (space_restrictor is used as an inert
+        // placeholder for unknown sections, so non-restrictor bytes can land here). Never
+        // read past the object's packet — otherwise r() asserts on the 8KB buffer bound.
         shape_def S;
+        if (tNetPacket.r_elapsed() < sizeof(u8))
+            break;
         tNetPacket.r_u8(S.type);
-        switch (S.type)
+        if (S.type == 0)
         {
-        case 0: tNetPacket.r(&S.data.sphere, sizeof(S.data.sphere)); break;
-        case 1: tNetPacket.r_matrix(S.data.box); break;
+            if (tNetPacket.r_elapsed() < sizeof(S.data.sphere))
+                break;
+            tNetPacket.r(&S.data.sphere, sizeof(S.data.sphere));
+        }
+        else if (S.type == 1)
+        {
+            if (tNetPacket.r_elapsed() < sizeof(S.data.box))
+                break;
+            tNetPacket.r_matrix(S.data.box);
         }
         shapes.push_back(S);
         --count;

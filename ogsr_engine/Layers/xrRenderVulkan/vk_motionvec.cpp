@@ -7,13 +7,18 @@
 
 // xrRenderVulkan — screen-space motion vectors. See vk_motionvec.h.
 #include "stdafx.h"
+#include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_motionvec.h"
 #include "vk_pass_ssao.h"          // VK::DeriveProjTerms / VK::ProjTerms (shared depth→world basis)
 #include "vk_pass_context.h"       // VK::FrameContext (dynamic MV pass)
 #include "vk_pass_skinned.h"       // VK::Skinned_RenderMotion (NPC animation MV)
+#include "CRender_Vulkan.h"        // RImplementation (grass detail manager access)
+#include "vk_DetailManager.h"      // CDetailManager::RenderMotion (grass wind-sway MV)
+#include "vk_TreeManager.h"        // CTreeManager::RenderMotion (tree wind-sway MV)
 #include "vk_swapchain.h"          // Swapchain.m_DepthView / m_Format
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_barriers.h"           // ImageBarrier
+#include "vk_image.h"              // VK::CreateImage2D / CreateImageView
 #include "vk_command_buffer.h"     // CommandManager.GetCurrentFrame()
 #include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline + draw
 #include "HW_Vulkan.h"
@@ -22,6 +27,8 @@
 extern int   ps_r_motion_vectors;  // r_motion_vectors — global MV pass on/off
 extern int   ps_r_mv_debug;        // r_mv_debug       — false-colour overlay on/off
 extern float ps_r_mv_debug_scale;  // r_mv_debug_scale — overlay magnitude scale
+extern int   ps_r_mv_trees;        // r_mv_trees       — tree wind-sway MV overlay on/off
+extern int   ps_r_mv_grass;        // r_mv_grass       — grass wind-sway MV overlay on/off
 
 namespace VK { namespace MotionVec {
 
@@ -57,16 +64,36 @@ namespace {
     // dynamic pass would then read as the CURRENT frame — a one-frame bug).
     Fmatrix s_prevVP;        // previous frame's view-proj
     Fmatrix s_curVP;         // this frame's view-proj (becomes prev next frame)
+    // Same history for the HUD-FOV projection (Device.mFullTransform_hud) — the HUD
+    // weapon MV overlay reprojects its cur/prev poses with the HUD matrices, not the
+    // world view-proj (different FOV + camera-at-origin).
+    Fmatrix s_prevHudVP;
+    Fmatrix s_curHudVP;
     bool    s_vpValid = false;
     u32     s_vpFrame = u32(-1);
+
+    // UNJITTERED view-proj for THIS frame + the jitter that was applied to the raster
+    // matrix (Option A). CRender::Begin sets these before it jitters Device.mFullTransform.
+    // When DLSS is off, SetFrameVP still runs with the plain matrices and zero jitter →
+    // behaviour is identical to the pre-jitter path.
+    Fmatrix s_frameWorldVP;
+    Fmatrix s_frameHudVP;
+    float   s_frameJitX  = 0.0f, s_frameJitY = 0.0f;
+    bool    s_frameVPSet = false;
 
     void EnsurePrevVP()
     {
         if (s_vpFrame == Device.dwFrame) return;   // already rolled this frame
-        s_prevVP  = s_vpValid ? s_curVP : Device.mFullTransform;   // first frame → zero motion
-        s_curVP   = Device.mFullTransform;
-        s_vpValid = true;
-        s_vpFrame = Device.dwFrame;
+        // Roll history from the UNJITTERED matrices (jitter-free MV). Fall back to the
+        // live Device matrices if Begin hasn't set them yet (defensive; Begin always runs first).
+        const Fmatrix& curWorld = s_frameVPSet ? s_frameWorldVP : Device.mFullTransform;
+        const Fmatrix& curHud   = s_frameVPSet ? s_frameHudVP   : Device.mFullTransform_hud;
+        s_prevVP    = s_vpValid ? s_curVP    : curWorld;       // first frame → zero motion
+        s_curVP     = curWorld;
+        s_prevHudVP = s_vpValid ? s_curHudVP : curHud;
+        s_curHudVP  = curHud;
+        s_vpValid   = true;
+        s_vpFrame   = Device.dwFrame;
     }
 
     struct MVPush {
@@ -74,9 +101,10 @@ namespace {
         float camRightT[4];  // xyz right*tanX, w eye.y
         float camTopT[4];    // xyz top*tanY, w eye.z
         float zp[4];         // _33, _43, 1/w, 1/h
-        float prevVP[16];    // row-major Fmatrix copied verbatim (see motion_vec.frag)
+        float prevVP[16];    // row-major Fmatrix copied verbatim (see motion_vec.frag) — UNJITTERED
+        float jitter[4];     // xy = this frame's sub-pixel jitter in D3D-NDC (unjitter the ndc); zw pad
     };
-    static_assert(sizeof(MVPush) == 128, "must match motion_vec.frag PC block (Vulkan-guaranteed 128B push)");
+    static_assert(sizeof(MVPush) == 144, "must match motion_vec.frag PC block");
 
     struct DbgPush { float p[4]; };   // x = display scale
 
@@ -84,14 +112,24 @@ namespace {
     {
         if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
         if (s_view)  { vkDestroyImageView(VulkanHW.m_Device, s_view, nullptr); s_view = VK_NULL_HANDLE; }
-        if (s_img)   { vmaDestroyImage(VulkanHW.m_Allocator, s_img, s_alloc); s_img = VK_NULL_HANDLE; s_alloc = VK_NULL_HANDLE; }
+        if (s_img)   { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_img, s_alloc); s_img = VK_NULL_HANDLE; s_alloc = VK_NULL_HANDLE; }
         s_extent = {};
         s_first  = true;
     }
 }
 
 bool        Enabled()       { return s_inited && !s_failed && ps_r_motion_vectors != 0 && s_img != VK_NULL_HANDLE; }
+void SetFrameVP(const Fmatrix& worldVP, const Fmatrix& hudVP, float jitterNdcX, float jitterNdcY)
+{
+    s_frameWorldVP = worldVP;
+    s_frameHudVP   = hudVP;
+    s_frameJitX    = jitterNdcX;
+    s_frameJitY    = jitterNdcY;
+    s_frameVPSet   = true;
+}
+
 VkImageView GetResultView() { return Enabled() ? s_view : VK_NULL_HANDLE; }
+VkImage     GetResultImage(){ return Enabled() ? s_img  : VK_NULL_HANDLE; }
 VkSampler   GetSampler()    { return s_samp; }
 VkFormat    Format()        { return kFormat; }
 u32         Generation()    { return s_generation; }
@@ -104,31 +142,14 @@ void EnsureSize(VkExtent2D extent)
     if (extent.width == 0 || extent.height == 0) return;
     s_extent = extent;
 
-    VkImageCreateInfo ici{};
-    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType     = VK_IMAGE_TYPE_2D;
-    ici.format        = kFormat;
-    ici.extent        = { extent.width, extent.height, 1 };
-    ici.mipLevels     = 1; ici.arrayLayers = 1;
-    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_img, &s_alloc, nullptr) != VK_SUCCESS) {
-        Msg("![VK MotionVec] image create failed"); s_img = VK_NULL_HANDLE; return;
+    if (!VK::CreateImage2D(kFormat, extent,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            s_img, s_alloc, "MotionVec")) {
+        return;
     }
-    VkImageViewCreateInfo vci{};
-    vci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vci.image    = s_img;
-    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format   = kFormat;
-    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    vci.subresourceRange.levelCount = 1;
-    vci.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_view) != VK_SUCCESS) {
-        Msg("![VK MotionVec] view create failed"); DestroyTarget(); return;
+    s_view = VK::CreateImageView(s_img, kFormat);
+    if (s_view == VK_NULL_HANDLE) {
+        DestroyTarget(); return;
     }
     ++s_generation;
     s_vpValid = false;   // history is stale across a resize
@@ -233,9 +254,12 @@ void Execute(VkCommandBuffer cmd, VkExtent2D extent)
         vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
     }
 
-    // Reconstruction basis from the matrix that RENDERED the depth (Device.mProject
-    // is identity on this path — derive from mFullTransform, like the GTAO pass).
-    const ProjTerms pt = DeriveProjTerms(Device.mFullTransform);
+    // Reconstruction basis from the UNJITTERED cur view-proj (s_curVP, set by
+    // EnsurePrevVP from CRender::Begin's pre-jitter capture). The depth was rendered
+    // JITTERED, but the shader unjitters the ndc (subtracts push.jitter) so the ray
+    // is built in the same unjittered space as this basis. p33/p43 are unaffected by
+    // the sub-pixel jitter (it only translates clip.xy), so depth decode is exact.
+    const ProjTerms pt = DeriveProjTerms(s_curVP);
     const Fvector eye  = Device.vCameraPosition;
     MVPush push{};
     push.camDir[0]    = pt.dir.x;          push.camDir[1]    = pt.dir.y;          push.camDir[2]    = pt.dir.z;          push.camDir[3]    = eye.x;
@@ -245,7 +269,9 @@ void Execute(VkCommandBuffer cmd, VkExtent2D extent)
     push.zp[1] = pt.p43;
     push.zp[2] = (extent.width  > 0) ? 1.0f / float(extent.width)  : 0.0f;
     push.zp[3] = (extent.height > 0) ? 1.0f / float(extent.height) : 0.0f;
-    std::memcpy(push.prevVP, &s_prevVP, sizeof(push.prevVP));
+    std::memcpy(push.prevVP, &s_prevVP, sizeof(push.prevVP));   // UNJITTERED prev VP
+    push.jitter[0] = s_frameJitX; push.jitter[1] = s_frameJitY;  // unjitter the ndc (0 when DLSS off)
+    push.jitter[2] = 0.0f;        push.jitter[3] = 0.0f;
 
     const VkImageLayout oldL = s_first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     ImageBarrier(cmd, s_img, oldL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -304,13 +330,37 @@ void ExecuteDynamic(VkCommandBuffer cmd, const FrameContext& ctx)
     VkRect2D sc{ {}, s_extent };
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
-    const Fmatrix curVP = ctx.viewProj ? *ctx.viewProj : Device.mFullTransform;
-    Skinned_RenderMotion(cmd, curVP, s_prevVP);
-    // (Trees / grass dynamics MV → Phase 2b, drawn here too.)
+    // Jitter-free MV (Option A): overlays reproject with the UNJITTERED cur/prev VP
+    // (s_curVP / s_prevVP, rolled from CRender::Begin's pre-jitter capture) and
+    // re-apply this frame's jitter only to gl_Position, so their depth still
+    // bit-matches the jittered forward geometry while the MV carries no jitter wobble.
+    const Fmatrix& curVP = s_curVP;
+    Skinned_RenderMotion(cmd, curVP, s_prevVP, s_frameJitX, s_frameJitY);
+
+
+    // First-person HUD weapon: its own overlay with the HUD-FOV projection at the
+    // near-depth range [0,0.02] (matches the forward HUD pass, drawn earlier in
+    // Pass_World → its depth is already in ctx.depthView). Replaces the fullscreen
+    // pass's bogus camera-reproject MV on the viewmodel so it doesn't ghost.
+    Skinned_RenderMotionHud(cmd, s_extent, s_curHudVP, s_prevHudVP, s_frameJitX, s_frameJitY);
+
+    // Grass wind-sway MV: re-project the cur/prev wind pose so blades swaying in the
+    // wind carry their true screen motion (the fullscreen reconstruction above only
+    // saw camera motion). Same open render pass; depth-tested against the grass depth.
+    if (ps_r_mv_grass && RImplementation.Details && RImplementation.Details->IsLoaded())
+        RImplementation.Details->RenderMotion(ctx, curVP, s_prevVP, s_frameJitX, s_frameJitY);
+
+    // Tree wind-sway MV: trees sway (SSFX trunk + crown flutter) → same overlay as
+    // grass so their crowns don't ghost on wind. Same open render pass.
+    if (ps_r_mv_trees && RImplementation.Trees && RImplementation.Trees->IsReady())
+        RImplementation.Trees->RenderMotion(ctx, curVP, s_prevVP, s_frameJitX, s_frameJitY);
 
     vkCmdEndRendering(cmd);
     ImageBarrier(cmd, s_img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
+
+const Fmatrix& CurVP()  { return s_curVP;  }
+const Fmatrix& PrevVP() { return s_prevVP; }
 
 void DrawDebugOverlay(VkCommandBuffer cmd, VkImageView dstView, VkExtent2D extent)
 {

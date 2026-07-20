@@ -47,10 +47,17 @@ struct WorldMaterial
     // the material is plain opaque (no aref/wmark — those must match the
     // flat depth prepass exactly). Others bind a 1×1 zero-alpha fallback.
     bool            tessellated  = false;
+    // Binding-3 view, kept so a streaming refresh can rewrite a FRESH set with
+    // all four bindings (the old set stays untouched for in-flight frames).
+    VkImageView     view_bump    = VK_NULL_HANDLE;
 
     VkDescriptorSet set      = VK_NULL_HANDLE;
     float           alphaRef = -1.0f;
     shared_str      name;          // diffuse texture name (for classification, e.g. tree trunk vs crown)
+
+    // GPU-feedback slot of the base diffuse (TextureStreamer::GetFeedbackSlot).
+    // Pushed to the world FS at offset 116; 0xFFFFFFFF = no feedback (shader skips).
+    u32             streamID = 0xFFFFFFFFu;
 
     // --- Terrain splatting (R4 CBlender_BmmD) ---
     // When the diffuse name starts with "terrain\", this material also gets an
@@ -60,6 +67,10 @@ struct WorldMaterial
     // non-terrain materials, which keep the plain 3-binding `set` above.
     bool            isTerrain  = false;
     VkDescriptorSet terrainSet = VK_NULL_HANDLE;
+    // Mask-less terrain only: the one-hot splat channel synthesized from the
+    // level shader name (0=R grass, 1=G asphalt, 2=B earth, 3=A yantar).
+    // 255 = the material has a REAL `_mask` (never touched by the mask bake).
+    u8              terrainChannel = 255;
 
     // Baked level decal (newspapers / dirt overlays — level shader effects\
     // wallmark*): geometry coplanar with the surface beneath. Rendered last,
@@ -103,12 +114,29 @@ void SetLevelTag(const char* tag);
 // for non-lightmapped materials → binding 2 falls back to 1×1 white.
 // Cache keys both names together so the same diffuse can pair with
 // different lmaps.
-WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark = false);
+// `shader_name` (the LEVEL shader, e.g. "levels\pripyat_asfalt") matters only
+// for terrain diffuses with NO `_mask` texture: the vanilla-SoC convention
+// regionalizes terrain by SHADER, so the material synthesizes a one-hot splat
+// mask from the shader name (asfalt→asphalt channel, grass→grass, ...) and is
+// keyed per shader — without it every region blends all four details evenly
+// ("каша" ground on mask-less maps like pripyat_full).
+WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark = false,
+                           const char* shader_name = nullptr);
 
 VkDescriptorSetLayout GetSetLayout();
 VkDescriptorSetLayout GetTerrainSetLayout();   // 7-binding terrain splat set
 VkSampler             GetSampler();
 WorldMaterial*        GetDefault();
+
+// Per-frame tick (called from CRender::Begin, after the frame fence, before any
+// recording): recycles descriptor sets retired by streaming refreshes once no
+// in-flight frame can still reference them.
+void FrameTick();
+
+// Rewrite binding 1 (splat mask) of every MASK-LESS terrain material's set to
+// `view` (the TerrainMask bake). Call only while the terrain sets are not
+// referenced by in-flight work (level load end).
+void RebindTerrainMasks(VkImageView view);
 
 }  // namespace WorldMaterialCache
 }  // namespace VK

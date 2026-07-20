@@ -7,10 +7,12 @@
 
 #include "stdafx.h"
 #include "HW_Vulkan.h"
+#include "vk_sl.h"          // VK::SL — Streamline init/probe (must precede vkCreateInstance)
 #include "vk_geometry.h"
 #include "vk_lighting.h"
 #include "vk_authorship.h"
 #include "vk_command_buffer.h"   // CommandManager — single-time helpers delegate to the immediate path
+#include "vk_vram_stats.h"       // VK::Vram::DestroySmallPools — before vmaDestroyAllocator
 #include <vector>
 #include <set>
 
@@ -185,6 +187,9 @@ bool CVulkanHW::CreateLogicalDevice()
     deviceFeatures.features.multiDrawIndirect = VK_TRUE;
     deviceFeatures.features.drawIndirectFirstInstance = VK_TRUE;  // trees: firstInstance encodes global tree index
     deviceFeatures.features.shaderClipDistance = VK_TRUE;         // VSM: gl_ClipDistance clips page geometry to its atlas sub-rect
+    deviceFeatures.features.imageCubeArray = VK_TRUE;             // point shadow POOL: array of shadow cubes (samplerCubeArray)
+    deviceFeatures.features.fragmentStoresAndAtomics = VK_TRUE;   // texture-streaming GPU feedback: world FS atomicMin desired mips
+    deviceFeatures.features.pipelineStatisticsQuery = VK_TRUE;    // VRS diag: FS-invocation counter around the world color pass
     deviceFeatures.pNext = &features12;
 
     // Tessellation (world heightmap displacement, R4 TESS_HM). Universal on
@@ -273,6 +278,20 @@ bool CVulkanHW::CreateLogicalDevice()
             Msg("[Vulkan] RT extensions: %u/%u available (need all 3 for RTGI)", rtFound, g_RtDeviceExtensionCount);
         }
 
+        // Optional: VK_NV_device_diagnostic_checkpoints — GPU progress markers that
+        // survive a device loss. Near-zero cost; enables post-mortem "which pass
+        // hung" logging on DEVICE_LOST (the level-transition GPU-hang hunt).
+        for (const auto& ext : availableExts) {
+            if (strcmp(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, ext.extensionName) == 0) {
+                enabledExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+                m_bCheckpointsSupported = true;
+                Msg("[Vulkan] NV diagnostic checkpoints: ENABLED");
+                break;
+            }
+        }
+        if (!m_bCheckpointsSupported)
+            Msg("[Vulkan] NV diagnostic checkpoints not available");
+
         // Optional: VK_KHR_fragment_shading_rate (attachment-based VRS) — coarse-shade
         // distant/peripheral pixels via a shading-rate image to cut forward fragment cost.
         {
@@ -297,13 +316,60 @@ bool CVulkanHW::CreateLogicalDevice()
                     vkGetPhysicalDeviceProperties2(m_PhysicalDevice, &props2);
                     // Use the coarsest allowed tile (smallest SRI). NVIDIA = 16x16.
                     m_VRSTexelSize = fsrProps.maxFragmentShadingRateAttachmentTexelSize;
-                    Msg("[Vulkan] VRS (attachment fragment shading rate): ENABLED (tile %ux%u)",
-                        m_VRSTexelSize.width, m_VRSTexelSize.height);
+                    // Per-pipeline coarse rate (separate feature) — lets us 2x2-shade the
+                    // low-freq light cones without an SRI image.
+                    m_bVRSPipelineSupported = fsrFeat.pipelineFragmentShadingRate != VK_FALSE;
+                    Msg("[Vulkan] VRS (attachment fragment shading rate): ENABLED (tile %ux%u, pipeline-rate %s)",
+                        m_VRSTexelSize.width, m_VRSTexelSize.height,
+                        m_bVRSPipelineSupported ? "yes" : "no");
                 } else {
                     Msg("[Vulkan] VRS extension present but attachmentFragmentShadingRate unsupported");
                 }
             } else {
                 Msg("[Vulkan] VRS extension not available");
+            }
+        }
+
+        // Optional: VK_EXT_memory_budget — lets VMA read the driver's LIVE VRAM
+        // budget/usage (what the OS + other processes actually left free) instead of
+        // guessing from static heap sizes. The texture streamer sizes its residency
+        // budget from this; without it we fall back to the heap size. No feature
+        // struct — enabling the extension is enough.
+        for (const auto& ext : availableExts) {
+            if (strcmp(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, ext.extensionName) == 0) {
+                enabledExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                m_bMemoryBudgetSupported = true;
+                Msg("[Vulkan] VK_EXT_memory_budget: ENABLED (live VRAM budget)");
+                break;
+            }
+        }
+        if (!m_bMemoryBudgetSupported)
+            Msg("[Vulkan] VK_EXT_memory_budget not available (static heap-size budget)");
+
+        // Optional: VK_EXT_memory_priority — per-allocation eviction priority. We tag
+        // streamable world textures LOW so the driver demotes them to system RAM under
+        // VRAM pressure before evicting render targets / VSM / geometry (HIGH). Turns a
+        // hard OOM into a graceful slowdown. Needs the feature bit chained below.
+        {
+            bool prioAvail = false;
+            for (const auto& ext : availableExts)
+                if (strcmp(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME, ext.extensionName) == 0) { prioAvail = true; break; }
+            if (prioAvail) {
+                VkPhysicalDeviceMemoryPriorityFeaturesEXT prioFeat = {};
+                prioFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+                VkPhysicalDeviceFeatures2 prioQuery = {};
+                prioQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                prioQuery.pNext = &prioFeat;
+                vkGetPhysicalDeviceFeatures2(m_PhysicalDevice, &prioQuery);
+                if (prioFeat.memoryPriority) {
+                    enabledExtensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+                    m_bMemoryPrioritySupported = true;
+                    Msg("[Vulkan] VK_EXT_memory_priority: ENABLED (fail-soft texture eviction)");
+                } else {
+                    Msg("[Vulkan] VK_EXT_memory_priority present but feature unsupported");
+                }
+            } else {
+                Msg("[Vulkan] VK_EXT_memory_priority not available");
             }
         }
     }
@@ -324,9 +390,19 @@ bool CVulkanHW::CreateLogicalDevice()
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR enableFsr = {};
     enableFsr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
     enableFsr.attachmentFragmentShadingRate = VK_TRUE;
+    enableFsr.pipelineFragmentShadingRate   = m_bVRSPipelineSupported ? VK_TRUE : VK_FALSE;
     if (m_bVRSSupported) {
         enableFsr.pNext = const_cast<void*>(features13.pNext);
         features13.pNext = &enableFsr;
+    }
+
+    // Chain memory-priority feature (prepend, preserving the existing pNext chain).
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT enableMemPrio = {};
+    enableMemPrio.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+    enableMemPrio.memoryPriority = VK_TRUE;
+    if (m_bMemoryPrioritySupported) {
+        enableMemPrio.pNext = const_cast<void*>(features13.pNext);
+        features13.pNext = &enableMemPrio;
     }
 
     // Device create info
@@ -393,11 +469,25 @@ bool CVulkanHW::CreateVMA()
 
     VmaAllocatorCreateInfo allocatorInfo = {};
     allocatorInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    // Let VMA consume the optional streaming extensions we enabled at device
+    // creation. BUDGET → vmaGetHeapBudgets returns the driver's live figures;
+    // PRIORITY → VmaAllocationCreateInfo::priority is forwarded to the allocation.
+    // Both flags are only legal when the matching extension is actually enabled.
+    if (m_bMemoryBudgetSupported)   allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    if (m_bMemoryPrioritySupported) allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
     allocatorInfo.physicalDevice = m_PhysicalDevice;
     allocatorInfo.device = m_Device;
     allocatorInfo.instance = m_Instance;
     allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_3;
     allocatorInfo.pVulkanFunctions = &vulkanFunctions;
+    // 64 MB heap blocks instead of VMA's 256 MB default. A block returns to the OS
+    // only when its LAST allocation dies; with 256 MB granularity the load-time
+    // churn (bake scratch, staging, swapped textures) left blocks pinned by a few
+    // survivors — measured 1449 MB of "vma-slack" on Pripyat (17-07 23:30 log), the
+    // bulk of the overcommit that starved NGX/DLSS. Finer blocks bound each pin to
+    // 64 MB and empty out far more often. Allocation-count cost is trivial
+    // (~120 blocks for the whole card + dedicated images, limit 4096).
+    allocatorInfo.preferredLargeHeapBlockSize = 64ull << 20;
 
     VkResult result = vmaCreateAllocator(&allocatorInfo, &m_Allocator);
 
@@ -406,6 +496,33 @@ bool CVulkanHW::CreateVMA()
     }
 
     return true;
+}
+
+// Sum live usage/budget across all DEVICE_LOCAL heaps. With VK_EXT_memory_budget
+// active these are the driver's real figures; otherwise VMA reports the static heap
+// size as budget and its own allocation total as usage (still useful, just not
+// OS-aware). Called by the texture streamer + ResourcesGetMemoryUsage.
+void CVulkanHW::GetVramBudget(VkDeviceSize& outUsage, VkDeviceSize& outBudget) const
+{
+    outUsage = 0;
+    outBudget = 0;
+    if (m_Allocator == VK_NULL_HANDLE)
+        return;
+
+    const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
+    vmaGetMemoryProperties(m_Allocator, &memProps);
+    if (!memProps)
+        return;
+
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(m_Allocator, budgets);
+
+    for (u32 h = 0; h < memProps->memoryHeapCount; ++h) {
+        if (memProps->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            outUsage  += budgets[h].usage;
+            outBudget += budgets[h].budget;
+        }
+    }
 }
 
 // Helper struct for finding unique video modes
@@ -494,6 +611,13 @@ bool CVulkanHW::CreateDevice(HWND hWnd)
     m_hWnd = hWnd;
 
     // ========================================================================
+    // Step 0: NVIDIA Streamline — MUST init before ANY Vulkan call (the linked
+    // sl.interposer proxies vkCreateInstance/Device so SL can hook DLSS/Reflex/FG).
+    // Non-fatal: if slInit fails, SL stays off and the raw-NGX DLSS path is used.
+    // ========================================================================
+    VK::SL::Init();
+
+    // ========================================================================
     // Step 1: Create Vulkan instance
     // ========================================================================
     Msg("[Vulkan] Step 1/11: Creating Vulkan instance...");
@@ -552,6 +676,9 @@ bool CVulkanHW::CreateDevice(HWND hWnd)
         Msg("![Vulkan] 3. Use DirectX renderer with -dx11 flag");
         return false;
     }
+
+    // Streamline: probe per-feature support now that the adapter is known.
+    VK::SL::OnDeviceReady(m_PhysicalDevice);
 
     // Display GPU information
     Msg("[Vulkan] Step 3/11: SUCCESS - Physical device selected");
@@ -620,6 +747,28 @@ bool CVulkanHW::CreateDevice(HWND hWnd)
         return false;
     }
     Msg("[Vulkan] Step 6/11: SUCCESS - Logical device created");
+
+    // Streamline: sl.dlss_g learns the game window (frame-pacing refresh-rate
+    // queries) from its vkCreateWin32SurfaceKHR after-hook, but SL plugins only
+    // initialise INSIDE vkCreateDevice — the Step-2 surface predates them, so
+    // the hook never fired and dlss_g polls a garbage HWND every frame
+    // ("Window handle ... is not a valid window" log spam; FG pacing would be
+    // blind). Recreate the surface now that the hooks are live; nothing holds
+    // the old one yet (the swapchain comes later).
+    if (VK::SL::Inited()) {
+        vkDestroySurfaceKHR(m_Instance, m_Surface, nullptr);
+        m_Surface = VK_NULL_HANDLE;
+        VkWin32SurfaceCreateInfoKHR slSurfaceInfo = {};
+        slSurfaceInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+        slSurfaceInfo.hinstance = GetModuleHandle(nullptr);
+        slSurfaceInfo.hwnd = hWnd;
+        result = vkCreateWin32SurfaceKHR(m_Instance, &slSurfaceInfo, nullptr, &m_Surface);
+        if (result != VK_SUCCESS) {
+            Msg("![Vulkan] FAILED: Streamline surface recreate (error: %d)", result);
+            return false;
+        }
+        Msg("[Vulkan] Streamline: window surface recreated post-device (SL surface hook now live)");
+    }
 
     // ========================================================================
     // Step 7: Create VMA (Vulkan Memory Allocator)
@@ -712,6 +861,7 @@ void CVulkanHW::DestroyDevice()
 
     // Уничтожаем VMA
     if (m_Allocator != VK_NULL_HANDLE) {
+        VK::Vram::DestroySmallPools(m_Allocator);   // custom pools must die first
         vmaDestroyAllocator(m_Allocator);
         m_Allocator = VK_NULL_HANDLE;
         Msg("[Vulkan] VMA allocator destroyed");

@@ -26,10 +26,12 @@
 
 #include "stdafx.h"
 #include "vk_DetailManager.h"
+#include "vk_color_space.h"   // ColorSpace::LinearizeRGB — env colours are authored sRGB
 #include "vk_pass_context.h"
 #include "vk_swapchain.h"
 #include "vk_env_light.h"               // VK::EnvLight::GetCurrentSet — set 1 (shadow lookup)
 #include "vk_cull.h"                    // VK::ExtractFrustumPlanes (shared with TreeManager)
+#include "vk_profiler.h"                // VK_CPU_PROBE — per-frame CPU attribution
 #include "HW_Vulkan.h"
 #include "../xrRender/DetailFormat.h"   // DO_NO_WAVING
 
@@ -48,6 +50,7 @@ extern float ps_r_sun_boost;            // r_sun_boost — global sun multiplier
 extern float ps_r_grass_aref;           // r_grass_aref — grass alpha-test cutoff (lower = fatter blades)
 extern float ps_r_grass_asharp;         // r_grass_asharp — mip alpha compensation (far grass keeps coverage)
 extern int   ps_r_grass_nowave;         // r_grass_nowave — respect DO_NO_WAVING (1) or wind everything (0)
+extern float ps_r_sun_grass_dist;       // r_sun_grass_dist — sun grass-shadow reach (sizes the caster set)
 
 namespace VK
 {
@@ -67,6 +70,14 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     if (!m_bCreated || !m_GenPipeline || !m_GfxPipeline) return;
     if (objects.empty()) return;
     if (!ctx.viewProj) return;
+
+    // Roll wind history for the MV overlay: m_GfxConstants still holds LAST frame's
+    // wind here (it is overwritten with this frame's values below), which is exactly
+    // the previous pose the grass MV pass must reproject to capture the sway delta.
+    if (m_MvWindPrevValid) {
+        m_MvWindParamsPrev = m_GfxConstants.wind_params;
+        m_MvWindAnimPrev   = m_GfxConstants.wind_anim;
+    }
 
     // Camera position from device transform (world inverse-transformed origin).
     // Approx: read it from Device.vCameraPosition for now — engine sets that
@@ -108,7 +119,7 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
         u->hmInvScaleZ   = (m_HMWorldSizeZ > 0.0f) ? (1.0f / m_HMWorldSizeZ) : 0.0f;
         u->totalPositions= m_Frame.totalPositions;
         u->numObjTypes   = u32(objects.size());
-        u->outputCapacity= GPU_OUTPUT_CAPACITY;
+        u->outputCapacity= m_OutputCapacity;   // live (auto-grown) capacity
         u->posPerSlot    = m_Frame.posPerSlot;
         u->dtOffsX       = float(dtH.offs_x);
         u->dtOffsZ       = float(dtH.offs_z);
@@ -165,6 +176,13 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
             m_GfxConstants.vHemiColor.set(env.CurrentEnv->hemi_color.x, env.CurrentEnv->hemi_color.y, env.CurrentEnv->hemi_color.z, 0.0f);
         }
     }
+    // Linearise before the boost, same rule and same order as the LightUBO fill in
+    // vk_env_light — grass bypasses that UBO and gets its env colours by push
+    // constant, so it needs its own conversion or the blades would stay gamma-lit
+    // while the ground under them went linear. (.w is a pad here, not colour.)
+    VK::ColorSpace::LinearizeRGB(m_GfxConstants.vSunColor);
+    VK::ColorSpace::LinearizeRGB(m_GfxConstants.vHemiColor);
+
     // The same global sun boost the world receives — vk_env_light premultiplies
     // it into the LightUBO; the grass sun colour travels via push constants.
     m_GfxConstants.vSunColor.mul(ps_r_sun_boost);
@@ -177,6 +195,14 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
     m_GfxConstants.wsetup_grass.set(9.5f, 1.4f, 1.5f, 0.4f);
     m_GfxConstants.wind_anim.set(windAnim.x, windAnim.y, windAnim.z, 0.1f);
     m_GfxConstants.vConsts.set(ps_r_grass_aref, ps_r_grass_asharp, sun_dir.y, 0.2f);   // x = grass alpha cutoff, y = mip alpha sharpen; sun.y feeds shader hemi calc
+
+    // First frame: seed prev == cur so the grass MV pass reports zero sway motion
+    // (nothing to reproject against yet).
+    if (!m_MvWindPrevValid) {
+        m_MvWindParamsPrev = m_GfxConstants.wind_params;
+        m_MvWindAnimPrev   = m_GfxConstants.wind_anim;
+        m_MvWindPrevValid  = true;
+    }
 
     // Character interaction: vInteractors[0] = player, [1..3] = nearest 3 NPCs
     // within 15 m. Empty slots have radius=0 so the shader skips them. Mirrors
@@ -237,8 +263,26 @@ void CDetailManager::PrepareFrame(const VK::FrameContext& ctx)
 // ============================================================================
 void CDetailManager::BuildHZB(VK::FrameContext& ctx)
 {
-    if (m_HZBPipeline == VK_NULL_HANDLE || m_HZBImage == VK_NULL_HANDLE) return;
     if (Swapchain.m_DepthImage == VK_NULL_HANDLE) return;
+
+    // The HZB caches a view of the scene depth (m_DepthSampleView) and is sized to
+    // depth/2. When the depth is resized (DLSS render<display, or a window resize) that
+    // view dangles at the freed image AND the HZB dims no longer match — sampling it
+    // faults the GPU (DEVICE_LOST). Rebuild against the current depth extent. Rare
+    // (only on a resolution change); DestroyHZB waits idle + recreates the descriptors.
+    if (m_HZBImage != VK_NULL_HANDLE &&
+        (m_HZBDepthExtent.width  != Swapchain.m_DepthExtent.width ||
+         m_HZBDepthExtent.height != Swapchain.m_DepthExtent.height)) {
+        DestroyHZB();
+        CreateHZB(Swapchain.m_DepthExtent.width, Swapchain.m_DepthExtent.height);
+        // The gen/caster sets' binding 6 still points at the DESTROYED old HZB view
+        // — sampling it reads garbage and the gen shader culls all grass past
+        // HZB_NEAR_SKIP (the "grass only in a 25 m bubble" bug under DLSS, where the
+        // render-res depth differs from the swapchain extent CreateHZB used at init).
+        UpdateGenDescriptors();
+    }
+
+    if (m_HZBPipeline == VK_NULL_HANDLE || m_HZBImage == VK_NULL_HANDLE) return;
     if (m_HZBDescSets.size() != m_HZBMipCount) return;
 
     // Build the pyramid at most once per frame. With r_hzb_cull, Pass_World builds
@@ -343,6 +387,33 @@ void CDetailManager::BuildHZB(VK::FrameContext& ctx)
 
 void CDetailManager::Render(VK::FrameContext& ctx)
 {
+    VK_CPU_PROBE("GrassCPU");
+    // Apply a pending output-buffer GROW before anything this frame touches it.
+    // Rare event (demand exceeded the per-type section → grass holes): wait the
+    // GPU idle (in-flight frames still read the old buffer), swap the buffer,
+    // rewrite the gen descriptors. One hitch per growth step, then never again
+    // at this demand level — a modder can pour any density and the buffer follows.
+    // NOTE: nothing recorded earlier THIS frame reads m_VisibleSSBO (shadow/VSM
+    // passes read the CASTER set) — the grass draw + MV overlay bind it below.
+    if (m_PendingCapacity > m_OutputCapacity && m_VisibleSSBO) {
+        const u32 newCap = _min(m_PendingCapacity, GPU_OUTPUT_CAP_MAX);
+        m_PendingCapacity = 0;
+        if (newCap > m_OutputCapacity) {
+            vkDeviceWaitIdle(VulkanHW.m_Device);
+            m_VisibleSSBO->Destroy();
+            m_VisibleSSBO->Create(u64(newCap) * sizeof(DetailInstance),
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT  |
+                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+            m_OutputCapacity = newCap;
+            UpdateGenDescriptors();
+            Msg("[VK Grass] output buffer GROWN to %u instances (%.1f MB), per-type section %u",
+                m_OutputCapacity, u64(m_OutputCapacity) * sizeof(DetailInstance) / (1024.0f * 1024.0f),
+                m_OutputCapacity / _max(u32(objects.size()), 1u));
+        }
+    }
+
     PrepareFrame(ctx);
     if (!m_Frame.valid) return;
     if (ctx.cmd == VK_NULL_HANDLE) return;
@@ -359,14 +430,23 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     // overwritten data no longer matches what frame N-1 meant to draw).
     // WAR needs only an execution dependency: order all prior-frame reads
     // before this frame's transfer/compute writes.
+    // VERTEX_SHADER is in the src scope because the VSM grass page pass (earlier
+    // THIS frame) PULLS the caster instance rows from m_CasterSSBO as a storage
+    // buffer in the vertex shader (pair compaction dropped the instance-rate
+    // attributes, which VERTEX_INPUT used to cover) — without it the gen below
+    // overwrites the rows mid-read and tufts cast garbage/cut shadows.
     {
         VkMemoryBarrier b{};
         b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         b.srcAccessMask = 0;
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        // TRANSFER in src: the PREVIOUS frame's diagnostics copy (counters →
+        // m_OverflowRB) must finish before THIS frame's counter fill zeroes the
+        // source — without it the readback raced the clear and reported ~0 usage.
         vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &b, 0, nullptr, 0, nullptr);
     }
@@ -375,7 +455,7 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     // compute samples it (binding 6). Restores depth to DEPTH_ATTACHMENT_OPTIMAL.
     BuildHZB(ctx);
     const u32 nObj = u32(objects.size());
-    const u32 sectionSize = GPU_OUTPUT_CAPACITY / _max(nObj, 1u);
+    const u32 sectionSize = m_OutputCapacity / _max(nObj, 1u);
 
     // -------------------------------------------------------------------
     // 1) Reset atomic counters only. We DON'T clear VisibleSSBO — the gen
@@ -389,6 +469,8 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     // atomic→indirect copy below.
     // -------------------------------------------------------------------
     vkCmdFillBuffer(cmd, m_AtomicCounters->GetHandle(), 0, VK_WHOLE_SIZE, 0u);
+    if (m_CasterAtomic)
+        vkCmdFillBuffer(cmd, m_CasterAtomic->GetHandle(), 0, VK_WHOLE_SIZE, 0u);
 
     // Barrier transfer-write → compute-read/write.
     {
@@ -422,12 +504,32 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     gpc.slotCountX = m_Frame.slotCountX;
     gpc.slotCountZ = m_Frame.slotCountZ;
 
+    gpc.casterParams.set(0.f, 0.f, 0.f, 0.f);   // visible pass: frustum+HZB cull as usual
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_GenPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_GenPipelineLayout,
                             0, 1, &m_GenDescSet, 0, nullptr);
     vkCmdPushConstants(cmd, m_GenPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(gpc), &gpc);
     vkCmdDispatch(cmd, m_Frame.groupCount, 1, 1);
+
+    // CASTER pass: same generator, distance-only cull (no frustum/HZB) into the
+    // caster buffers — the shadow passes (spot beam / sun cascades / point cubes
+    // / VSM grass) need blades that are OUTSIDE the camera frustum too: walk
+    // toward a wall and the campfire grass behind you still dapples it. Radius =
+    // the farthest a consumer reaches (sun grass dist; near lights sit < 40 m +
+    // ~15 m range), capped by the visual fade limit.
+    if (m_CasterDescSet != VK_NULL_HANDLE && m_CasterSSBO && m_CasterAtomic && m_CasterIndirectBuf) {
+        DetailGenPushConstants cpc = gpc;
+        const float lim = float(_max(ps_r__detail_radius, 1));
+        const float cr  = _min(_max(55.f, ps_r_sun_grass_dist), lim);
+        cpc.casterParams.set(cr * cr, float(GPU_CASTER_CAPACITY), 0.f, 0.f);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_GenPipelineLayout,
+                                0, 1, &m_CasterDescSet, 0, nullptr);
+        vkCmdPushConstants(cmd, m_GenPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(cpc), &cpc);
+        vkCmdDispatch(cmd, m_Frame.groupCount, 1, 1);
+    }
 
     // Barrier compute-write → transfer-read (atomics → indirect copy).
     {
@@ -454,6 +556,44 @@ void CDetailManager::Render(VK::FrameContext& ctx)
         vkCmdCopyBuffer(cmd, m_AtomicCounters->GetHandle(),
                         m_IndirectCmdBuf->GetHandle(),
                         nObj, copies.data());
+        if (m_CasterAtomic && m_CasterIndirectBuf)   // caster counters → caster indirect
+            vkCmdCopyBuffer(cmd, m_CasterAtomic->GetHandle(),
+                            m_CasterIndirectBuf->GetHandle(),
+                            nObj, copies.data());
+    }
+
+    // Usage / overflow diagnostics + AUTO-GROW. The host mirror holds
+    // counters[0..63] = per-type used and [64..127] = per-type dropped
+    // (a few frames stale — fine). A non-zero drop = grass holes; request a
+    // grow to observed demand + 25% headroom (applied at next Render start).
+    if (m_OverflowRB && m_OverflowPtr) {
+        u32 usedTotal = 0, needSection = 0, topType = 0, dropped = 0;
+        for (u32 i = 0; i < nObj; ++i) {
+            const u32 need = m_OverflowPtr[i] + m_OverflowPtr[GPU_MAX_OBJ_TYPES + i];
+            usedTotal += m_OverflowPtr[i];
+            dropped   += m_OverflowPtr[GPU_MAX_OBJ_TYPES + i];
+            if (need > needSection) { needSection = need; topType = i; }
+        }
+        if (dropped && m_OutputCapacity < GPU_OUTPUT_CAP_MAX) {
+            const u64 want = u64(needSection) * 5u / 4u * nObj;             // demand + 25% headroom
+            m_PendingCapacity = _max(m_PendingCapacity, u32(_min(want, (u64)GPU_OUTPUT_CAP_MAX)));
+        }
+        if (dropped && Device.dwTimeGlobal > m_OverflowLastLog + 2000) {
+            m_OverflowLastLog = Device.dwTimeGlobal;
+            Msg("![VK Grass] section OVERFLOW: %u instances/frame dropped (top type %u needs %u, section=%u) — %s",
+                dropped, topType, needSection, sectionSize,
+                m_OutputCapacity < GPU_OUTPUT_CAP_MAX ? "growing buffer" : "AT HARD CAP, lower density/radius");
+        }
+        // Live consumption line for tuning/modding (r_profiler cadence, 5 s).
+        extern int ps_r_profiler;
+        if (ps_r_profiler > 0 && Device.dwTimeGlobal > m_UsageLastLog + 5000) {
+            m_UsageLastLog = Device.dwTimeGlobal;
+            Msg("[VK Grass] usage: %u/%u instances (%.0f%%), top type %u: %u/%u section, %u types",
+                usedTotal, m_OutputCapacity, 100.0f * usedTotal / _max(m_OutputCapacity, 1u),
+                topType, m_OverflowPtr[topType], sectionSize, nObj);
+        }
+        VkBufferCopy oc{ 0, 0, (VkDeviceSize)(2u * GPU_MAX_OBJ_TYPES) * sizeof(u32) };
+        vkCmdCopyBuffer(cmd, m_AtomicCounters->GetHandle(), m_OverflowRB->GetHandle(), 1, &oc);
     }
 
     // Barrier: VisibleSSBO ↦ vertex-input read; IndirectCmdBuf ↦ indirect read.
@@ -530,11 +670,86 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     }
 }
 
+// ---- Wind-sway motion-vector overlay ----------------------------------------
+// Re-draws THIS frame's visible grass (same VisibleSSBO + indirect the forward
+// pass filled) into the MV target, reprojecting the cur AND prev wind pose so the
+// sway carries true screen motion. Runs INSIDE MotionVec::ExecuteDynamic's render
+// pass (MV target + scene depth already bound, viewport set). Depth-tests LEQUAL
+// (no write) against the grass depth the forward pass wrote — same VP + wind + bias
+// → bit-match. No PrepareFrame here (the forward Render already ran it this frame;
+// re-running would clobber the prev-wind roll).
+void CDetailManager::RenderMotion(const VK::FrameContext& ctx, const Fmatrix& curVP, const Fmatrix& prevVP,
+                                  float jitterNdcX, float jitterNdcY)
+{
+    if (!m_Frame.valid) return;                       // grass didn't draw this frame
+    if (ctx.cmd == VK_NULL_HANDLE) return;
+    if (m_VisibleSSBO == nullptr || m_IndirectCmdBuf == nullptr) return;
+
+    CreateMotionPipeline();                           // lazy — needs m_GfxDescLayout (built by Load)
+    if (m_MotionPipeline == VK_NULL_HANDLE) return;
+
+    const VkCommandBuffer cmd = ctx.cmd;
+    const u32 nObj = u32(objects.size());
+    const u32 sectionSize = m_OutputCapacity / _max(nObj, 1u);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_MotionPipeline);
+
+    DetailMotionPushConstants pc{};
+    pc.curVP            = curVP;
+    pc.prevVP           = prevVP;
+    pc.wind_params      = m_GfxConstants.wind_params;    // .w patched per-type below
+    pc.wsetup_grass     = m_GfxConstants.wsetup_grass;
+    pc.wind_anim        = m_GfxConstants.wind_anim;
+    pc.wind_params_prev = m_MvWindParamsPrev;
+    pc.wind_anim_prev   = m_MvWindAnimPrev;
+    pc.jitter.set(jitterNdcX, jitterNdcY, 0.0f, 0.0f);   // re-applied to gl_Position (jitter-free MV)
+    vkCmdPushConstants(cmd, m_MotionPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+
+    for (u32 i = 0; i < nObj; ++i) {
+        const VK::CDetail* obj = objects[i];
+        if (!obj || !obj->m_VertexBuffer || !obj->m_IndexBuffer) continue;
+
+        if (i < m_GfxDescSets.size() && m_GfxDescSets[i] != VK_NULL_HANDLE)
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    m_MotionPipelineLayout, 0, 1, &m_GfxDescSets[i], 0, nullptr);
+
+        // Same per-type wind scale as the forward pass (DO_NO_WAVING → 0 → the tiny
+        // static shoots write pure camera MV, matching their static forward pose).
+        const float windScale = (ps_r_grass_nowave && (obj->m_Flags & DO_NO_WAVING)) ? 0.0f : 1.0f;
+        vkCmdPushConstants(cmd, m_MotionPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           offsetof(DetailMotionPushConstants, wind_params) + 3u * sizeof(float),
+                           sizeof(float), &windScale);
+
+        VkBuffer vbs[2] = { obj->m_VertexBuffer->GetHandle(), m_VisibleSSBO->GetHandle() };
+        VkDeviceSize off[2] = { 0, u64(i) * u64(sectionSize) * sizeof(DetailInstance) };
+        vkCmdBindVertexBuffers(cmd, 0, 2, vbs, off);
+        vkCmdBindIndexBuffer(cmd, obj->m_IndexBuffer->GetHandle(), 0, VK_INDEX_TYPE_UINT16);
+
+        vkCmdDrawIndexedIndirect(cmd, m_IndirectCmdBuf->GetHandle(),
+                                 i * sizeof(VkDrawIndexedIndirectCommand),
+                                 1, sizeof(VkDrawIndexedIndirectCommand));
+    }
+
+    static bool s_diagMv = false;
+    if (!s_diagMv) { s_diagMv = true; Msg("[VK Grass] first wind-sway MV render: types=%u", nObj); }
+}
+
 // ---- VSM grass-shadow caster access (read-only; see vk_vsm.cpp) -------------
-VkBuffer CDetailManager::Vsm_VisibleSSBO() const { return m_VisibleSSBO  ? m_VisibleSSBO->GetHandle()  : VK_NULL_HANDLE; }
-VkBuffer CDetailManager::Vsm_IndirectBuf() const { return m_IndirectCmdBuf ? m_IndirectCmdBuf->GetHandle() : VK_NULL_HANDLE; }
+// Shadow passes read the CASTER set (distance-only cull — blades behind the
+// camera still cast); fall back to the visible set if the caster one is absent.
+VkBuffer CDetailManager::Vsm_VisibleSSBO() const {
+    if (m_CasterSSBO && m_CasterIndirectBuf) return m_CasterSSBO->GetHandle();
+    return m_VisibleSSBO ? m_VisibleSSBO->GetHandle() : VK_NULL_HANDLE;
+}
+VkBuffer CDetailManager::Vsm_IndirectBuf() const {
+    if (m_CasterSSBO && m_CasterIndirectBuf) return m_CasterIndirectBuf->GetHandle();
+    return m_IndirectCmdBuf ? m_IndirectCmdBuf->GetHandle() : VK_NULL_HANDLE;
+}
 u32      CDetailManager::Vsm_TypeCount()   const { return u32(objects.size()); }
-u32      CDetailManager::Vsm_SectionSize() const { return GPU_OUTPUT_CAPACITY / _max(u32(objects.size()), 1u); }
+u32      CDetailManager::Vsm_SectionSize() const {
+    const u32 cap = (m_CasterSSBO && m_CasterIndirectBuf) ? GPU_CASTER_CAPACITY : m_OutputCapacity;
+    return cap / _max(u32(objects.size()), 1u);
+}
 u32      CDetailManager::Vsm_VertexStride() const { return (u32)sizeof(VK::CDetail::Vertex); }
 
 bool CDetailManager::Vsm_TypeMesh(u32 i, VkBuffer& vb, VkBuffer& ib, u32& indexCount) const

@@ -49,6 +49,8 @@ public:
 private:
     void CreatePipeline();
     void CreateAtlasDescriptor();
+    void BuildGpuPath();                 // r_lods_gpu: facet SSBO + cull pipeline + pulling pipeline
+    void RenderGpu(VK::FrameContext& ctx);
 
 private:
     bool m_bBuilt = false;
@@ -57,6 +59,25 @@ private:
     // Triple-buffered host-visible vertex stream (6 verts per FLOD quad).
     CVulkanBuffer* m_DynVB[LOD_FRAMES] = {};
     u32            m_MaxVerts = 0;
+
+    // ----- GPU path (r_lods_gpu): compute cull + vertex pulling ------------
+    // Static per-FLOD facet SSBO (784 B each), a visible-instance stream and a
+    // single VkDrawIndirectCommand — all GPU-only; the per-frame CPU cost is one
+    // vkCmdUpdateBuffer + one dispatch. CPU path above stays as instant A/B.
+    CVulkanBuffer* m_GpuLods     = nullptr;   // LodEntry[] (matches lod_cull.comp)
+    CVulkanBuffer* m_GpuInsts    = nullptr;   // u32 per visible quad: (lod<<3)|facet
+    CVulkanBuffer* m_GpuIndirect = nullptr;   // VkDrawIndirectCommand, reset each frame
+
+    VkDescriptorSetLayout m_CullDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSet       m_CullSets[LOD_FRAMES] = {};   // per-frame: HZB binding rewritten
+    VkPipelineLayout      m_CullPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            m_CullPipeline       = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout m_VtxDescLayout = VK_NULL_HANDLE;   // set 1 of the pulling draw
+    VkDescriptorSet       m_VtxSet        = VK_NULL_HANDLE;
+    VkDescriptorPool      m_GpuDescPool   = VK_NULL_HANDLE;
+    VkPipelineLayout      m_PipelineLayoutGPU = VK_NULL_HANDLE;
+    VkPipeline            m_PipelineGPU       = VK_NULL_HANDLE;
 
     // Atlas (level_lods) descriptor. The atlas lives in $level$, not
     // $game_textures$, so it's loaded directly (not via WorldMaterialCache).

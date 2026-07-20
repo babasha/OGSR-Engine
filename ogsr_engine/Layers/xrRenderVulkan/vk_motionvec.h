@@ -24,8 +24,18 @@ namespace VK { namespace MotionVec {
 
 bool        Init();                                   // load shaders, pipelines, sets (after swapchain ready)
 void        Destroy();
+const Fmatrix& CurVP();                               // this frame's UNJITTERED view-proj (SL DLSS constants)
+const Fmatrix& PrevVP();                              // previous frame's UNJITTERED view-proj
 void        EnsureSize(VkExtent2D extent);            // (re)create the RG16F target on size change
 bool        Enabled();                                // r_motion_vectors != 0 && inited && target ready
+
+// Option A (jitter-free MV): CRender::Begin calls this ONCE per frame with the
+// UNJITTERED world/HUD view-proj (BEFORE it applies the DLSS sub-pixel jitter to
+// Device.mFullTransform) plus this frame's jitter offset in D3D-NDC (0 when DLSS
+// off). The MV passes reproject with these unjittered matrices so motion vectors
+// carry NO jitter wobble, and re-apply `jitterNdc` only to gl_Position so raster/
+// depth still bit-match the jittered forward geometry.
+void        SetFrameVP(const Fmatrix& worldVP, const Fmatrix& hudVP, float jitterNdcX, float jitterNdcY);
 
 // Reconstruct camera/static screen-space motion from the prepass depth. Caller
 // must have the scene depth in SHADER_READ_ONLY. Leaves the MV target in
@@ -43,6 +53,7 @@ void        ExecuteDynamic(VkCommandBuffer cmd, const FrameContext& ctx);
 void        DrawDebugOverlay(VkCommandBuffer cmd, VkImageView dstView, VkExtent2D extent);
 
 VkImageView GetResultView();   // RG16F motion, SHADER_READ after Execute (null until ready)
+VkImage     GetResultImage();  // the RG16F motion image (for DLSS resource tagging / barriers)
 VkSampler   GetSampler();
 VkFormat    Format();
 u32         Generation();      // bumped on every (re)create

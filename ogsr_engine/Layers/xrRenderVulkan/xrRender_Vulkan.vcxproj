@@ -52,7 +52,7 @@
       <PrecompiledHeader>Use</PrecompiledHeader>
       <WarningLevel>Level4</WarningLevel>
       <DisableSpecificWarnings>4456;4457;4458;4459;4315;4267;</DisableSpecificWarnings>
-      <AdditionalIncludeDirectories>./;..\..\xrCore;..\..\Luabind;..\..\LuaJIT\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./;..\..\xrCore;..\..\Luabind;..\..\LuaJIT\src;$(SolutionDir)\3rd_party\Src\NVIDIA_DLSS\DLSS\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
@@ -63,7 +63,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <WholeProgramOptimization>true</WholeProgramOptimization>
-      <AdditionalIncludeDirectories>./;..\..\xrCore;..\..\Luabind;..\..\LuaJIT\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./;..\..\xrCore;..\..\Luabind;..\..\LuaJIT\src;$(SolutionDir)\3rd_party\Src\NVIDIA_DLSS\DLSS\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;XRENGINE_STATIC;XRCORE_STATIC;XRCDB_STATIC;XR_PARTICLES_STATIC;LUABIND_STATIC;XRRENDER_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
@@ -91,10 +91,15 @@
     <ClInclude Include="vk_RenderFactory.h" />
     <ClInclude Include="vk_barriers.h" />
     <ClInclude Include="vk_command_buffer.h" />
+    <ClInclude Include="vk_compute_util.h" />
     <ClInclude Include="vk_core.h" />
+    <ClInclude Include="vk_image.h" />
     <ClInclude Include="vk_swapchain.h" />
     <ClInclude Include="vk_sync.h" />
     <ClInclude Include="vk_stub.h" />
+    <ClInclude Include="vk_cluster_stream.h" />
+    <ClInclude Include="vk_texture_stream.h" />
+    <ClInclude Include="vk_vram_stats.h" />
     <ClInclude Include="vk_UIPipeline.h" />
     <ClInclude Include="vk_ui_shader.h" />
     <ClInclude Include="vk_Visual.h" />
@@ -107,6 +112,7 @@
     <ClInclude Include="vk_pass_world.h" />
     <ClInclude Include="vk_env_light.h" />
     <ClInclude Include="vk_deform.h" />
+    <ClInclude Include="vk_terrain_cache.h" />
     <ClInclude Include="vk_pass_snow.h" />
     <ClInclude Include="vk_light.h" />
     <ClInclude Include="vk_shadow.h" />
@@ -119,6 +125,8 @@
     <ClInclude Include="vk_pass_bloom.h" />
     <ClInclude Include="vk_pass_ssao.h" />
     <ClInclude Include="vk_motionvec.h" />
+    <ClInclude Include="vk_dlss.h" />
+    <ClInclude Include="vk_sl.h" />
     <ClInclude Include="vk_gpu_particles.h" />
     <ClInclude Include="vk_pipeline_cache.h" />
     <ClInclude Include="vk_render_queue.h" />
@@ -130,20 +138,30 @@
     <ClInclude Include="vk_vrs.h" />
     <ClInclude Include="vk_vsm.h" />
     <ClInclude Include="vk_shadow_gpu.h" />
+    <ClInclude Include="vk_instance_gpu.h" />
     <ClInclude Include="vk_world_gpu.h" />
     <ClInclude Include="vk_clustered.h" />
+    <ClInclude Include="vk_color_space.h" />
+    <ClInclude Include="vk_ibl.h" />
     <ClInclude Include="vk_volumetrics.h" />
+    <ClInclude Include="vk_framegraph.h" />
+    <ClInclude Include="vk_async.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CRender_Vulkan.cpp" />
     <ClCompile Include="vk_profiler.cpp" />
     <ClCompile Include="vk_imgui.cpp" />
     <ClCompile Include="vk_vrs.cpp" />
+    <ClCompile Include="vk_vram_stats.cpp" />
     <ClCompile Include="vk_vsm.cpp" />
     <ClCompile Include="vk_shadow_gpu.cpp" />
+    <ClCompile Include="vk_instance_gpu.cpp" />  <!-- GPU-driven instanced rigid casters (host/editor scenes) -->
     <ClCompile Include="vk_world_gpu.cpp" />
     <ClCompile Include="vk_clustered.cpp" />
+    <ClCompile Include="vk_ibl.cpp" />          <!-- sky specular IBL prefilter (compute) -->
     <ClCompile Include="vk_volumetrics.cpp" />
+    <ClCompile Include="vk_framegraph.cpp" />   <!-- render graph: frame-wide resource-state tracker -->
+    <ClCompile Include="vk_async.cpp" />        <!-- async compute foundation (cross-queue timeline) -->
     <ClCompile Include="stdafx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
@@ -157,8 +175,10 @@
     <ClCompile Include="vk_buffer.cpp" />
     <ClCompile Include="vk_buffer_pool.cpp" />
     <ClCompile Include="vk_command_buffer.cpp" />
+    <ClCompile Include="vk_compute_util.cpp" />
     <ClCompile Include="vk_console_min.cpp" />
     <ClCompile Include="vk_core.cpp" />
+    <ClCompile Include="vk_image.cpp" />
     <ClCompile Include="vk_descriptors.cpp" />
     <ClCompile Include="vk_fullscreen.cpp" />
     <ClCompile Include="vk_DynamicStream.cpp" />
@@ -167,6 +187,8 @@
     <ClCompile Include="vk_shader.cpp" />
     <ClCompile Include="vk_shaders.cpp" />
     <ClCompile Include="vk_texture.cpp" />
+    <ClCompile Include="vk_cluster_stream.cpp" />
+    <ClCompile Include="vk_texture_stream.cpp" />
     <ClCompile Include="vk_UIPipeline.cpp" />
     <ClCompile Include="vk_vertex_formats.cpp" />
     <ClCompile Include="vk_engine_stubs.cpp" />
@@ -185,6 +207,8 @@
     <ClCompile Include="vk_pass_bloom.cpp" />
     <ClCompile Include="vk_pass_ssao.cpp" />
     <ClCompile Include="vk_motionvec.cpp" />
+    <ClCompile Include="vk_dlss.cpp" />
+    <ClCompile Include="vk_sl.cpp" />
     <ClCompile Include="vk_gpu_particles.cpp" />
     <ClCompile Include="vk_gpu_particles_translate.cpp" />
     <ClCompile Include="vk_gpu_particles_feed.cpp" />
@@ -222,6 +246,7 @@
     <ClCompile Include="vk_rain.cpp" />         <!-- rain drops/splashes + thunderbolt (dxRainRender port) -->
     <ClCompile Include="vk_water_sim.cpp" />    <!-- shallow-water flow/accumulation sim (compute) -->
     <ClCompile Include="vk_deform.cpp" />       <!-- snow deform press field (compute) -->
+    <ClCompile Include="vk_terrain_cache.cpp" /> <!-- terrain composite cache bake (compute) -->
     <ClCompile Include="vk_pass_snow.cpp" />    <!-- dense snow surface mesh (VHM-style) -->
 
     <ClCompile Include="vk_Detail.cpp" />
@@ -233,6 +258,9 @@
     <ClCompile Include="..\xrRender\ETextureParams.cpp" />
     <ClCompile Include="..\xrRender\Animation.cpp" />  <!-- animation::channels for CKinematicsAnimated -->
     <ClCompile Include="vma_impl.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="vk_meshopt.cpp">  <!-- vendored meshoptimizer amalgamation (cluster-LOD) -->
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="xrRender_Vulkan.cpp" />

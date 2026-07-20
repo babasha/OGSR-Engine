@@ -8,6 +8,7 @@
 #include "stdafx.h"
 #include "vk_swapchain.h"
 #include "HW_Vulkan.h"
+#include "vk_profiler.h"   // VK::Prof::DumpCheckpoints — GPU-hang post-mortem
 
 // Глобальный экземпляр
 CVulkanSwapchain Swapchain;
@@ -64,6 +65,13 @@ VkPresentModeKHR CVulkanSwapchain::ChoosePresentMode(const std::vector<VkPresent
         Msg("[Vulkan] Using IMMEDIATE present mode (-no_vsync — uncapped, may tear)");
         return VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
+
+    // NB (DLSS-G): the FG plugin reports "VSync with FG: not supported" — Frame
+    // Generation wants vsync OFF (its pacer owns frame timing). FIFO (= vsync) makes
+    // the pacer fight it (SyncInterval 0<->1 toggling -> "Out of order frame - skip
+    // the present"), so we do NOT force FIFO here. MAILBOX below is vsync-off-ish
+    // (no tearing, no hard vsync) and was the most stable with FG; for the cleanest
+    // FG pacing use -no_vsync (IMMEDIATE) above.
 
     // Default: MAILBOX (triple buffering, low latency) when available.
     if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
@@ -172,6 +180,7 @@ void CVulkanSwapchain::Create(u32 width, u32 height)
     m_Format = surfaceFormat.format;
     m_Extent = extent;
     m_ImageCount = imageCount;
+    m_DepthExtent = { 0, 0 };   // re-default depth to the new swapchain extent; Begin's ResizeDepth refines it if DLSS upscales
 
     // Создаём image views
     m_ImageViews.resize(imageCount);
@@ -307,6 +316,7 @@ void CVulkanSwapchain::Present(VkSemaphore waitSemaphore, u32 imageIndex)
         Msg("[Vulkan] Swapchain out of date/suboptimal during present (result=%d)", result);
     } else if (result != VK_SUCCESS) {
         Msg("![Vulkan] Failed to present swapchain image: %d", result);
+        if (result == VK_ERROR_DEVICE_LOST) VK::Prof::DumpCheckpoints("Present");
     }
 }
 
@@ -372,12 +382,16 @@ void CVulkanSwapchain::CreateDepthResources()
     // Находим подходящий depth format
     m_DepthFormat = FindDepthFormat();
 
+    // Depth defaults to the swapchain extent; ResizeDepth() can shrink it to the DLSS
+    // render resolution (render<display upscale). Track the actual depth size separately.
+    if (m_DepthExtent.width == 0 || m_DepthExtent.height == 0) m_DepthExtent = m_Extent;
+
     // Создаём depth image через VMA
     VkImageCreateInfo imageInfo = {};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.extent.width = m_Extent.width;
-    imageInfo.extent.height = m_Extent.height;
+    imageInfo.extent.width = m_DepthExtent.width;
+    imageInfo.extent.height = m_DepthExtent.height;
     imageInfo.extent.depth = 1;
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
@@ -393,8 +407,9 @@ void CVulkanSwapchain::CreateDepthResources()
     VmaAllocationCreateInfo allocInfo = {};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    allocInfo.priority = 1.0f;   // main depth buffer — hot, never evict before streamable textures
 
-    VK_CHECK(vmaCreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
+    VK_CHECK(VK::Vram::CreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
                             &m_DepthImage, &m_DepthAllocation, nullptr));
 
     // Создаём image view для depth
@@ -415,7 +430,20 @@ void CVulkanSwapchain::CreateDepthResources()
     m_DepthImageView = m_DepthView;  // Sync alias
 
     Msg("[Vulkan] Depth buffer created: %dx%d, format %d",
-        m_Extent.width, m_Extent.height, m_DepthFormat);
+        m_DepthExtent.width, m_DepthExtent.height, m_DepthFormat);
+}
+
+// Recreate the scene depth at a specific extent (DLSS render<display). No-op when the
+// depth already has that size. The caller (CRender::Begin) guarantees the GPU is idle
+// w.r.t. the old depth before calling (it only fires on a render-resolution change).
+void CVulkanSwapchain::ResizeDepth(VkExtent2D extent)
+{
+    if (extent.width == 0 || extent.height == 0) return;
+    if (m_DepthImage != VK_NULL_HANDLE && extent.width == m_DepthExtent.width && extent.height == m_DepthExtent.height)
+        return;   // already the right size
+    DestroyDepthResources();
+    m_DepthExtent = extent;
+    CreateDepthResources();
 }
 
 // Уничтожение depth resources
@@ -428,7 +456,7 @@ void CVulkanSwapchain::DestroyDepthResources()
     }
 
     if (m_DepthImage != VK_NULL_HANDLE) {
-        vmaDestroyImage(VulkanHW.m_Allocator, m_DepthImage, m_DepthAllocation);
+        VK::Vram::DestroyImage(VulkanHW.m_Allocator, m_DepthImage, m_DepthAllocation);
         m_DepthImage = VK_NULL_HANDLE;
         m_DepthAllocation = VK_NULL_HANDLE;
     }

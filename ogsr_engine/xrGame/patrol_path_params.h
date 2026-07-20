@@ -39,6 +39,14 @@ public:
     Flags32 flags(u32 index) const;
     bool terminal(u32 index) const;
 
+private:
+    // True (with a loud log) when the path is absent or vertex-less on the current
+    // level — cross-level mod scripts probe paths that were never shipped here; the
+    // accessors above then return inert data instead of the old fatal assert.
+    bool dead_path() const;
+
+public:
+
     DECLARE_SCRIPT_REGISTER_FUNCTION
 };
 add_to_type_list(CPatrolPathParams)

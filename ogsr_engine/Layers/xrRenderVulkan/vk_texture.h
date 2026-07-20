@@ -15,6 +15,44 @@ class CRT;
 namespace VK
 {
 
+// Streaming/residency class of a texture. Decides (a) VK_EXT_memory_priority so the
+// driver evicts the right things first under VRAM pressure, (b) whether the manual
+// `texture_lod` quality slider applies, and (c) whether the texture is eligible for
+// dynamic mip streaming (r_txstream). Defaults to UI so existing callers (menu/font)
+// stay full-resolution and never get streamed.
+enum class TexStreamClass : u8
+{
+    UI = 0,        // menu/HUD/font atlases — crispness critical, never skip/stream
+    WorldDiffuse,  // level + model base diffuse — the big VRAM consumers; slider + streaming apply
+    Detail,        // R4 detail textures (tiled) — tracked, budget-fit only, not streamed
+    Lmap,          // lightmaps — tracked, budget-fit only, not streamed
+    Terrain,       // terrain splat detail/normal/height — tracked, budget-fit only
+    Bump,          // <bump># height/error maps — tracked, budget-fit only
+};
+
+// Is a texture's content COLOR (sRGB-encoded light/albedo the eye was meant to see)
+// or DATA (numbers that happen to live in a texture — normals, height, masks)?
+//
+// This decides whether the loader picks the _SRGB VkFormat, i.e. whether the sampler
+// hardware-decodes to linear on every fetch. It is deliberately NOT TexStreamClass:
+// that one is a residency/priority classifier and is already overloaded across roles
+// (TexStreamClass::Terrain covers the terrain colour detail AND its _bump, _height and
+// _mask alike — vk_world_material.cpp), so it cannot answer this question.
+//
+// No name heuristic is needed anywhere: every call site already knows the role, either
+// because it built the filename itself with a role suffix ("_bump"/"_height"/"_mask")
+// or because it called a role-dedicated helper (GetOrLoadLmapTex/GetOrLoadDetailTex).
+// Compare UE5, which stores the same bit per asset as UTexture::SRGB, derived from
+// TextureCompressionSettings at import — metadata decided once, never guessed at runtime.
+//
+// Data is the DEFAULT on purpose: it reproduces the historical all-UNORM pipeline, so a
+// call site that is never audited keeps its old behaviour instead of silently changing.
+enum class TexColorSpace : u8
+{
+    Data = 0,  // normals, height, gloss, splat masks, lightmaps, UI — sample raw
+    Color,     // albedo/diffuse, sky, particle sprites — sRGB-encoded, decode on sample
+};
+
 /**
  * Vulkan Texture Wrapper
  *
@@ -69,15 +107,19 @@ public:
      *                        for level statics which are stock BC1/3 RGB).
      * @return true если успешно
      */
-    bool LoadDDS(const char* filename, bool applyBCSwizzle = true);
+    bool LoadDDS(const char* filename, bool applyBCSwizzle = true,
+                 TexStreamClass streamClass = TexStreamClass::UI,
+                 TexColorSpace colorSpace = TexColorSpace::Data);
 
     /**
      * Загрузить cubemap текстуру из DDS файла (6 faces)
      * @param filename Путь к файлу
      * @param applyBCSwizzle  R↔B swap on BC formats — see LoadDDS notes.
+     * @param colorSpace      Color vs data — see TexColorSpace.
      * @return true если успешно
      */
-    bool LoadDDSCubemap(const char* filename, bool applyBCSwizzle = true);
+    bool LoadDDSCubemap(const char* filename, bool applyBCSwizzle = true,
+                        TexColorSpace colorSpace = TexColorSpace::Data);
 
     /**
      * Уничтожить текстуру
@@ -118,6 +160,36 @@ public:
      */
     void UploadData(const void* data, VkDeviceSize size);
 
+    // --- Texture streaming support (see vk_texture_stream.{h,cpp}) --------------
+
+    // Memory-priority (VK_EXT_memory_priority, 0..1) for this texture's VMA
+    // allocation. Set BEFORE Create(); streamable world diffuse gets ~0.25 so the
+    // driver spills it first. Ignored when the extension is absent.
+    float m_MemPriority = 0.5f;
+
+    // Atomically exchange every GPU handle + descriptor-visible field with `other`,
+    // WITHOUT touching either object's registration. The streamer uses this to swap
+    // a freshly-built mip-range image into a live CVulkanTexture (keeping the object
+    // identity — and thus WorldMaterial::tex pointers — stable) while the old handles
+    // migrate into `other` for deferred destruction.
+    void SwapContents(CVulkanTexture& other);
+
+    // Re-open this texture's source .dds and build a NEW image covering mips
+    // [mipSkip .. end] into `out` (out must be freshly constructed/empty). Does NOT
+    // touch `this`. Returns false (and leaves `out` empty) on any failure so the
+    // caller can keep the current residency. Used by the streamer to promote/demote.
+    bool BuildStreamImage(CVulkanTexture& out, u32 mipSkip) const;
+
+    // Same as BuildStreamImage but parses an already-read .dds file blob (whole
+    // file, magic included) instead of touching the filesystem. The streamer's IO
+    // worker reads files off-thread; the render thread only pays image creation +
+    // staging the copy.
+    bool BuildStreamImageFromBlob(CVulkanTexture& out, u32 mipSkip,
+                                  const void* blob, size_t blobSize) const;
+
+    // Source .dds path this texture was loaded from ("" for procedural/RT/video).
+    const char* GetSourceFile() const { return m_SourceFile.c_str(); }
+
 private:
     /**
      * Создать VkImageView
@@ -143,6 +215,29 @@ private:
      */
     void GenerateMipsCube(const void* mip0Data, VkDeviceSize mip0Size);
 
+    // Parse `filename`, create the image covering mips [mipSkip..end], upload it.
+    // Pure worker shared by LoadDDS (mipSkip resolved from the streamer plan) and
+    // BuildStreamImage (explicit mipSkip). Does NOT register with the streamer.
+    // Outputs the on-disk full-chain metadata so the caller can register/track.
+    struct DDSLoadResult
+    {
+        bool         ok           = false;
+        u32          fullW        = 0;
+        u32          fullH        = 0;
+        u32          fullMips     = 0;
+        VkFormat     format       = VK_FORMAT_UNDEFINED;
+        u32          residentBase = 0;      // mip actually uploaded (== applied skip)
+        VkDeviceSize residentBytes= 0;
+    };
+    // mipSkip == UINT32_MAX → resolve via TextureStreamer::PlanLoadMipSkip.
+    DDSLoadResult loadDDSToImage(const char* filename, bool applyBCSwizzle, u32 mipSkip,
+                                 TexColorSpace colorSpace = TexColorSpace::Data);
+    // Same parse/create/upload from an in-memory .dds file image (whole file,
+    // magic included). `filename` is only for logging + VMA alloc naming.
+    DDSLoadResult loadDDSFromMemory(const char* filename, const void* blob, size_t blobSize,
+                                    bool applyBCSwizzle, u32 mipSkip,
+                                    TexColorSpace colorSpace = TexColorSpace::Data);
+
     /**
      * Проверить является ли формат compressed (BC/DXT)
      */
@@ -166,6 +261,13 @@ private:
     VkImageLayout   m_CurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool            m_bAlphaSwizzle = false; // For alpha-only textures (fonts): swizzle R→A, RGB→ONE
     bool            m_bBCSwizzle = false;    // For BC/DXT textures: swizzle R<->B for DirectX compatibility
+
+    // Streaming metadata — populated by LoadDDS, consumed by the streamer.
+    shared_str      m_SourceFile;            // resolved .dds path (for re-reading mips)
+    TexStreamClass  m_StreamClass = TexStreamClass::UI;
+    bool            m_Registered  = false;   // true while present in the streamer registry
+    bool            m_LoadSwizzleIntent = true;  // applyBCSwizzle used at load (for reload)
+    TexColorSpace   m_LoadColorSpace = TexColorSpace::Data;  // colourspace used at load (for reload)
 };
 
 /**

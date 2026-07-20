@@ -15,24 +15,36 @@
 #include "vk_pipeline_cache.h"             // depth pipelines/layout
 #include "vk_barriers.h"                   // ImageBarrier
 #include "vk_pass_skinned.h"               // Skinned_UploadBones / Skinned_RenderShadow
+#include "vk_pass_world.h"                 // g_DynamicVisuals — rigid dynamic sun casters
 #include "vk_light.h"                      // Lights::CollectFrame (shadowed spot/point picks)
 #include "vk_TreeManager.h"                // Trees->RenderDepth (leafy crown casters)
 #include "vk_DetailManager.h"              // CDetailManager Vsm_* getters — grass casters into the spot map
+#include "vk_buffer.h"                     // CVulkanBuffer (GPU grass-cull arena/count/indirect ring)
+#include "vk_command_buffer.h"             // CommandManager.GetCurrentFrame() (grass-cull in-flight slot)
 #include "vk_shaders.h"                    // g_ShaderManager (grass_spot_depth.{vert,frag}.spv)
 #include "vk_shadow_gpu.h"                 // ShadowGPU::Cull/Draw (GPU-driven opaque casters)
+#include "vk_world_gpu.h"                  // WorldGPU::CullShadow/DrawShadow (Phase 3 cluster-LOD casters)
+#include "vk_instance_gpu.h"               // InstanceGPU::CullShadow/DrawShadow (host-pushed rigid instances)
 #include "vk_vsm.h"                        // VSM::MaskReady (skip the redundant sun cascade/far raster under VSM)
 #include "vk_cull.h"                       // VK::ExtractFrustumPlanes (light frustum → cull planes)
 #include "vk_profiler.h"                   // VK::Prof::ZoneBegin/ZoneEnd (per-target shadow GPU timing)
 #include "CRender_Vulkan.h"                // RImplementation.Visuals / b_loaded
 #include "vk_Visual.h"                     // vkRender_Visual::Submit
+#include "vk_world_material.h"             // WorldMaterial::alphaRef (AT caster sublist probe)
 #include "HW_Vulkan.h"
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_dir)
 #include "../../xr_3da/device.h"           // Device.vCameraPosition (cache check)
 
+// VKEditor has no header — every consumer forward-declares just what it needs
+// (see vk_imgui.cpp:20, vk_pass_tonemap.cpp:15). >0 means a host pushed a scene,
+// which is exactly the condition the instanced caster path is for.
+namespace VKEditor { int HostModelCount(); }
+
 // GLOBAL scope (NOT inside namespace VK — a block-scope extern there would
 // mangle as VK::ps_r_rain_enable → LNK2001). r_rain master off skips the map.
 extern int ps_r_rain_enable;
+extern int   ps_r_light_debug;        // r_light_debug — point-pool per-cube diagnostic log
 extern int   ps_r_snow_deform;        // snow footprint deformation enable
 extern int   ps_r_snow_deform_tex;    // use the dense deform texture (vk_deform)
 extern float ps_r_mud_deform;         // mud footprints (same deform texture, active without snow)
@@ -45,10 +57,16 @@ extern int ps_r_light_occ;   // dynamic-light occlusion: render the ground-heigh
 extern int ps_r_gpu_shadows; // GPU-driven opaque sun shadow casters (A/B with 0)
 extern int   ps_r_shadow_lod;      // caster-LOD: distant casters draw coarse geometry (A/B with 0)
 extern float ps_r_shadow_lod_dist; // metres from camera beyond which casters go coarse
+extern int   ps_r_shadow_cluster;  // Phase 3: sun targets draw the cluster-LOD cut instead of per-mesh casters (live A/B)
 extern int   ps_r_shadow_casc_cache; // cascade static-map cache (0 = re-raster every frame)
 extern float ps_r_shadow_casc_sun;   // sun-rotation degrees that forces a cascade static redraw
 extern float ps_r_wind_shadow_dist;  // tree-shadow wind radius: near (< dist) per-frame, far cached; 0 = all static
 extern int   ps_r_spot_grass;        // grass casters into the spot shadow map (beam cutouts through a grass field)
+extern int   ps_r_sun_grass;         // grass casters into the sun cascades (swaying blade shadows near the camera)
+extern float ps_r_sun_grass_dist;    // sun grass-shadow instance-cull radius around the camera (m)
+extern int   ps_r_point_grass;       // grass casters into the campfire point cubes (dapples around near fires)
+extern int   ps_r_grass_cull;        // GPU per-light grass caster cull + compaction (A/B: 0 = brute-force full VS pass)
+extern int   ps_r_grass_cull_debug;  // [VK GrassCull] per-frame culled-instance totals (readback probe)
 extern int   ps_r_vsm;               // VSM on → its mask drives ALL sun receivers, so the cascade/far sun maps are redundant
 extern int   ps_r_vol;               // froxel volumetrics: samples the cascade for froxel SUN occlusion → keep it rendered even under VSM
 extern int   ps_r_vol_debug;
@@ -60,21 +78,45 @@ namespace {
     RenderQueue s_ShadowQueue;            // static caster queue (rebuilt on redraw)
     bool        s_firstUse = true;        // static map starts UNDEFINED, TRANSFER_SRC thereafter
     bool        s_combinedFirst = true;   // combined map starts UNDEFINED, SHADER_READ thereafter
-    bool        s_spotFirst     = true;   // spot map: UNDEFINED on first use
-    bool        s_spotBeamFirst = true;   // spot BEAM map (spot copy + grass): UNDEFINED on first use
     bool        s_pointFirst    = true;   // point cube: UNDEFINED on first use
 
-    // Cached static-caster queues for the shadowed dynamic lights. Rebuilding
-    // them means walking ALL level visuals — only do that when the light sphere
-    // actually changed (flashlight moved / another fire selected / level load),
-    // never per frame.
-    RenderQueue s_SpotQueue;
-    bool        s_spotQValid = false;
-    Fvector     s_spotQPos{};  float s_spotQRange = 0.f;  size_t s_spotQVis = 0;
-    RenderQueue s_PointQueue;                // static occluders for the point cube (incl. terrain)
-    bool        s_pointQValid = false;
-    Fvector     s_pointQPos{};  float s_pointQRange = 0.f;  size_t s_pointQVis = 0;
-    bool        s_pointHadSkinned = false;   // cube contains NPC shadows from last render
+    // Spot shadow POOL: persistent per-tile state. A tile keeps its owner light
+    // across frames — a static lamp's tile is rendered ONCE and reused until the
+    // light moves, its casters change, or an NPC enters the cone (VSM-style
+    // static caching at spot scale). Owner pointers are COMPARED only, never
+    // dereferenced outside the owning frame.
+    struct SpotTile {
+        const void* owner = nullptr;       // vkLight* identity (compare only)
+        Fvector pos{}, dir{};              // light params at the last STATIC render
+        float   range = 0.f, cone = 0.f;
+        bool    staticValid  = false;      // STATIC layer holds this owner's statics+trees
+        bool    contentValid = false;      // CLEAN layer composited (static copy + NPC)
+        bool    hadSkinned   = false;      // NPCs were in the cone at the last clean render
+        u32     lastSeen     = 0;          // frame the owner was last in the pool (LRU)
+        u32     lastDyn      = 0;          // frame the NPC overlay was last recomposited (LOD cadence)
+        RenderQueue queue;                 // cached static-caster queue
+        bool    qValid = false; Fvector qPos{}; float qRange = 0.f; size_t qVis = 0;
+    };
+    SpotTile s_spotTiles[Lights::kMaxShadowSpots];
+    int      s_giTile[Lights::kMaxLights];          // this frame: gpu[] index → tile (-1)
+    bool     s_spotAtlasFirst = true;               // all spot atlases start UNDEFINED
+
+    // Point shadow POOL: persistent per-cube state, same cache/LOD as spots.
+    // Owner pointers COMPARED only, never dereferenced outside the owning frame.
+    struct PointCube {
+        const void* owner = nullptr;       // vkLight* identity (compare only)
+        Fvector pos{};  float range = 0.f; // light params at the last render
+        bool    staticValid  = false;      // STATIC cube holds this owner's statics (6 faces cached)
+        bool    contentValid = false;      // COMBINED cube composited (static copy + NPC/grass overlay)
+        bool    hadSkinned   = false;      // NPCs were in radius at the last render
+        u32     lastSeen     = 0;          // frame the owner was last in the pool (LRU)
+        u32     lastDyn      = 0;          // frame the cube was last re-rendered (LOD cadence)
+        RenderQueue queue;                 // cached static-caster queue
+        bool    qValid = false; Fvector qPos{}; float qRange = 0.f; size_t qVis = 0;
+    };
+    PointCube s_pointCubes[Lights::kMaxShadowPoints];
+    bool      s_pointStaticFirst = true;            // STATIC cube array starts UNDEFINED
+    int       s_giCube[Lights::kMaxLights];         // this frame: gpu[] index → cube (-1)
 
     // Statics with huge bounding spheres (terrain chunks, giant merges) are
     // receivers, not meaningful blockers, for a hand-held light — and they cost
@@ -181,11 +223,12 @@ namespace {
 
     // Draw all grass types into the current depth target (viewport/scissor/bias
     // already set by the caller). Reads last frame's instance buffer — the same
-    // 1-frame-stale convention the VSM grass casters use.
+    // 1-frame-stale convention the VSM grass casters use. Serves the spot BEAM
+    // atlas, the SUN cascades (lightPos = camera, range = r_sun_grass_dist) and
+    // the point cubes — callers gate on their own cvar (r_spot/sun/point_grass).
     void DrawGrassSpotCasters(VkCommandBuffer cmd, const Fmatrix& vp,
                               const Fvector& lightPos, float lightRange)
     {
-        if (!ps_r_spot_grass) return;
         CDetailManager* dm = RImplementation.Details;
         if (!dm) return;
         VkBuffer vis = dm->Vsm_VisibleSSBO();
@@ -224,6 +267,313 @@ namespace {
                                      1, sizeof(VkDrawIndexedIndirectCommand));
         }
     }
+
+    // ── GrassCull: GPU per-light grass caster cull + COMPACTION (Phase 1) ────
+    // DrawGrassSpotCasters above is brute force: it runs the grass VS over EVERY
+    // visible caster blade for each shadow light — and ×6 for a point cube —
+    // degen-culling the out-of-range 99% inside the VS. Near a campfire that was
+    // the single fattest Shadow/Dyn cost (~3.6 ms, 2026-07-04 profile). Here a
+    // compute counting-sort compacts blades into per-(light,type) arena regions
+    // once per frame; each depth pass then draws only its few-hundred-instance
+    // region via indirect (firstInstance = region base). One CullLights() call
+    // serves a whole client (the active spot BEAM tiles, or the point CUBES —
+    // all 6 faces of a cube share ONE sphere cull). See grass_cull(.setup).comp.
+    namespace GrassCull {
+        constexpr u32 kMaxLights = 16;                      // spot pool 8 + point pool 4 (+ headroom)
+        constexpr u32 kMaxTypes  = 64;                      // dm_max_objects
+        constexpr u32 kMaxCells  = kMaxLights * kMaxTypes;  // 1024 draw commands
+        constexpr u32 kArenaCap  = 131072;                  // instances / frame (8 MB) — total across all lights
+        // The light list is host-written per CullLights CALL, but a frame makes
+        // several (spot beams, campfire cubes) and the GPU reads them 1+ frames
+        // later — so a single UBO region would be clobbered before the first cull
+        // read it. Sub-region the UBO per call and bind it with a DYNAMIC offset
+        // (256 B/call == kMaxLights*vec4, already offset-aligned on any GPU).
+        constexpr u32 kLightBytes = kMaxLights * (u32)sizeof(Fvector4);   // 256 B / call
+        constexpr u32 kMaxCalls   = 4;                      // spots + cubes (+ sun/headroom)
+
+        VkPipeline            s_cullPipe    = VK_NULL_HANDLE;   // count + scatter (push .pass selects)
+        VkPipelineLayout      s_cullLayout  = VK_NULL_HANDLE;
+        VkDescriptorSetLayout s_cullSetL    = VK_NULL_HANDLE;
+        VkPipeline            s_setupPipe   = VK_NULL_HANDLE;   // prefix-sum + indirect emit
+        VkPipelineLayout      s_setupLayout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout s_setupSetL   = VK_NULL_HANDLE;
+        VkDescriptorPool      s_pool        = VK_NULL_HANDLE;
+        VkDescriptorSet       s_cullSet [VK_FRAMES_IN_FLIGHT] = {};
+        VkDescriptorSet       s_setupSet[VK_FRAMES_IN_FLIGHT] = {};
+
+        CVulkanBuffer* s_arena   [VK_FRAMES_IN_FLIGHT] = {};
+        CVulkanBuffer* s_count   [VK_FRAMES_IN_FLIGHT] = {};
+        CVulkanBuffer* s_cursor  [VK_FRAMES_IN_FLIGHT] = {};
+        CVulkanBuffer* s_indirect[VK_FRAMES_IN_FLIGHT] = {};
+        CVulkanBuffer* s_lightUBO[VK_FRAMES_IN_FLIGHT] = {};   void* s_lightPtr[VK_FRAMES_IN_FLIGHT] = {};
+        CVulkanBuffer* s_typeInfo = nullptr;                    // per-type indexCount (shared, level-stable)
+
+        VkBuffer s_boundVis[VK_FRAMES_IN_FLIGHT] = {};         // descriptor cache: the dm buffers a set points at
+        VkBuffer s_boundInd[VK_FRAMES_IN_FLIGHT] = {};
+        u32      s_updFrame[VK_FRAMES_IN_FLIGHT] = { ~0u, ~0u, ~0u };
+        u32      s_callFrame[VK_FRAMES_IN_FLIGHT] = { ~0u, ~0u, ~0u };   // which frame s_callIdx tracks
+        u32      s_callIdx[VK_FRAMES_IN_FLIGHT]   = {};                  // per-call light sub-region cursor
+        u32      s_typeInfoTypes = 0;
+        bool     s_tried = false, s_ready = false;
+
+        struct CullPush  { u32 sectionSize, typeCount, numLights, pass, maxCull, p0, p1, p2; };
+        struct SetupPush { u32 numLights, typeCount, maxCull, pad; };
+
+        inline void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
+                               VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+            VkMemoryBarrier b{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            b.srcAccessMask = src; b.dstAccessMask = dst;
+            vkCmdPipelineBarrier(cmd, ss, ds, 0, 1, &b, 0, nullptr, 0, nullptr);
+        }
+
+        bool Ensure() {
+            if (s_ready) return true;
+            if (s_tried) return false;
+            s_tried = true;
+            if (!g_ShaderManager) return false;
+
+            VkShaderModule csCull  = g_ShaderManager->Load("grass_cull.comp.spv");
+            VkShaderModule csSetup = g_ShaderManager->Load("grass_cull_setup.comp.spv");
+            if (!csCull || !csSetup) { Msg("![VK Shadow] grass_cull(.setup).comp.spv missing - GPU grass cull disabled"); return false; }
+
+            // Set layouts: cull(0 vis,1 detail-indirect,2 lights[UBO],3 count,4 cursor,5 arena); setup(0 count,1 cursor,2 indirect,3 typeinfo).
+            { VkDescriptorSetLayoutBinding b[6]{};
+              const VkDescriptorType t[6] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
+              for (u32 i = 0; i < 6; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+              VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+              lci.bindingCount = 6; lci.pBindings = b;
+              if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_cullSetL) != VK_SUCCESS) return false; }
+            { VkDescriptorSetLayoutBinding b[4]{};
+              for (u32 i = 0; i < 4; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+              VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+              lci.bindingCount = 4; lci.pBindings = b;
+              if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setupSetL) != VK_SUCCESS) return false; }
+
+            VkDescriptorPoolSize ps[2] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         (5 + 4) * VK_FRAMES_IN_FLIGHT },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 * VK_FRAMES_IN_FLIGHT } };
+            VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            pci.maxSets = 2 * VK_FRAMES_IN_FLIGHT; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
+            if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
+            { VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (auto& x : ls) x = s_cullSetL;
+              VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+              dai.descriptorPool = s_pool; dai.descriptorSetCount = VK_FRAMES_IN_FLIGHT; dai.pSetLayouts = ls;
+              if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_cullSet) != VK_SUCCESS) return false; }
+            { VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (auto& x : ls) x = s_setupSetL;
+              VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+              dai.descriptorPool = s_pool; dai.descriptorSetCount = VK_FRAMES_IN_FLIGHT; dai.pSetLayouts = ls;
+              if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_setupSet) != VK_SUCCESS) return false; }
+
+            auto mkPipe = [&](VkShaderModule cs, VkDescriptorSetLayout setL, u32 pushSz, VkPipelineLayout& pl, VkPipeline& pipe) -> bool {
+                VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSz };
+                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+                plci.setLayoutCount = 1; plci.pSetLayouts = &setL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+                if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &pl) != VK_SUCCESS) return false;
+                VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = pl;
+                return vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipe) == VK_SUCCESS;
+            };
+            if (!mkPipe(csCull,  s_cullSetL,  sizeof(CullPush),  s_cullLayout,  s_cullPipe))  return false;
+            if (!mkPipe(csSetup, s_setupSetL, sizeof(SetupPush), s_setupLayout, s_setupPipe)) return false;
+
+            for (u32 i = 0; i < VK_FRAMES_IN_FLIGHT; ++i) {
+                s_arena[i] = xr_new<CVulkanBuffer>();
+                s_arena[i]->Create((VkDeviceSize)kArenaCap * sizeof(DetailInstance),
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+                s_count[i] = xr_new<CVulkanBuffer>();
+                s_count[i]->Create(kMaxCells * sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+                s_cursor[i] = xr_new<CVulkanBuffer>();
+                s_cursor[i]->Create(kMaxCells * sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+                s_indirect[i] = xr_new<CVulkanBuffer>();
+                s_indirect[i]->Create(kMaxCells * sizeof(VkDrawIndexedIndirectCommand), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+                s_lightUBO[i] = xr_new<CVulkanBuffer>();
+                s_lightUBO[i]->Create((VkDeviceSize)kMaxCalls * kLightBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+                s_lightPtr[i] = s_lightUBO[i]->Map();
+            }
+            s_typeInfo = xr_new<CVulkanBuffer>();
+            s_typeInfo->Create(kMaxTypes * sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+
+            s_ready = true;
+            Msg("[VK Shadow] GPU grass cull ready (arena %u inst/frame, %u cells, %.1f MB)",
+                kArenaCap, kMaxCells, VK_FRAMES_IN_FLIGHT * (float)kArenaCap * sizeof(DetailInstance) / (1024.0f * 1024.0f));
+            return true;
+        }
+
+        void updateSets(u32 cur, VkBuffer vis, VkBuffer ind) {
+            VkDescriptorBufferInfo cb[6] = {
+                { vis,                          0, VK_WHOLE_SIZE }, { ind,                          0, VK_WHOLE_SIZE },
+                { s_lightUBO[cur]->GetHandle(), 0, kLightBytes    }, { s_count[cur]->GetHandle(),    0, VK_WHOLE_SIZE },   // range = ONE call's window (dynamic offset picks it)
+                { s_cursor[cur]->GetHandle(),   0, VK_WHOLE_SIZE }, { s_arena[cur]->GetHandle(),    0, VK_WHOLE_SIZE } };
+            const VkDescriptorType ct[6] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
+            VkWriteDescriptorSet w[6]{};
+            for (u32 i = 0; i < 6; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_cullSet[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = ct[i]; w[i].pBufferInfo = &cb[i]; }
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+
+            VkDescriptorBufferInfo sb[4] = {
+                { s_count[cur]->GetHandle(),    0, VK_WHOLE_SIZE }, { s_cursor[cur]->GetHandle(),   0, VK_WHOLE_SIZE },
+                { s_indirect[cur]->GetHandle(), 0, VK_WHOLE_SIZE }, { s_typeInfo->GetHandle(),      0, VK_WHOLE_SIZE } };
+            VkWriteDescriptorSet w2[4]{};
+            for (u32 i = 0; i < 4; ++i) { w2[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w2[i].dstSet = s_setupSet[cur]; w2[i].dstBinding = i; w2[i].descriptorCount = 1; w2[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w2[i].pBufferInfo = &sb[i]; }
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w2, 0, nullptr);
+        }
+
+        // Cull the given light spheres into slots [0..nLights) of THIS frame's
+        // arena. Idempotent to call more than once per frame (spots, then cubes):
+        // the entry barrier serializes each call against the prior client's draws.
+        void CullLights(VkCommandBuffer cmd, const Fvector4* lights, u32 nLights) {
+            if (!s_ready || nLights == 0) return;
+            CDetailManager* dm = RImplementation.Details;
+            if (!dm) return;
+            VkBuffer vis = dm->Vsm_VisibleSSBO();
+            VkBuffer ind = dm->Vsm_IndirectBuf();
+            const u32 types = dm->Vsm_TypeCount();
+            const u32 section = dm->Vsm_SectionSize();
+            if (vis == VK_NULL_HANDLE || ind == VK_NULL_HANDLE || types == 0 || section == 0) return;
+            if (nLights > kMaxLights) nLights = kMaxLights;
+            const u32 tc  = (types < kMaxTypes) ? types : kMaxTypes;
+            const u32 cur = CommandManager.GetCurrentFrame();
+
+            if (s_typeInfoTypes != tc) {                          // per-type indexCount (level-stable)
+                if (u32* p = (u32*)s_typeInfo->Map()) {
+                    for (u32 i = 0; i < kMaxTypes; ++i) { VkBuffer vb, ib; u32 ic = 0; p[i] = (i < tc && dm->Vsm_TypeMesh(i, vb, ib, ic)) ? ic : 0u; }
+                    s_typeInfo->Flush();
+                }
+                s_typeInfoTypes = tc;
+            }
+            // Descriptor sets point at level-stable buffers → update once per
+            // frame-slot (rewriting a set an earlier same-frame call may still be
+            // consuming would corrupt it; the slot's own use N frames ago is fenced).
+            if (s_updFrame[cur] != Device.dwFrame || s_boundVis[cur] != vis || s_boundInd[cur] != ind) {
+                updateSets(cur, vis, ind);
+                s_boundVis[cur] = vis; s_boundInd[cur] = ind; s_updFrame[cur] = Device.dwFrame;
+            }
+            // Per-call light sub-region (dynamic UBO offset): a fresh window each
+            // CullLights so the GPU still reads the spot lights after the host has
+            // written the cube lights for the same in-flight frame.
+            if (s_callFrame[cur] != Device.dwFrame) { s_callFrame[cur] = Device.dwFrame; s_callIdx[cur] = 0u; }
+            const u32 call   = (s_callIdx[cur] < kMaxCalls) ? s_callIdx[cur] : (kMaxCalls - 1u);
+            s_callIdx[cur]   = call + 1u;
+            const u32 dynOff = call * kLightBytes;
+            { Fvector4* lp = (Fvector4*)((u8*)s_lightPtr[cur] + dynOff);
+              for (u32 i = 0; i < nLights; ++i) lp[i] = lights[i];
+              s_lightUBO[cur]->Flush(); }
+
+            const u32 nCells = nLights * tc;
+            // Entry barrier: the prior consumer (this frame's earlier grass draws
+            // AND/OR the prior client's cull compute) must finish before we clear
+            // and overwrite the shared ring buffers.
+            MemBarrier(cmd,
+                VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            vkCmdFillBuffer(cmd, s_count[cur]->GetHandle(), 0, nCells * sizeof(u32), 0u);
+            MemBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            CullPush cp{}; cp.sectionSize = section; cp.typeCount = tc; cp.numLights = nLights; cp.maxCull = kArenaCap;
+            const u32 groups = (section * tc + 63u) / 64u;
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cullPipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cullLayout, 0, 1, &s_cullSet[cur], 1, &dynOff);
+            cp.pass = 0u; vkCmdPushConstants(cmd, s_cullLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cp), &cp);
+            vkCmdDispatch(cmd, groups, 1, 1);                     // COUNT
+            MemBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            SetupPush spc{}; spc.numLights = nLights; spc.typeCount = tc; spc.maxCull = kArenaCap;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_setupPipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_setupLayout, 0, 1, &s_setupSet[cur], 0, nullptr);
+            vkCmdPushConstants(cmd, s_setupLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spc), &spc);
+            vkCmdDispatch(cmd, 1, 1, 1);                          // PREFIX-SUM + indirect emit
+            MemBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cullPipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_cullLayout, 0, 1, &s_cullSet[cur], 1, &dynOff);
+            cp.pass = 1u; vkCmdPushConstants(cmd, s_cullLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cp), &cp);
+            vkCmdDispatch(cmd, groups, 1, 1);                     // SCATTER
+            // Publish arena (instances) + indirect (commands) to the depth draws.
+            MemBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
+
+            if (ps_r_grass_cull_debug) {
+                static u32 s_dbg = 0;
+                if (Device.dwTimeGlobal - s_dbg > 1500) { s_dbg = Device.dwTimeGlobal;
+                    Msg("[VK GrassCull] lights=%u types=%u cells=%u (section=%u)", nLights, tc, nCells, section); }
+            }
+        }
+
+        // Draw one culled light's compact region into the current depth target.
+        // Reuses the grass-spot pipeline (identical vertex layout); the arena is
+        // bound whole and the per-cell indirect command's firstInstance offsets it.
+        void Draw(VkCommandBuffer cmd, const Fmatrix& vp, const Fvector& lightPos, float lightRange, u32 slot) {
+            CDetailManager* dm = RImplementation.Details;
+            if (!dm) return;
+            VkPipeline pipe = EnsureGrassSpotPipeline();
+            if (pipe == VK_NULL_HANDLE) return;
+            const u32 types = dm->Vsm_TypeCount();
+            const u32 tc = (types < kMaxTypes) ? types : kMaxTypes;
+            if (slot >= kMaxLights || tc == 0) return;
+            const u32 cur = CommandManager.GetCurrentFrame();
+            if (!s_arena[cur] || !s_indirect[cur]) return;
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            GrassSpotPush push{};
+            push.vp = vp;
+            push.lightPosRange.set(lightPos.x, lightPos.y, lightPos.z, lightRange);
+            dm->Vsm_WindPush(push.wind_params, push.wsetup_grass, push.wind_anim);
+            vkCmdPushConstants(cmd, s_grassSpotLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+
+            VkBuffer arena = s_arena[cur]->GetHandle();
+            VkBuffer indir = s_indirect[cur]->GetHandle();
+            for (u32 i = 0; i < tc; ++i) {
+                VkBuffer mvb, mib; u32 ic;
+                if (!dm->Vsm_TypeMesh(i, mvb, mib, ic)) continue;
+                VkDescriptorSet diffuse = dm->Vsm_TypeDiffuseSet(i);
+                if (diffuse == VK_NULL_HANDLE) continue;
+                const float windScale = dm->Vsm_TypeWindScale(i);
+                vkCmdPushConstants(cmd, s_grassSpotLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                                   offsetof(GrassSpotPush, wind_params) + 3u * sizeof(float), sizeof(float), &windScale);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_grassSpotLayout, 0, 1, &diffuse, 0, nullptr);
+                VkBuffer vbs[2] = { mvb, arena };
+                VkDeviceSize off[2] = { 0, 0 };   // firstInstance in the indirect command offsets the arena
+                vkCmdBindVertexBuffers(cmd, 0, 2, vbs, off);
+                vkCmdBindIndexBuffer(cmd, mib, 0, VK_INDEX_TYPE_UINT16);
+                const u32 cell = slot * tc + i;
+                vkCmdDrawIndexedIndirect(cmd, indir, (VkDeviceSize)cell * sizeof(VkDrawIndexedIndirectCommand),
+                                         1, sizeof(VkDrawIndexedIndirectCommand));
+            }
+        }
+
+        void Destroy() {
+            for (u32 i = 0; i < VK_FRAMES_IN_FLIGHT; ++i) {
+                if (s_arena[i])    { xr_delete(s_arena[i]); }
+                if (s_count[i])    { xr_delete(s_count[i]); }
+                if (s_cursor[i])   { xr_delete(s_cursor[i]); }
+                if (s_indirect[i]) { xr_delete(s_indirect[i]); }
+                if (s_lightUBO[i]) { xr_delete(s_lightUBO[i]); s_lightPtr[i] = nullptr; }
+                s_boundVis[i] = s_boundInd[i] = VK_NULL_HANDLE; s_updFrame[i] = ~0u;
+            }
+            if (s_typeInfo) xr_delete(s_typeInfo);
+            if (s_cullPipe    != VK_NULL_HANDLE) { vkDestroyPipeline(VulkanHW.m_Device, s_cullPipe, nullptr);    s_cullPipe = VK_NULL_HANDLE; }
+            if (s_setupPipe   != VK_NULL_HANDLE) { vkDestroyPipeline(VulkanHW.m_Device, s_setupPipe, nullptr);   s_setupPipe = VK_NULL_HANDLE; }
+            if (s_cullLayout  != VK_NULL_HANDLE) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_cullLayout, nullptr);  s_cullLayout = VK_NULL_HANDLE; }
+            if (s_setupLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_setupLayout, nullptr); s_setupLayout = VK_NULL_HANDLE; }
+            if (s_pool        != VK_NULL_HANDLE) { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
+            if (s_cullSetL    != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_cullSetL, nullptr);  s_cullSetL = VK_NULL_HANDLE; }
+            if (s_setupSetL   != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setupSetL, nullptr); s_setupSetL = VK_NULL_HANDLE; }
+            s_typeInfoTypes = 0; s_tried = false; s_ready = false;
+        }
+    }  // namespace GrassCull
 
     // Static-map cache: static casters + the box tracking the camera only go
     // stale when the camera or the sun actually moves. Redraw when the camera
@@ -322,6 +672,164 @@ namespace {
     // shelters is negligible, but they're most of the 19795-item count → cutting
     // them shrinks the redraw spike. Roofs/cars/buildings/trees (large R) stay.
     constexpr float kRainMinCasterR = 1.5f;
+
+    // Precomputed depth-caster list. Every cached caster queue in this pass
+    // (far sun map, rain/occlusion map, 2 near cascades, fog map, spot tiles /
+    // point cubes) used to rebuild by walking ALL of RImplementation.Visuals —
+    // on heavy levels ~450k virtual Submit() calls per target per rebuild,
+    // each a cache miss on rv->vis.sphere. With r_vsm 0 the cascades re-collect
+    // every few metres of drift / 0.3° of sun creep, so the CPU sat at 48-87 ms
+    // while the GPU idled at 14-16 ms (under VSM the sun rebuilds sleep, which
+    // is why nobody saw it). The vast majority of those visuals can NEVER push
+    // a caster: trees draw through CTreeManager (Submit no-op), skinned leaves
+    // are no-ops, pool-compacted statics have their CPU slices freed. Probe
+    // each visual ONCE per level with a scratch queue, keep only real casters,
+    // and copy the cull sphere inline so a rebuild scan is a contiguous read.
+    struct CasterEntry { Fsphere bs; vkRender_Visual* rv; };
+    xr_vector<CasterEntry> s_Casters;
+    // Alpha-tested ITEM cache for the rain/occlusion map. When the GPU cluster
+    // path draws the opaque casters, FlushDepth(alphaTestedOnly) draws ONLY
+    // items whose material has alphaRef >= 0 — but the old rebuild re-Submitted
+    // whole MU hierarchies (13k AT casters → 188k pushed items) and re-sorted
+    // them, ~48 ms per rain-window move, firing even in DRY weather via the
+    // lamp-occlusion/ground maps. Cache the exact AT DrawItems once (captured
+    // from the probe queue, PRE-SORTED by sortKey); a rebuild is then a sphere-
+    // filtered ordered copy — no Submit recursion, no sort.
+    struct RainATItem { Fsphere bs; float casterR; DrawItem item; };
+    xr_vector<RainATItem> s_RainATItems;
+    bool   s_castersBuilt     = false;
+    size_t s_castersVis       = 0;      // Visuals.size() at build
+    bool   s_castersCompacted = false;  // pool compaction no-ops more Submits → rebuild once to harvest
+
+    // ---- RIGID dynamic sun casters -------------------------------------------------
+    // Skinned_RenderShadow only ever draws SKELETONS: it walks s_uploads, which is built
+    // by filtering g_DynamicVisuals through dynamic_cast<CKinematics*> with non-empty
+    // children. So a rigid visual has never cast a sun shadow in this renderer at all.
+    //
+    // In game that goes unnoticed, because rigid props are level geometry and reach the
+    // sun maps through the static caster list instead. It becomes glaring the moment a
+    // host drives the renderer with rigid models only — the editor, where every object of
+    // a whole level arrives through g_DynamicVisuals and nothing casts anything.
+    //
+    // Queue is static: reused every call, cleared per invocation. It is drawn from the
+    // same three sites as the skinned overlay (far/combined map and each cascade).
+    RenderQueue s_RigidDynQueue;
+    RenderQueue s_RigidFullQueue;   // visuals the instanced path does not own
+
+    void Rigid_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade = -1)
+    {
+        if (g_DynamicVisuals.empty())
+            return;
+
+        s_RigidDynQueue.Clear();
+        // Visuals the instanced path does NOT own still need their OPAQUE casters
+        // drawn here, so they go to a second queue flushed without the AT-only
+        // filter. Without this split their opaque leaves would fall between the two
+        // paths and lose their shadows entirely.
+        s_RigidFullQueue.Clear();
+
+        for (const DynVisual& d : g_DynamicVisuals)
+        {
+            if (!d.vis)
+                continue;
+
+            // Skeletons belong to Skinned_RenderShadow — drawing them here too would
+            // double-draw them in their BIND pose, as this path uploads no bones.
+            if (Skinned_HandlesVisual(d.vis))
+                continue;
+
+            // Cull against the target this call is filling: a cascade box, or the
+            // combined far map when the caller has no cascade.
+            const Fsphere& bs = d.vis->vis.sphere;
+            if (bs.R > 0.f)
+            {
+                Fvector c;
+                d.xform.transform_tiny(c, bs.P);
+                const bool visible = (cascade >= 0) ? ShadowMap::CascadeSphereVisible((u32)cascade, c, bs.R)
+                                                    : ShadowMap::SphereVisible(c, bs.R);
+                if (!visible)
+                    continue;
+            }
+
+            d.vis->Submit(InstanceGPU::OwnsVisual(d.vis) ? s_RigidDynQueue : s_RigidFullQueue,
+                          d.xform, 0.0f);
+        }
+
+        if (s_RigidDynQueue.Size() == 0 && s_RigidFullQueue.Size() == 0)
+            return;
+
+        s_RigidDynQueue.SortByKey();
+        s_RigidFullQueue.SortByKey();
+        // When the instanced GPU path owns the opaque leaves this queue draws only
+        // the alpha-tested cutouts — the same split the static GPU-driven path
+        // already uses ("opaque handled by GPU-driven shadow path",
+        // vk_render_queue.cpp). Ready() is false until the set builds, so a failed
+        // build falls back to drawing everything here rather than losing shadows.
+        const bool atOnly = InstanceGPU::Ready();
+        s_RigidDynQueue.FlushDepth(cmd, lightVP, false, atOnly);
+        // Not owned by the instanced path → this queue draws them in full.
+        s_RigidFullQueue.FlushDepth(cmd, lightVP);
+
+        static bool s_diag = false;
+        if (!s_diag)
+        {
+            s_diag = true;
+            Msg("[VK Shadow] rigid dynamic casters: %zu draw item(s) from %zu dynamic visual(s); mode=%s",
+                s_RigidDynQueue.Size(), g_DynamicVisuals.size(),
+                atOnly ? "GPU-instanced opaque + CPU alpha-tested" : "full CPU");
+            if (atOnly)
+                Msg("[VK InstanceGPU] %u instance(s) in %u group(s) now GPU-driven per shadow target",
+                    InstanceGPU::InstanceCount(), InstanceGPU::GroupCount());
+        }
+    }
+
+    void EnsureCasterList()
+    {
+        const size_t nVis      = RImplementation.Visuals.size();
+        const bool   compacted = WorldGPU::PoolsCompacted();
+        if (s_castersBuilt && s_castersVis == nVis && s_castersCompacted == compacted)
+            return;
+        s_castersBuilt     = true;
+        s_castersVis       = nVis;
+        s_castersCompacted = compacted;
+        s_Casters.clear();
+        s_RainATItems.clear();
+
+        Fmatrix identity; identity.identity();
+        RenderQueue probe;                 // scratch: "did Submit push anything?"
+        size_t nProbe = 0;
+        for (IRenderVisual* iv : RImplementation.Visuals) {
+            if (!iv) continue;
+            auto* rv = static_cast<vkRender_Visual*>(iv);
+            rv->Submit(probe, identity, 0.0f);
+            // Glass diverts to the queue's late list at Push — count it as a
+            // caster too so the rebuild-time Push side effects stay identical.
+            if (probe.Size() != nProbe || probe.HasGlass()) {
+                s_Casters.push_back({ rv->vis.sphere, rv });
+                // Capture the AT items THIS Submit pushed — same material
+                // predicate FlushDepth uses to route to the AT depth pipeline.
+                // The item keeps its OWN visual's (smaller) sphere for the
+                // rain-window test; the parent caster radius feeds the dry-mode
+                // clutter trim so filtering matches the old Submit-based walk.
+                const auto& items = probe.Items();
+                for (size_t k = nProbe; k < items.size(); ++k) {
+                    auto* fv = static_cast<vkFVisual*>(items[k].vis);
+                    const WorldMaterial* mat = (fv && fv->m_pWorldMaterial) ? fv->m_pWorldMaterial : nullptr;
+                    if (mat && !mat->isWmark && mat->alphaRef >= 0.f)
+                        s_RainATItems.push_back({ fv->vis.sphere, rv->vis.sphere.R, items[k] });
+                }
+                if (probe.HasGlass())      probe.ClearGlass();
+                if (probe.Size() > 16384)  probe.Clear();
+                nProbe = probe.Size();
+            }
+        }
+        // Pre-sort once with SortByKey's exact comparator: a rebuild's filtered
+        // copy preserves this order, so it can skip its own sort entirely.
+        std::sort(s_RainATItems.begin(), s_RainATItems.end(),
+                  [](const RainATItem& a, const RainATItem& b) { return a.item.sortKey < b.item.sortKey; });
+        Msg("[VK Shadow] caster list: %zu casters (%zu AT items cached) of %zu visuals%s",
+            s_Casters.size(), s_RainATItems.size(), nVis, compacted ? " (post-compaction)" : "");
+    }
 }
 
 void Pass_SunShadow(FrameContext& ctx)
@@ -350,6 +858,7 @@ void Pass_SunShadow(FrameContext& ctx)
         if (nowLoaded && !s_wasLoaded) {
             s_stableSunInit = false;
             s_cascSunInit   = false;
+            s_castersBuilt  = false;   // new level → the caster list holds the old one's visuals
         }
         s_wasLoaded = nowLoaded;
     }
@@ -366,6 +875,19 @@ void Pass_SunShadow(FrameContext& ctx)
     }
     sunDir = s_stableSunDir;                              // bolt → hold last real direction
 
+    // NIGHT gate: with a black env sun every receiver multiplies the sun-shadow
+    // term by sun_color = 0 and the fog's sun in-scatter is black too — nothing
+    // can see the sun maps' CONTENT. Skip the sun raster/copy work exactly like
+    // the vsmActive path below (transitions/clears/zones still run, so layouts
+    // and the profiler's zone order stay valid). Measured: the per-frame cascade
+    // combined rebuild alone was ~1.5-3.5 ms of pure waste at night. The dyn
+    // spot/point (headlamps, campfires) and rain/deform maps are NOT sun work
+    // and are unaffected.
+    bool sunLit = true;
+    if (g_pGamePersistent)
+        if (auto* E = g_pGamePersistent->Environment().CurrentEnv)
+            sunLit = (E->sun_color.x + E->sun_color.y + E->sun_color.z) > 1e-3f;
+
     const bool   loaded = RImplementation.b_loaded && !RImplementation.Visuals.empty();
     const size_t nVis   = loaded ? RImplementation.Visuals.size() : 0;
 
@@ -375,10 +897,54 @@ void Pass_SunShadow(FrameContext& ctx)
     // cutout casters (atOnly). Falls back to the full CPU path when disabled or
     // when the GPU system has no casters / failed to build (so opaque shadows
     // never silently vanish).
-    const bool gpuShadows = ps_r_gpu_shadows && ShadowGPU::Built();
+    // Pool compaction: the GPU-set opaque casters' CPU slices are freed (their
+    // per-mesh ShadowGPU snapshot excludes them too — it built after the swap),
+    // so both the full-CPU fallback (r_gpu_shadows 0) and the per-mesh path
+    // (r_shadow_cluster 0) would silently lose the freed statics. Force the
+    // cluster path; r_pool_compact 0 + reload restores the A/Bs.
+    const bool compacted  = WorldGPU::PoolsCompacted();
+    const bool gpuShadows = (ps_r_gpu_shadows || compacted) && ShadowGPU::Built();
     // caster-LOD distance (0 disables → full detail everywhere). Distant casters
     // (esp. progressive terrain/big meshes) emit their coarse slice in the cull.
     const float shadowLodDist = ps_r_shadow_lod ? ps_r_shadow_lod_dist : 0.0f;
+    // Phase 3: opaque statics in the sun targets via the cluster-LOD cut (the
+    // WorldGPU DAG entries with a constant per-target world-error budget)
+    // instead of the per-mesh ShadowGPU set. Cull AND draw switch on the same
+    // flag each frame; the CPU AT cutout path is identical in both modes.
+    const bool clShadows = gpuShadows && (ps_r_shadow_cluster || compacted) && WorldGPU::ShadowReady();
+    // GPU AT casters (r_gpu_shadows_at): the cluster cull/draw covers the
+    // alpha-tested cutouts too → the CPU caster queues (far/cascade/fog + the
+    // rain AT replay + spot/point statics) aren't built OR flushed at all.
+    // Any fallback (cvar off, no AT layout, per-mesh path) keeps the legacy
+    // split: GPU opaques + CPU FlushDepth(alphaTestedOnly).
+    const bool gpuAT = clShadows && WorldGPU::ShadowATActive();
+    // HOST-PUSHED RIGID INSTANCES (the editor's entire scene). None of the paths
+    // above can take them: they bake geometry into WORLD SPACE at level load and
+    // carry no transform, while these are one shared mesh instanced many times
+    // with a matrix each. vk_instance_gpu is that other shape — local geometry +
+    // a per-instance transform SSBO + compute cull + indirect, so moving an
+    // object costs 64 bytes instead of a re-bake.
+    // Editor-only: in game the rigid dynamic set is small and the CPU path costs
+    // nothing, so this stays out of the shipping frame. r_gpu_shadows doubles as
+    // the kill switch. InstanceGPU::Ready() only turns true after CullShadow has
+    // built the set, so the CPU path keeps the first frame and any failed build —
+    // opaque rigid shadows can never silently vanish.
+    const bool instShadows = ps_r_gpu_shadows && VKEditor::HostModelCount() > 0;
+    { static bool s_atDiag = false;
+      if (!s_atDiag && gpuAT) { s_atDiag = true;
+          Msg("[VK Shadow] AT casters: GPU indirect (r_gpu_shadows_at 1) — CPU caster queues idle"); } }
+    if (compacted && (!ps_r_gpu_shadows || (!ps_r_shadow_cluster && clShadows))) {
+        static u32 s_warned = 0;
+        if (Device.dwTimeGlobal > s_warned + 5000) { s_warned = Device.dwTimeGlobal;
+            Msg("![VK Shadow] r_gpu_shadows/r_shadow_cluster 0 ignored: pools compacted (r_pool_compact 0 + reload for A/B)"); }
+    }
+    // Target texel size in metres from its ortho VP: ndc.x spans 2 over the
+    // box width, X-Ray row-vector matrices put the world→ndc.x scale in column
+    // 0 → width = 2/|col0|, texel = width/resolution.
+    auto orthoTexel = [](const Fmatrix& vp, u32 size) -> float {
+        const float sc = _sqrt(vp._11 * vp._11 + vp._21 * vp._21 + vp._31 * vp._31);
+        return (sc > 1e-8f && size) ? 2.0f / (sc * (float)size) : 0.05f;
+    };
 
     // VSM owns the SUN shadow once its screen-space mask is ready: every sun receiver
     // samples the mask instead of these cascade/far maps (vk_env_light shadow_params.w).
@@ -400,7 +966,7 @@ void Pass_SunShadow(FrameContext& ctx)
     // ready, or r_vol_shadow's dedicated per-frame map (which falls back to the cascade).
     const bool fogUsesVSM = VK::VSM::AtlasReady() && !ps_r_vol_shadow;
     const bool cascForVol = (ps_r_vol || ps_r_vol_debug) && !fogUsesVSM;
-    const bool cascRaster = !vsmActive || cascForVol;   // render the cascade casters this frame
+    const bool cascRaster = (!vsmActive || cascForVol) && sunLit;   // render the cascade casters this frame
     // r_vol toggled WHILE under VSM: the near cascades were sitting idle (cleared /
     // never transitioned), so their cached-static state + image layouts are stale.
     // Force a fresh first-frame re-init so the froxel occlusion samples real depth.
@@ -414,6 +980,35 @@ void Pass_SunShadow(FrameContext& ctx)
         }
         s_prevCascForVol = cascForVol;
     }
+    // Live r_shadow_cluster flip: cull and draw read whichever path's buffers
+    // are selected THIS frame, so the cached far/cascade maps must re-cull +
+    // re-raster through the new path immediately (the other path's indirect
+    // data is stale; its counts are zeroed at Build so a stray draw is empty,
+    // not garbage — but the shadow would silently vanish until a cache miss).
+    {
+        static bool s_prevClShadows = false;
+        if (clShadows != s_prevClShadows) {
+            s_cacheValid = false;
+            for (u32 ci = 0; ci < ShadowMap::kNumSunCascades; ++ci)
+                s_cascStaticValid[ci] = false;
+        }
+        s_prevClShadows = clShadows;
+    }
+    // VSM hand-over: while VSM owns the sun, the far/cascade caster queues are
+    // neither drawn nor collected (see the gates below) — so when VSM releases
+    // (mask lost, r_vsm flipped) every cache must rebuild from scratch, and vice
+    // versa a fresh grab must drop stale VSM-era validity stamps.
+    {
+        static bool s_prevVsmActive = false;
+        if (vsmActive != s_prevVsmActive) {
+            s_cacheValid = false;
+            for (u32 ci = 0; ci < ShadowMap::kNumSunCascades; ++ci) {
+                s_cascStaticValid[ci] = false;
+                s_cascQValid[ci]      = false;
+            }
+        }
+        s_prevVsmActive = vsmActive;
+    }
 
     // Bones for the skinned casters below (Pass_Skinned reuses the same upload).
     Skinned_UploadBones();
@@ -425,9 +1020,20 @@ void Pass_SunShadow(FrameContext& ctx)
     // ---- STATIC map (cached): redraw only when the camera/sun/level moved. ----
     // While valid we keep the cached lightVP (ComputeLightVP is NOT re-run), so
     // the sampling matrix always matches the cached contents.
-    const bool staticValid = s_cacheValid && !s_firstUse && nVis == s_lastVisCount
+    // At night the map is unread (sun_color = 0) → hold it as-is once the image
+    // has a defined layout (first use still runs the clear/transition path).
+    // Under live VSM the far map is as unread as at night (receivers sample the
+    // VSM mask; only the HUD weapon reads the combined map, which stays fully
+    // lit) — so skip the whole redraw path, NOT just the draws. Before this the
+    // caster COLLECT below still ran on every 10 m cache miss: a fast demo
+    // flight re-walked ~90k casters + queue-pushed the visible tens of
+    // thousands every few frames for a map nobody sampled (54-68 ms/frame of
+    // the flight CPU wall). The vsmActive-transition invalidation above forces
+    // a real redraw the moment VSM hands the sun back.
+    const bool staticValid = ((!sunLit || vsmActive) && !s_firstUse)
+        || (s_cacheValid && !s_firstUse && nVis == s_lastVisCount
         && Device.vCameraPosition.distance_to_sqr(s_lastCamPos) < kRedrawDist * kRedrawDist
-        && s_lastSunDir.dotproduct(sunDir) > kSunDotRedraw;
+        && s_lastSunDir.dotproduct(sunDir) > kSunDotRedraw);
 
     // GPU-zone the far static-map REDRAW. Opened EVERY frame (even when the cache
     // holds → brackets no work → ~0 ms) so the profiler's open-order zone indices
@@ -436,7 +1042,9 @@ void Pass_SunShadow(FrameContext& ctx)
     if (!staticValid)
     {
         ShadowMap::ComputeLightVP(sunDir);
-        s_cacheValid   = true;
+        // A night first-use pass leaves the cache INVALID: the map is cleared but
+        // never drawn (sunLit gates below), so dawn must trigger a real redraw.
+        s_cacheValid   = sunLit;
         s_lastCamPos   = Device.vCameraPosition;
         s_lastSunDir   = sunDir;
         s_lastVisCount = nVis;
@@ -446,24 +1054,42 @@ void Pass_SunShadow(FrameContext& ctx)
         // Visuals whose bounding sphere misses the light ortho box can't write any
         // shadow texel — cull them here instead of pushing the whole level.
         s_ShadowQueue.Clear();
-        if (loaded) {
+        // night/VSM: draws below are skipped; gpuAT: the queue would only feed
+        // FlushDepth(alphaTestedOnly) and the GPU path draws the AT casters now
+        // → don't pay the visuals walk in either case.
+        if (loaded && sunLit && !vsmActive && !gpuAT) {
+            VK_CPU_PROBE("ShadowQ/far");
+            EnsureCasterList();
             Fmatrix identity; identity.identity();
-            for (IRenderVisual* iv : RImplementation.Visuals) {
-                if (!iv) continue;
-                auto* rv = static_cast<vkRender_Visual*>(iv);
-                const Fsphere& bs = rv->vis.sphere;
-                if (bs.R > 0.f && !ShadowMap::SphereVisible(bs.P, bs.R)) continue;
-                rv->Submit(s_ShadowQueue, identity, 0.0f);
+            for (const CasterEntry& e : s_Casters) {
+                if (e.bs.R > 0.f && !ShadowMap::SphereVisible(e.bs.P, e.bs.R)) continue;
+                e.rv->Submit(s_ShadowQueue, identity, 0.0f);
             }
             s_ShadowQueue.SortByKey();
         }
 
         // GPU-driven opaque caster cull (compute) — MUST run before BeginRendering.
-        if (gpuShadows && !vsmActive) {
+        if (gpuShadows && !vsmActive && sunLit) {
+            if (clShadows) {
+                const u32   tgt   = (u32)ShadowGPU::TGT_FAR;
+                const float texel = orthoTexel(ShadowMap::GetLightVP(), ShadowMap::Size());
+                WorldGPU::CullShadow(cmd, &tgt, &ShadowMap::GetLightVP(), &texel, 1);
+            } else {
+                Fvector4 planes[6];
+                VK::ExtractFrustumPlanes(ShadowMap::GetLightVP(), planes);
+                ShadowGPU::Target tgt = ShadowGPU::TGT_FAR;
+                ShadowGPU::Cull(cmd, &tgt, planes, 1, Device.vCameraPosition, shadowLodDist);
+            }
+        }
+
+        // Host rigid instances — an INDEPENDENT cull: ShadowGPU/WorldGPU never
+        // build without a level, so this cannot ride their gpuShadows flag. Same
+        // plane source, same "must precede BeginRendering" rule.
+        if (instShadows && !vsmActive && sunLit) {
             Fvector4 planes[6];
             VK::ExtractFrustumPlanes(ShadowMap::GetLightVP(), planes);
-            ShadowGPU::Target tgt = ShadowGPU::TGT_FAR;
-            ShadowGPU::Cull(cmd, &tgt, planes, 1, Device.vCameraPosition, shadowLodDist);
+            const InstanceGPU::Target tgt = InstanceGPU::TGT_FAR;
+            InstanceGPU::CullShadow(cmd, &tgt, planes, 1);
         }
 
         // TRANSFER_SRC (or UNDEFINED on first use) → DEPTH_ATTACHMENT for writing.
@@ -498,10 +1124,13 @@ void Pass_SunShadow(FrameContext& ctx)
         // Opaque statics via the GPU indirect path; the CPU queue draws only the
         // alpha-tested cutout casters (atOnly). Without the GPU path, full CPU flush.
         // Skipped under VSM (the map is left cleared/fully-lit — receivers use the mask).
-        if (!vsmActive) {
-            s_ShadowQueue.FlushDepth(cmd, ShadowMap::GetLightVP(), false, gpuShadows);
-            if (gpuShadows)
-                ShadowGPU::Draw(cmd, ShadowGPU::TGT_FAR, ShadowMap::GetLightVP());
+        if (!vsmActive && sunLit) {
+            if (!gpuAT)   // GPU AT: the cutouts ride the indirect draw below
+                s_ShadowQueue.FlushDepth(cmd, ShadowMap::GetLightVP(), false, gpuShadows);
+            if (gpuShadows) {
+                if (clShadows) WorldGPU::DrawShadow(cmd, (u32)ShadowGPU::TGT_FAR, ShadowMap::GetLightVP());
+                else           ShadowGPU::Draw(cmd, ShadowGPU::TGT_FAR, ShadowMap::GetLightVP());
+            }
 
             // Trees (GPU-driven elsewhere — not in the queue): alpha-tested leafy
             // crowns into the sun map, CPU-culled by the light box. Redraw-only cost.
@@ -528,7 +1157,7 @@ void Pass_SunShadow(FrameContext& ctx)
     copy.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
     copy.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
     copy.extent         = { sz, sz, 1 };
-    if (!vsmActive)   // under VSM nothing samples the far sun map (mask drives receivers) → skip the 4096^2 copy
+    if (!vsmActive && sunLit)   // under VSM/night nothing samples the far sun map → skip the 4096^2 copy
         vkCmdCopyImage(cmd, ShadowMap::GetStaticImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        ShadowMap::GetImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
@@ -555,8 +1184,14 @@ void Pass_SunShadow(FrameContext& ctx)
         vkCmdSetScissor(cmd, 0, 1, &scShadow);
         vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
-        if (!vsmActive)                                       // VSM live → no sun skinned overlay (mask drives it)
+        if (!vsmActive && sunLit)                             // VSM live / night → no sun skinned overlay
+        {
             Skinned_RenderShadow(cmd, ShadowMap::GetLightVP());
+            // Opaque rigid instances go GPU-driven when the set built; the CPU call
+            // below then draws only the alpha-tested cutouts (it checks Ready()).
+            InstanceGPU::DrawShadow(cmd, InstanceGPU::TGT_FAR, ShadowMap::GetLightVP());
+            Rigid_RenderShadow(cmd, ShadowMap::GetLightVP());  // rigid dynamics — the editor's whole scene
+        }
 
         vkCmdEndRendering(cmd);
     }
@@ -593,8 +1228,21 @@ void Pass_SunShadow(FrameContext& ctx)
         // cuts the always-on spike frequency 3× — fewer frame hitches that make the
         // sun cascades "tick".
         const float redrawDist = wantRain ? kRainRedrawDist : 48.0f;
+        // Time floor on distance-triggered redraws: at walking speed 16 m ≈ every
+        // 2-3 s (unchanged), but a fast demo flight crosses 16 m every 2-3 FRAMES —
+        // each redraw a 30-50 ms caster re-collect for a ±75 m top-down map that
+        // can't stay glued to a camera moving that fast anyway. ≥400 ms between
+        // rebuilds bounds the flight cost to ~2 collects/s; invalid/level-change
+        // rebuilds are exempt (correctness, not drift).
+        static u32 s_rainLastMs = 0;
+        const bool driftOk = Device.dwTimeGlobal - s_rainLastMs >= 400;
         const bool stale = !s_rainValid || nVis != s_rainVis
-            || Device.vCameraPosition.distance_to_sqr(s_rainCamPos) > redrawDist * redrawDist;
+            || (driftOk && Device.vCameraPosition.distance_to_sqr(s_rainCamPos) > redrawDist * redrawDist);
+
+        // Pool compaction: freed opaque statics only exist in the cluster pools —
+        // draw them into the rain/ground maps via the kTargetRain cluster target
+        // (the CPU queue keeps the alpha-tested cutouts, same split as the sun).
+        const bool gpuRain = compacted && clShadows;
 
         if (s_rainFirst || (wantMap && stale))
         {
@@ -602,22 +1250,45 @@ void Pass_SunShadow(FrameContext& ctx)
 
             s_RainQueue.Clear();
             if (loaded && wantMap) {
+                VK_CPU_PROBE("ShadowQ/rain");
                 // Occlusion-only (no rain) needs just the big blockers (terrain, walls,
                 // floors) — skip small props with a much higher min radius so the
                 // always-on redraw isn't the all-statics SPIKE that makes the frame
                 // hitch ("sun ticks") every 16 m. Wetness still wants the small
                 // occluders, so keep the tight cutoff while it's actually raining.
                 const float minCasterR = wantRain ? kRainMinCasterR : 6.0f;
-                Fmatrix identity; identity.identity();
-                for (IRenderVisual* iv : RImplementation.Visuals) {
-                    if (!iv) continue;
-                    auto* rv = static_cast<vkRender_Visual*>(iv);
-                    const Fsphere& bs = rv->vis.sphere;
-                    if (bs.R > 0.f && bs.R < minCasterR) continue;   // skip clutter (spike trim)
-                    if (bs.R > 0.f && !ShadowMap::RainSphereVisible(bs.P, bs.R)) continue;
-                    rv->Submit(s_RainQueue, identity, 0.0f);
+                if (gpuRain && gpuAT) {
+                    // Fully GPU: opaque AND alpha-tested casters come from the
+                    // kTargetRain cluster slice — no queue, no caster list.
+                } else if (gpuRain) {
+                    EnsureCasterList();
+                    // GPU cluster path draws the opaque casters; the flushes below
+                    // run alphaTestedOnly — so replay ONLY the cached AT items.
+                    // The old walk re-Submitted whole MU hierarchies (188k items
+                    // pushed, 8% drawn) + re-sorted them = the 48 ms rebuild spike,
+                    // firing even in DRY weather via the occlusion/ground maps.
+                    // The cache is pre-sorted; the filtered copy needs no sort.
+                    for (const RainATItem& a : s_RainATItems) {
+                        if (a.casterR > 0.f && a.casterR < minCasterR) continue;   // clutter trim (parent radius, as before)
+                        if (a.bs.R > 0.f && !ShadowMap::RainSphereVisible(a.bs.P, a.bs.R)) continue;
+                        s_RainQueue.PushPresorted(a.item);
+                    }
+                } else {
+                    // CPU fallback draws opaque too — keep the full Submit walk.
+                    EnsureCasterList();
+                    Fmatrix identity; identity.identity();
+                    for (const CasterEntry& e : s_Casters) {
+                        const Fsphere& bs = e.bs;
+                        if (bs.R > 0.f && bs.R < minCasterR) continue;   // skip clutter (spike trim)
+                        if (bs.R > 0.f && !ShadowMap::RainSphereVisible(bs.P, bs.R)) continue;
+                        e.rv->Submit(s_RainQueue, identity, 0.0f);
+                    }
+                    s_RainQueue.SortByKey();
                 }
-                s_RainQueue.SortByKey();
+                static bool s_diagQ = false;
+                if (!s_diagQ) { s_diagQ = true;
+                    Msg("[VK Rain] rebuild: gpu=%d queue=%zu (AT cache %zu, casters %zu)",
+                        (int)gpuRain, s_RainQueue.Size(), s_RainATItems.size(), s_Casters.size()); }
             }
             // Only mark the cache valid if we actually BUILT the queue (loaded). A
             // first render during level load (loaded=false → empty queue) must NOT
@@ -627,6 +1298,17 @@ void Pass_SunShadow(FrameContext& ctx)
             s_rainValid  = wantMap && loaded;
             s_rainCamPos = Device.vCameraPosition;
             s_rainVis    = nVis;
+            s_rainLastMs = Device.dwTimeGlobal;
+
+            // Cluster cull for the rain VP (outside any render pass) — one cull
+            // feeds both the rain map and the ground map below (same VP). The
+            // draws below gate on the same (gpuRain && wantMap && loaded), so
+            // the slice is never consumed stale (counts are zeroed at Build).
+            if (gpuRain && wantMap && loaded) {
+                const u32   tgt   = WorldGPU::kTargetRain;
+                const float texel = orthoTexel(ShadowMap::GetRainVP(), ShadowMap::RainSize());
+                WorldGPU::CullShadow(cmd, &tgt, &ShadowMap::GetRainVP(), &texel, 1);
+            }
 
             const u32 rsz = ShadowMap::RainSize();
             const VkViewport vpR{ 0.f, (float)rsz, (float)rsz, -(float)rsz, 0.f, 1.f };
@@ -660,7 +1342,10 @@ void Pass_SunShadow(FrameContext& ctx)
                 vkCmdSetViewport(cmd, 0, 1, &vpR);
                 vkCmdSetScissor(cmd, 0, 1, &scR);
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
-                s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP());
+                if (!(gpuRain && gpuAT))   // fully-GPU rain: AT rides the indirect draw
+                    s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP(), false, gpuRain);
+                if (gpuRain && wantMap && loaded)
+                    WorldGPU::DrawShadow(cmd, WorldGPU::kTargetRain, ShadowMap::GetRainVP());
                 if (wantRain && RImplementation.Trees && RImplementation.Trees->IsBuilt())
                     RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetRainVP());
                 vkCmdEndRendering(cmd);
@@ -700,7 +1385,10 @@ void Pass_SunShadow(FrameContext& ctx)
                 vkCmdSetViewport(cmd, 0, 1, &vpR);
                 vkCmdSetScissor(cmd, 0, 1, &scR);
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
-                s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP());   // statics+terrain, NO trees
+                if (!(gpuRain && gpuAT))   // fully-GPU rain: AT rides the indirect draw
+                    s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP(), false, gpuRain);   // statics+terrain, NO trees
+                if (gpuRain && wantMap && loaded)
+                    WorldGPU::DrawShadow(cmd, WorldGPU::kTargetRain, ShadowMap::GetRainVP());
                 vkCmdEndRendering(cmd);
                 ImageBarrier(cmd, ShadowMap::GetGroundImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -725,8 +1413,12 @@ void Pass_SunShadow(FrameContext& ctx)
         }
 
         // ---- Snow/mud deform texture: stamp foot contacts into the dense persistent
-        // player-centred press field (vk_deform). Read by the terrain shaders for
+        // world-anchored press field (vk_deform). Read by the terrain shaders for
         // sharp, persistent, non-faceted footprints (snow prints + mud prints).
+        // Own timed sub-zone (opened EVERY frame in fixed order — even when wantDeform is
+        // false or the compute cache-gates — so it separates the deform cost from the rain
+        // occlusion raster that shares this "Shadow/Rain" parent zone).
+        const int zDef = VK::Prof::ZoneBegin(cmd, "Deform");
         if (wantDeform) {
             xr_vector<VK::Deform::Stamp> stamps;
             const Fvector& camp = Device.vCameraPosition;
@@ -767,6 +1459,7 @@ void Pass_SunShadow(FrameContext& ctx)
             for (const auto& f : steps) stamps.push_back({ f.pos, r, 1.f, f.dirX, f.dirZ });
             VK::Deform::Dispatch(cmd, stamps.data(), (u32)stamps.size());
         }
+        VK::Prof::ZoneEnd(cmd, zDef);
     }
     VK::Prof::ZoneEnd(cmd, zRain);
 
@@ -796,6 +1489,13 @@ void Pass_SunShadow(FrameContext& ctx)
         bool              redrawStatic[ShadowMap::kNumSunCascades] = {};
         ShadowGPU::Target cullTgts[ShadowMap::kNumSunCascades];
         Fvector4          cullPlanes[ShadowMap::kNumSunCascades * 6];
+        // Same batch, own enum: InstanceGPU::Target mirrors ShadowGPU::Target's
+        // values, but aliasing one array as the other would be a reinterpret_cast
+        // across unrelated types — cheap to just fill both.
+        InstanceGPU::Target instTgts[ShadowMap::kNumSunCascades];
+        u32               clTgts[ShadowMap::kNumSunCascades];      // cluster path: target ids
+        Fmatrix           clVPs[ShadowMap::kNumSunCascades];       // + per-target VP
+        float             clTexel[ShadowMap::kNumSunCascades];     // + per-target texel (m)
         u32 nCull = 0;
         // Sun-rotation redraw threshold: a frozen cascade re-rasters once the sun
         // creeps past r_shadow_casc_sun degrees so shadows keep moving with the sun.
@@ -807,13 +1507,22 @@ void Pass_SunShadow(FrameContext& ctx)
         const float sunEpsSq = sunEps * sunEps;
         for (u32 ci = 0; ci < ShadowMap::kNumSunCascades; ++ci)
         {
-            redrawStatic[ci] = !ps_r_shadow_casc_cache || s_cascStaticFirst || !s_cascStaticValid[ci] || nVis != s_cascStaticVis[ci]
-                || Device.vCameraPosition.distance_to_sqr(s_cascStaticCamPos[ci]) > kCascRedrawDist[ci] * kCascRedrawDist[ci]
-                || s_cascStaticSunDir[ci].distance_to_sqr(sunDir) > sunEpsSq;
+            // Night (== !sunLit): no redraw at all past the first-use init — the
+            // cascades are unread. Validity is NOT stamped, so dawn re-rasters.
+            // cascRaster (== sunLit && cascades actually sampled) instead of plain
+            // sunLit: while VSM owns the sun AND the froxel fog reads the VSM atlas,
+            // the cascades are pure fallback — before this gate every 2-4 m of
+            // camera drift still re-walked the caster list + rebuilt both cascade
+            // queues for maps whose draws cascRaster then skipped anyway (a steady
+            // slice of the fast-flight CPU wall). Night semantics unchanged.
+            redrawStatic[ci] = s_cascStaticFirst
+                || (cascRaster && (!ps_r_shadow_casc_cache || !s_cascStaticValid[ci] || nVis != s_cascStaticVis[ci]
+                    || Device.vCameraPosition.distance_to_sqr(s_cascStaticCamPos[ci]) > kCascRedrawDist[ci] * kCascRedrawDist[ci]
+                    || s_cascStaticSunDir[ci].distance_to_sqr(sunDir) > sunEpsSq));
             if (!redrawStatic[ci])
                 continue;   // static cached → VP frozen, no queue/cull/raster; only the combined copy+skinned runs in Phase B
 
-            s_cascStaticValid[ci]  = true;
+            s_cascStaticValid[ci]  = sunLit;
             s_cascStaticCamPos[ci] = Device.vCameraPosition;
             s_cascStaticSunDir[ci] = sunDir;
             s_cascStaticVis[ci]    = nVis;
@@ -825,7 +1534,7 @@ void Pass_SunShadow(FrameContext& ctx)
             const bool qValid = s_cascQValid[ci] && nVis == s_cascQVis[ci]
                 && Device.vCameraPosition.distance_to_sqr(s_cascQCamPos[ci]) < kCascQueueDist * kCascQueueDist
                 && s_cascQSunDir[ci].dotproduct(sunDir) > kCascQueueSunDot;
-            if (!qValid)
+            if (!qValid && sunLit && !gpuAT)   // night/gpuAT: the queue isn't flushed → skip the walk too
             {
                 s_cascQValid[ci]  = true;
                 s_cascQCamPos[ci] = Device.vCameraPosition;
@@ -833,27 +1542,35 @@ void Pass_SunShadow(FrameContext& ctx)
                 s_cascQVis[ci]    = nVis;
                 s_CascQueue[ci].Clear();
                 if (loaded) {
+                    VK_CPU_PROBE("ShadowQ/casc");
+                    EnsureCasterList();
                     Fmatrix identity; identity.identity();
-                    for (IRenderVisual* iv : RImplementation.Visuals) {
-                        if (!iv) continue;
-                        auto* rv = static_cast<vkRender_Visual*>(iv);
-                        const Fsphere& bs = rv->vis.sphere;
-                        if (bs.R > 0.f && !ShadowMap::CascadeSphereVisible(ci, bs.P, bs.R, kCascQueueInflate)) continue;
-                        rv->Submit(s_CascQueue[ci], identity, 0.0f);
+                    for (const CasterEntry& e : s_Casters) {
+                        if (e.bs.R > 0.f && !ShadowMap::CascadeSphereVisible(ci, e.bs.P, e.bs.R, kCascQueueInflate)) continue;
+                        e.rv->Submit(s_CascQueue[ci], identity, 0.0f);
                     }
                     s_CascQueue[ci].SortByKey();
                 }
             }
 
-            if (gpuShadows) {
+            if (gpuShadows || instShadows) {
                 VK::ExtractFrustumPlanes(ShadowMap::GetCascadeVP(ci), &cullPlanes[nCull * 6]);
                 cullTgts[nCull] = (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci);
+                instTgts[nCull] = (InstanceGPU::Target)(InstanceGPU::TGT_CASCADE0 + ci);
+                clTgts[nCull]   = (u32)(ShadowGPU::TGT_CASCADE0 + ci);
+                clVPs[nCull]    = ShadowMap::GetCascadeVP(ci);
+                clTexel[nCull]  = orthoTexel(ShadowMap::GetCascadeVP(ci), ShadowMap::CascadeSize(ci));
                 ++nCull;
             }
         }
         const int zCull = VK::Prof::ZoneBegin(cmd, "Shadow/CascCull");
-        if (gpuShadows && nCull && cascRaster)
-            ShadowGPU::Cull(cmd, cullTgts, cullPlanes, nCull, Device.vCameraPosition, shadowLodDist);
+        if (gpuShadows && nCull && cascRaster) {
+            if (clShadows) WorldGPU::CullShadow(cmd, clTgts, clVPs, clTexel, nCull);
+            else           ShadowGPU::Cull(cmd, cullTgts, cullPlanes, nCull, Device.vCameraPosition, shadowLodDist);
+        }
+        // Host rigid instances: one batched cull for every cascade, same as above.
+        if (instShadows && nCull && cascRaster)
+            InstanceGPU::CullShadow(cmd, instTgts, cullPlanes, nCull);
         VK::Prof::ZoneEnd(cmd, zCull);
 
         // Phase B: per cascade — (re-)raster the STATIC map only on a cache miss,
@@ -893,9 +1610,12 @@ void Pass_SunShadow(FrameContext& ctx)
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
                 if (cascRaster) {   // VSM live → normally cleared/fully-lit, but kept rendered for r_vol froxel occlusion
-                    s_CascQueue[ci].FlushDepth(cmd, ShadowMap::GetCascadeVP(ci), false, gpuShadows);
-                    if (gpuShadows)
-                        ShadowGPU::Draw(cmd, (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
+                    if (!gpuAT)   // GPU AT: the cutouts ride the indirect draw below
+                        s_CascQueue[ci].FlushDepth(cmd, ShadowMap::GetCascadeVP(ci), false, gpuShadows);
+                    if (gpuShadows) {
+                        if (clShadows) WorldGPU::DrawShadow(cmd, (u32)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
+                        else           ShadowGPU::Draw(cmd, (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
+                    }
                     if (RImplementation.Trees && RImplementation.Trees->IsBuilt())
                         // Static (cached) layer = FAR trees only; near trees sway in
                         // the per-frame dynamic overlay below (r_wind_shadow_dist;
@@ -945,12 +1665,23 @@ void Pass_SunShadow(FrameContext& ctx)
             vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
             if (cascRaster) {                                // skinned (NPC) overlay → they also cast volumetric shadows
                 Skinned_RenderShadow(cmd, ShadowMap::GetCascadeVP(ci));
+                // Opaque rigid instances GPU-driven; the CPU call keeps the cutouts.
+                InstanceGPU::DrawShadow(cmd, (InstanceGPU::Target)(InstanceGPU::TGT_CASCADE0 + ci),
+                                        ShadowMap::GetCascadeVP(ci));
+                Rigid_RenderShadow(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci);  // rigid dynamics
                 // NEAR trees, re-rasterized EVERY frame at their current wind pose
                 // (the far forest stays in the cached static map). Bounded by
                 // r_wind_shadow_dist → same cost class as the NPC overlay.
                 if (ps_r_wind_shadow_dist > 0.f && RImplementation.Trees && RImplementation.Trees->IsBuilt())
                     RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci,
                                                        nullptr, 0.0f, ps_r_wind_shadow_dist);
+                // GRASS casters (r_sun_grass): swaying blades cast real sun shadows.
+                // Same per-frame dynamic layer (blades track the SSFX wind of the
+                // colour pass). Instance-culled to r_sun_grass_dist around the
+                // camera; skip casc1 when the reach fits inside casc0's half-box.
+                if (ps_r_sun_grass && (ci == 0 || ps_r_sun_grass_dist > 12.f))
+                    DrawGrassSpotCasters(cmd, ShadowMap::GetCascadeVP(ci),
+                                         Device.vCameraPosition, ps_r_sun_grass_dist);
             }
             vkCmdEndRendering(cmd);
 
@@ -971,17 +1702,16 @@ void Pass_SunShadow(FrameContext& ctx)
     // with a fresh anchor-snapped VP → continuous (no cache tick). Cached caster queue. =====
     if (ps_r_vol && ps_r_vol_shadow && loaded) {
         const float kFogRange = 130.f;   // collect casters within this radius of the camera
-        if (!s_fogQValid || nVis != s_fogQVis
-            || Device.vCameraPosition.distance_to_sqr(s_fogQCamPos) > 8.f * 8.f) {
+        if (!gpuAT && (!s_fogQValid || nVis != s_fogQVis
+            || Device.vCameraPosition.distance_to_sqr(s_fogQCamPos) > 8.f * 8.f)) {
             s_fogQValid = true; s_fogQCamPos = Device.vCameraPosition; s_fogQVis = nVis;
             s_FogQueue.Clear();
+            VK_CPU_PROBE("ShadowQ/fog");
+            EnsureCasterList();
             Fmatrix identity; identity.identity();
-            for (IRenderVisual* iv : RImplementation.Visuals) {
-                if (!iv) continue;
-                auto* rv = static_cast<vkRender_Visual*>(iv);
-                const Fsphere& bs = rv->vis.sphere;
-                if (bs.R > 0.f && Device.vCameraPosition.distance_to(bs.P) > kFogRange + bs.R) continue;
-                rv->Submit(s_FogQueue, identity, 0.0f);
+            for (const CasterEntry& e : s_Casters) {
+                if (e.bs.R > 0.f && Device.vCameraPosition.distance_to(e.bs.P) > kFogRange + e.bs.R) continue;
+                e.rv->Submit(s_FogQueue, identity, 0.0f);
             }
             s_FogQueue.SortByKey();
         }
@@ -1012,9 +1742,12 @@ void Pass_SunShadow(FrameContext& ctx)
         // pointers = the crash). FlushDepth's alphaTestedOnly=gpuShadows skips
         // opaque when the GPU path covers them; reuse TGT_FAR's culled opaque set
         // (covers the fog box) drawn with the fresh fog VP.
-        s_FogQueue.FlushDepth(cmd, ShadowMap::GetFogShadowVP(), false, gpuShadows);
-        if (gpuShadows)
-            ShadowGPU::Draw(cmd, ShadowGPU::TGT_FAR, ShadowMap::GetFogShadowVP());
+        if (!gpuAT)   // GPU AT: the cutouts ride the reused TGT_FAR indirect slice below
+            s_FogQueue.FlushDepth(cmd, ShadowMap::GetFogShadowVP(), false, gpuShadows);
+        if (gpuShadows) {   // reuse whichever path culled TGT_FAR this session (stale-buffer safe)
+            if (clShadows) WorldGPU::DrawShadow(cmd, (u32)ShadowGPU::TGT_FAR, ShadowMap::GetFogShadowVP());
+            else           ShadowGPU::Draw(cmd, ShadowGPU::TGT_FAR, ShadowMap::GetFogShadowVP());
+        }
         if (RImplementation.Trees && RImplementation.Trees->IsBuilt())
             RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetFogShadowVP());
         vkCmdEndRendering(cmd);
@@ -1023,20 +1756,46 @@ void Pass_SunShadow(FrameContext& ctx)
         s_fogFirst = false;
     }
 
-    // ===== Dynamic light shadows (STEP 3b): 1 spot + 1 point cube per frame =====
+    // ===== Dynamic light shadows (STEP 3b): spot POOL + 1 point cube per frame =====
     // EnvLight::Update (Pass_World, later this frame) reads the same CollectFrame
     // result, so the gpu[] indices below match what the receivers see.
     const auto& FL = Lights::CollectFrame(Device.vCameraPosition);
-    const bool haveSpot  = FL.spotIdx  >= 0;
-    const bool havePoint = FL.pointIdx >= 0;
+    const bool haveSpots  = FL.poolCount  > 0;
+    const bool havePoints = FL.poolCountP > 0;
 
-    // Spot (flashlight) + point (campfire) dynamic shadow maps. Zone opened here
-    // and closed on BOTH exits below so the per-frame zone count is constant even
+    // Level unload: tile/cube owners are dangling identities of freed lights and
+    // the cached queues hold dead visuals — reset the whole pool.
+    if (!loaded) {
+        s_castersBuilt = false;
+        s_Casters.clear();          // drop the dangling visual pointers with the level
+        s_RainATItems.clear();
+        for (auto& T : s_spotTiles) {
+            T.owner = nullptr; T.staticValid = false; T.contentValid = false;
+            T.hadSkinned = false; T.qValid = false; T.queue.Clear();
+            T.lastSeen = 0; T.lastDyn = 0;
+        }
+        for (auto& C : s_pointCubes) {
+            C.owner = nullptr; C.contentValid = false; C.hadSkinned = false;
+            C.qValid = false; C.queue.Clear(); C.lastSeen = 0; C.lastDyn = 0;
+        }
+    }
+
+    // Spot pool + point (campfire) dynamic shadow maps. Zone opened here and
+    // closed on BOTH exits below so the per-frame zone count is constant even
     // when the early-out fires (profiler matches zones by open-order index).
     const int zDyn = VK::Prof::ZoneBegin(cmd, "Shadow/Dyn");
 
-    // Nothing selected and both maps already initialized → zero cost.
-    if (!haveSpot && !havePoint && !s_spotFirst && !s_pointFirst)
+    // Pool compaction: freed opaque statics only exist in the cluster pools —
+    // spot tiles / point-cube faces draw them via the shared kTargetDyn cluster
+    // target (cull→draw pairs serialize in the frame cmd); the cached CPU queue
+    // keeps the alpha-tested cutouts + anything outside the GPU set.
+    const bool gpuDynStatics = compacted && clShadows;
+    // GPU AT for the dyn maps too: the kTargetDyn slice covers the cutouts →
+    // the per-light static queues aren't rebuilt or flushed at all.
+    const bool gpuDynAT = gpuDynStatics && WorldGPU::ShadowATActive();
+
+    // Nothing selected and the targets already initialized → zero cost.
+    if (!haveSpots && !havePoints && !s_spotAtlasFirst && !s_pointFirst)
     {
         VK::Prof::ZoneEnd(cmd, zDyn);
         return;
@@ -1052,17 +1811,19 @@ void Pass_SunShadow(FrameContext& ctx)
             return false;
         q.Clear();
         if (loaded) {
+            EnsureCasterList();
             Fmatrix identity; identity.identity();
-            for (IRenderVisual* iv : RImplementation.Visuals) {
-                if (!iv) continue;
-                auto* rv = static_cast<vkRender_Visual*>(iv);
-                const Fsphere& bs = rv->vis.sphere;
+            for (const CasterEntry& e : s_Casters) {
+                const Fsphere& bs = e.bs;
                 if (bs.R > maxCasterR) continue;
                 if (bs.R > 0.f) {
-                    const float rr = range + bs.R;
+                    // +1 m: qPos may drift up to 1 m before the next re-collect
+                    // (the cache-keep test above) — without the margin a walking
+                    // light misses casters entering the sphere in that window.
+                    const float rr = range + bs.R + 1.0f;
                     if (p.distance_to_sqr(bs.P) > rr * rr) continue;
                 }
-                rv->Submit(q, identity, 0.0f);
+                e.rv->Submit(q, identity, 0.0f);
             }
             q.SortByKey();
         }
@@ -1070,119 +1831,443 @@ void Pass_SunShadow(FrameContext& ctx)
         return true;
     };
 
-    // One depth render into a dynamic shadow target (spot map or a cube face).
-    // statics == nullptr → skinned casters only (point cube: NPC shadows are the
-    // point; statics there cost terrain×6 faces for near-zero visual gain).
-    // withTrees: also rasterize tree/bush casters (spot map only — headlight and
-    // flashlight beams must be cut by crowns; the cube's 6 faces aren't worth it).
-    auto renderDepthTarget = [&](VkImageView view, u32 size, const Fmatrix& vp, RenderQueue* statics,
-                                 const Fvector& lightPos, float lightRange, bool drawCasters,
-                                 bool withTrees = false) {
+    // One depth render into a POINT-cube face. STATIC/DYNAMIC split: the static
+    // pass (statics=&queue, skinned/grass off, clear=true) fills the cached STATIC
+    // cube; the dynamic pass (statics=null, skinned/grass on, clear=false) overlays
+    // NPC + culled grass on TOP of a copy of the static face. This is what stopped
+    // an NPC/grass refresh from re-rastering all 6 static faces (the ~2.5ms DynPoint).
+    const u32 kPointSz = ShadowMap::PointSize();
+    auto renderPointFace = [&](VkImageView view, const Fmatrix& vp, RenderQueue* statics,
+                               const Fvector& lightPos, float lightRange,
+                               bool clear, bool doSkinned, bool drawGrass, int grassCullSlot) {
         VkRenderingAttachmentInfo dAtt{};
         dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         dAtt.imageView               = view;
         dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        dAtt.loadOp                  = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
         dAtt.clearValue.depthStencil = { 1.0f, 0 };
 
         VkRenderingInfo ri{};
         ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent = { size, size };
+        ri.renderArea.extent = { kPointSz, kPointSz };
         ri.layerCount        = 1;
         ri.pDepthAttachment  = &dAtt;
         vkCmdBeginRendering(cmd, &ri);
 
-        if (drawCasters) {
-            VkViewport vp2{ 0.f, (float)size, (float)size, -(float)size, 0.f, 1.f };
-            vkCmdSetViewport(cmd, 0, 1, &vp2);
-            VkRect2D sc{ {0,0}, { size, size } };
-            vkCmdSetScissor(cmd, 0, 1, &sc);
-            vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
-            if (statics) statics->FlushDepth(cmd, vp);
-            Skinned_RenderShadow(cmd, vp, &lightPos, lightRange);
-            if (withTrees && RImplementation.Trees && RImplementation.Trees->IsReady()) {
-                // Frustum override path of RenderDepth: culls trees against the
-                // SPOT frustum instead of the sun boxes.
-                CFrustum fr;
-                Fmatrix vpCopy = vp;   // CreateFromMatrix takes a non-const ref
-                fr.CreateFromMatrix(vpCopy, FRUSTUM_P_ALL);
-                RImplementation.Trees->RenderDepth(cmd, vp, -1, &fr);
+        VkViewport vp2{ 0.f, (float)kPointSz, (float)kPointSz, -(float)kPointSz, 0.f, 1.f };
+        vkCmdSetViewport(cmd, 0, 1, &vp2);
+        VkRect2D sc{ {0,0}, { kPointSz, kPointSz } };
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
+        if (statics) {
+            // gpuDynStatics: opaque statics via the kTargetDyn cluster slice the
+            // caller culled for this face; the CPU queue keeps the AT cutouts —
+            // unless gpuDynAT covers those through the same slice too.
+            if (!gpuDynAT) {
+                // Per-face frustum for the statics too: the queue is a sphere collect,
+                // each face sees ~1/6 of it (same lever as the skinned cull below).
+                CFrustum fr; Fmatrix vpCopy = vp; fr.CreateFromMatrix(vpCopy, FRUSTUM_P_ALL);
+                statics->FlushDepth(cmd, vp, false, gpuDynStatics, false, &fr);
             }
+            if (gpuDynStatics)
+                WorldGPU::DrawShadow(cmd, WorldGPU::kTargetDyn, vp, /*skipTerrain*/true);
+        }
+        if (doSkinned) {
+            // Per-face frustum: an NPC by the fire sits in 1-2 of the 6 cube faces,
+            // but the sphere cull alone re-drew it into all six (the ~2 ms DynPoint
+            // remainder after the static/dynamic split). Cull it to the faces it's in.
+            CFrustum fr; Fmatrix vpCopy = vp; fr.CreateFromMatrix(vpCopy, FRUSTUM_P_ALL);
+            Skinned_RenderShadow(cmd, vp, &lightPos, lightRange, &fr);
+        }
+        if (drawGrass) {
+            if (grassCullSlot >= 0)
+                GrassCull::Draw(cmd, vp, lightPos, lightRange, u32(grassCullSlot));
+            else
+                DrawGrassSpotCasters(cmd, vp, lightPos, lightRange);
         }
         vkCmdEndRendering(cmd);
     };
 
-    // --- SPOT (flashlight): re-rendered while selected (it moves with the player);
-    // the static-caster queue only rebuilds when the player walked > 1m.
-    if (haveSpot || s_spotFirst)
+    // --- SPOT POOL: assign atlas tiles to this frame's pooled lights (ownership
+    // persists across frames → cached tiles survive), then re-render only the
+    // tiles that actually changed. A static lamp costs its tile ONCE; the
+    // flashlight (moves every frame) re-renders as before.
+    // Sub-zone so a fat Shadow/Dyn in the [VK Perf] log attributes itself:
+    // spot tiles (lamps/beams/flashlight) vs point cubes (campfires) below.
+    const int zDynSpot = VK::Prof::ZoneBegin(cmd, "Shadow/DynSpot");
     {
-        ImageBarrier(cmd, ShadowMap::GetSpotImage(),
-                     s_spotFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                     VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-        s_spotFirst = false;
-
-        if (haveSpot) {
-            ShadowMap::ComputeSpotVP(FL.spotPos, FL.spotDir, FL.spotRange, FL.spotCone);
-            // Flashlight: keep the terrain-excluding cap (wide range, terrain is a
-            // receiver here, not a blocker) — see kSpotCasterMaxR.
-            refreshStaticQueue(s_SpotQueue, s_spotQValid, s_spotQPos, s_spotQRange, s_spotQVis,
-                               FL.spotPos, FL.spotRange, kSpotCasterMaxR);
-        } else {
-            s_spotQValid = false;
+        for (auto& t : s_giTile) t = -1;
+        const u32 frame = Device.dwFrame;
+        int assign[Lights::kMaxShadowSpots];
+        // Pass 1: keep tiles already owned by a pooled light.
+        for (u32 k = 0; k < FL.poolCount; ++k) {
+            assign[k] = -1;
+            const void* owner = FL.src[FL.poolGi[k]];
+            for (u32 t = 0; t < Lights::kMaxShadowSpots; ++t)
+                if (s_spotTiles[t].owner == owner && s_spotTiles[t].lastSeen != frame) {
+                    assign[k] = int(t); s_spotTiles[t].lastSeen = frame; break;
+                }
         }
-        renderDepthTarget(ShadowMap::GetSpotView(), ShadowMap::SpotSize(),
-                          ShadowMap::GetSpotVP(), &s_SpotQueue, FL.spotPos, FL.spotRange, haveSpot,
-                          /*withTrees=*/true);
+        // Pass 2: newcomers get the least-recently-used remaining tiles.
+        for (u32 k = 0; k < FL.poolCount; ++k) {
+            if (assign[k] >= 0) continue;
+            int best = -1; u32 bestSeen = 0xFFFFFFFFu;
+            for (u32 t = 0; t < Lights::kMaxShadowSpots; ++t) {
+                if (s_spotTiles[t].lastSeen == frame) continue;   // taken this frame
+                if (s_spotTiles[t].lastSeen < bestSeen) { bestSeen = s_spotTiles[t].lastSeen; best = int(t); }
+            }
+            if (best < 0) break;
+            SpotTile& T = s_spotTiles[best];
+            T.owner = nullptr; T.staticValid = false; T.contentValid = false;
+            T.qValid = false;   // evicted — everything stale
+            T.lastSeen = frame;
+            assign[k] = best;
+        }
 
-        // --- Spot BEAM map: clean spot map copy + grass casters on top. The
-        // visible cone / fog sample THIS ONE (blades cut the beam); surfaces
-        // keep the clean map — one shared map let dense grass blanket the
-        // ground and eat the headlight's light pool.
+        // Camera frustum for the dynamic-LOD visibility gate: a light whose cone
+        // volume is entirely off-screen freezes its NPC/grass overlays (the
+        // cached static tile keeps shadowing anything that IS in view of it).
+        CFrustum camFrustum;
+        { Fmatrix mvp = Device.mFullTransform;   // CreateFromMatrix takes a non-const ref
+          camFrustum.CreateFromMatrix(mvp, FRUSTUM_P_LRTB | FRUSTUM_P_FAR); }
+
+        // Per-tile work decision + VP refresh. THREE layers (VSM-style split):
+        //   STATIC = statics+trees (cached until the light MOVES)
+        //   CLEAN  = static copy + NPC overlay (recomposited on an LOD cadence)
+        //   BEAM   = clean copy + grass (near, in-view, for wind animation)
+        bool needStatic[Lights::kMaxShadowSpots] = {};
+        bool needClean[Lights::kMaxShadowSpots]  = {};
+        bool needBeam[Lights::kMaxShadowSpots]   = {};
+        bool anyStatic = false, anyClean = false, anyBeam = false;
+        const Fvector eyePos = Device.vCameraPosition;
+        for (u32 k = 0; k < FL.poolCount; ++k) {
+            if (assign[k] < 0) continue;
+            const u32 t  = u32(assign[k]);
+            SpotTile&  T = s_spotTiles[t];
+            const int gi = FL.poolGi[k];
+            if (gi >= 0 && gi < int(Lights::kMaxLights)) s_giTile[gi] = int(t);
+            const vkLight* l = FL.src[gi];
+            const Fvector lpos = l->pos;
+            Fvector ldir = l->dir;
+            if (ldir.magnitude() < 1e-5f) ldir.set(0.f, 0.f, 1.f);
+            ldir.normalize();
+
+            // STATIC layer: only when the light itself moved / changed owner.
+            // Thresholds are FLOAT-NOISE guards, not motion deadbands: a truly
+            // static lamp repeats bit-identical pos/dir so the cache holds, while
+            // anything genuinely animated (NPC headlamp swaying with the head
+            // bone) re-renders every frame like the player flashlight. The old
+            // 2 cm / ~0.6° band left slow head-sway INSIDE it → stale map.
+            const bool newOwner = (T.owner != (const void*)l);
+            const bool moved = newOwner
+                || T.pos.distance_to_sqr(lpos) > 4e-6f        // 2 mm
+                || T.dir.dotproduct(ldir) < 0.999999f         // ~0.08°
+                || _abs(T.range - l->range) > 0.01f
+                || _abs(T.cone  - l->cone)  > 0.001f;
+
+            // Visibility + distance LOD. The cone bound is a sphere at the light
+            // of radius = range (conservative). Off-screen → freeze; near → every
+            // frame; mid/far → staggered cadence.
+            const bool  visible = camFrustum.testSphere_dirty(lpos, l->range);
+            const float dist    = eyePos.distance_to(lpos);
+            u32 cadence = (dist < 30.f) ? 1u : (dist < 70.f ? 4u : 12u);
+            const bool dynDue = ((frame + t) % cadence) == 0u;
+
+            // Moving-light LOD: a near light that moved re-renders its STATIC
+            // layer every frame (the honest headlamp cost); farther out the
+            // refresh rides the same dyn cadence, and off-screen it freezes.
+            // Safe against wobble because VP + content always update TOGETHER.
+            needStatic[t] = !T.staticValid || newOwner || (moved && visible && dynDue);
+
+            // The sampling VP must stay glued to the depth CONTENT: refresh it
+            // only when the tile re-renders. Setting it every frame while the
+            // tile cached made receivers project with a matrix the map was never
+            // rendered with — a headlamp drifting inside the deadband wobbled its
+            // whole shadow (drift + snap-back on every threshold trip).
+            if (needStatic[t])
+                ShadowMap::SetSpotTileVP(t, ShadowMap::ComputeSpotVPFor(lpos, ldir, l->range, l->cone));
+            if (gi == FL.spotIdx) ShadowMap::SetSpotVP(ShadowMap::GetSpotTileVP(t));   // cookie projection matrix
+
+            const bool skinnedNow = visible && Skinned_AnyCasterInSphere(lpos, l->range);
+            // Recomposite CLEAN when the static layer changed, or (visible) an NPC
+            // is due for a refresh, or an NPC that WAS there has left (clear it).
+            needClean[t] = needStatic[t]
+                || (!T.contentValid)
+                || (visible && dynDue && (skinnedNow || T.hadSkinned));
+            // BEAM: whenever clean recomposited, plus in-view lights on a distance-
+            // tiered cadence so the SSFX wind keeps animating the grass cutouts.
+            // NOT every frame: a beam refresh = tile copy + a full-grass VS pass,
+            // and with several evening lamps pooled this was the single biggest
+            // Shadow/Dyn cost (~4.4ms, 2026-07-04 profile). Wind sway at 20 m+
+            // reads through coarse tile texels + penumbra — half/quarter rate is
+            // invisible there; only near beams keep the every-frame animation.
+            const u32 beamCad = (dist < 20.f) ? 1u : (dist < 35.f ? 2u : 4u);
+            needBeam[t] = needClean[t]
+                || (ps_r_spot_grass && visible && dist < 50.f && ((frame + t) % beamCad) == 0u);
+
+            anyStatic |= needStatic[t];
+            anyClean  |= needClean[t];
+            anyBeam   |= needBeam[t];
+            if (needStatic[t]) {
+                T.owner = l; T.pos = lpos; T.dir = ldir;
+                T.range = l->range; T.cone = l->cone;
+                T.staticValid = true;
+            }
+            if (needClean[t]) {
+                T.hadSkinned   = skinnedNow;
+                T.contentValid = true;
+                T.lastDyn      = frame;
+            }
+        }
+
+        const u32 tilePx = ShadowMap::SpotSize();
+        const u32 ax     = ShadowMap::SpotAtlasX();
+        auto tileRect = [&](u32 t) {
+            return VkRect2D{ { s32((t % ax) * tilePx), s32((t / ax) * tilePx) }, { tilePx, tilePx } };
+        };
+        const VkExtent2D atlasExt{ tilePx * ax, tilePx * ShadowMap::SpotAtlasY() };
+        auto setTileViewport = [&](const VkRect2D& r) {
+            VkViewport v{ float(r.offset.x), float(r.offset.y) + float(tilePx),
+                          float(tilePx), -float(tilePx), 0.f, 1.f };
+            vkCmdSetViewport(cmd, 0, 1, &v);
+        };
+
+        // 1) STATIC atlas: re-raster only the tiles whose light moved (statics +
+        // trees, NO NPCs). This is the layer NPC movement no longer disturbs.
+        // gpuDynStatics: the opaque statics come from the cluster kTargetDyn
+        // target, whose cull is a compute dispatch that can't live inside a
+        // render pass — so each tile gets its own cull → begin/load → draw →
+        // end sequence (rare: tiles are cached; only the flashlight re-renders
+        // per frame). Without it the original single-pass path is kept intact.
+        if (anyStatic || s_spotAtlasFirst)
         {
-            const u32 sz = ShadowMap::SpotSize();
-            ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            ImageBarrier(cmd, ShadowMap::GetSpotStaticImage(),
+                         s_spotAtlasFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            VkRenderingAttachmentInfo dAtt{};
+            dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            dAtt.imageView               = ShadowMap::GetSpotStaticView();
+            dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            dAtt.loadOp                  = s_spotAtlasFirst ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                           : VK_ATTACHMENT_LOAD_OP_LOAD;   // keep cached tiles
+            dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
+            dAtt.clearValue.depthStencil = { 1.0f, 0 };
+            VkRenderingInfo ri{};
+            ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.extent = atlasExt;
+            ri.layerCount        = 1;
+            ri.pDepthAttachment  = &dAtt;
+            // WAW guard between the per-tile depth passes (disjoint tiles, but
+            // same subresource): previous pass's depth writes → next pass.
+            auto depthPassBarrier = [&]() {
+                VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                     0, 1, &mb, 0, nullptr, 0, nullptr);
+            };
+            if (gpuDynStatics && s_spotAtlasFirst) {
+                // First use under per-tile rendering: one clear-only pass so the
+                // per-tile LOAD ops below always see defined content.
+                vkCmdBeginRendering(cmd, &ri);
+                vkCmdEndRendering(cmd);
+                dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            }
+            if (!gpuDynStatics)
+                vkCmdBeginRendering(cmd, &ri);
+            bool firstTilePass = true;
+            for (u32 k = 0; k < FL.poolCount; ++k) {
+                if (assign[k] < 0) continue;
+                const u32 t = u32(assign[k]);
+                if (!needStatic[t]) continue;
+                SpotTile& T = s_spotTiles[t];
+                const VkRect2D r = tileRect(t);
+                const Fmatrix& vp = ShadowMap::GetSpotTileVP(t);
+                if (!gpuDynAT)   // fully-GPU statics: the tile flush below is skipped
+                    refreshStaticQueue(T.queue, T.qValid, T.qPos, T.qRange, T.qVis,
+                                       T.pos, T.range, kSpotCasterMaxR);
+                if (gpuDynStatics) {
+                    // Cluster cull for this tile's VP (outside the render pass);
+                    // error budget = the tile's texel size at the cone's far end.
+                    const u32   tgt   = WorldGPU::kTargetDyn;
+                    const float texel = 2.f * T.range * tanf(T.cone * 0.5f) / _max(1.f, (float)tilePx);
+                    WorldGPU::CullShadow(cmd, &tgt, &vp, &texel, 1);
+                    if (!firstTilePass || s_spotAtlasFirst) depthPassBarrier();
+                    vkCmdBeginRendering(cmd, &ri);
+                }
+                firstTilePass = false;
+                if (!s_spotAtlasFirst) {   // whole atlas cleared on first use
+                    VkClearAttachment ca{};
+                    ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                    ca.clearValue.depthStencil = { 1.0f, 0 };
+                    VkClearRect cr{ r, 0, 1 };
+                    vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+                }
+                setTileViewport(r);
+                vkCmdSetScissor(cmd, 0, 1, &r);
+                vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
+                // Cone frustum: the cached queue is a range-SPHERE collect, but
+                // the spot cone is a small slice of that sphere — cull statics
+                // (and trees) to it. Same lever as the point-cube per-face cull.
+                CFrustum fr;
+                { Fmatrix vpCopy = vp; fr.CreateFromMatrix(vpCopy, FRUSTUM_P_ALL); }
+                if (!gpuDynAT)   // GPU AT: the cutouts ride the indirect draw below
+                    T.queue.FlushDepth(cmd, vp, false, gpuDynStatics, false, &fr);
+                if (gpuDynStatics)
+                    WorldGPU::DrawShadow(cmd, WorldGPU::kTargetDyn, vp, /*skipTerrain*/true);
+                if (RImplementation.Trees && RImplementation.Trees->IsReady())
+                    RImplementation.Trees->RenderDepth(cmd, vp, -1, &fr);
+                if (gpuDynStatics)
+                    vkCmdEndRendering(cmd);
+            }
+            if (!gpuDynStatics)
+                vkCmdEndRendering(cmd);
+            ImageBarrier(cmd, ShadowMap::GetSpotStaticImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-            ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(),
-                         s_spotBeamFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        }
+
+        // Region copy helper (static→clean or clean→beam) for the refreshed tiles.
+        auto copyTiles = [&](VkImage src, VkImage dst, const bool* mask) {
+            VkImageCopy regions[Lights::kMaxShadowSpots];
+            u32 nRegions = 0;
+            if (s_spotAtlasFirst) {
+                VkImageCopy& rg = regions[nRegions++]; rg = {};
+                rg.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+                rg.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+                rg.extent         = { atlasExt.width, atlasExt.height, 1 };
+            } else {
+                for (u32 k = 0; k < FL.poolCount; ++k) {
+                    if (assign[k] < 0 || !mask[u32(assign[k])]) continue;
+                    const VkRect2D r = tileRect(u32(assign[k]));
+                    VkImageCopy& rg = regions[nRegions++]; rg = {};
+                    rg.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+                    rg.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+                    rg.srcOffset      = { r.offset.x, r.offset.y, 0 };
+                    rg.dstOffset      = { r.offset.x, r.offset.y, 0 };
+                    rg.extent         = { r.extent.width, r.extent.height, 1 };
+                }
+            }
+            if (nRegions)
+                vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nRegions, regions);
+        };
+
+        // 2) CLEAN atlas: copy the (cached) static tile, then draw the NPC overlay
+        // on top. Static rasterization is NOT repeated — that's the split's win.
+        if (anyClean || s_spotAtlasFirst)
+        {
+            ImageBarrier(cmd, ShadowMap::GetSpotImage(),
+                         s_spotAtlasFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-            s_spotBeamFirst = false;
-            VkImageCopy region{};
-            region.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
-            region.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
-            region.extent         = { sz, sz, 1 };
-            vkCmdCopyImage(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            copyTiles(ShadowMap::GetSpotStaticImage(), ShadowMap::GetSpotImage(), needClean);
+            ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            VkRenderingAttachmentInfo dAtt{};
+            dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            dAtt.imageView   = ShadowMap::GetSpotView();
+            dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;   // NPC ON TOP of the static copy
+            dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo ri{};
+            ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.extent = atlasExt;
+            ri.layerCount        = 1;
+            ri.pDepthAttachment  = &dAtt;
+            vkCmdBeginRendering(cmd, &ri);
+            for (u32 k = 0; k < FL.poolCount; ++k) {
+                if (assign[k] < 0) continue;
+                const u32 t = u32(assign[k]);
+                if (!needClean[t]) continue;
+                SpotTile& T = s_spotTiles[t];
+                if (!T.hadSkinned) continue;   // clean tile = pure static copy, no NPC to draw
+                const VkRect2D r = tileRect(t);
+                setTileViewport(r);
+                vkCmdSetScissor(cmd, 0, 1, &r);
+                vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
+                // Cone cull (mirrors the point-face fix): an NPC beside/behind
+                // the lamp sits inside the range sphere but outside the cone.
+                CFrustum fr;
+                { Fmatrix vpc = ShadowMap::GetSpotTileVP(t); fr.CreateFromMatrix(vpc, FRUSTUM_P_ALL); }
+                Skinned_RenderShadow(cmd, ShadowMap::GetSpotTileVP(t), &T.pos, T.range, &fr);
+            }
+            vkCmdEndRendering(cmd);
+            ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         (anyBeam || s_spotAtlasFirst) ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                       : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+
+        // GPU grass cull (Phase 1): compact the beam tiles' blades ONCE, up front
+        // (compute, before the render pass), so each per-tile beam draw becomes a
+        // few-hundred-instance indirect instead of a full grass VS pass. Falls back
+        // to brute force when r_grass_cull is off or the cull failed to init.
+        int  beamSlot[Lights::kMaxShadowSpots]; for (auto& s : beamSlot) s = -1;
+        bool beamCulled = false;
+        if (ps_r_spot_grass && ps_r_grass_cull && (anyBeam || s_spotAtlasFirst) && GrassCull::Ensure()) {
+            Fvector4 lights[GrassCull::kMaxLights]; u32 nL = 0;
+            for (u32 k = 0; k < FL.poolCount; ++k) {
+                if (assign[k] < 0) continue;
+                const u32 t = u32(assign[k]);
+                if (!needBeam[t] || nL >= GrassCull::kMaxLights) continue;
+                const SpotTile& T = s_spotTiles[t];
+                lights[nL].set(T.pos.x, T.pos.y, T.pos.z, T.range + 2.0f);   // +2 m = the grass VS cull margin
+                beamSlot[t] = int(nL);
+                ++nL;
+            }
+            if (nL > 0) { GrassCull::CullLights(cmd, lights, nL); beamCulled = true; }
+        }
+
+        // 3) BEAM atlas: copy the clean tile + grass on top (in-view near lights).
+        if (anyBeam || s_spotAtlasFirst)
+        {
+            if (!anyClean && !s_spotAtlasFirst)
+                ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(),
+                         s_spotAtlasFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            copyTiles(ShadowMap::GetSpotImage(), ShadowMap::GetSpotBeamImage(), needBeam);
             ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
             ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-
             VkRenderingAttachmentInfo dAtt{};
-            dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            dAtt.imageView               = ShadowMap::GetSpotBeamView();
-            dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            dAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_LOAD;   // grass ON TOP of the copy
-            dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
+            dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            dAtt.imageView   = ShadowMap::GetSpotBeamView();
+            dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;   // grass ON TOP of the copy
+            dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
             VkRenderingInfo ri{};
             ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            ri.renderArea.extent = { sz, sz };
+            ri.renderArea.extent = atlasExt;
             ri.layerCount        = 1;
             ri.pDepthAttachment  = &dAtt;
             vkCmdBeginRendering(cmd, &ri);
-            if (haveSpot) {
-                VkViewport vp2{ 0.f, (float)sz, (float)sz, -(float)sz, 0.f, 1.f };
-                vkCmdSetViewport(cmd, 0, 1, &vp2);
-                VkRect2D sc{ {0,0}, { sz, sz } };
-                vkCmdSetScissor(cmd, 0, 1, &sc);
+            for (u32 k = 0; k < FL.poolCount; ++k) {
+                if (assign[k] < 0) continue;
+                const u32 t = u32(assign[k]);
+                if (!needBeam[t]) continue;
+                SpotTile& T = s_spotTiles[t];
+                const VkRect2D r = tileRect(t);
+                setTileViewport(r);
+                vkCmdSetScissor(cmd, 0, 1, &r);
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
-                DrawGrassSpotCasters(cmd, ShadowMap::GetSpotVP(), FL.spotPos, FL.spotRange);
+                if (ps_r_spot_grass) {
+                    if (beamCulled && beamSlot[t] >= 0)
+                        GrassCull::Draw(cmd, ShadowMap::GetSpotTileVP(t), T.pos, T.range, u32(beamSlot[t]));
+                    else
+                        DrawGrassSpotCasters(cmd, ShadowMap::GetSpotTileVP(t), T.pos, T.range);
+                }
             }
             vkCmdEndRendering(cmd);
             ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
+        s_spotAtlasFirst = false;
     }
+    VK::Prof::ZoneEnd(cmd, zDynSpot);
 
     // --- POINT (campfire / lamp) cube: STATIC occluders + skinned casters. The
     // statics (floors, walls, AND terrain — no size cap here) are what stop the
@@ -1192,39 +2277,234 @@ void Pass_SunShadow(FrameContext& ctx)
     // unlike the wide flashlight where it's a receiver. Re-render while an NPC is
     // (or was) in radius OR when the static set changed (light picked / moved
     // >1 m); otherwise the cached cube keeps occluding for free.
+    // POINT POOL: a cube per pooled campfire/lamp (cube ARRAY), same LRU cache +
+    // distance/visibility LOD as the spot pool. A static fire with no NPCs costs
+    // its cube ONCE; a fire with NPCs re-renders on a distance cadence; an
+    // off-screen fire freezes. (Phase A: whole-cube re-render, no static/dynamic
+    // split — cube copies ×6 faces aren't worth it until profiling says so.)
+    const int zDynPoint = VK::Prof::ZoneBegin(cmd, "Shadow/DynPoint");
     {
-        bool staticChanged = false;
-        if (havePoint)
-            // Statics only (walls/floors) — NOT terrain. Rendering terrain chunks into
-            // 6 cube faces was a per-frame SPIKE that made the sun cascades "tick".
-            // Under-terrain (earth) lamps are occluded by the rain-map heightfield
-            // (r_light_occ) in the receivers instead; building floors still occlude here.
-            staticChanged = refreshStaticQueue(s_PointQueue, s_pointQValid, s_pointQPos, s_pointQRange,
-                                               s_pointQVis, FL.pointPos, FL.pointRange, kSpotCasterMaxR);
-        else
-            s_pointQValid = false;
+        const u32 nLayers = 6u * Lights::kMaxShadowPoints;
+        for (auto& g : s_giCube) g = -1;
+        const u32 frame = Device.dwFrame;
 
-        const bool anySkinned  = havePoint && Skinned_AnyCasterInSphere(FL.pointPos, FL.pointRange);
-        const bool renderPoint = havePoint && (anySkinned || s_pointHadSkinned || staticChanged);
-        if (renderPoint || s_pointFirst)
+        // Tile assignment (2-pass LRU, mirrors the spot pool).
+        int assignP[Lights::kMaxShadowPoints];
+        for (u32 k = 0; k < FL.poolCountP; ++k) {
+            assignP[k] = -1;
+            const void* owner = FL.src[FL.poolGiP[k]];
+            for (u32 t = 0; t < Lights::kMaxShadowPoints; ++t)
+                if (s_pointCubes[t].owner == owner && s_pointCubes[t].lastSeen != frame) {
+                    assignP[k] = int(t); s_pointCubes[t].lastSeen = frame; break;
+                }
+        }
+        for (u32 k = 0; k < FL.poolCountP; ++k) {
+            if (assignP[k] >= 0) continue;
+            int best = -1; u32 bestSeen = 0xFFFFFFFFu;
+            for (u32 t = 0; t < Lights::kMaxShadowPoints; ++t) {
+                if (s_pointCubes[t].lastSeen == frame) continue;
+                if (s_pointCubes[t].lastSeen < bestSeen) { bestSeen = s_pointCubes[t].lastSeen; best = int(t); }
+            }
+            if (best < 0) break;
+            PointCube& C = s_pointCubes[best];
+            C.owner = nullptr; C.staticValid = false; C.contentValid = false; C.qValid = false;
+            C.lastSeen = frame;
+            assignP[k] = best;
+        }
+
+        CFrustum camFrustumP;
+        { Fmatrix mvp = Device.mFullTransform;
+          camFrustumP.CreateFromMatrix(mvp, FRUSTUM_P_LRTB | FRUSTUM_P_FAR); }
+
+        // Static/dynamic cube split (mirrors the spot pool + sun cascades). A near
+        // fire's ~2.5 ms DynPoint was 6 STATIC faces re-rastered EVERY time an NPC
+        // moved or grass swayed (A/B confirmed grass itself was noise). Now the
+        // statics are cached in a STATIC cube; an NPC/grass refresh copies that +
+        // draws only the dynamic overlay (skinned + culled grass).
+        bool needStatic[Lights::kMaxShadowPoints] = {};   // re-raster the 6 static faces (fire/casters moved)
+        bool needDyn[Lights::kMaxShadowPoints]    = {};    // recomposite combined = static copy + NPC/grass
+        bool grassCube[Lights::kMaxShadowPoints]  = {};
+        bool anyStatic = false, anyDyn = false;
+        const Fvector eyeP = Device.vCameraPosition;
+        for (u32 k = 0; k < FL.poolCountP; ++k) {
+            if (assignP[k] < 0) continue;
+            const u32 t  = u32(assignP[k]);
+            PointCube& C = s_pointCubes[t];
+            const int gi = FL.poolGiP[k];
+            if (gi >= 0 && gi < int(Lights::kMaxLights)) s_giCube[gi] = int(t);
+            const vkLight* l = FL.src[gi];
+            const Fvector lpos = l->pos;
+            // EFFECTIVE range = the boosted gpu[] range (r_point_range) so the cube's
+            // far plane matches what the receivers light with — a bigger fire lights
+            // AND shadows farther in one consistent radius.
+            const float lrange = FL.gpu[gi].pos[3];
+
+            const bool newOwner = (C.owner != (const void*)l);
+            const bool moved = newOwner || C.pos.distance_to_sqr(lpos) > 0.0004f
+                            || _abs(C.range - lrange) > 0.01f;
+            // Static-caster queue for this cube (statics/walls, NOT terrain — the
+            // r_light_occ heightfield handles under-terrain leak in the receivers).
+            // gpuDynAT: no CPU queue, but keep the visuals-count stamp so level
+            // streaming still re-renders the cube when new geometry loads in.
+            bool staticChanged;
+            if (gpuDynAT) {
+                staticChanged = C.qVis != nVis;
+                C.qVis = nVis; C.qValid = false;   // flip to CPU later → full rebuild
+            } else {
+                staticChanged = refreshStaticQueue(C.queue, C.qValid, C.qPos, C.qRange, C.qVis,
+                                                   lpos, lrange, kSpotCasterMaxR);
+            }
+            // STATIC layer: only when the fire itself moved or its casters changed.
+            needStatic[t] = !C.staticValid || moved || staticChanged;
+
+            const bool visible = camFrustumP.testSphere_dirty(lpos, lrange);
+            const float dist   = eyeP.distance_to(lpos);
+            u32 cadence = (dist < 20.f) ? 1u : (dist < 50.f ? 4u : 12u);
+            const bool dynDue = ((frame + t) % cadence) == 0u;
+            const bool skinnedNow = visible && Skinned_AnyCasterInSphere(lpos, lrange);
+            // Grass dapples (r_point_grass): near in-view fires get the detail
+            // manager's blades into their cube — swaying grass around a campfire
+            // cuts its light like the spot BEAM atlas. (Grass instances only exist
+            // near the camera, hence the 40 m gate.) Grass runs on its OWN cadence
+            // at HALF the NPC rate; firelight flicker masks the half-rate sway.
+            grassCube[t] = ps_r_point_grass && visible && dist < 40.f;
+            const bool grassDue = ((frame + t) % (cadence * 2u)) == 0u;
+
+            // DYNAMIC recomposite: static changed, or (visible) an NPC due, or an
+            // NPC that WAS there left, or a grass sway is due. This copies the cached
+            // static + overlays the dynamics — it NO LONGER re-rasters the statics.
+            needDyn[t] = needStatic[t] || !C.contentValid
+                      || (visible && dynDue && (skinnedNow || C.hadSkinned))
+                      || (grassCube[t] && grassDue);
+            anyStatic |= needStatic[t];
+            anyDyn    |= needDyn[t];
+            if (needStatic[t]) { C.owner = l; C.pos = lpos; C.range = lrange; C.staticValid = true; }
+            if (needDyn[t])    { C.hadSkinned = skinnedNow; C.contentValid = true; C.lastDyn = frame; }
+            // Diagnostic (r_light_debug): why a fire near the player does/doesn't
+            // cast — is it pooled, visible, does the pass see an NPC in range?
+            if (ps_r_light_debug && dist < 25.f) {
+                static u32 s_pdLog = 0;
+                if (Device.dwTimeGlobal - s_pdLog > 2000) { s_pdLog = Device.dwTimeGlobal;
+                    Msg("[VK PointPool] cube=%u gi=%d pos=(%.0f,%.0f,%.0f) range=%.1f dist=%.1f vis=%d npc=%d static=%d dyn=%d",
+                        t, gi, lpos.x, lpos.y, lpos.z, lrange, dist, visible ? 1 : 0,
+                        skinnedNow ? 1 : 0, needStatic[t] ? 1 : 0, needDyn[t] ? 1 : 0);
+                }
+            }
+        }
+
+        // GPU grass cull (Phase 1): one sphere cull per campfire covers ALL 6 of
+        // its cube faces — instead of 6 full grass VS passes per fire we compact
+        // once and draw a few-hundred-instance indirect ×6. Compute, before the
+        // render pass. Falls back to brute force when off / not ready.
+        int  cubeSlot[Lights::kMaxShadowPoints]; for (auto& s : cubeSlot) s = -1;
+        bool cubeCulled = false;
+        if (ps_r_point_grass && ps_r_grass_cull && (anyDyn || s_pointFirst) && GrassCull::Ensure()) {
+            Fvector4 lights[GrassCull::kMaxLights]; u32 nL = 0;
+            for (u32 k = 0; k < FL.poolCountP; ++k) {
+                if (assignP[k] < 0) continue;
+                const u32 t = u32(assignP[k]);
+                if (!needDyn[t] || !grassCube[t] || nL >= GrassCull::kMaxLights) continue;
+                const PointCube& C = s_pointCubes[t];
+                lights[nL].set(C.pos.x, C.pos.y, C.pos.z, C.range + 2.0f);   // +2 m = the grass VS cull margin
+                cubeSlot[t] = int(nL);
+                ++nL;
+            }
+            if (nL > 0) { GrassCull::CullLights(cmd, lights, nL); cubeCulled = true; }
+        }
+
+        // 1) STATIC cube faces: re-raster only cubes whose fire/casters moved
+        //    (statics only, no NPC/grass) — the cached copy source.
+        if (anyStatic || s_pointStaticFirst)
+        {
+            ImageBarrier(cmd, ShadowMap::GetPointStaticImage(),
+                         s_pointStaticFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, nLayers);
+            s_pointStaticFirst = false;
+            for (u32 k = 0; k < FL.poolCountP; ++k) {
+                if (assignP[k] < 0) continue;
+                const u32 t = u32(assignP[k]);
+                if (!needStatic[t]) continue;
+                PointCube& C = s_pointCubes[t];
+                for (u32 f = 0; f < 6; ++f) {
+                    const Fmatrix faceVP = ShadowMap::ComputePointFaceVP(C.pos, C.range, f);
+                    if (gpuDynStatics) {
+                        // Shared kTargetDyn slot, culled per face right before its
+                        // draw (the cull's own barriers order it after the previous
+                        // face's indirect draw). 90° face: texel = 2·range / size.
+                        const u32   tgt   = WorldGPU::kTargetDyn;
+                        const float texel = 2.f * C.range / _max(1.f, (float)kPointSz);
+                        WorldGPU::CullShadow(cmd, &tgt, &faceVP, &texel, 1);
+                    }
+                    renderPointFace(ShadowMap::GetPointStaticFaceView(t, f), faceVP, &C.queue,
+                                    C.pos, C.range, /*clear*/true, /*skinned*/false, /*grass*/false, -1);
+                }
+            }
+            ImageBarrier(cmd, ShadowMap::GetPointStaticImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, nLayers);
+        }
+
+        // 2) COMBINED cube: copy the cached static faces, then overlay the dynamics
+        //    (skinned NPC + culled grass) — NO static re-raster on an NPC/grass tick.
+        if (anyDyn || s_pointFirst)
         {
             ImageBarrier(cmd, ShadowMap::GetPointImage(),
                          s_pointFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, 6);
-            s_pointFirst = false;
-
-            for (u32 f = 0; f < 6; ++f) {
-                const Fmatrix faceVP = ShadowMap::ComputePointFaceVP(FL.pointPos, FL.pointRange, f);
-                renderDepthTarget(ShadowMap::GetPointFaceView(f), ShadowMap::PointSize(),
-                                  faceVP, &s_PointQueue, FL.pointPos, FL.pointRange, renderPoint);
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, nLayers);
+            for (u32 k = 0; k < FL.poolCountP; ++k) {
+                if (assignP[k] < 0) continue;
+                const u32 t = u32(assignP[k]);
+                if (!needDyn[t]) continue;
+                VkImageCopy rg{};
+                rg.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, t * 6u, 6u };   // this cube's 6 faces
+                rg.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, t * 6u, 6u };
+                rg.extent         = { kPointSz, kPointSz, 1 };
+                vkCmdCopyImage(cmd, ShadowMap::GetPointStaticImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               ShadowMap::GetPointImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
             }
-
+            ImageBarrier(cmd, ShadowMap::GetPointImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, nLayers);
+            s_pointFirst = false;
+            for (u32 k = 0; k < FL.poolCountP; ++k) {
+                if (assignP[k] < 0) continue;
+                const u32 t = u32(assignP[k]);
+                if (!needDyn[t]) continue;
+                PointCube& C = s_pointCubes[t];
+                for (u32 f = 0; f < 6; ++f) {
+                    const Fmatrix faceVP = ShadowMap::ComputePointFaceVP(C.pos, C.range, f);
+                    renderPointFace(ShadowMap::GetPointFaceView(t, f), faceVP, nullptr,
+                                    C.pos, C.range, /*clear*/false, /*skinned*/true, grassCube[t],
+                                    cubeCulled ? cubeSlot[t] : -1);
+                }
+            }
             ImageBarrier(cmd, ShadowMap::GetPointImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, 6);
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, nLayers);
         }
-        s_pointHadSkinned = anySkinned;
     }
+    VK::Prof::ZoneEnd(cmd, zDynPoint);
     VK::Prof::ZoneEnd(cmd, zDyn);
+}
+
+// Spot-pool tile of a light this frame (-1 = not pooled / not rendered yet).
+// Identity comparison only — callers pass the vkLight* from FrameLights::src.
+int SpotShadow_TileOfLight(const void* light)
+{
+    if (!light) return -1;
+    for (u32 t = 0; t < Lights::kMaxShadowSpots; ++t)
+        if (s_spotTiles[t].owner == light && s_spotTiles[t].lastSeen == Device.dwFrame
+            && s_spotTiles[t].contentValid)
+            return int(t);
+    return -1;
+}
+
+// Point-pool cube of a light this frame (-1 = not pooled / not rendered yet).
+int PointShadow_CubeOfLight(const void* light)
+{
+    if (!light) return -1;
+    for (u32 t = 0; t < Lights::kMaxShadowPoints; ++t)
+        if (s_pointCubes[t].owner == light && s_pointCubes[t].lastSeen == Device.dwFrame
+            && s_pointCubes[t].contentValid)
+            return int(t);
+    return -1;
 }
 
 // Grass-spot caster pipeline teardown (device shutdown). Survives level swaps:
@@ -1237,6 +2517,7 @@ void SunShadow_Destroy()
     // Shader modules are owned by g_ShaderManager (shared cache) — not ours.
     s_grassSpotVS = s_grassSpotFS = VK_NULL_HANDLE;
     s_grassSpotTried = false;
+    GrassCull::Destroy();
 }
 
 }  // namespace VK

@@ -216,4 +216,49 @@ void SceneAttachmentBarrier(VkCommandBuffer cmd)
         | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
 }
 
+// ---------------------------------------------------------------------------
+// ImageState::Require — emit a transition only when the state actually changes.
+// ---------------------------------------------------------------------------
+static constexpr VkAccessFlags2 kWriteAccessMask =
+      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+    | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+    | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+    | VK_ACCESS_2_TRANSFER_WRITE_BIT
+    | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
+void ImageState::Require(VkCommandBuffer cmd, VkImageLayout lay,
+    VkPipelineStageFlags2 stg, VkAccessFlags2 acc, u32 mipLevels, u32 layerCount)
+{
+    const bool isWrite  = (acc    & kWriteAccessMask) != 0;
+    const bool wasWrite = (access & kWriteAccessMask) != 0;
+
+    // Same layout AND pure read-after-read → nothing to synchronize. Remember this
+    // reader's stage/access so a later write's barrier waits on the union of all
+    // readers that ran since the last transition.
+    if (lay == layout && !isWrite && !wasWrite)
+    {
+        stage  |= stg;
+        access |= acc;
+        return;
+    }
+
+    VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    b.srcStageMask  = stage;
+    b.srcAccessMask = access;
+    b.dstStageMask  = stg;
+    b.dstAccessMask = acc;
+    b.oldLayout = layout;
+    b.newLayout = lay;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = { aspect, 0, mipLevels, 0, layerCount };
+
+    VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+
+    layout = lay; stage = stg; access = acc;
+}
+
 } // namespace VK

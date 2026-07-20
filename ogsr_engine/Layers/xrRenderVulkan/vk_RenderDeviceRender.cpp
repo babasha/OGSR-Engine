@@ -14,6 +14,8 @@
 #include "vk_UIPipeline.h"
 #include "vk_pipeline_cache.h"
 #include "vk_world_material.h"
+#include "vk_terrain_cache.h"    // TerrainCache/TerrainMask teardown
+#include "vk_texture_stream.h"  // VK::TextureStreamer — DeferredLoad bracketing + VRAM report
 #include "vk_env_light.h"      // VK::EnvLight — shared per-frame sun/hemi/ambient UBO (set 1/2)
 #include "vk_shadow.h"         // VK::ShadowMap — sun shadow map (created with EnvLight)
 #include "vk_pass_sky.h"
@@ -22,11 +24,15 @@
 #include "vk_pass_bloom.h"     // VK::BloomPass — bright-pass + blur for the composite
 #include "vk_pass_ssao.h"      // VK::SSAOPass — GTAO + folded-in SSIL (one-bounce SSGI in the horizon march)
 #include "vk_motionvec.h"      // VK::MotionVec — screen-space motion vectors (DLSS/FSR/PT foundation)
+#include "vk_dlss.h"           // VK::Dlss — NVIDIA DLSS 4.5 (NGX) init + capability probe
+#include "vk_sl.h"             // VK::SL — Streamline (DLSS/Reflex/FG) shutdown
 #include "vk_pass_registry.h"  // VK::PassTimingDestroy() — GPU timing query pool teardown
 #include "vk_imgui.h"          // VK::ImGuiVK::Shutdown() — profiler overlay teardown
 #include "vk_vrs.h"            // VK::VRS::Destroy() — shading-rate image teardown
 #include "vk_vsm.h"            // VK::VSM::Destroy() — virtual shadow maps teardown
+#include "vk_instance_gpu.h"   // VK::InstanceGPU::Destroy() — instanced rigid casters teardown
 #include "vk_clustered.h"      // VK::Clustered::Destroy() — clustered forward teardown
+#include "vk_async.h"          // VK::Async::Destroy() — async compute teardown
 #include "vk_volumetrics.h"    // VK::Vol::Init/Destroy() — froxel volumetrics
 #include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_lightcones.h" // VK::LightCones_Destroy()
@@ -79,7 +85,42 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     // -draw_borders (same launch param R4 honors).
     const bool bDrawBorders = Core.Params && strstr(Core.Params, "-draw_borders");
 
-    if (hWnd && !bDrawBorders) {
+    // SPIKE 1 (editor-on-Vulkan): render into a normal, resizable, bordered
+    // window instead of taking over the whole monitor — the embeddable-viewport
+    // probe. The swapchain sizes itself to the client rect (ChooseSwapExtent uses
+    // the surface currentExtent), so no fullscreen restyle is needed. Additive /
+    // experimental; see EDITOR_ON_VULKAN_ROADMAP.md in the SDK repo.
+    const bool bSpikeWindow = Core.Params && (strstr(Core.Params, "-vk_spike") || strstr(Core.Params, "-vk_editor"));
+
+    // A2.3 — embedded editor viewport: the HOST owns this window's size and position
+    // (it is a child of the SDK's panel), so take the client rect as-is and restyle
+    // nothing. Checked BEFORE the spike/fullscreen branches, which both move the window.
+    extern bool g_ed_embedded;
+
+    if (hWnd && g_ed_embedded) {
+        RECT cr{};
+        GetClientRect(hWnd, &cr);
+        dwWidth  = u32(cr.right - cr.left);
+        dwHeight = u32(cr.bottom - cr.top);
+        psCurrentVidMode[0] = dwWidth;
+        psCurrentVidMode[1] = dwHeight;
+        Msg("[VK] DevRender::Create — EMBEDDED host window %ux%u", dwWidth, dwHeight);
+    }
+    else if (hWnd && bSpikeWindow) {
+        RECT rc{ 0, 0, 1280, 720 };
+        SetWindowLongPtr(hWnd, GWL_STYLE, WS_VISIBLE | WS_OVERLAPPEDWINDOW);
+        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(hWnd, HWND_TOP, 60, 60, rc.right - rc.left, rc.bottom - rc.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        RECT cr{};
+        GetClientRect(hWnd, &cr);
+        dwWidth  = u32(cr.right - cr.left);
+        dwHeight = u32(cr.bottom - cr.top);
+        psCurrentVidMode[0] = dwWidth;
+        psCurrentVidMode[1] = dwHeight;
+        Msg("[VK] DevRender::Create — SPIKE windowed %ux%u", dwWidth, dwHeight);
+    }
+    else if (hWnd && !bDrawBorders) {
         // Cover the monitor the window currently lives on (multi-monitor safe).
         HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi{ sizeof(MONITORINFO) };
@@ -149,6 +190,7 @@ void vkRenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight,
     VK::BloomPass::Init();         // bright-pass + blur feeding the tonemap composite
     VK::SSAOPass::Init();          // GTAO from the depth prepass (EnvLight binding 8) + folded-in SSIL (tonemap binding 5)
     VK::MotionVec::Init();         // screen-space motion vectors from the prepass depth (DLSS/FSR/PT foundation; needs Swapchain.m_Format)
+    VK::Dlss::Init();              // NVIDIA DLSS (NGX) init + capability probe — logs SuperRes/FrameGen availability
     VK::GPUParticles::Init();      // GPU-driven particles Phase 1 — pool + free-list + compute emit/sim/draw
     VK::Vol::Init();               // froxel volumetrics (3D volume eager so the tonemap binding 4 is valid)
     VK::ParticlePass_Init();
@@ -208,6 +250,8 @@ void vkRenderDeviceRender::Destroy()
     VK::SkyPass::Destroy();             Msg("[VK] DevRender::Destroy: SkyPass done");
     VK::SSAOPass::Destroy();            Msg("[VK] DevRender::Destroy: SSAOPass done");
     VK::MotionVec::Destroy();           Msg("[VK] DevRender::Destroy: MotionVec done");
+    VK::Dlss::Shutdown();               Msg("[VK] DevRender::Destroy: DLSS done");
+    VK::SL::Shutdown();                 Msg("[VK] DevRender::Destroy: Streamline done");
     VK::BloomPass::Destroy();           Msg("[VK] DevRender::Destroy: BloomPass done");
     VK::TonemapPass::Destroy();         Msg("[VK] DevRender::Destroy: TonemapPass done");
     VK::SceneColor::Destroy();          Msg("[VK] DevRender::Destroy: SceneColor done");
@@ -219,12 +263,17 @@ void vkRenderDeviceRender::Destroy()
     VK::ShadowMap::Destroy();          Msg("[VK] DevRender::Destroy: ShadowMap done");
     VK::VRS::Destroy();                 Msg("[VK] DevRender::Destroy: VRS done");
     VK::VSM::Destroy();                 Msg("[VK] DevRender::Destroy: VSM done");
+    VK::InstanceGPU::Destroy();         Msg("[VK] DevRender::Destroy: InstanceGPU done");
     VK::Clustered::Destroy();           Msg("[VK] DevRender::Destroy: Clustered done");
+    VK::Async::Destroy();               Msg("[VK] DevRender::Destroy: Async done");
     VK::Vol::Destroy();                 Msg("[VK] DevRender::Destroy: Vol done");
     VK::ImGuiVK::Shutdown();            Msg("[VK] DevRender::Destroy: ImGui overlay done");
     VK::PassTimingDestroy();            Msg("[VK] DevRender::Destroy: PassTiming done");
     VK::PipelineCache::Destroy();       Msg("[VK] DevRender::Destroy: PipelineCache done");
+    VK::TerrainCache::Destroy();        Msg("[VK] DevRender::Destroy: TerrainCache done");
+    VK::TerrainMask::Destroy();         Msg("[VK] DevRender::Destroy: TerrainMask done");
     VK::WorldMaterialCache::Destroy();  Msg("[VK] DevRender::Destroy: WorldMaterial done");
+    VK::TextureStreamer::Instance().Shutdown();  Msg("[VK] DevRender::Destroy: TexStreamer done");
     VulkanUI::Destroy();                Msg("[VK] DevRender::Destroy: VulkanUI done");
 
     // Free the SPIRV module cache LAST among shader consumers: SkyPass / Skinned /
@@ -262,15 +311,43 @@ void vkRenderDeviceRender::Reset(HWND hWnd, u32& dwWidth, u32& dwHeight,
 
 // ----- Resource stubs (filled in when texture/asset wiring lands) -----------
 
-void vkRenderDeviceRender::DeferredLoad(BOOL)                    { VK_STUB_ONCE("DevRender"); }
-void vkRenderDeviceRender::ResourcesDeferredUpload()             { VK_STUB_ONCE("DevRender"); }
-void vkRenderDeviceRender::ResourcesDumpMemoryUsage()            { VK_STUB_ONCE("DevRender"); }
+// DeferredLoad(TRUE) at level-load start, DeferredLoad(FALSE) after geometry lands.
+// The DX renderers use this to batch texture uploads; the VK backend uploads eagerly
+// via the transfer queue, so here it just brackets the texture streamer's per-level
+// accounting (budget snapshot + demotion tally + end-of-load residency report).
+void vkRenderDeviceRender::DeferredLoad(BOOL E)
+{
+    if (E) VK::TextureStreamer::Instance().BeginLevelLoad();
+    else   VK::TextureStreamer::Instance().EndLevelLoad();
+}
+
+// Called right after DeferredLoad(FALSE) (Level_network_start_client). Textures are
+// already resident on the VK path; log the final footprint so the load report is
+// complete even when DeferredLoad(FALSE) wasn't paired.
+void vkRenderDeviceRender::ResourcesDeferredUpload()
+{
+    VK::TextureStreamer::Instance().EndLevelLoad();
+}
+
+void vkRenderDeviceRender::ResourcesDumpMemoryUsage()
+{
+    VK::TextureStreamer::Instance().DumpStats();
+}
+
 void vkRenderDeviceRender::ResourcesPrefetchCreateTexture(LPCSTR){ VK_STUB_ONCE("DevRender"); }
 
+// R4's HUD reads these as (texture bytes, texture count, lightmap bytes, lightmap
+// count). We report the streamer's tracked texture footprint as the base figure;
+// lightmaps are folded into the same registry (Lmap class), so keep the split simple.
 void vkRenderDeviceRender::ResourcesGetMemoryUsage(u32& m_base, u32& c_base,
                                                    u32& m_lmaps, u32& c_lmaps)
 {
-    m_base = c_base = m_lmaps = c_lmaps = 0;
+    u32 bytes = 0, count = 0;
+    VK::TextureStreamer::Instance().GetMemoryUsage(bytes, count);
+    m_base  = bytes;
+    c_base  = count;
+    m_lmaps = 0;
+    c_lmaps = 0;
 }
 
 IRenderDeviceRender::DeviceState vkRenderDeviceRender::GetDeviceState()

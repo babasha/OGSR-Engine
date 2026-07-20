@@ -1035,10 +1035,20 @@ T* CLocatorAPI::r_open_impl(LPCSTR path, LPCSTR _fname)
 
     if (!check_for_file(path, _fname, fname, desc))
     {
-        if (is_file_exists(_fname))
+        // Not in the VFS registry — fall back to a loose file on disk. Test the
+        // RESOLVED path (`fname`), not the caller's relative name: stat() resolves a
+        // relative name against the PROCESS CWD, which has nothing to do with fs_root.
+        // That mismatch is fatal when the engine is hosted inside another process
+        // (the SDK): probing "gamedata\shaders.xr" matched the SDK's own file under
+        // its CWD, so this branch was taken and then opened the engine's resolved
+        // path, which does not exist -> CHECK failure in CVirtualFileReader.
+        // NOTE: `desc` is necessarily null here; both file_from_cache_impl overloads
+        // ignore it, but pass a valid object rather than dereferencing nullptr.
+        if (is_file_exists(fname))
         {
+            const file dummy_desc{};
             T* R = nullptr;
-            file_from_cache(R, fname, *desc);
+            file_from_cache(R, fname, dummy_desc);
             return (R);
         }
 

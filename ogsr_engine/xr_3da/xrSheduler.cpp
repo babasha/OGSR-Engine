@@ -357,20 +357,43 @@ void CSheduler::Update()
     {
         ZoneScopedN("ItemsRT");
 
-        // Realtime priority
+        // Realtime priority. Each item is guarded: a C++ exception (Lua error on a
+        // foreign map) thrown here used to unwind the WHOLE CSheduler::Update — no
+        // normal queue, no shedule_Update→MakeMeCrow anywhere, the world freezes
+        // (actor can't walk, NPCs statues) while rendering keeps going.
         for (auto& curr : ItemsRT)
         {
             R_ASSERT(curr.Object);
 
-            if (!curr.Object->shedule_Needed())
+            try
             {
-                curr.dwTimeOfLastExecute = dwTime;
-                continue;
-            }
+                if (!curr.Object->shedule_Needed())
+                {
+                    curr.dwTimeOfLastExecute = dwTime;
+                    continue;
+                }
 
-            const u32 elapsed = dwTime - curr.dwTimeOfLastExecute;
-            curr.Object->shedule_Update(elapsed);
-            curr.dwTimeOfLastExecute = dwTime;
+                const u32 elapsed = dwTime - curr.dwTimeOfLastExecute;
+                curr.Object->shedule_Update(elapsed);
+                curr.dwTimeOfLastExecute = dwTime;
+            }
+            catch (const std::exception& e)
+            {
+                static u32 s_rt_throws = 0;
+                const u32 n = ++s_rt_throws;
+                if ((n & (n - 1)) == 0) // log at 1,2,4,8,… occurrences
+                    Msg("!![CSheduler] RT item '%s' threw [%s: %s] — skipped (total %u)", curr.scheduled_name.c_str(), typeid(e).name(), e.what(), n);
+                curr.dwTimeOfLastExecute = dwTime;
+            }
+            catch (...)
+            {
+                static u32 s_rt_throws = 0;
+                const u32 n = ++s_rt_throws;
+                if ((n & (n - 1)) == 0) // log at 1,2,4,8,… occurrences
+                    Msg("!![CSheduler] RT item '%s' threw [non-std; lua top: %s] — skipped (total %u)", curr.scheduled_name.c_str(),
+                        g_lua_error_peek ? g_lua_error_peek() : "<no hook>", n);
+                curr.dwTimeOfLastExecute = dwTime;
+            }
         }
     }
 

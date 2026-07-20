@@ -14,6 +14,7 @@
 // go through ParticleManager() exactly as in R4.
 
 #include "stdafx.h"
+#include "vk_color_space.h"   // ColorSpace::Linearize — particle colours are authored sRGB
 
 // ParticleEffectDef.h -> Shader.h -> tss_def.h needs the xrD3DDefs Vulkan-branch
 // D3D type stubs; the skeleton compat preamble (vk_FBasicVisual.h + CRender_Vulkan.h
@@ -44,7 +45,14 @@ namespace VK { namespace GPUParticles {
     bool Enabled();
     int  ResolveProgram(const char* name);
     bool ProgramRoutable(int slot);
+    void AddProgramInstance(int slot);
+    void ReleaseProgramInstance(int slot);
+    void QueueKill(int slot, const Fvector& pos, float radius);
 } }
+// Live-effect emission registry (vk_gpu_particles_feed.cpp) — claimed effects
+// emit from here regardless of visibility (CPU shedule_Update parity).
+extern void VK_GP_RegisterEffect(vkCParticleEffect* e);
+extern void VK_GP_UnregisterEffect(vkCParticleEffect* e);
 
 // ============================================================================
 // Birth / death callbacks (same as R4 OnEffectParticleBirth/Dead).
@@ -131,6 +139,15 @@ vkCParticleEffect::vkCParticleEffect()
 
 vkCParticleEffect::~vkCParticleEffect()
 {
+    // #5/#6: CPU parity — DestroyEffect removes the instance's particles with
+    // the object; kill this emitter's GPU particles too, then release its
+    // budget share and emission registration.
+    if (m_GpuProgram >= 0) {
+        const Fvector& c = m_RT_Flags.is(flRT_XFORM) ? m_XFORM.c : m_InitialPosition;
+        VK::GPUParticles::QueueKill(m_GpuProgram, c, 1.5f);
+        VK_GP_UnregisterEffect(this);
+        VK::GPUParticles::ReleaseProgramInstance(m_GpuProgram);
+    }
     ParticleManager()->DestroyEffect(m_HandleEffect);
     ParticleManager()->DestroyActionList(m_HandleActionList);
     m_HandleEffect = m_HandleActionList = -1;
@@ -187,7 +204,18 @@ void vkCParticleEffect::Stop(BOOL bDefferedStop)
     if (bDefferedStop)
         m_RT_Flags.set(flRT_DefferedStop, TRUE);
     else
+    {
         m_RT_Flags.set(flRT_Playing, FALSE);
+        // CPU parity: a hard stop wipes the particles instantly (PAPI
+        // p_count = 0) — kill this emitter's GPU particles too, and free the
+        // per-instance spawn slots so a restart can ignite immediately.
+        if (m_GpuProgram >= 0)
+        {
+            const Fvector& c = m_RT_Flags.is(flRT_XFORM) ? m_XFORM.c : m_InitialPosition;
+            VK::GPUParticles::QueueKill(m_GpuProgram, c, 1.5f);
+            for (u32 i = 0; i < kGpuOwnSlots; ++i) m_GpuSpawnT[i] = -1e9f;
+        }
+    }
 }
 
 void vkCParticleEffect::UpdateParent(const Fmatrix& m, const Fvector& velocity, BOOL bXFORM)
@@ -204,6 +232,56 @@ void vkCParticleEffect::UpdateParent(const Fmatrix& m, const Fvector& velocity, 
 
 void vkCParticleEffect::OnFrame(u32 frame_dt)
 {
+    // Emission liveness stamp: a dead-queued PS object stops being ticked —
+    // the GPU emission registry must stop feeding it too (see the feed gate).
+    m_GpuLastTickT = Device.fTimeGlobal;
+
+    // #6 (drop CPU double-sim): once the GPU path owns this effect, the PAPI
+    // Update is skipped entirely — the pool simulates + draws + feeds the fog.
+    // Only the timing/lifetime bookkeeping stays. Uses the CACHED slot (never
+    // resolves here — OnFrame also runs off the scheduler thread; resolution
+    // happens on the render thread in BuildVertices / the emitter feed, which
+    // also purges any CPU particles born before the claim).
+    const bool gpuOwned = (m_GpuProgram >= 0) && VK::GPUParticles::Enabled();
+
+    if (m_Def && m_RT_Flags.is(flRT_Playing) && gpuOwned)
+    {
+        m_MemDT += frame_dt;
+        const u32 uDT_STEP = m_Def->GetUStep();
+        const float fDT_STEP = m_Def->GetFStep();
+        if (uDT_STEP && m_MemDT >= (s32)uDT_STEP)
+        {
+            int StepCount = m_MemDT / uDT_STEP;
+            m_MemDT = m_MemDT % uDT_STEP;
+            clamp(StepCount, 0, 3);
+            for (; StepCount; StepCount--)
+            {
+                if (m_Def->m_Flags.is(CPEDef::dfTimeLimit) && !m_RT_Flags.is(flRT_DefferedStop))
+                {
+                    m_fElapsedLimit -= fDT_STEP;
+                    if (m_fElapsedLimit < 0.f)
+                    {
+                        m_fElapsedLimit = m_Def->m_fTimeLimit;
+                        Stop(true);
+                        break;
+                    }
+                }
+            }
+        }
+        // No CPU particles to drain — a deferred stop completes immediately.
+        // The pool particles live out their own lifetimes (KillOld).
+        if (m_RT_Flags.is(flRT_DefferedStop))
+            m_RT_Flags.set(flRT_Playing | flRT_DefferedStop, FALSE);
+
+        // Emitter-anchored bounds keep the visual in the spatial/frustum set —
+        // GPU emission is fed off visibility; the GPU draw itself isn't CPU-culled.
+        const Fvector& c = m_RT_Flags.is(flRT_XFORM) ? m_XFORM.c : m_InitialPosition;
+        vis.box.set(c, c);
+        vis.box.grow(3.f);
+        vis.box.getsphere(vis.sphere.P, vis.sphere.R);
+        return;
+    }
+
     if (m_Def && m_RT_Flags.is(flRT_Playing))
     {
         m_MemDT += frame_dt;
@@ -306,12 +384,16 @@ VkDescriptorSet vkCParticleEffect::ResolveTextureSet()
 }
 
 // Routed to the GPU particle path? Lazily resolve + cache the program slot.
-// Only alpha-blended world smoke is eligible (additive fire/sparks stay on the
-// CPU billboard path; the GPU draw is alpha-only and has no textures yet).
+// Alpha smoke (PBM_BLEND) and additive fire/sparks (PBM_ADD / PBM_ALPHA_ADD)
+// are eligible on both the world and the HUD path (muzzle flashes) — the GPU
+// draw has alpha + additive pipelines and a HUD-FOV sub-pass. Distort (heat
+// haze) and mul/set effects stay on the CPU billboard path.
 bool vkCParticleEffect::GpuClaimed()
 {
     if (!VK::GPUParticles::Enabled())               return false;
-    if (m_BlendMode != PBM_BLEND || GetHudMode())   return false;
+    if (m_GpuNoRoute)                               return false;   // group child-spawner → CPU sim required
+    if (m_BlendMode != PBM_BLEND && m_BlendMode != PBM_ADD && m_BlendMode != PBM_ALPHA_ADD)
+        return false;
     if (m_GpuProgram == -2) {
         int s = VK::GPUParticles::ResolveProgram(Name().c_str());
         // Area fog / persistent fields would saturate the shared GPU pool and
@@ -321,6 +403,20 @@ bool vkCParticleEffect::GpuClaimed()
             s = -1;
         }
         m_GpuProgram = s;
+        // #6: OnFrame stops running the CPU sim from here on — kill any CPU
+        // particles born before the claim resolved (a frame or two), or they'd
+        // linger forever (no Update → no KillOld) and keep splatting fog media.
+        if (m_GpuProgram >= 0) {
+            u32 cnt = ParticleManager()->GetParticlesCount(m_HandleEffect);
+            while (cnt--) ParticleManager()->RemoveParticle(m_HandleEffect, 0);
+            // #5: this live instance carries m_MaxParticles of alive budget
+            // for its program — for its whole object lifetime, visible or not
+            // (CPU parity: the per-instance PAPI pool existed just the same).
+            VK::GPUParticles::AddProgramInstance(m_GpuProgram);
+            // Emission runs from the live registry (visible or not) — the CPU
+            // path "always burns" off-screen via shedule_Update; so do we.
+            VK_GP_RegisterEffect(this);
+        }
     }
     return m_GpuProgram >= 0;
 }
@@ -377,7 +473,14 @@ u32 vkCParticleEffect::BuildVertices(FVF::LIT* dst, u32 maxVerts)
             r_y += speed * m_Def->m_VelocityScale.y;
         }
 
-        const u32 clr = color_rgba_f(m.colorR, m.colorG, m.colorB, m.colorA);
+        // Particle colours come from the effect definition (PASource colour domain +
+        // PATargetColor curve), authored by eye in the Particle Editor → sRGB. Decoded
+        // on the CPU here rather than in particle.frag: the shader has no cheap way to
+        // know which pipeline is active, and this is the one place every CPU-simulated
+        // sprite's colour is packed. Alpha is coverage, never colour — left alone.
+        float pr = m.colorR, pg = m.colorG, pb = m.colorB;
+        VK::ColorSpace::Linearize(pr, pg, pb);
+        const u32 clr = color_rgba_f(pr, pg, pb, m.colorA);
 
         if (m_Def->m_Flags.is(CPEDef::dfAlignToPath))
         {

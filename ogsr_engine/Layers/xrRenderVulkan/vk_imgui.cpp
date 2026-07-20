@@ -10,12 +10,19 @@
 #include "stdafx.h"
 #include "vk_imgui.h"
 #include "vk_profiler.h"            // Prof::GetZones / GetMem / GetFrame
+#include "vk_image.h"               // VK::CreateImage / CreateImageView
 #include "HW_Vulkan.h"             // VulkanHW (device/allocator + single-time cmds)
 #include "vk_swapchain.h"          // Swapchain.m_Format
 #include "vk_shaders.h"            // g_ShaderManager (.spv loader)
 #include "vk_command_buffer.h"     // CommandManager.GetCurrentFrame()
 
+// Editor viewport state (CRender_Vulkan.cpp) — how many objects the host has placed.
+namespace VKEditor { int HostModelCount(); }
+
 #include "../../../3rd_party/Src/imgui/imgui.h"
+#include "../../../3rd_party/Src/imgui/addons/ImGuizmo/ImGuizmo.h"
+
+#include <mutex>
 
 extern int ps_r_profiler;
 
@@ -51,6 +58,45 @@ ImGuiContext* s_ctx = nullptr;
 
 struct PushC { float scale[2]; float translate[2]; };
 
+// ---- editor Log store (fed by the host via PushEditorLog) ------------------
+struct LogLine { xr_string text; bool err; bool sel; };
+xr_vector<LogLine> s_editorLog;
+std::mutex         s_editorLogMtx;
+bool               s_editorLogDirty = false; // a new line arrived → auto-scroll
+bool               s_editorWantMouse = false; // ImGui captured the mouse this frame
+constexpr size_t   kEditorLogMax = 4000;
+
+// ---- editor Statistics overlay (mirrored from the SDK each frame) ----------
+struct EdStats { float fps, rfps; int verts, tris, dips, lights, totalLights; bool valid; };
+EdStats s_edStats{};
+
+// ---- transform gizmo -------------------------------------------------------
+// We are only the WIDGET here. The host (the SDK's IM_Manipulator) decides the
+// operation, the coordinate space and the snap, owns the object list and the undo
+// stack, and applies whatever comes back. We run ImGuizmo because it has to be drawn
+// with OUR matrices: the host's ImGuizmo renders onto its DX9 surface, which sits
+// UNDER our Vulkan child and is therefore invisible, and its SetRect covers the host's
+// whole window rather than the inset viewport.
+//
+// The host sends a request, we service it during the next frame, and the host reads the
+// outcome on its next call — one frame of lag, imperceptible during a drag and far
+// simpler than trying to run a widget synchronously across two ImGui contexts.
+struct GizmoState
+{
+    bool requested = false;     // host asked for a gizmo this frame
+    bool live = false;          // ...and it was still asking when we drew
+    int op = 0;                 // 0 translate, 1 rotate, 2 scale
+    int mode = 0;               // 0 local, 1 world
+    bool useSnap = false;
+    float snap[3] = {0.f, 0.f, 0.f};
+    Fmatrix matrix = {};        // in: object transform; out: manipulated transform
+    Fmatrix delta = {};         // out: this frame's change
+    bool changed = false;       // out: the manipulation moved something
+    bool using_ = false;        // out: a drag is in progress
+    bool over = false;          // out: the pointer is over a gizmo handle
+};
+GizmoState s_gizmo;
+
 // ---- font atlas upload -----------------------------------------------------
 bool CreateFontTexture()
 {
@@ -60,21 +106,14 @@ bool CreateFontTexture()
     const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
 
     // device-local image
-    VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ici.extent = { (u32)w, (u32)h, 1 };
-    ici.mipLevels = 1; ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VmaAllocationCreateInfo iaci{}; iaci.usage = VMA_MEMORY_USAGE_AUTO;
-    if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &iaci, &s_fontImage, &s_fontAlloc, nullptr) != VK_SUCCESS) {
-        Msg("![VK ImGui] font image create failed"); return false;
-    }
-    Prof::NameImage(s_fontImage, "ImGui.FontAtlas");
+    VK::ImageDesc fd;
+    fd.format   = VK_FORMAT_R8G8B8A8_UNORM;
+    fd.extent   = { (u32)w, (u32)h, 1 };
+    fd.usage    = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    fd.memUsage = VMA_MEMORY_USAGE_AUTO;
+    fd.name     = "ImGui.FontAtlas";
+    if (!VK::CreateImage(fd, s_fontImage, s_fontAlloc))
+        return false;
 
     // staging
     VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -83,7 +122,7 @@ bool CreateFontTexture()
     baci.usage = VMA_MEMORY_USAGE_AUTO;
     baci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     VkBuffer staging = VK_NULL_HANDLE; VmaAllocation stagingA = VK_NULL_HANDLE; VmaAllocationInfo sInfo{};
-    if (vmaCreateBuffer(VulkanHW.m_Allocator, &bci, &baci, &staging, &stagingA, &sInfo) != VK_SUCCESS) {
+    if (VK::Vram::CreateBuffer(VulkanHW.m_Allocator, &bci, &baci, &staging, &stagingA, &sInfo) != VK_SUCCESS) {
         Msg("![VK ImGui] font staging failed"); return false;
     }
     memcpy(sInfo.pMappedData, pixels, (size_t)bytes);
@@ -113,7 +152,7 @@ bool CreateFontTexture()
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     VulkanHW.EndSingleTimeCommands(cmd);
-    vmaDestroyBuffer(VulkanHW.m_Allocator, staging, stagingA);
+    VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, staging, stagingA);
 
     VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     vci.image = s_fontImage; vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -267,7 +306,7 @@ void EnsureBuffers(FrameBuf& f, VkDeviceSize vbNeed, VkDeviceSize ibNeed)
     auto make = [&](VkBuffer& buf, VmaAllocation& alloc, void*& map, VkDeviceSize& cap,
                     VkDeviceSize need, VkBufferUsageFlags usage) {
         if (cap >= need && buf) return;
-        if (buf) vmaDestroyBuffer(VulkanHW.m_Allocator, buf, alloc);
+        if (buf) VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, buf, alloc);
         VkDeviceSize sz = need + (need / 2) + 4096;
         VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
         bci.size = sz; bci.usage = usage;
@@ -275,7 +314,7 @@ void EnsureBuffers(FrameBuf& f, VkDeviceSize vbNeed, VkDeviceSize ibNeed)
         aci.usage = VMA_MEMORY_USAGE_AUTO;
         aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
         VmaAllocationInfo info{};
-        if (vmaCreateBuffer(VulkanHW.m_Allocator, &bci, &aci, &buf, &alloc, &info) != VK_SUCCESS) {
+        if (VK::Vram::CreateBuffer(VulkanHW.m_Allocator, &bci, &aci, &buf, &alloc, &info) != VK_SUCCESS) {
             buf = VK_NULL_HANDLE; cap = 0; map = nullptr; return;
         }
         map = info.pMappedData; cap = sz;
@@ -333,11 +372,254 @@ void BuildProfilerWindow()
     ImGui::End();
 }
 
+// SPIKE 3 (editor-on-Vulkan): interactive panel proving editor UI runs on the
+// Vulkan ImGui backend with (polled) mouse input. Button/slider/checkbox update
+// on click — the same widgets the editor's panels use. See ROADMAP §12.
+void BuildSpikeWindow()
+{
+    static int   clicks = 0;
+    static float slider = 0.5f;
+    static bool  check  = false;
+    ImGui::SetNextWindowPos(ImVec2(40, 60), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340, 210), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Spike 3 - ImGui on Vulkan");
+    ImGui::TextWrapped("Editor-UI proof: this panel runs on the Vulkan ImGui backend "
+                       "with polled mouse input. Try the button / slider.");
+    ImGui::Separator();
+    if (ImGui::Button("Click me")) { ++clicks; Msg("[VK][spike] ImGui button click #%d", clicks); }
+    ImGui::SameLine();
+    ImGui::Text("clicks: %d", clicks);
+    ImGui::SliderFloat("value", &slider, 0.0f, 1.0f);
+    ImGui::Checkbox("checkbox", &check);
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    ImGui::Text("mouse: %.0f, %.0f", mp.x, mp.y);
+    ImGui::End();
+}
+
+// ---- editor Log window -----------------------------------------------------
+// Mirrors the SDK's IM_Log (selectable lines, Clear / Clear selected) plus Copy.
+void BuildEditorLogWindow()
+{
+    ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(560, 260), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Log", nullptr, ImGuiWindowFlags_NoNav))
+    {
+        ImGui::End();
+        return;
+    }
+
+    const float footer = ImGui::GetFrameHeightWithSpacing() + 6.0f;
+    ImGui::BeginChild("##loglines", ImVec2(0, -footer), true, ImGuiWindowFlags_HorizontalScrollbar);
+    {
+        std::lock_guard<std::mutex> lk(s_editorLogMtx);
+        int id = 0;
+        for (LogLine& l : s_editorLog)
+        {
+            if (l.err) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.4f, 1.0f));
+            ImGui::PushID(id++);
+            ImGui::Selectable(l.text.c_str(), &l.sel);
+            ImGui::PopID();
+            if (l.err) ImGui::PopStyleColor(1);
+        }
+        // Auto-scroll to the bottom when new lines arrived and we're already near it.
+        if (s_editorLogDirty && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f)
+            ImGui::SetScrollHereY(1.0f);
+        s_editorLogDirty = false;
+    }
+    ImGui::EndChild();
+
+    if (ImGui::Button("Copy")) // selected lines if any, else all — to the OS clipboard
+    {
+        xr_string out;
+        std::lock_guard<std::mutex> lk(s_editorLogMtx);
+        bool any = false;
+        for (const LogLine& l : s_editorLog) if (l.sel) { any = true; break; }
+        for (const LogLine& l : s_editorLog)
+            if (!any || l.sel) { out += l.text; out += "\r\n"; }
+        ImGui::SetClipboardText(out.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear"))
+    {
+        std::lock_guard<std::mutex> lk(s_editorLogMtx);
+        s_editorLog.clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear selected"))
+    {
+        std::lock_guard<std::mutex> lk(s_editorLogMtx);
+        s_editorLog.erase(std::remove_if(s_editorLog.begin(), s_editorLog.end(),
+                                         [](const LogLine& l) { return l.sel; }),
+                          s_editorLog.end());
+    }
+    ImGui::End();
+}
+
+// ---- editor Statistics overlay ---------------------------------------------
+// Mirrors the SDK's IM_Stats: borderless, transparent, white text, same fields.
+//
+// The numbers come from OUR renderer, not from the host's. Once the host stops drawing
+// the scene itself (it hands the viewport to us), its DX9 counters describe nothing but
+// its own UI — so reporting them here would show a near-empty scene while we are drawing
+// thousands of objects. Ed_SetStats stays in the facade for a host that renders its own
+// view, but the editor overlay reports the renderer actually producing the picture.
+void BuildEditorStatsWindow()
+{
+    ImGui::SetNextWindowPos(ImVec2(60, 100), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.0f);
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("Statistics", nullptr, flags))
+    {
+        // Only what this renderer actually measures. Deliberately NO tris/draw-call counts:
+        // the VK backend has no RCache.stat, and the profiler's draw counters are dead —
+        // Prof::CountDraw() exists but is called from nowhere, so they would always read 0.
+        // Reporting a hard 0 next to a visibly full scene is worse than not reporting it;
+        // wiring CountDraw into the draw path is the real fix if these are wanted.
+        const Prof::FrameInfo fi = Prof::GetFrame();
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::Text("FPS/RFPS:     %3.1f/%3.1f", Device.Statistic->fFPS, Device.Statistic->fRFPS);
+        ImGui::Text("CPU/GPU ms:   %.2f/%.2f", fi.cpuMs, fi.gpuMs);
+        ImGui::Text("OBJECTS:      %d", VKEditor::HostModelCount());
+        // Lights come from the host: with no level loaded we run no light manager of our own.
+        if (s_edStats.valid)
+            ImGui::Text("LIGHT S/T:    %d/%d", s_edStats.lights, s_edStats.totalLights);
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+}
+
+// ---- screen-space orientation compass (RGB axis gizmo) ---------------------
+// Bottom-left corner of the viewport, like the SDK's coordinate marker. Uses the
+// camera basis so it reflects the current view orientation. Drawn via ImGui's
+// foreground draw list — no dedicated pipeline needed.
+void DrawAxisCompass(VkExtent2D extent)
+{
+    const Fvector& R = Device.vCameraRight;
+    const Fvector& U = Device.vCameraTop;
+
+    // World axes projected onto the screen basis: screen.x = dot(axis,Right),
+    // screen.y = -dot(axis,Up) (screen y is down). Depth (dot with Dir) is not needed.
+    auto project = [&](const Fvector& a) -> ImVec2 {
+        return ImVec2(a.dotproduct(R), -a.dotproduct(U));
+    };
+
+    const float len = 34.0f;
+    const ImVec2 org(58.0f, (float)extent.height - 58.0f); // bottom-left anchor
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    struct Axis { Fvector dir; ImU32 col; const char* name; };
+    const Axis axes[3] = {
+        { {1.f, 0.f, 0.f}, IM_COL32(230, 60, 60, 255),  "X" },
+        { {0.f, 1.f, 0.f}, IM_COL32(70, 210, 70, 255),  "Y" },
+        { {0.f, 0.f, 1.f}, IM_COL32(80, 130, 240, 255), "Z" },
+    };
+    for (const Axis& ax : axes)
+    {
+        const ImVec2 p = project(ax.dir);
+        const ImVec2 tip(org.x + p.x * len, org.y + p.y * len);
+        dl->AddLine(org, tip, ax.col, 2.0f);
+        dl->AddText(ImVec2(tip.x - 4.f, tip.y - 7.f), ax.col, ax.name);
+    }
+    dl->AddCircleFilled(org, 3.0f, IM_COL32(200, 200, 200, 255));
+}
+
+// Run the host's gizmo request against OUR view/projection, which is the whole reason
+// the widget lives on this side of the boundary.
+void DrawGizmo(VkExtent2D extent)
+{
+    s_gizmo.live = s_gizmo.requested;
+    s_gizmo.requested = false; // one frame per request; the host re-arms every frame
+    s_gizmo.changed = false;
+    if (!s_gizmo.live)
+    {
+        s_gizmo.using_ = false;
+        s_gizmo.over = false;
+        return;
+    }
+
+    ImGuizmo::SetOrthographic(false);
+    ImGuizmo::SetRect(0.f, 0.f, (float)extent.width, (float)extent.height);
+
+    const ImGuizmo::OPERATION op = s_gizmo.op == 1 ? ImGuizmo::ROTATE : (s_gizmo.op == 2 ? ImGuizmo::SCALE : ImGuizmo::TRANSLATE);
+    const ImGuizmo::MODE mode = s_gizmo.mode == 1 ? ImGuizmo::WORLD : ImGuizmo::LOCAL;
+
+    s_gizmo.delta.identity();
+    s_gizmo.changed = ImGuizmo::Manipulate((const float*)&Device.mView, (const float*)&Device.mProject, op, mode, (float*)&s_gizmo.matrix, (float*)&s_gizmo.delta,
+                                           s_gizmo.useSnap ? s_gizmo.snap : nullptr);
+
+    s_gizmo.using_ = ImGuizmo::IsUsing();
+    s_gizmo.over = ImGuizmo::IsOver();
+}
+
 } // anonymous namespace
+
+bool EditorWantsMouse() { return s_editorWantMouse; }
+
+void SetGizmo(int op, int mode, const float* snap, const Fmatrix& xform)
+{
+    s_gizmo.requested = true;
+    s_gizmo.op = op;
+    s_gizmo.mode = mode;
+    s_gizmo.useSnap = snap != nullptr;
+    if (snap)
+    {
+        // ImGuizmo reads one float for translate/scale and three for rotate; copying
+        // three is harmless for the former and required for the latter.
+        s_gizmo.snap[0] = snap[0];
+        s_gizmo.snap[1] = snap[0];
+        s_gizmo.snap[2] = snap[0];
+    }
+
+    // Take the host's matrix as authoritative every frame: it reflects whatever the host
+    // actually applied, including its own snapping and any edit from elsewhere.
+    if (!s_gizmo.using_)
+        s_gizmo.matrix = xform;
+}
+
+int GizmoResult(Fmatrix& out_xform, Fmatrix& out_delta)
+{
+    out_xform = s_gizmo.matrix;
+    out_delta = s_gizmo.delta;
+
+    // Consume the flag: a result describes ONE serviced frame. If the overlay stops
+    // running — DrawOverlay bails early on a zero extent mid-resize, for instance — a
+    // sticky flag would have the host re-apply the same delta every frame and walk the
+    // object off on its own.
+    const int changed = s_gizmo.changed ? 1 : 0;
+    s_gizmo.changed = false;
+    return changed;
+}
+
+bool GizmoIsUsing() { return s_gizmo.using_; }
+bool GizmoWantsMouse() { return s_gizmo.over || s_gizmo.using_; }
+
+void PushEditorStats(float fps, float rfps, int verts, int tris, int dips, int lights, int totalLights)
+{
+    s_edStats = { fps, rfps, verts, tris, dips, lights, totalLights, true };
+}
+
+void PushEditorLog(const char* text, bool isError)
+{
+    if (!text || !text[0]) return;
+    std::lock_guard<std::mutex> lk(s_editorLogMtx);
+    s_editorLog.push_back({ xr_string(text), isError, false });
+    if (s_editorLog.size() > kEditorLogMax)
+        s_editorLog.erase(s_editorLog.begin(), s_editorLog.begin() + (s_editorLog.size() - kEditorLogMax));
+    s_editorLogDirty = true;
+}
 
 void DrawOverlay(VkCommandBuffer cmd, VkImageView swapchainView, VkExtent2D extent, float dt)
 {
-    if (ps_r_profiler < 2) return;
+    // SPIKE 3: also run when -vk_spike is set (interactive editor-UI probe), not
+    // only for the r_profiler>=2 overlay. -vk_editor adds the hosted-editor overlay
+    // (Log window + axis compass over the viewport).
+    static const bool s_spike  = Core.Params && strstr(Core.Params, "-vk_spike");
+    static const bool s_editor = Core.Params && strstr(Core.Params, "-vk_editor");
+    if (ps_r_profiler < 2 && !s_spike && !s_editor) return;
     if (!Init()) return;
     if (extent.width == 0 || extent.height == 0) return;
 
@@ -346,9 +628,46 @@ void DrawOverlay(VkCommandBuffer cmd, VkImageView swapchainView, VkExtent2D exte
     io.DisplaySize = ImVec2((float)extent.width, (float)extent.height);
     io.DeltaTime   = dt > 1e-5f ? dt : 1.0f / 60.0f;
 
+    // SPIKE 3: polled mouse input (no imgui_impl_win32 in the tree). Enough to
+    // prove editor-UI interactivity on Vulkan; best at the menu where the cursor
+    // is free (in-level the game captures the mouse for look). ImGui draws its
+    // own cursor so it's obvious the backend is receiving the mouse.
+    if (s_spike) {
+        io.MouseDrawCursor = true;
+        POINT pt;
+        if (GetCursorPos(&pt) && VulkanHW.m_hWnd) {
+            ScreenToClient(VulkanHW.m_hWnd, &pt);
+            io.AddMousePosEvent((float)pt.x, (float)pt.y);
+        }
+        io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+        io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
+    }
+
+    // Editor overlay is INTERACTIVE (Log window is clickable). Feed polled mouse — but
+    // NOT MouseDrawCursor: the host owns a real OS cursor (see EnforceCursor). Buttons
+    // come from global key state; position from the viewport window's client space.
+    if (s_editor) {
+        POINT pt;
+        if (GetCursorPos(&pt) && VulkanHW.m_hWnd) {
+            ScreenToClient(VulkanHW.m_hWnd, &pt);
+            io.AddMousePosEvent((float)pt.x, (float)pt.y);
+        }
+        io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+        io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
+    }
+
     ImGui::NewFrame();
-    BuildProfilerWindow();
+    if (s_editor) ImGuizmo::BeginFrame();
+    if (ps_r_profiler >= 2) BuildProfilerWindow();
+    if (s_spike)            BuildSpikeWindow();
+    if (s_editor)         { BuildEditorLogWindow(); BuildEditorStatsWindow(); DrawAxisCompass(extent); DrawGizmo(extent); }
     ImGui::Render();
+
+    // Publish capture state so the editor orbit camera yields when the pointer is over
+    // an ImGui window (the Log panel) — read next frame by CEditorViewport::PollInput.
+    // The gizmo counts too, or dragging a handle would orbit the camera at the same time.
+    if (s_editor)
+        s_editorWantMouse = ImGui::GetIO().WantCaptureMouse || s_gizmo.over || s_gizmo.using_;
     ImDrawData* dd = ImGui::GetDrawData();
     if (!dd || dd->TotalVtxCount == 0) return;
 
@@ -432,8 +751,8 @@ void Shutdown()
 {
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     for (FrameBuf& f : s_frame) {
-        if (f.vb) vmaDestroyBuffer(VulkanHW.m_Allocator, f.vb, f.vbA);
-        if (f.ib) vmaDestroyBuffer(VulkanHW.m_Allocator, f.ib, f.ibA);
+        if (f.vb) VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, f.vb, f.vbA);
+        if (f.ib) VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, f.ib, f.ibA);
         f = FrameBuf{};
     }
     if (s_pipeline)  { vkDestroyPipeline(VulkanHW.m_Device, s_pipeline, nullptr); s_pipeline = VK_NULL_HANDLE; }
@@ -442,7 +761,7 @@ void Shutdown()
     if (s_setLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }
     if (s_sampler)   { vkDestroySampler(VulkanHW.m_Device, s_sampler, nullptr); s_sampler = VK_NULL_HANDLE; }
     if (s_fontView)  { vkDestroyImageView(VulkanHW.m_Device, s_fontView, nullptr); s_fontView = VK_NULL_HANDLE; }
-    if (s_fontImage) { vmaDestroyImage(VulkanHW.m_Allocator, s_fontImage, s_fontAlloc); s_fontImage = VK_NULL_HANDLE; }
+    if (s_fontImage) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_fontImage, s_fontAlloc); s_fontImage = VK_NULL_HANDLE; }
     if (s_ctx)       { ImGui::DestroyContext(s_ctx); s_ctx = nullptr; }
     s_inited = false;
 }

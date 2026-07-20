@@ -273,7 +273,10 @@ namespace luabind
 						throw luabind::error(L);
 #else
 						error_callback_fun e = get_error_callback();
-						if (e) e(L);
+						// Историческое поведение OGSR: void-вызов после error-колбэка ПРОДОЛЖАЕТ работу.
+						// Колбэк (CScriptEngine::lua_error) теперь бросает — глотаем здесь, чтобы все
+						// существующие void-вызыватели пережили Lua-ошибку как раньше.
+						if (e) { try { e(L); } catch (...) {} }
                         else
                         {
                             assert(0 && "the lua function threw an error and exceptions are disabled."

@@ -8,27 +8,49 @@
 // xrRenderVulkan — shared per-frame environment lighting UBO. See vk_env_light.h.
 #include "stdafx.h"
 #include "vk_env_light.h"
+#include "vk_color_space.h"                 // ColorSpace::Linearize* — sRGB→linear on upload (r_linear_color)
 #include "vk_buffer.h"                     // CVulkanBuffer
 #include "vk_command_buffer.h"             // CVulkanCommandManager::FRAMES_IN_FLIGHT
 #include "vk_shadow.h"                     // ShadowMap (binding 1 = shadow map, sun_vp)
+#include "vk_pass_shadow.h"                // SpotShadow_TileOfLight — spot-pool tile per light
 #include "vk_vsm.h"                        // VSM receivers (bindings 14-16: atlas, page table, clipmap UBO)
 #include "vk_clustered.h"                  // Clustered forward (bindings 17-19: lights, grid, indices)
+#include "vk_profiler.h"                    // VK::Prof::NameSet — TEMP VUID-hunt instrumentation
 #include "vk_water_sim.h"                  // WaterSim (binding 11 = water depth)
 #include "vk_deform.h"                     // Deform (binding 20 = snow deform press field)
 #include "vk_pass_skinned.h"               // Skinned_CollectFeet (snow footprint deformation)
 #include "vk_texture.h"                    // CVulkanTexture (fallback ambient cube)
+#include "vk_texture_stream.h"             // TextureStreamer feedback SSBO (binding 30)
 #include "vk_pass_sky.h"                   // SkyPass::AcquireAmbientCubes (hemisphere sky ambient)
+#include "vk_ibl.h"                        // Sky specular IBL (binding 26 = prefiltered cube)
+#include "vk_volumetrics.h"                // integrated froxel volume (binding 27 = sun-beam ground deposit)
+#include "vk_terrain_cache.h"              // terrain composite cache (bindings 28/29 + tcache UBO params)
 #include "vk_pass_ssao.h"                  // GTAO result (binding 8, white fallback until ready)
+#include "vk_pipeline_cache.h"             // PipelineCache::SetFrameSpecMask (Inc 1 world uber-FS variant bits)
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
+#include "../../xr_3da/IGame_Level.h"      // g_pGameLevel->name() — per-level terrain channel offsets
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_dir/sun_color/hemi/ambient)
 #include "../../xr_3da/device.h"           // Device.vCameraPosition (light collection)
+#include "vk_pass_context.h"               // FrameContext — scene render extent (ao_params, DLSS mip bias)
 
 #include <cstring>
+#include <cmath>    // log2f — DLSS texture mip bias
+
+extern VK::FrameContext g_FrameCtx;   // CRender_Vulkan.cpp — scene render / display extents
 
 extern int   ps_r_ssao_debug;     // r_ssao_debug — draw the raw AO map (vk_console_min.cpp)
 extern float ps_r_ssao_strength;  // r_ssao_strength — live AO depth knob
+extern float ps_r_dlss_bias;      // r_dlss_bias — scale of the DLSS mip-LOD bias (1 = full NVIDIA log2(render/display), 0 = off)
 extern float ps_r_sun_boost;      // r_sun_boost — global sun multiplier (was ×1.25 literals in 5 shaders)
+extern float ps_r_sun_beam;       // r_sun_beam — surface beam-gap recovery strength (0 = off)
+extern float ps_r_sun_beam_dist;  // r_sun_beam_dist — max recovery distance (m)
+extern float ps_r_sun_beam_boost; // r_sun_beam_boost — extra sun in the recovered gap (splash)
+extern float ps_r_sun_beam_bias;  // r_sun_beam_bias — atlas self-bias (m along the sun ray)
+extern float ps_r_sun_beam_ground;     // r_sun_beam_ground — forward sun-beam GROUND deposit strength (0 = off)
+extern float ps_r_sun_beam_ground_thr; // r_sun_beam_ground_thr — in-scatter luminance threshold for the deposit
+extern int   ps_r_vol;                 // r_vol — volumetric fog master (the deposit needs the volume)
 extern float ps_r_ambient_floor;  // r_ambient_floor — flat ambient lift (was +0.05 literals in 4 shaders)
+extern float ps_r_ambient_sky_gate; // r_ambient_sky_gate — gate the flat sky ambient by sky visibility (no indoor leak)
 extern float ps_r_wet_darken;     // r_wet_darken — wet albedo darkening strength (0..1)
 extern float ps_r_wet_refl;       // r_wet_refl — wet sky-reflection strength
 extern int   ps_r_wet_debug;      // r_wet_debug — draw the wet mask (negative darken = flag)
@@ -43,9 +65,12 @@ extern float ps_r_pom_ao;         // r_pom_ao — POM view-independent contact A
 extern int   ps_r_pom_debug;      // r_pom_debug — draw the POM AO×self-shadow mask
 extern int   ps_r_rain_enable;    // r_rain — master rain on/off (forces wetness 0 when off)
 extern int   ps_r_ao_flat;        // r_ao_flat — debug: neutralize all ambient occlusion
+extern int   ps_r_shade_debug;    // r_shade_debug — lighting-component isolation views (world shaders)
 extern float ps_r_pom_ceil;       // r_pom_ceil — POM strength on down-facing surfaces (ceilings)
 extern float ps_r_pom_floor;      // r_pom_floor — POM strength on up-facing surfaces (floors)
 extern int   ps_r_pom_terrain;    // r_pom_terrain — terrain POM enable (experimental, default off)
+extern float ps_r_pom_zoff;       // r_pom_zoff — terrain POM depth offset strength (SSFX, 1 = 0.11 m)
+extern float ps_r_terra_blend;    // r_terra_blend — detail-blend depth (0 = GAMMA plain-mask cross-fade)
 extern float ps_r_terrain_normal; // r_terrain_normal — terrain detail normal-mapping strength
 extern float ps_r_terrain_ao;     // r_terrain_ao — terrain micro contact AO strength
 extern int   ps_r_terrain_debug;  // r_terrain_debug — terrain debug view (0..3)
@@ -77,6 +102,13 @@ extern float ps_r_mud_depth;          // r_mud_depth — mud print POM carve dep
 extern int   ps_r_snow_mesh;          // r_snow_mesh — dense snow surface mesh (VHM-style)
 extern int   ps_r_spot_grass;         // r_spot_grass — grass casters into the spot beam map
 extern float ps_r_spot_grass_shadow;  // r_spot_grass_shadow — grass shadow strength on SURFACES (0..1)
+extern float ps_r_flashlight_grass;   // r_flashlight_grass — FULL grass shadow for flashlight tiles (night wow)
+extern int   ps_r_point_debug;        // r_point_debug — point-shadow coverage overlay
+extern int   ps_r_grass_debug;        // r_grass_debug — grass lighting-component isolation view
+extern float ps_r_grass_self_bias;    // r_grass_self_bias — grass dyn-atlas anti-acne slack (m)
+extern int   ps_r_ibl;                // r_ibl — sky specular IBL master (prefiltered sky reflections + sun glint)
+extern float ps_r_ibl_spec;           // r_ibl_spec — specular IBL strength
+extern int   ps_r_ibl_debug;          // r_ibl_debug — show only the specular field
 
 namespace VK { namespace EnvLight {
 
@@ -119,6 +151,14 @@ namespace {
     CVulkanTexture*       s_fallbackBlack = nullptr;
     VkImageView           s_boundIL[kFramesInFlight] = {};
 
+    // Sky specular IBL (binding 26): grey cube fallback until vk_ibl prefilters the
+    // real sky; Update() swaps in IBL::GetSpecView() once ready (gated by ibl_params.x).
+    VkImageView           s_boundIBL[kFramesInFlight] = {};
+    VkBuffer              s_boundSH[kFramesInFlight] = {};   // sky SH9 SSBO (binding 31), swapped in lazily
+    VkImageView           s_boundVol3D[kFramesInFlight] = {};   // binding 27: integrated froxel volume (sun-beam ground deposit)
+    VkImageView           s_boundTCacheH[kFramesInFlight] = {}; // binding 28: terrain composite cache height
+    VkImageView           s_boundTCacheW[kFramesInFlight] = {}; // binding 29: terrain composite cache weights
+
     // Spot light cookie (flashlight beam texture, binding 10): loaded once per
     // texture name (Torch config "spot_texture"), per-slot bound-view tracking.
     VkImageView           s_boundCookie[kFramesInFlight] = {};
@@ -152,7 +192,11 @@ namespace {
         FS.update_path(full, "$game_textures$", leaf);
         if (FS.exist(full)) {
             t = xr_new<CVulkanTexture>();
-            if (!t->LoadDDS(full, /*applyBCSwizzle*/ false)) { xr_delete(t); t = nullptr; }
+            // Spot cookie — Colour: it is a projected light-colour pattern that
+            // multiplies emitted radiance, so leaving it gamma-encoded would make the
+            // lamp's colour the one gamma-space term in an otherwise linear light path.
+            if (!t->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::UI,
+                            TexColorSpace::Color)) { xr_delete(t); t = nullptr; }
         }
         if (t) Msg("[VK Light] spot cookie loaded: '%s'", name.c_str());
         else   Msg("![VK Light] spot cookie not found: '%s'", name.c_str());
@@ -190,7 +234,7 @@ bool Init()
     // water-sim (r_water_sim, off by default); the SSS puddle path doesn't use them
     // but they stay bound (harmless) so the sim can be switched on without relayout.
     // All FRAGMENT.
-    VkDescriptorSetLayoutBinding b[23]{};
+    VkDescriptorSetLayoutBinding b[32]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     // Also visible to VS/TES: snow geometric displacement reads sf_params.w (coverage).
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
@@ -223,21 +267,63 @@ bool Init()
     // with the clean spot map so grass shadows surfaces PARTIALLY (r_spot_grass_shadow).
     b[22].binding = 22; b[22].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[22].descriptorCount = 1;
     b[22].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // VSM STATIC atlas (binding 23): GRASS samples it directly at the blade's own
+    // world position (detail.frag VSM_GRASS_DIRECT) — the screen-space mask (14)
+    // belongs to the surface BEHIND the blade and paints terrain shadows onto the
+    // canopy. Pairs with the page table (15) + clipmap UBO (16) already bound.
+    b[23].binding = 23; b[23].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[23].descriptorCount = 1;
+    b[23].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // + the DYNAMIC atlas (24) and its page table (25): grass-on-grass / NPC-on-grass
+    // shadows, sampled with an extra bias so a casting blade doesn't acne on itself.
+    b[24].binding = 24; b[24].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[24].descriptorCount = 1;
+    b[24].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[25].binding = 25; b[25].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         b[25].descriptorCount = 1;
+    b[25].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Sky specular IBL (binding 26): prefiltered sky cube (roughness mips), sampled
+    // by iblSpecular()/sunSpec() in the forward receivers. FRAGMENT.
+    b[26].binding = 26; b[26].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[26].descriptorCount = 1;
+    b[26].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Integrated froxel volume (binding 27, sampler3D): the forward receivers probe the
+    // shaft in-scatter at their own pixel to deposit a sun-beam "ground splash" (see
+    // world_terrain.frag). Written per-slot in Update (Vol::Init runs AFTER EnvLight::Init,
+    // so the 3D view is null here; the first Update fills it before any forward draw).
+    b[27].binding = 27; b[27].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[27].descriptorCount = 1;
+    b[27].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Terrain COMPOSITE CACHE (bindings 28/29, vk_terrain_cache): baked composite
+    // height + blend weights, marched by world_terrain(+_depth).frag when live.
+    // Written per-slot in Update (the cache bakes after EnvLight::Init) — white
+    // fallback until then.
+    b[28].binding = 28; b[28].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[28].descriptorCount = 1;
+    b[28].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[29].binding = 29; b[29].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[29].descriptorCount = 1;
+    b[29].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Texture-streaming GPU feedback (binding 30, vk_texture_stream): the world FS
+    // atomicMin the encoded desired LOD of the base diffuse it sampled. Bound to the
+    // streamer's feedback SSBO (or the dummy when creation failed — shaders skip on
+    // out-of-range streamID pushes, so the dummy is never written).
+    b[30].binding = 30; b[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[30].descriptorCount = 1;
+    b[30].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Diffuse sky SH9 (binding 31, vk_ibl): 9 irradiance coefficients projected from
+    // the world-space sky probe. Read by skyAmbient() in every forward receiver
+    // (world / terrain / grass / trees / skinned). Bound to the dummy until the
+    // first projection lands; sh_params.x gates the read.
+    b[31].binding = 31; b[31].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[31].descriptorCount = 1;
+    b[31].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     // The snow MESH (vk_pass_snow) vertex shader samples the RAIN map (9, base height)
     // + deform field (20) to place + displace its dense grid -> need VERTEX visibility.
     b[9].stageFlags  |= VK_SHADER_STAGE_VERTEX_BIT;
     b[13].stageFlags |= VK_SHADER_STAGE_VERTEX_BIT;
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 23; slci.pBindings = b;
+    slci.bindingCount = 32; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
     VkDescriptorPoolSize ps[3]{
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight * 2 },    // LightUBO + VSM clipmap UBO
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 17 },   // 13 shadow/sky/ao + VSM atlas + deform + SSIL + spot beam
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kFramesInFlight * 4 },    // VSM page table + 3 cluster SSBOs
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 24 },   // 13 shadow/sky/ao + VSM mask + deform + SSIL + spot beam + VSM static/dyn atlases (grass) + IBL spec cube + froxel volume
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kFramesInFlight * 7 },    // VSM static+dyn page tables + 3 cluster SSBOs + tex-stream feedback + sky SH9
     };
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -254,6 +340,7 @@ bool Init()
     if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_set) != VK_SUCCESS) {
         Msg("![VK EnvLight] alloc sets failed"); s_failed = true; return false;
     }
+    for (u32 i = 0; i < kFramesInFlight; ++i) VK::Prof::NameSet(s_set[i], "EnvLight.WorldSet1");   // TEMP diag: VUID hunt
 
     // Host-visible UBO, one aligned LightUBO region per in-flight slot; each set
     // bound to its slice at an alignment-safe offset.
@@ -265,7 +352,7 @@ bool Init()
     // Tiny valid SSBO/UBO bound to VSM bindings 15/16 until VSM initialises (lazy on
     // first r_vsm). Receivers gate VSM sampling on shadow_params.w, so it's never read.
     s_dummyBuf.Create(256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                      VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+                      VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     // Trilinear cube sampler (mips → blurred sky = diffuse irradiance) + a
     // neutral 1×1×6 fallback so bindings 6/7 are valid before SkyPass loads the
@@ -368,6 +455,10 @@ bool Init()
         // the white fallback is never actually sampled before then).
         VkDescriptorImageInfo dfI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundDeform[i] = fbWhite;
+        // Binding 26: sky specular IBL cube — grey cube fallback until vk_ibl has a
+        // probe; Update() swaps in IBL::GetSpecView() (gated by ibl_params.x anyway).
+        VkDescriptorImageInfo iblI{ s_cubeSampler, fbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundIBL[i] = fbView;
 
         // Clustered forward (bindings 17/18/19): valid SSBO placeholder until the
         // vk_clustered module inits; Update() swaps in the real buffers (gated by
@@ -378,7 +469,7 @@ bool Init()
             { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
         };
 
-        VkWriteDescriptorSet w[20]{};
+        VkWriteDescriptorSet w[32]{};
         w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
@@ -444,12 +535,103 @@ bool Init()
         w[count].dstSet = s_set[i]; w[count].dstBinding = 20; w[count].descriptorCount = 1;
         w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &dfI;
         ++count;
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 26; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &iblI;
+        ++count;
+        // VSM receiver bindings 14/15/16 + 23/24/25 — fallback (white image / dummy
+        // buffer) so they are DEFINED from Init, before the first EnvLight::Update
+        // writes the real VSM data. Without this, a draw that binds this set before the
+        // first Update reads an unwritten binding 14 (uVsmMask) → VUID-08114. Update()
+        // overwrites all six each frame.
+        VkDescriptorImageInfo  vsmFbImg{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorBufferInfo vsmFbBuf{ s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        const struct { u32 binding; VkDescriptorType type; bool img; } vsmFb[6] = {
+            { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, true  },
+            { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         false },
+            { 16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         false },
+            { 23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, true  },
+            { 24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, true  },
+            { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         false },
+        };
+        for (const auto& f : vsmFb) {
+            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[count].dstSet = s_set[i]; w[count].dstBinding = f.binding; w[count].descriptorCount = 1;
+            w[count].descriptorType = f.type;
+            if (f.img) w[count].pImageInfo = &vsmFbImg; else w[count].pBufferInfo = &vsmFbBuf;
+            ++count;
+        }
+        // Terrain composite cache (28/29) — white fallback until the first bake;
+        // Update() swaps in TerrainCache views (gated by tcache_params.x anyway).
+        VkDescriptorImageInfo tcI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundTCacheH[i] = fbWhite; s_boundTCacheW[i] = fbWhite;
+        for (u32 tb = 28; tb <= 29; ++tb) {
+            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[count].dstSet = s_set[i]; w[count].dstBinding = tb; w[count].descriptorCount = 1;
+            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &tcI;
+            ++count;
+        }
+        // Texture-streaming GPU feedback SSBO (binding 30). The streamer creates it
+        // on this first call; on failure the dummy keeps the binding defined (world
+        // FS skips the write for streamID >= kFeedbackSlots, and no real slots are
+        // ever handed out when the buffer doesn't exist).
+        VkBuffer fbStream = VK::TextureStreamer::Instance().GetFeedbackBuffer();
+        VkDescriptorBufferInfo fbStreamI{ fbStream != VK_NULL_HANDLE ? fbStream : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 30; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &fbStreamI;
+        ++count;
+        // Sky SH9 (binding 31): dummy for now — IBL::Init() runs AFTER this block, so
+        // the real buffer does not exist yet. Update() swaps it in lazily per slot
+        // (same pattern as the IBL cube at binding 26). The binding must be defined
+        // here regardless: an unwritten descriptor is undefined behaviour even for a
+        // shader that never reads it.
+        VkDescriptorBufferInfo shI{ s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[count].dstSet = s_set[i]; w[count].dstBinding = 31; w[count].descriptorCount = 1;
+        w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &shI;
+        ++count;
         vkUpdateDescriptorSets(VulkanHW.m_Device, count, w, 0, nullptr);
     }
+
+    // Sky specular IBL prefilter module (owns the RGBA16F reflection cube at
+    // binding 26). Self-guards if the compute .spv is missing → binding stays grey.
+    IBL::Init();
 
     s_current = s_set[0];
     Msg("[VK EnvLight] init OK (UBO %u bytes x %u slots)", (u32)sizeof(LightUBO), kFramesInFlight);
     return true;
+}
+
+// ---- Per-level terrain channel depth offsets (SSFX ssfx_terrain_offset) ----
+// gamedata\config\terrain_details.ltx, [<level name>] offsets = R,G,B,A —
+// per-channel height shifts (asphalt sinks below soil etc.), same table as
+// GAMMA's ssfx_parallax_setup. Missing file/section = all-zero (SSFX default
+// for unlisted levels). Cached per level; re-read on level change.
+static float      s_chOff[4]   = { 0.f, 0.f, 0.f, 0.f };
+static shared_str s_chOffLevel;
+static bool       s_chOffInit  = false;
+
+const float* TerrainChOff()
+{
+    shared_str lvl = g_pGameLevel ? g_pGameLevel->name() : shared_str("");
+    if (s_chOffInit && lvl.equal(s_chOffLevel)) return s_chOff;
+    s_chOffInit  = true;
+    s_chOffLevel = lvl;
+    s_chOff[0] = s_chOff[1] = s_chOff[2] = s_chOff[3] = 0.f;
+    if (lvl.size()) {
+        string_path fn;
+        if (FS.exist(fn, "$game_config$", "terrain_details.ltx")) {
+            CInifile ini(fn, TRUE);
+            if (ini.section_exist(lvl) && ini.line_exist(lvl, "offsets")) {
+                const Fvector4 v = ini.r_fvector4(lvl, "offsets");
+                s_chOff[0] = v.x; s_chOff[1] = v.y; s_chOff[2] = v.z; s_chOff[3] = v.w;
+            }
+        }
+        Msg("[VK Terrain] level '%s' channel offsets = (%.3f, %.3f, %.3f, %.3f)",
+            lvl.c_str(), s_chOff[0], s_chOff[1], s_chOff[2], s_chOff[3]);
+    }
+    return s_chOff;
 }
 
 void Update(u32 slot)
@@ -490,16 +672,52 @@ void Update(u32 slot)
             }
         }
     }
+    // LINEARISE BEFORE THE KNOBS (r_linear_color; no-op in the gamma pipeline).
+    // Placed here so it covers BOTH the real env values above and the neutral
+    // fallbacks — one conversion point instead of two that can drift apart.
+    //
+    // Order matters and this order is the physical one: r_sun_boost is a radiance
+    // SCALE and r_ambient_floor a radiance OFFSET, so they must act on linear values.
+    // Applying them before the decode would put them on the wrong side of a pow(2.4)
+    // and quietly change what the knobs mean — a boost of 1.25 in gamma space is not
+    // a boost of 1.25 in light.
+    //
+    // .w riders survive untouched by construction: hemi_color[3] is the "R2
+    // correction" factor and ambient[3] the sky gate, neither of which is colour.
+    ColorSpace::LinearizeRGB(ub.sun_color);
+    ColorSpace::LinearizeRGB(ub.hemi_color);
+    ColorSpace::LinearizeRGB(ub.ambient);
+    ColorSpace::LinearizeRGB(ub.fog_color);
+
     // LDR-era brightness hacks, centralized: the sun boost (was a ×1.25 literal
     // in five shaders) and the ambient floor (was +0.05 in four) apply ONCE
     // here, so every receiver consumes FINAL values. Live knobs r_sun_boost /
     // r_ambient_floor; 1.0/0.0 = raw env values. The grass/tree sun pushes get
     // the same boost in their managers (they bypass this UBO); sunshafts
     // kDensity is retuned ÷1.25 to keep shaft brightness unchanged.
+    //
+    // r_ambient_floor is DECODED, r_sun_boost is NOT — and the asymmetry is the point.
+    // A multiplier is unitless: ×1.25 means the same thing in either space, so boosting
+    // linear radiance directly is right. An ADDITIVE floor is not: the 0.05 was dialled
+    // in by eye against the screen, so it is a display-space quantity like every other
+    // authored colour in this pipeline. Adding it raw to linear radiance and then
+    // encoding for output turns it into 0.05^(1/2.2) ≈ 0.26 on screen — five times the
+    // intended lift, and precisely in the black end, which is why it read as "night is
+    // too bright" while daylight looked fine (there it drowns in the sun).
+    //
+    // Decoding it keeps the knob's number meaning exactly what it has always meant to
+    // the person turning it, in BOTH pipelines. Same rule as the env colours above:
+    // authored by eye ⇒ sRGB ⇒ decode on the way in.
+    const float ambFloor = ColorSpace::Active() ? ColorSpace::SrgbToLinear(ps_r_ambient_floor)
+                                                : ps_r_ambient_floor;
     for (int c = 0; c < 3; ++c) {
         ub.sun_color[c] *= ps_r_sun_boost;
-        ub.ambient[c]   += ps_r_ambient_floor;
+        ub.ambient[c]   += ambFloor;
     }
+    // Sky-visibility gate for the flat ambient (env_common skyAmbientGate): the
+    // sky-coloured fill leaks indoors, so houses/basements read as sky-lit. .w = how
+    // much covered surfaces (rainVis) lose it. 0 = old ungated look. Surfaces only.
+    ub.ambient[3] = _min(_max(ps_r_ambient_sky_gate, 0.f), 1.f);
 
     // Sun light view·proj for the shadow lookup (Pass_SunShadow ran earlier this
     // frame and stored it). Fmatrix is 16 floats row-major → straight copy.
@@ -513,6 +731,21 @@ void Update(u32 slot)
     // counts.x drives the UBO lights[16] loop — clamp it so a >16-light frame
     // never reads past the UBO array (the clustered path reads the SSBO instead).
     ub.counts[0] = float(_min(FL.count, kMaxGpuLights));
+    // Spot shadow POOL: per-light tile assignment (+1, 0 = none) and the
+    // per-tile view·proj matrices (Pass_SunShadow rendered them earlier).
+    u32 flashTileMask = 0;   // bit t set → pooled tile t's owner is a handheld torch
+    for (u32 i = 0; i < kMaxGpuLights; ++i) {
+        const int tile = (i < FL.count) ? SpotShadow_TileOfLight(FL.src[i]) : -1;
+        ub.spot_assign[i >> 2][i & 3] = float(tile + 1);
+        if (tile >= 0 && i < FL.count && FL.flashFlag[i]) flashTileMask |= (1u << u32(tile));
+    }
+    for (u32 t = 0; t < Lights::kMaxShadowSpots; ++t)
+        memcpy(ub.spot_pool_vp[t], &ShadowMap::GetSpotTileVP(t), sizeof(ub.spot_pool_vp[t]));
+    // Point shadow POOL: per-light cube-array index (+1, packed 4/vec4).
+    for (u32 i = 0; i < kMaxGpuLights; ++i) {
+        const int cube = (i < FL.count) ? PointShadow_CubeOfLight(FL.src[i]) : -1;
+        ub.point_assign[i >> 2][i & 3] = float(cube + 1);
+    }
     // Clustered forward: upload ALL collected lights to this slot's SSBO so the
     // compute cull (Pass_World) can bin them. r_clustered_debug also activates the
     // machinery (so the heatmap works without also typing r_clustered 1). This
@@ -578,6 +811,13 @@ void Update(u32 slot)
     // SkyPass and rebind this slot's bindings 6/7 if they changed (fence-safe —
     // Begin waited this slot's fence). Weight cross-fades the two cubes.
     float skyWeight = 0.f;
+    // The editor used to be pinned to the grey fallback here, because the Sky pass was
+    // skipped entirely in -vk_editor and its cubes were assumed to be left unusable. The
+    // cost was severe and easy to misread as "the editor has no shaders": skyAmbient()
+    // samples this cube ALONG THE SURFACE NORMAL and is the largest term in the lighting
+    // sum, so a 1x1 uniform cube hands every surface of every object the same value —
+    // flat, no matter how it is oriented. The Sky pass now runs as soon as the host
+    // pushes a scene, which loads and transitions the real weather cubes, so take them.
     {
         VkImageView v0 = VK_NULL_HANDLE, v1 = VK_NULL_HANDLE, samp = VK_NULL_HANDLE;
         VkSampler   skSamp = VK_NULL_HANDLE;
@@ -603,6 +843,14 @@ void Update(u32 slot)
                         slot, w, kAmbientScale, kAmbientLod);
                 }
             }
+            // Sky specular IBL: refresh the prefiltered reflection cube from the SAME
+            // weather cubes (no-op unless they/the cross-fade/the spin changed;
+            // fence-waited immediate submit). The prefilter also drives the DIFFUSE
+            // path now — it unwraps the sky into world space and the SH9 projection
+            // rides along in the same submit — so it must run whenever either
+            // consumer is on, not just for r_ibl.
+            if (ps_r_ibl || ps_r_sky_sh)
+                IBL::Update(v0, v1, s_cubeSampler, w, skyRot, ps_r_sky_sh_ground);
             (void)samp;
         } else {
             static bool s_skyFail = false;
@@ -615,6 +863,102 @@ void Update(u32 slot)
     // Animation clock for the wet-surface ripples (wrapped to keep float sin()
     // precision; 1000×2π → a re-phase only every ~1.7 h).
     ub.sky_params[3] = fmodf(Device.fTimeGlobal, 6283.185f);
+
+    // Sky specular IBL (binding 26): swap the grey fallback for the prefiltered
+    // reflection cube once vk_ibl has content (lazy, per slot). ibl_params gates
+    // the receivers regardless, so the grey fallback is never actually reflected.
+    {
+        const bool iblReady = ps_r_ibl && IBL::Ready();
+        VkImageView iv = iblReady ? IBL::GetSpecView()
+                                  : (s_fallbackCube ? s_fallbackCube->GetView() : VK_NULL_HANDLE);
+        VkSampler   is = iblReady ? IBL::GetSampler() : s_cubeSampler;
+        if (iv != VK_NULL_HANDLE && iv != s_boundIBL[slot]) {
+            VkDescriptorImageInfo ii{ is, iv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 26; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundIBL[slot] = iv;
+        }
+        // Fade-in (~1 s) when the probe first becomes ready → hides the reflection
+        // "pop" the user saw when the first prefilter completes at load. x = enable×fade.
+        static float s_iblFade = 0.f;
+        const float dtF = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+        if (iblReady) { s_iblFade += dtF; if (s_iblFade > 1.f) s_iblFade = 1.f; }
+        else            s_iblFade = 0.f;
+        ub.ibl_params[0] = s_iblFade;                         // enable × fade-in (0..1)
+        ub.ibl_params[1] = ps_r_ibl_spec;                    // spec strength
+        ub.ibl_params[2] = float(IBL::GetMaxMip());           // max roughness mip
+        ub.ibl_params[3] = (iblReady && ps_r_ibl_debug) ? 1.f : 0.f;  // debug field view
+    }
+
+    // [PARKED 2026-07-06 — r_sun_beam_ground default 0, so beam2.z stays 0 and the forward
+    //  deposit is skipped; binding 27 is still written (cheap, one descriptor) but unused.
+    //  Kept as scaffolding. See the PARKED note in vk_console_min.cpp.]
+    // Sun-beam GROUND DEPOSIT (r_sun_beam_ground, binding 27): bind the integrated
+    // froxel volume so the forward receivers can probe the shaft in-scatter at their
+    // own pixel and deposit sun where a visible beam lands (world_terrain.frag). The
+    // 3D view is eager (created at Vol::Init) and stable; write it per slot when it
+    // first appears / changes. Layout stays SHADER_READ (Vol::Execute leaves it so
+    // before the forward pass — same as the tonemap read).
+    {
+        VkImageView vv = Vol::GetIntegratedView();
+        if (vv != VK_NULL_HANDLE && vv != s_boundVol3D[slot]) {
+            VkDescriptorImageInfo ii{ Vol::GetSampler(), vv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 27; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundVol3D[slot] = vv;
+        }
+        // Terrain composite cache (28/29): swap in the baked views once they exist.
+        VkImageView th = TerrainCache::HeightView(), tw = TerrainCache::WeightsView();
+        if (th != VK_NULL_HANDLE && tw != VK_NULL_HANDLE
+            && (th != s_boundTCacheH[slot] || tw != s_boundTCacheW[slot])) {
+            VkDescriptorImageInfo hi{ TerrainCache::Sampler(), th, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkDescriptorImageInfo wi{ TerrainCache::Sampler(), tw, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet tws[2]{};
+            tws[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            tws[0].dstSet = s_set[slot]; tws[0].dstBinding = 28; tws[0].descriptorCount = 1;
+            tws[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; tws[0].pImageInfo = &hi;
+            tws[1] = tws[0]; tws[1].dstBinding = 29; tws[1].pImageInfo = &wi;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 2, tws, 0, nullptr);
+            s_boundTCacheH[slot] = th; s_boundTCacheW[slot] = tw;
+        }
+        // tcache UBO params: duv->cacheUV transform + live flag. Live only once
+        // baked AND the views are bound this slot (first frames keep the white
+        // fallback -> flag 0 keeps the shaders on the per-channel path).
+        const bool tcLive = TerrainCache::Live() && s_boundTCacheH[slot] == th && th != VK_NULL_HANDLE;
+        float txf[4] = { 0,0,0,0 }, tof[2] = { 0,0 };
+        if (tcLive) TerrainCache::GetXform(txf, tof);
+        ub.tcache_xform[0] = txf[0]; ub.tcache_xform[1] = txf[1];
+        ub.tcache_xform[2] = txf[2]; ub.tcache_xform[3] = txf[3];
+        ub.tcache_params[0] = tcLive ? 1.f : 0.f;
+        // .y = march features of the CURRENT bake (toggling the cvars forces a
+        // rebake, so this tracks): 1 = cone-step, 2 = cone + sun horizon.
+        ub.tcache_params[1] = (tcLive && TerrainCache::ConeLive())
+                                  ? (TerrainCache::HorizonLive() ? 2.f : 1.f) : 0.f;
+        ub.tcache_params[2] = tof[0]; ub.tcache_params[3] = tof[1];
+        // beam2 = { froxel nearZ, log2(far/near), deposit strength, in-scatter threshold }.
+        // Strength 0 unless r_vol is on AND the volume is ready (else the froxel data is
+        // stale/garbage). Same exp-Z terms the tonemap composite uses (single source).
+        const Vol::GridZParams gz = Vol::GetGridZ();
+        const bool volLive = (ps_r_vol != 0) && Vol::Ready();
+        ub.beam2[0] = gz.nearZ;
+        ub.beam2[1] = gz.logFarNear;
+        ub.beam2[2] = volLive ? ps_r_sun_beam_ground : 0.f;
+        ub.beam2[3] = ps_r_sun_beam_ground_thr;
+    }
+
+    // Sun-beam ground recovery (r_sun_beam): let surfaces re-open the thin sun gaps
+    // the temporal screen mask smears shut, so the volumetric shaft and the ground
+    // agree on where the sun lands. Only meaningful under VSM (crisp atlas source).
+    ub.beam_params[0] = ps_r_sun_beam;        // recovery strength (0 = off)
+    ub.beam_params[1] = ps_r_sun_beam_dist;   // max distance (m)
+    ub.beam_params[2] = ps_r_sun_beam_boost;  // extra-sun kick in the recovered gap
+    ub.beam_params[3] = ps_r_sun_beam_bias;   // atlas self-bias (m)
 
     // GTAO (binding 8): swap the real AO view in when the pass has one, back to
     // the white fallback when it doesn't (prepass off / not rendered yet).
@@ -725,8 +1069,16 @@ void Update(u32 slot)
             s_boundDeform[slot] = dv;
         }
     }
-    ub.ao_params[0] = Device.dwWidth  ? 1.f / float(Device.dwWidth)  : 0.f;
-    ub.ao_params[1] = Device.dwHeight ? 1.f / float(Device.dwHeight) : 0.f;
+    // 1/screen must be the SCENE RENDER resolution, not the window: gl_FragCoord in
+    // the scene passes runs over the render extent, and every screen-space consumer
+    // (uVsmMask, uAO, uIL, cluster lookup) maps fragcoord*ao_params.xy → [0,1]. With
+    // DLSS render<display upscaling those differ — Device.dwWidth here displaced all
+    // shadows/AO ("тени слетают со своих мест"). Fall back to the window before the
+    // first CRender::Begin has published the frame extent.
+    const u32 sceneW = g_FrameCtx.extent.width  ? g_FrameCtx.extent.width  : Device.dwWidth;
+    const u32 sceneH = g_FrameCtx.extent.height ? g_FrameCtx.extent.height : Device.dwHeight;
+    ub.ao_params[0] = sceneW ? 1.f / float(sceneW) : 0.f;
+    ub.ao_params[1] = sceneH ? 1.f / float(sceneH) : 0.f;
     ub.ao_params[2] = SSAOPass::Strength() * ps_r_ssao_strength;
     ub.ao_params[3] = (SSAOPass::Strength() > 0.f && ps_r_ssao_debug) ? 1.f : 0.f;
 
@@ -807,7 +1159,7 @@ void Update(u32 slot)
     ub.pom_params2[1] = ps_r_pom_normal;
     ub.pom_params2[2] = ps_r_pom_shadow;
     ub.pom_params2[3] = ps_r_pom_ao;
-    ub.pom_params3[0] = ps_r_pom_debug ? 1.f : 0.f;
+    ub.pom_params3[0] = float(ps_r_pom_debug);   // 1 = AO x shadow mask, 2 = self-shadow only
     ub.pom_params3[1] = ps_r_ao_flat ? 1.f : 0.f;
     ub.pom_params3[2] = ps_r_pom_ceil;
     ub.pom_params3[3] = ps_r_pom_floor;
@@ -929,7 +1281,47 @@ void Update(u32 slot)
     // Zero when grass casters are off — the beam map then equals the clean map
     // anyway, but skipping the 9 extra taps is free.
     ub.spot_params[0] = ps_r_spot_grass ? _min(_max(ps_r_spot_grass_shadow, 0.f), 1.f) : 0.f;
-    ub.spot_params[1] = ub.spot_params[2] = ub.spot_params[3] = 0.f;
+    ub.spot_params[1] = float(ps_r_point_debug);   // point-shadow debug overlay
+    ub.spot_params[2] = float(ps_r_grass_debug);   // grass component isolation (detail.frag)
+    ub.spot_params[3] = ps_r_grass_self_bias;      // grass dyn-atlas anti-acne slack (m)
+    // Flashlight tiles paint crisp grass dapples in their ground pool (night wow) —
+    // full-strength grass shadow instead of the subtle spot_params.x lamp blend.
+    ub.spot_flash[0] = float(flashTileMask);
+    ub.spot_flash[1] = ps_r_spot_grass ? _min(_max(ps_r_flashlight_grass, 0.f), 1.f) : 0.f;
+    // Texture mip-LOD bias when DLSS renders below display res: log2(render/display)
+    // (negative). Without it material textures pick the coarser mip for the low-res
+    // raster and the DLSS output stays soft — NVIDIA requires this bias for SR.
+    // Material frag shaders add it to their implicit-LOD albedo/detail fetches.
+    {
+        float texBias = 0.f;
+        if (g_FrameCtx.displayExtent.width > g_FrameCtx.extent.width && g_FrameCtx.extent.width > 0)
+            texBias = log2f(float(g_FrameCtx.extent.width) / float(g_FrameCtx.displayExtent.width));
+        // r_dlss_bias scales the NVIDIA-recommended bias (1 = full). The full bias
+        // SHARPENS the alpha mips of alpha-tested foliage → leaf coverage shrinks at
+        // the cutoff → black holes onto the dark crown interior at distance (the
+        // «чёрные пятна на листве» saga). 0 = off for A/B.
+        ub.spot_flash[2] = texBias * _min(_max(ps_r_dlss_bias, 0.f), 1.f);
+    }
+    ub.spot_flash[3] = 0.f;
+    // Terrain DEPTH OFFSET (r_pom_zoff, SSFX port): sink terrain depth into the POM
+    // cracks (prepass + color) so GTAO / VSM resolve shade INTO the relief. Only
+    // meaningful with terrain POM data; the pipeline variant gates on the same pair.
+    ub.zoff_params[0] = ps_r_pom_terrain ? _max(ps_r_pom_zoff, 0.f) : 0.f;
+    // .y = r_terra_blend: terrain detail-blend transition depth. 0 = plain mask
+    // cross-fade (GAMMA/SSFX ships with height-blending commented out — asphalt
+    // fades smoothly into soil); >0 = Mishkinis height blend (0.25 = old sharp).
+    ub.zoff_params[1] = ps_r_terra_blend;
+    // .z = r_shade_debug: lighting-component isolation views in the world shaders
+    // (1 albedo, 2 baked lmap/vertex, 3 hemi-occ, 4 GTAO, 5 ambient sky gate,
+    //  6 sky hemisphere, 7 total lighting, 8 flat ambient, 9 sun, 10 wetness).
+    ub.zoff_params[2] = float(ps_r_shade_debug);
+    ub.zoff_params[3] = 0.f;
+    // Per-level SSFX terrain channel offsets (terrain_details.ltx; also consumed
+    // by the terrain composite cache bake, which pulls TerrainChOff() directly).
+    memcpy(ub.ch_off, TerrainChOff(), sizeof(ub.ch_off));
+    // Baked terrain splat mask (mask-less maps): world XZ -> mask UV affine;
+    // z == 0 (inactive) keeps the shaders on the material's own mask at vUV.
+    TerrainMask::GetParams(ub.tmask_params);
     // Periodic state log while debugging wetness (pairs with the mask view).
     if (ps_r_wet_debug) {
         static u32 s_wetLogCd = 0;
@@ -940,14 +1332,32 @@ void Update(u32 slot)
         } else --s_wetLogCd;
     }
 
+    // Inc 1: fold the frame-global world uber-FS variant bits (WS_FRAME) from THIS
+    // frame's UBO so the world + terrain pipelines bake matching spec constants — a
+    // plain summer/dry/no-debug frame → all off → the lean variant. Reads the same ub
+    // fields the shader's snow/wet/ibl/debug branches test, so the mask can't disagree.
+    {
+        u8 sm = 0;
+        if (ub.sf_params[3]   > 0.f)    sm |= VK::PipelineCache::WS_SNOW;   // eased snow coverage
+        if (ub.rain_params[1] > 0.f)    sm |= VK::PipelineCache::WS_WET;    // wetness (already rain-gated)
+        if (ub.ibl_params[0]  > 0.004f) sm |= VK::PipelineCache::WS_IBL;    // r_ibl enable×fade (matches shader gate)
+        if (ub.ao_params[3]   > 0.5f || ub.rain_params[2]   < 0.f  || ub.pom_params5[3]   > 0.5f ||
+            ub.pom_params3[0] > 0.5f || ub.pom_params3[1]   > 0.5f || ub.cluster_params[3] > 1.5f ||
+            ub.sf_params[1]   > 0.5f || ub.pom_params4[3]   > 0.5f || ub.zoff_params[2]   > 0.5f ||
+            ub.ibl_params[3]  > 0.5f)   sm |= VK::PipelineCache::WS_DEBUG;
+        VK::PipelineCache::SetFrameSpecMask(sm);
+    }
+
     memcpy(s_mapped + size_t(slot) * kSlotStride, &ub, sizeof(LightUBO));
 
-    // VSM receiver bindings. As of the temporal-resolve phase, binding 14 is the
-    // SCREEN-SPACE sun-shadow mask (resolved each frame in Pass_World) — receivers
-    // sample it by screen UV instead of doing the atlas/page-table lookup themselves.
-    // Bindings 15/16 (page table / clipmap UBO) stay in the layout but are unused by
-    // receivers now (the resolve compute owns them). Mask is in GENERAL layout; the
-    // placeholder = white (lit) when not yet resolved (also gated off by shadow_params.w).
+    // VSM receiver bindings. Binding 14 = the SCREEN-SPACE sun-shadow mask (resolved
+    // each frame in Pass_World) — SURFACE receivers (in the prepass) sample it by
+    // screen UV. Bindings 15/16 (static page table / clipmap UBO) + 23/24/25 (static
+    // atlas / dyn atlas / dyn page table) serve the GRASS receiver, which does the
+    // full atlas lookup at the blade's own world position instead (the mask belongs
+    // to the surface BEHIND a blade — see vsm_sample.glsl VSM_GRASS_DIRECT). Mask is
+    // in GENERAL layout; placeholders = white (lit) until resolved/rendered (also
+    // gated off by shadow_params.w).
     {
         const bool maskOk = VK::VSM::MaskReady();
         VkDescriptorImageInfo  atI{
@@ -958,12 +1368,34 @@ void Update(u32 slot)
         const VkBuffer ubBuf = VK::VSM::GetUBOHandle();
         VkDescriptorBufferInfo ptI{ ptBuf ? ptBuf : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo vuI{ ubBuf ? ubBuf : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet wv[3]{};
-        for (u32 k = 0; k < 3; ++k) { wv[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wv[k].dstSet = s_set[slot]; wv[k].dstBinding = 14 + k; wv[k].descriptorCount = 1; }
+        // Bindings 23/24/25: the STATIC + DYNAMIC atlases and the dyn page table —
+        // grass receivers sample them at the blade's own world pos (no screen-space
+        // parallax; dyn taps use an extra bias so a casting blade doesn't acne on
+        // itself). White (= lit) until the atlases have content; receivers
+        // additionally gate on shadow_params.w.
+        const bool atlasOk = VK::VSM::AtlasReady();
+        VkDescriptorImageInfo  asI{
+            atlasOk ? VK::VSM::GetSampler()    : s_cubeSampler,
+            atlasOk ? VK::VSM::GetAtlasView()  : s_fallbackWhite->GetView(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo  adI{
+            atlasOk ? VK::VSM::GetSampler()       : s_cubeSampler,
+            atlasOk ? VK::VSM::GetDynAtlasView()  : s_fallbackWhite->GetView(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        const VkBuffer pdBuf = VK::VSM::GetDynPageTableHandle();
+        VkDescriptorBufferInfo pdI{ pdBuf ? pdBuf : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet wv[6]{};
+        for (u32 k = 0; k < 6; ++k) { wv[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wv[k].dstSet = s_set[slot]; wv[k].dstBinding = 14 + k; wv[k].descriptorCount = 1; }
         wv[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[0].pImageInfo  = &atI;
         wv[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         wv[1].pBufferInfo = &ptI;
         wv[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         wv[2].pBufferInfo = &vuI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 3, wv, 0, nullptr);
+        wv[3].dstBinding = 23;
+        wv[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[3].pImageInfo  = &asI;
+        wv[4].dstBinding = 24;
+        wv[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[4].pImageInfo  = &adI;
+        wv[5].dstBinding = 25;
+        wv[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         wv[5].pBufferInfo = &pdI;
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 6, wv, 0, nullptr);
     }
 
     // Clustered forward SSBOs (bindings 17/18/19): swap the dummy for the real
@@ -992,6 +1424,7 @@ void Update(u32 slot)
 void Destroy()
 {
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+    IBL::Destroy();   // EnvLight owns the IBL module's lifecycle (Init'd in Init())
     if (s_fallbackCube) { s_fallbackCube->Destroy(); xr_delete(s_fallbackCube); }
     if (s_fallbackWhite) { s_fallbackWhite->Destroy(); xr_delete(s_fallbackWhite); }
     if (s_fallbackBlack) { s_fallbackBlack->Destroy(); xr_delete(s_fallbackBlack); }
@@ -1006,7 +1439,7 @@ void Destroy()
     s_dummyBuf.Destroy();
     s_mapped = nullptr;
     s_current = VK_NULL_HANDLE;
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundIL[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundDeform[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundIL[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundDeform[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; s_boundIBL[i] = VK_NULL_HANDLE; s_boundSH[i] = VK_NULL_HANDLE; }
     s_inited = false; s_failed = false;
 }
 

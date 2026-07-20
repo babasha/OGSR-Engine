@@ -187,11 +187,22 @@ int CObjectSpace::GetNearest(xr_vector<CObject*>& q_nearest, ICollisionForm* obj
 //----------------------------------------------------------------------
 static void __stdcall build_callback(Fvector* V, const size_t Vcnt, CDB::TRI* T, const size_t Tcnt, void* params) { g_pGameLevel->Load_GameSpecific_CFORM(T, Tcnt); }
 
+// Tiled CDB residency (streaming-world Stage C): stream the OPCODE tree
+// (2/3 of level-cform RAM) in 256m tiles instead of holding it whole.
+// 0=off (monolith), 1=on, 2=on+periodic stats. Takes effect on level load.
+// Default ON since 16-07: verified on Pripyat (61M tris) — load 0.5s vs 2.4s,
+// resident 1.3GB vs 3.7GB, zero rebuilds/mismatches; first visit bakes the cache.
+int psCDB_Tiles = 1;
+int psCDB_TileBudget = 512; // MB of resident tile trees before LRU eviction
+int psCDB_TileRadius = 300; // m: prefetch/pin bubble around the camera
+
+void CObjectSpace::UpdateStreaming(const Fvector& focus)
+{
+    Static.update_streaming(focus, (size_t)psCDB_TileBudget, (float)psCDB_TileRadius, psCDB_Tiles > 1);
+}
+
 void CObjectSpace::Load()
 {
-    // TEMP measurement (CDB-cache feasibility): split file read+decompress from
-    // the OPCODE tree build and print in Release too (the old MsgDbg is __noop in
-    // Release). Tells us if caching the built tree is worth it. Remove afterwards.
     CTimer t_read;
     t_read.Start();
     IReader* F = FS.r_open(fsgame::level, fsgame::level_files::level_cform);
@@ -206,13 +217,76 @@ void CObjectSpace::Load()
     R_ASSERT(CFORM_CURRENT_VERSION == H.version);
     const u32 readMs = t_read.GetElapsed_ms();
 
-    CTimer t_total;
+    // ------------------------------------------------------------------------
+    // CDB disk cache. The OPCODE build is single-threaded, ~50s on 60M-tri
+    // levels, and its builder temporaries dominate the load-time RAM peak — so
+    // the finished model (incl. the material remap the build callback applied
+    // to the tris) is cached under $app_data_root$ and reloaded on later runs.
+    // Key: cform payload sample + counts, XOR gamemtl.xr (the callback's input).
+    // ------------------------------------------------------------------------
+    const u8* payload = (const u8*)verts;
+    const size_t payloadLen = (size_t)F->length() - sizeof(hdrCFORM);
+    const u32 sample = (u32)std::min<size_t>(payloadLen, 4u << 20);
+    u32 crcData = crc32(payload, sample);
+    if (payloadLen > sample)
+        crcData ^= crc32(payload + payloadLen - sample, sample);
+    crcData ^= H.vertcount ^ (H.facecount * 2654435761u) ^ (u32)payloadLen;
+    u32 crcMtl = 0;
+    if (IReader* M = FS.r_open(fsgame::game_data, "gamemtl.xr")) // GAMEMTL_FILENAME — the build callback remaps tri materials by it
+    {
+        crcMtl = crc32(M->pointer(), (u32)M->length());
+        FS.r_close(M);
+    }
+    const u64 cacheKey = ((u64)crcData << 32) | crcMtl;
 
+    string_path levelPath{};
+    FS.update_path(levelPath, fsgame::level, "");
+    string64 cacheName;
+    xr_sprintf(cacheName, "cdb_%08x.cdb", crc32(levelPath, (u32)xr_strlen(levelPath)));
+    string_path cacheFile;
+    FS.update_path(cacheFile, fsgame::app_data_root, cacheName);
+
+    CTimer t_total;
     t_total.Start();
-    Static.build(verts, H.vertcount, tris, H.facecount, build_callback);
-    const u32 buildMs = t_total.GetElapsed_ms();
-    Msg("[CDB measure] cform read+decompress %u ms | OPCODE tree build %u ms | %u verts, %u tris | CDB RAM ~%.1f MB",
-        readMs, buildMs, H.vertcount, H.facecount, Static.memory() / (1024.f * 1024.f));
+
+    // Tiled mode first (own cache file — both caches can coexist while A/B-ing)
+    if (psCDB_Tiles)
+    {
+        string64 tiledName;
+        xr_sprintf(tiledName, "cdbt_%08x.cdbt", crc32(levelPath, (u32)xr_strlen(levelPath)));
+        string_path tiledFile;
+        FS.update_path(tiledFile, fsgame::app_data_root, tiledName);
+
+        if (Static.cache_load_tiled(tiledFile, cacheKey))
+            Msg("[CDB tiles] HIT '%s' — load %u ms (tile trees lazy) | read %u ms | %u verts, %u tris | resident CDB RAM ~%.1f MB",
+                tiledName, t_total.GetElapsed_ms(), readMs, H.vertcount, H.facecount, Static.memory() / (1024.f * 1024.f));
+        else if (Static.build_tiled(verts, H.vertcount, tris, H.facecount, H.aabb, build_callback, nullptr, tiledFile, cacheKey))
+            Msg("[CDB tiles] MISS — baked '%s' in %u ms | read %u ms | %u verts, %u tris", tiledName, t_total.GetElapsed_ms(), readMs, H.vertcount, H.facecount);
+        else
+            Msg("![CDB tiles] tiled path failed — falling back to monolith");
+    }
+
+    if (!Static.tiled())
+    {
+        if (Static.cache_load(cacheFile, cacheKey))
+        {
+            Msg("[CDB cache] HIT '%s' — load %u ms (OPCODE build skipped) | read %u ms | %u verts, %u tris | CDB RAM ~%.1f MB",
+                cacheName, t_total.GetElapsed_ms(), readMs, H.vertcount, H.facecount, Static.memory() / (1024.f * 1024.f));
+        }
+        else
+        {
+            Static.build(verts, H.vertcount, tris, H.facecount, build_callback);
+            const u32 buildMs = t_total.GetElapsed_ms();
+
+            CTimer t_save;
+            t_save.Start();
+            if (Static.cache_save(cacheFile, cacheKey))
+                Msg("[CDB cache] built %u ms, saved '%s' in %u ms | read %u ms | %u verts, %u tris | CDB RAM ~%.1f MB",
+                    buildMs, cacheName, t_save.GetElapsed_ms(), readMs, H.vertcount, H.facecount, Static.memory() / (1024.f * 1024.f));
+            else
+                Msg("![CDB cache] built %u ms, save FAILED '%s'", buildMs, cacheFile);
+        }
+    }
 
     m_BoundingVolume.set(H.aabb);
     g_SpatialSpace->initialize(H.aabb);

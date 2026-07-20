@@ -44,11 +44,23 @@ void CmdEndLabel(VkCommandBuffer cmd);
 // Typed convenience wrappers for the handles we name most.
 void NameImage (VkImage  img, const char* name);
 void NameBuffer(VkBuffer buf, const char* name);
+void NameSet   (VkDescriptorSet s, const char* name);
+
+// ---------------------------------------------------------------------------
+// NV diagnostic checkpoints (VK_NV_device_diagnostic_checkpoints; no-ops when
+// unsupported). Checkpoint() drops a named marker into the command stream —
+// ZoneBegin does this automatically, call it manually only on non-zone command
+// buffers (uploads, immediates). After a DEVICE_LOST, DumpCheckpoints() logs,
+// per queue, the last marker the GPU STARTED and the last it COMPLETED — the
+// hang lives between them. Markers are interned; names must be short.
+// ---------------------------------------------------------------------------
+void Checkpoint(VkCommandBuffer cmd, const char* name);
+void DumpCheckpoints(const char* why);   // call on device loss / fence timeout (logs once per loss)
 
 // ---------------------------------------------------------------------------
 // Phase 1 — per-frame GPU/CPU zones
 // ---------------------------------------------------------------------------
-constexpr u32 kMaxZones    = 32;   // top-level passes + sub-zones (World/*, Shadow/*) + headroom
+constexpr u32 kMaxZones    = 64;   // top-level passes + sub-zones (World/*, Shadow/*, Deform, VSM/*, Bins/*) + headroom
 constexpr u32 kHistory     = 96;   // samples kept per zone (avg/min/max + graph)
 
 // Called by ExecutePasses. FrameBegin reads back the previous occupant of this
@@ -64,6 +76,46 @@ void FrameEnd  (VkCommandBuffer cmd);
 // elapsed or a MARK was requested.
 void MaybeLog();
 void RequestMark();   // `vk_perf` console command → forces the next MaybeLog to print
+
+// Coarse main-thread CPU PHASE meters (QPC, sub-ms) — separates real CPU work
+// from GPU-blocking waits inside the frame's render section. Logged as
+// [VK CPUphase]. Begin/End bracket one phase per frame (single-threaded).
+enum CpuPhaseIdx : u32 {
+    CPU_BEGIN = 0,    // CRender::Begin — fence wait + swapchain acquire (GPU/present block)
+    CPU_CALC,         // CRender::Calculate — scene traversal/collect
+    CPU_RECORD,       // CRender::Render — pass recording (ExecutePasses)
+    CPU_END,          // CRender::End — submit + present (can block on queue/vsync)
+    CPU_PHASE_COUNT
+};
+void CpuPhaseBegin(u32 idx);
+void CpuPhaseEnd(u32 idx);
+struct CpuPhaseScope {
+    u32 i;
+    explicit CpuPhaseScope(u32 idx) : i(idx) { CpuPhaseBegin(idx); }
+    ~CpuPhaseScope() { CpuPhaseEnd(i); }
+};
+
+// ---------------------------------------------------------------------------
+// CPU probes — RAII wall-time meters for ARBITRARY main-thread code (no
+// VkCommandBuffer needed, unlike ZoneBegin — so they cover the helpers the pass
+// zones can't see: streamer ticks, caster-queue rebuilds, tree/near-set walks,
+// grass update...). Accumulate per frame (multiple scopes with the same slot
+// sum up), reset in FrameEnd, printed as the 5-second [VK CPUprobes] line
+// (r_profiler; vk_perf MARK includes it). Main thread only.
+// ---------------------------------------------------------------------------
+int  CpuProbeSlot(const char* name);        // intern a stable slot by name
+void CpuProbeAdd(int slot, float ms);       // manual add (RAII scope preferred)
+struct CpuProbeScope {
+    int slot; u64 t0;
+    explicit CpuProbeScope(int s);
+    ~CpuProbeScope();
+};
+// One-liner: static slot + scope. Usage: VK_CPU_PROBE("cpu:TexStream");
+#define VK_CPU_PROBE2(name, line) \
+    static const int _cpslot##line = VK::Prof::CpuProbeSlot(name); \
+    VK::Prof::CpuProbeScope _cpscope##line(_cpslot##line)
+#define VK_CPU_PROBE1(name, line) VK_CPU_PROBE2(name, line)
+#define VK_CPU_PROBE(name) VK_CPU_PROBE1(name, __LINE__)
 
 void Shutdown();
 

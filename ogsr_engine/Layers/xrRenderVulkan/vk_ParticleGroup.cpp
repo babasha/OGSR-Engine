@@ -196,8 +196,19 @@ BOOL vkCParticleGroup::Compile(PS::CPGDef* def)
             // spawn/stop children (replaces the effect's own callback set in
             // Compile; param = item index — R4 OnGroupParticleBirth scheme).
             if (E)
+            {
                 PAPI::ParticleManager()->SetCallback(E->GetHandleEffect(),
                     vk_OnGroupParticleBirth, vk_OnGroupParticleDead, this, (u32)i);
+                // #6: child spawning hangs off the CPU per-particle callbacks —
+                // an emitter with on-birth/on-play/on-dead children must keep
+                // the CPU sim (GpuClaimed refuses it; the CHILDREN it spawns
+                // are plain effects and may still route to the GPU).
+                const CPGDef::SEffect* eff = m_Def->m_Effects[i];
+                if (eff->m_Flags.is(CPGDef::SEffect::flOnBirthChild) ||
+                    eff->m_Flags.is(CPGDef::SEffect::flOnPlayChild)  ||
+                    eff->m_Flags.is(CPGDef::SEffect::flOnDeadChild))
+                    E->m_GpuNoRoute = true;
+            }
         }
     }
     return TRUE;

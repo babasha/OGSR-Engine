@@ -9,12 +9,15 @@
 #include "vk_render_queue.h"
 #include "vk_pipeline_cache.h"
 #include "vk_world_material.h"  // WorldMaterial set bind
+#include "vk_texture_stream.h"  // TextureStreamer::Touch — LRU heuristic (r_txstream)
 #include "vk_env_light.h"       // EnvLight::GetCurrentSet — set 1 (per-frame lighting)
 #include "vk_pass_lightcones.h" // SynthCones::Submit — lightplanes-derived beams
 #include "vk_Visual.h"
 #include "vk_UIPipeline.h"   // g_VkUI_FrameCmd
+#include "vk_terrain_cache.h"   // composite-cache capture (terrain material + mesh)
 
 #include "../../xr_3da/device.h"   // Device.vCameraPosition (tess distance factors)
+#include "../../xrCDB/Frustum.h"   // CFrustum — optional caster cull in FlushDepth
 
 #include <algorithm>
 #include <unordered_set>
@@ -183,6 +186,7 @@ void RenderQueue::Flush(FrameContext& ctx)
     float            lastAref   = 999.0f;          // sentinel — first push always fires
     float            lastDetailScale = -999.0f;    // sentinel
     float            lastHemi        = -999.0f;    // sentinel (per-object sky-ambient gate)
+    u32              lastStreamID    = 0xFEFEFEFEu;// sentinel (never a real/none id)
     VkBuffer         lastVB     = VK_NULL_HANDLE;
     VkBuffer         lastIB     = VK_NULL_HANDLE;
     VkIndexType      lastIType  = VK_INDEX_TYPE_MAX_ENUM;
@@ -210,6 +214,10 @@ void RenderQueue::Flush(FrameContext& ctx)
                               ? fv->m_pWorldMaterial
                               : WorldMaterialCache::GetDefault();
 
+        // Mark the diffuse used this frame for the streamer's LRU heuristic (no-op
+        // unless r_txstream is on — Touch self-gates and only takes the lock then).
+        if (mat) TextureStreamer::Instance().Touch(mat->tex);
+
         VkPipeline       pipe   = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkDescriptorSet  set    = VK_NULL_HANDLE;
@@ -221,6 +229,13 @@ void RenderQueue::Flush(FrameContext& ctx)
             pipe   = PipelineCache::GetTerrainPipeline();
             layout = PipelineCache::GetTerrainLayout();
             set    = mat->terrainSet;
+            // Composite cache (r_terra_cache): remember the terrain material +
+            // mesh once so the bake can read mask/heights and probe the VB for
+            // the world->uv affine. No-ops after the first capture.
+            TerrainCache::OnTerrainMaterial(mat->terrainSet, mat->detailScale);
+            if (fv->m_mesh.p_rm_Vertices)
+                TerrainCache::OnTerrainMesh(fv->m_mesh.p_rm_Vertices->GetHandle(), fv->m_mesh.vBase,
+                                            fv->m_mesh.vStride, fv->m_mesh.tcOffset);
         } else {
             PipelineCache::Key k{};
             k.stride   = fv->m_mesh.vStride;
@@ -233,6 +248,10 @@ void RenderQueue::Flush(FrameContext& ctx)
             k.depthTest = true;
             k.wmark     = mat && mat->isWmark;   // baked decal: blend + bias + no z-write
             k.emis      = mat && mat->isEmisAdd; // glow/selflight: ADDITIVE + unlit (aref -3)
+            // Uber-FS variant (Inc 1): POM bit only for materials with a real `#` height;
+            // flat materials bake the POM-off pipeline (no march + no march VGPRs). The
+            // frame-global bits (snow/wet/ibl/debug) are stamped in Get().
+            k.specMask  = (mat && mat->tessellated) ? (u8)PipelineCache::WS_POM : (u8)0;
             // Heightmap tessellation: only for opted-in materials (bump# in
             // the .thm) whose bounds reach inside the tess range — beyond
             // tessFar the factors would all be 1, so a flat pipeline is free.
@@ -256,6 +275,7 @@ void RenderQueue::Flush(FrameContext& ctx)
             haveXform       = false;
             lastAref        = 999.0f;
             lastDetailScale = -999.0f;
+            lastStreamID    = 0xFEFEFEFEu;
             lastPipe        = VK_NULL_HANDLE;
             lastMatSet      = VK_NULL_HANDLE;
             lastVB          = VK_NULL_HANDLE;
@@ -329,6 +349,15 @@ void RenderQueue::Flush(FrameContext& ctx)
             lastHemi        = hemiEnc;
             ++nTailPush;
         }
+        // GPU-feedback stream id of the base diffuse (offset 116, past the tess
+        // block). 0xFFFFFFFF = not streamable — the FS skips the report. Tracked
+        // separately from the tail: two materials can share aref/scale/hemi.
+        const u32 streamID = mat ? mat->streamID : 0xFFFFFFFFu;
+        if (streamID != lastStreamID) {
+            constexpr u32 kStreamIDOffset = sizeof(Fmatrix) + 13 * sizeof(float);   // 116
+            vkCmdPushConstants(cmd, layout, kStages, kStreamIDOffset, sizeof(u32), &streamID);
+            lastStreamID = streamID;
+        }
 
         VkBuffer vb = fv->m_mesh.p_rm_Vertices->GetHandle();
         if (vb != lastVB) {
@@ -366,7 +395,7 @@ void RenderQueue::Flush(FrameContext& ctx)
 }
 
 void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool skipAlphaTested,
-                            bool alphaTestedOnly, bool displaceTerrain)
+                            bool alphaTestedOnly, bool displaceTerrain, const CFrustum* cull)
 {
     if (m_Items.empty() || cmd == VK_NULL_HANDLE) return;
     VkPipelineLayout layoutSolid = PipelineCache::GetDepthLayout();
@@ -392,6 +421,16 @@ void RenderQueue::FlushDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, bool s
         auto* fv = static_cast<vkFVisual*>(it.vis);
         if (!fv || !fv->m_mesh.IsValid()) continue;
         if (!fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) continue;
+
+        // Optional cone/face cull: skip casters whose bounding sphere misses the
+        // caller's frustum (conservative — touching spheres still draw).
+        if (cull) {
+            const Fsphere& bs = fv->vis.sphere;
+            if (bs.R > 0.f) {
+                Fvector c; it.xform.transform_tiny(c, bs.P);
+                if (!cull->testSphere_dirty(c, bs.R)) continue;
+            }
+        }
 
         // Alpha-tested items go through the AT variant (punch-out silhouette in
         // the depth); without it (shader missing / caller opted out) skip them.

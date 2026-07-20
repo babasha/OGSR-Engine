@@ -139,6 +139,20 @@ void CParticlesObject::Stop(BOOL bDefferedStop)
     V->Stop(bDefferedStop);
 }
 
+void CParticlesObject::PSI_destroy()
+{
+    // The object leaves the render world the moment it is death-queued — on
+    // the CPU renderers its particles simply stop being drawn, but GPU-pool
+    // particles (Vulkan renderer) would outlive it by their remaining life.
+    // A hard stop wipes them instantly on both paths (PAPI p_count = 0 /
+    // Vulkan GPU kill request), so a destroyed campfire flare vanishes at
+    // once instead of fading out.
+    if (renderable.visual)
+        if (IParticleCustom* V = smart_cast<IParticleCustom*>(renderable.visual))
+            V->Stop(FALSE);
+    inherited::PSI_destroy();
+}
+
 void CParticlesObject::shedule_Update(u32 _dt)
 {
     inherited::shedule_Update(_dt);

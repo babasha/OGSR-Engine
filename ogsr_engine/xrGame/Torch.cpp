@@ -37,6 +37,7 @@ CTorch::CTorch(void)
     light_render->set_type(IRender_Light::SPOT);
     light_render->set_shadow(true);
     light_render->set_moveable(true);
+    light_render->set_flashlight(true);   // worn head-lamp — restrained R4 fog (not a searchlight)
     light_omni = ::Render->light_create();
     light_omni->set_type(IRender_Light::POINT);
     light_omni->set_shadow(false);
@@ -444,17 +445,31 @@ void CTorch::UpdateCL()
 			light_render->set_rotation( dir, right );
 			light_omni->set_rotation( dir, right );
 		}// if(actor)
-		else 
+		else
 		{
-			light_render->set_position	(M.c);
-			light_render->set_rotation	(M.k,M.i);
+            // NPC head-lamp: low-pass the guide-bone transform. The bone jitters
+            // every frame with the idle animation, and a bare copy made the beam's
+            // projected (grass) shadow tremble as if the NPC twitched. Exponential
+            // smooth toward the bone (framerate-independent τ ≈ 90 ms — kills the
+            // per-frame noise, still follows real head turns). Seed on first use.
+            Fvector tgtPos = M.c;
+            Fvector tgtDir = M.k;
+            if (!m_npc_light_valid) {
+                m_npc_light_pos = tgtPos;
+                m_npc_light_dir = tgtDir;
+                m_npc_light_valid = true;
+            } else {
+                const float a = 1.f - expf(-Device.fTimeDelta / 0.09f);
+                m_npc_light_pos.lerp(m_npc_light_pos, tgtPos, a);
+                m_npc_light_dir.lerp(m_npc_light_dir, tgtDir, a);
+                if (m_npc_light_dir.magnitude() > 1e-4f) m_npc_light_dir.normalize();
+                else m_npc_light_dir = tgtDir;
+            }
+			light_render->set_position	(m_npc_light_pos);
+			light_render->set_rotation	(m_npc_light_dir, M.i);
 
-            Fvector offset = M.c;
-            offset.mad(M.i, OMNI_OFFSET.x);
-            offset.mad(M.j, OMNI_OFFSET.y);
-            offset.mad(M.k, OMNI_OFFSET.z);
-            light_omni->set_position(M.c);
-            light_omni->set_rotation(M.k, M.i);
+            light_omni->set_position(m_npc_light_pos);
+            light_omni->set_rotation(m_npc_light_dir, M.i);
         }
     }
     else

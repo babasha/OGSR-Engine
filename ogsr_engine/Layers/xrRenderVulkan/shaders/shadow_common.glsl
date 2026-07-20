@@ -5,19 +5,20 @@
 #ifndef SHADOW_COMMON_GLSL
 #define SHADOW_COMMON_GLSL
 
-// Spot shadow: project by spot_vp, 3x3 PCF manual compare (flashlight quality).
+// Spot shadow POOL: project by the light's TILE view·proj, 3x3 PCF manual
+// compare inside the tile's atlas rect (4x2 tiles of 1024² — see vk_shadow).
 // Compared in LINEAR depth with a WORLD-space epsilon: a constant NDC bias on
 // the perspective spot projection is worth centimetres near the lamp but
 // METRES near the far plane — light leaked straight through fences standing a
 // few metres past a parked headlight.
 float spotLinZ(float zndc, float f)
 {
-    const float n = 0.5;   // ComputeSpotVP near plane
+    const float n = 0.5;   // ComputeSpotVPFor near plane
     return n * f / max(f - zndc * (f - n), 1e-4);
 }
-float spotShadowF(vec3 wp, float range)
+float spotShadowF(vec3 wp, float range, int tile)
 {
-    vec4 c = L.spot_vp * vec4(wp, 1.0);
+    vec4 c = L.spot_pool_vp[tile] * vec4(wp, 1.0);
     if (c.w <= 0.0) return 1.0;
     vec3 ndc = c.xyz / c.w;
     vec2 uv = ndc.xy * 0.5 + 0.5;
@@ -25,37 +26,94 @@ float spotShadowF(vec3 wp, float range)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
     float f    = max(range, 1.0);
     float zRef = spotLinZ(ndc.z, f) - 0.08;   // 8 cm world bias, range-independent
-    vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
+    // Tile rect in atlas UV, inset 1.5 texels so PCF taps never leak into a
+    // neighbouring tile.
+    const vec2 kTileScale = vec2(0.25, 0.5);              // 1/4 cols, 1/2 rows
+    vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));   // atlas texel
+    vec2  tBase = vec2(float(tile & 3), float(tile >> 2)) * kTileScale;
+    vec2  tMin  = tBase + texel * 1.5;
+    vec2  tMax  = tBase + kTileScale - texel * 1.5;
+    vec2  auv   = tBase + uv * kTileScale;
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += (zRef <= spotLinZ(texture(uSpotShadow, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
+            sum += (zRef <= spotLinZ(texture(uSpotShadow, clamp(auv + vec2(x, y) * texel, tMin, tMax)).r, f)) ? 1.0 : 0.0;
     float vis = sum * (1.0 / 9.0);
     // Grass shadows surfaces PARTIALLY: a second tap set against the spot+grass
-    // beam map (b22), blended by L.spot_params.x. The beam map is a superset of
-    // the clean one, so its visibility is <= clean — the mix darkens the pool
+    // beam atlas (b22), blended by L.spot_params.x. The beam tile is a superset
+    // of the clean one, so its visibility is <= clean — the mix darkens the pool
     // with translucent grass dapples instead of the binary blanket (which ate
     // the headlight's ground pool at full strength) or nothing (sterile pool).
-    float k = L.spot_params.x;
+    // Flashlight tiles (handheld torch) paint CRISP grass shadows at full strength —
+    // the night wow of a beam raking through grass; wide fixtures keep the subtle blend.
+    uint  fmask = uint(L.spot_flash.x + 0.5);
+    float k = (((fmask >> uint(tile)) & 1u) == 1u) ? L.spot_flash.y : L.spot_params.x;
     if (k > 0.001) {
         float sumG = 0.0;
         for (int y = -1; y <= 1; ++y)
             for (int x = -1; x <= 1; ++x)
-                sumG += (zRef <= spotLinZ(texture(uSpotShadowGrass, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
+                sumG += (zRef <= spotLinZ(texture(uSpotShadowGrass, clamp(auv + vec2(x, y) * texel, tMin, tMax)).r, f)) ? 1.0 : 0.0;
         vis = mix(vis, sumG * (1.0 / 9.0), k);
     }
     return vis;
 }
 
-// Point (cube) shadow: 1-tap, compare D3D-style perspective depth along the major
-// axis of the lookup vector (faces rendered at 90 deg with near 0.1).
-float pointShadowF(vec3 wp, vec3 lp, float range)
+// Point POOL (cube array) shadow: 1-tap, compare D3D-style perspective depth
+// along the major axis of the lookup vector (faces rendered at 90 deg, near 0.1).
+// `cube` = the light's cube-array index (pointCubeOf(gi)).
+float pointShadowF(vec3 wp, vec3 lp, float range, int cube)
 {
+    // LINEAR-depth compare with a WORLD epsilon (same fix as the spot pool): the
+    // old constant 0.01 NDC bias on the 0.1-near cube projection is centimetres
+    // by the fire but METRES at the range edge — an NPC standing past ~half the
+    // fire's radius was lit yet cast NO shadow (his depth gap fell inside the bias).
     vec3 d = wp - lp;
     float z = max(max(abs(d.x), abs(d.y)), abs(d.z));
-    const float n = 0.1;
-    float refD = range * (z - n) / (max(z, n) * max(range - n, 1e-3));
-    return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
+    const float n = 0.1;                 // kPointNear (ComputePointFaceVP)
+    float f    = max(range, 1.0);
+    float zRef = z - 0.08;               // 8 cm world bias, range-independent
+    // 3x3 PCF, like the spot tiles: a blade by the fire projects onto a wall
+    // hugely magnified, so the 512 cube's texels read as hard pixel squares
+    // with 1 tap. Offsets step one cube texel in the plane perpendicular to
+    // the lookup ray (90-deg face spans 2z at distance z -> texel = 2z/size).
+    vec3 up = (abs(d.y) > abs(d.x) && abs(d.y) > abs(d.z)) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t1 = normalize(cross(up, d));
+    vec3 t2 = normalize(cross(d, t1));
+    float texel = 2.0 * z / float(textureSize(uPointShadow, 0).x);
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            vec3 dd = d + (t1 * float(x) + t2 * float(y)) * texel;
+            float zMap = texture(uPointShadow, vec4(dd, float(cube))).r;
+            zMap = n * f / max(f - zMap * (f - n), 1e-4);
+            sum += (zRef <= zMap) ? 1.0 : 0.0;
+        }
+    return sum * (1.0 / 9.0);
+}
+
+// r_point_debug (L.spot_params.y): visualize the point-shadow POOL coverage on
+// opaque receivers. Returns vec4(rgb, a>0 = override this pixel). GREEN = the
+// pixel is inside a pooled point light's range; RED = that light's cube shadows
+// it. A campfire with an NPC should paint a green pool with a red NPC shadow —
+// green pool but no red = the cube has no caster; no green at all = the light/
+// cube isn't reaching the receiver.
+vec4 pointDebugOverlay(vec3 wp)
+{
+    if (L.spot_params.y < 0.5) return vec4(0.0);
+    int n = int(L.counts.x + 0.5);
+    float reach = 0.0, shadow = 1.0;
+    for (int i = 0; i < n; ++i) {
+        if (L.lights[i].color.w > 0.5) continue;   // spots handled elsewhere
+        int cube = pointCubeOf(i);
+        if (cube < 0) continue;
+        vec3  dv = L.lights[i].pos.xyz - wp;
+        float r  = L.lights[i].pos.w;
+        if (dot(dv, dv) >= r * r) continue;
+        reach = 1.0;
+        shadow = min(shadow, pointShadowF(wp, L.lights[i].pos.xyz, r, cube));
+    }
+    if (reach < 0.5) return vec4(0.0);
+    return vec4(mix(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), shadow), 1.0);
 }
 
 // Bilinear-weighted PCF tap on a manual-compare map: textureGather fetches the

@@ -6,7 +6,10 @@
 // form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
+#include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_water_sim.h"
+#include "vk_image.h"      // VK::CreateImage2D / CreateImageView
+#include "vk_compute_util.h" // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_shadow.h"          // rain ortho VP / views / size / sampler (the grid)
 #include "vk_shaders.h"         // g_ShaderManager
 #include "vk_pipeline_cache.h"  // shared pipeline cache object
@@ -60,32 +63,16 @@ namespace {
 
     bool createImage(VkFormat fmt, VkImageUsageFlags usage, Buf& out)
     {
-        VkImageCreateInfo ici{};
-        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = fmt;
-        ici.extent = { s_size, s_size, 1 };
-        ici.mipLevels = 1; ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = usage;
-        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo aci{};
-        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &out.img, &out.alloc, nullptr) != VK_SUCCESS)
+        if (!VK::CreateImage2D(fmt, { s_size, s_size }, usage, out.img, out.alloc, "WaterSim"))
             return false;
-        VkImageViewCreateInfo vci{};
-        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vci.image = out.img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = fmt;
-        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        return vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &out.view) == VK_SUCCESS;
+        out.view = VK::CreateImageView(out.img, fmt);
+        return out.view != VK_NULL_HANDLE;
     }
 
     void destroyBuf(Buf& b)
     {
         if (b.view) { vkDestroyImageView(VulkanHW.m_Device, b.view, nullptr); b.view = VK_NULL_HANDLE; }
-        if (b.img)  { vmaDestroyImage(VulkanHW.m_Allocator, b.img, b.alloc); b.img = VK_NULL_HANDLE; }
+        if (b.img)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, b.img, b.alloc); b.img = VK_NULL_HANDLE; }
     }
 
     // compute write (GENERAL) -> copy to state -> back to working layouts.
@@ -184,24 +171,12 @@ bool Init()
     }
     vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants) };
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setLayout;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_pipeLayout);
+    s_pipeLayout = VK::MakePipelineLayout({ s_setLayout }, sizeof(PushConstants));
 
     VkShaderModule cs = g_ShaderManager->Load("water_sim.comp.spv");
     if (cs == VK_NULL_HANDLE) { Msg("![VK Water] water_sim.comp.spv load failed"); s_failed = true; return false; }
-    VkComputePipelineCreateInfo cpi{};
-    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = cs; cpi.stage.pName = "main";
-    cpi.layout = s_pipeLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &s_pipe) != VK_SUCCESS) {
-        Msg("![VK Water] compute pipeline create failed"); s_failed = true; return false;
-    }
+    s_pipe = VK::CreateComputePipeline(cs, s_pipeLayout, "Water.Sim");
+    if (s_pipe == VK_NULL_HANDLE) { s_failed = true; return false; }
 
     s_inited = true; s_first = true;
     Msg("[VK Water] velocity sim init OK (%ux%u, depth R16F + vel RG16F)", s_size, s_size);

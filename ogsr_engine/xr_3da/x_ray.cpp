@@ -18,6 +18,7 @@
 #include "DiscordRPC.hpp"
 #include "Render.h"
 #include "splash.h"
+#include "../../3rd_party/Src/mimalloc/mimalloc/include/mimalloc.h" // -mi_guard (guarded heap sampling)
 
 #define CORE_FEATURE_SET(feature, section) Core.Features.set(xrCore::Feature::feature, READ_IF_EXISTS(pSettings, r_bool, section, #feature, false))
 
@@ -157,7 +158,12 @@ void InitConsole()
     CORE_FEATURE_SET(busy_actor_restrictions, "features");
 }
 
-void InitInput() { pInput = xr_new<CInput>(); }
+// Defined in the editor-host facade below (A2.3).
+extern bool g_ed_embedded;
+
+// Embedded in a host UI (the SDK): input must be NON-exclusive, otherwise DirectInput
+// takes the mouse away from the host's own menus/panels and hides the cursor.
+void InitInput() { pInput = xr_new<CInput>(!g_ed_embedded); }
 void destroyInput() { xr_delete(pInput); }
 
 void InitSound1() { CSound_manager_interface::_create(0); }
@@ -412,6 +418,28 @@ int APIENTRY WinMain_impl(HINSTANCE hInstance, HINSTANCE hPrevInstance, char* lp
     }
 
     Core._initialize("xray", NULL, TRUE, fsgame[0] ? fsgame : NULL);
+
+    // Heap-corruption hunt: mimalloc is built with MI_GUARDED (1/4000 allocations
+    // get a trailing guard page — an overrun AVs at the corrupting WRITE, not at
+    // some later allocation). -mi_guard N tightens sampling to 1/N (default 32).
+    if (const char* mg = strstr(lpCmdLine, "-mi_guard"))
+    {
+        int rate = atoi(mg + sizeof("-mi_guard") - 1);
+        if (rate <= 0)
+            rate = 32;
+        mi_option_set(mi_option_guarded_sample_rate, rate);
+        Msg("* [mi_guard] guarded objects: 1/%d allocations get a guard page", rate);
+    }
+
+    // Tiled-CDB soak harness (see xrCDB_stress.cpp) — runs headless and exits
+    if (strstr(lpCmdLine, "-cdb_stress"))
+    {
+        extern void run_cdb_tiled_stress(const char* cmd);
+        run_cdb_tiled_stress(lpCmdLine);
+        Core._destroy();
+        return 0;
+    }
+
     InitSettings();
 
     // Adjust player & computer name for Asian
@@ -451,6 +479,385 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, char* lpCmdLi
     ExitFromWinMain = true;
 
     return 0;
+}
+
+// ============================================================================
+// Editor-host facade (architecture a2) — see ed_facade.h. Boots the engine up to
+// the point of rendering but does NOT run Device.Run()'s message loop, so an external
+// host (the SDK) drives frames via Ed_RenderFrame(). This is the SAME sequence as
+// WinMain_impl + Startup(), minus the mutex/splash niceties and the message loop.
+// Additive and DLL-only in practice (built with EdDllBuild=true); the .exe game path
+// through WinMain is completely untouched.
+// ============================================================================
+#include "ed_facade.h"
+
+static bool s_edBooted = false;
+
+// Anchor symbol whose address lives in THIS module — used to resolve the DLL's own
+// HMODULE via GetModuleHandleEx(FROM_ADDRESS).
+static void ed_module_anchor() {}
+
+// A2.3 — embedded-viewport state. Non-static: the VK renderer reads it to skip its
+// window restyle/reposition, and Xr_input to pick a top-level coop window.
+// (declared extern above, near InitInput)
+bool g_ed_embedded = false;
+static HWND s_edChildWnd = nullptr;
+
+extern LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+// Create the render surface as a child of the host's panel. We make our OWN child
+// window rather than rendering straight into the host HWND: the engine needs its
+// WndProc on the render window, and the host keeps its panel's proc untouched.
+static HWND ed_create_child_window(HWND parent, int w, int h)
+{
+    static bool s_classReg = false;
+    const char* wndclass = "_XRAY_ED_VIEWPORT";
+    HINSTANCE hInst = (HINSTANCE)GetModuleHandle(nullptr);
+    if (!s_classReg)
+    {
+        WNDCLASS wc = {CS_OWNDC, WndProc, 0, 0, hInst, nullptr, LoadCursor(nullptr, IDC_ARROW), (HBRUSH)GetStockObject(BLACK_BRUSH), nullptr, wndclass};
+        RegisterClass(&wc);
+        s_classReg = true;
+    }
+    return CreateWindowEx(0, wndclass, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, 0, 0, w, h, parent, nullptr, hInst, nullptr);
+}
+
+int Ed_Init(const char* extra_params) { return Ed_InitEx(nullptr, 0, 0, extra_params); }
+
+int Ed_InitEx(void* parent_hwnd, int width, int height, const char* extra_params)
+{
+    if (s_edBooted)
+        return 1;
+
+    gModulesLoaded = true;
+    Debug._initialize();
+
+    // Resolve THIS DLL's own directory (…\bin_x64\) and hand it to Core as the
+    // ApplicationPath, so the FS finds fsgame.ltx at fs_root (= its parent, the engine
+    // folder) no matter which host process loaded us. The host exe's path is irrelevant.
+    string_path dllDir = {0};
+    {
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&ed_module_anchor), &hSelf);
+        GetModuleFileNameA(hSelf, dllDir, sizeof(dllDir));
+        if (char* sl = strrchr(dllDir, '\\'))
+            *(sl + 1) = 0; // strip filename, keep trailing '\\'
+    }
+    // Build the engine's OWN command line: argv[0] = the engine module, then the
+    // facade params. The host's real command line is deliberately NOT inherited — the
+    // SDK's flags belong to the SDK, and some (e.g. `-nocache`) are consumed during FS
+    // init and would break the engine's archive mounting.
+    string_path edParams = {0};
+    strconcat(sizeof(edParams), edParams, "\"", dllDir, "xrEngine_VK.dll\" ", extra_params ? extra_params : "");
+
+    Core._initialize("xray", nullptr, TRUE, nullptr, dllDir[0] ? dllDir : nullptr, edParams);
+    Msg("[Ed] facade boot — Params=[%s]", Core.Params);
+
+    InitSettings();
+
+    // A2.3: hand Device a substitute HWND BEFORE InitEngine() (which runs
+    // Device.Initialize(), and that only creates its own window `if (m_hWnd == nullptr)`).
+    if (parent_hwnd && width > 0 && height > 0)
+    {
+        s_edChildWnd = ed_create_child_window((HWND)parent_hwnd, width, height);
+        if (!s_edChildWnd)
+        {
+            Msg("!![Ed] failed to create child render window in parent %p (err %d)", parent_hwnd, GetLastError());
+            return 2;
+        }
+        g_ed_embedded = true;
+        Device.m_hWnd = s_edChildWnd;
+        gGameWindow = s_edChildWnd;
+        Msg("[Ed] embedded viewport: child hwnd=%p in parent=%p, %dx%d", s_edChildWnd, parent_hwnd, width, height);
+    }
+
+    InitEngine();
+    InitInput();
+    InitConsole();
+    Engine.External.Initialize(); // AttachRender + AttachGame (object factory) — MUST precede Device.Create / NEW_INSTANCE
+
+    // ---- Startup() body, minus Device.Run() ----
+    InitSound1();
+    execUserScript();
+    InitSound2();
+
+    Device.Create();
+    LALib.OnCreate();
+    pApp = xr_new<CApplication>();
+    g_pGamePersistent = (IGame_Persistent*)NEW_INSTANCE(CLSID_GAME_PERSISTANT);
+    g_SpatialSpace = xr_new<ISpatial_DB>();
+    g_SpatialSpacePhysic = xr_new<ISpatial_DB>();
+
+    // A WS_CHILD window never receives WM_ACTIVATE, so OnWM_Activate never runs and
+    // b_is_Active stays FALSE — and on_idle() gates ALL rendering on it (device.cpp:315),
+    // which is exactly a black viewport. An embedded editor viewport should keep drawing
+    // regardless of the host's focus, so latch it active here.
+    if (g_ed_embedded)
+        Device.b_is_Active = TRUE;
+
+    // ---- Device.Run() pre-loop setup (everything BEFORE message_loop) ----
+    Device.dwTimeGlobal = 0;
+    Device.seqAppStart.Process(rp_AppStart);
+    ::Render->ClearTarget();
+    if (!g_ed_embedded)
+        Device.ShowMainWindow(); // embedded: the child is already WS_VISIBLE, and
+                                 // SetForegroundWindow on the host's window is rude
+
+    s_edBooted = true;
+    Msg("[Ed] facade booted OK — external frame driving ready");
+    return 0;
+}
+
+void Ed_RenderFrame()
+{
+    if (!s_edBooted)
+        return;
+
+    // Pump the engine window's messages (Ed_Init created the window on THIS thread),
+    // then render exactly one frame — the body of the engine's own message_loop.
+    // When embedded, restrict the pump to OUR child window: the host has its own
+    // message loop and must keep receiving (and pre-processing, e.g. through its ImGui
+    // Win32 hook) everything addressed to it.
+    MSG msg;
+    HWND pumpWnd = g_ed_embedded ? s_edChildWnd : nullptr;
+    while (PeekMessage(&msg, pumpWnd, 0, 0, PM_REMOVE))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    Device.on_idle();
+}
+
+// ---- A2.4: host-driven camera + scene. Implemented in the VK renderer's editor
+// viewport (Layers/xrRenderVulkan/CRender_Vulkan.cpp); the monolith links it in.
+namespace VKEditor
+{
+void HostSetCamera(const Fvector& pos, const Fvector& dir, const Fvector& up, float fov_deg, float zn, float zf);
+int HostAddModel(const char* name, const Fmatrix& xf);
+int HostAddModelFile(const char* ogf_path, const char* logical_name, const Fmatrix& xf);
+void SetTextureRoot(const char* dir); // Layers/xrRenderVulkan/vk_world_material.cpp
+void HostSetModelXform(int id, const Fmatrix& xf);
+void HostClearScene();
+bool HostScreenRay(int x, int y, Fvector& out_start, Fvector& out_dir);
+void HostSetSelection(const int* ids, int count);
+} // namespace VKEditor
+
+void Ed_SetCamera(const float* pos3, const float* dir3, const float* up3, float fov_deg, float znear, float zfar)
+{
+    if (!s_edBooted || !pos3 || !dir3 || !up3)
+        return;
+
+    Fvector p, d, u;
+    p.set(pos3[0], pos3[1], pos3[2]);
+    d.set(dir3[0], dir3[1], dir3[2]);
+    u.set(up3[0], up3[1], up3[2]);
+    VKEditor::HostSetCamera(p, d, u, fov_deg, znear, zfar);
+}
+
+void Ed_GetCamera(float* pos3, float* dir3, float* up3, float* fov_deg)
+{
+    if (!s_edBooted)
+        return;
+
+    // Straight off the Device: whoever set the camera this frame (host or the built-in
+    // orbit camera), this is the basis the frame was actually rendered with.
+    if (pos3)
+    {
+        pos3[0] = Device.vCameraPosition.x;
+        pos3[1] = Device.vCameraPosition.y;
+        pos3[2] = Device.vCameraPosition.z;
+    }
+    if (dir3)
+    {
+        dir3[0] = Device.vCameraDirection.x;
+        dir3[1] = Device.vCameraDirection.y;
+        dir3[2] = Device.vCameraDirection.z;
+    }
+    if (up3)
+    {
+        up3[0] = Device.vCameraTop.x;
+        up3[1] = Device.vCameraTop.y;
+        up3[2] = Device.vCameraTop.z;
+    }
+    if (fov_deg)
+        *fov_deg = Device.fFOV;
+}
+
+int Ed_AddModel(const char* visual_name, const float* xform16)
+{
+    if (!s_edBooted)
+        return -1;
+
+    Fmatrix xf;
+    if (xform16)
+        CopyMemory(&xf, xform16, sizeof(float) * 16);
+    else
+        xf.identity();
+
+    return VKEditor::HostAddModel(visual_name, xf);
+}
+
+void Ed_SetTextureRoot(const char* dir)
+{
+    if (s_edBooted)
+        VKEditor::SetTextureRoot(dir);
+}
+
+int Ed_AddModelFile(const char* ogf_path, const char* logical_name, const float* xform16)
+{
+    if (!s_edBooted)
+        return -1;
+
+    Fmatrix xf;
+    if (xform16)
+        CopyMemory(&xf, xform16, sizeof(float) * 16);
+    else
+        xf.identity();
+
+    return VKEditor::HostAddModelFile(ogf_path, logical_name, xf);
+}
+
+void Ed_SetModelXform(int id, const float* xform16)
+{
+    if (!s_edBooted || !xform16)
+        return;
+
+    Fmatrix xf;
+    CopyMemory(&xf, xform16, sizeof(float) * 16);
+    VKEditor::HostSetModelXform(id, xf);
+}
+
+void Ed_ClearScene()
+{
+    if (s_edBooted)
+        VKEditor::HostClearScene();
+}
+
+int Ed_ScreenRay(int x, int y, float* out_start3, float* out_dir3)
+{
+    if (!s_edBooted || !out_start3 || !out_dir3)
+        return 0;
+
+    Fvector s, d;
+    if (!VKEditor::HostScreenRay(x, y, s, d))
+        return 0;
+
+    out_start3[0] = s.x; out_start3[1] = s.y; out_start3[2] = s.z;
+    out_dir3[0] = d.x; out_dir3[1] = d.y; out_dir3[2] = d.z;
+    return 1;
+}
+
+void Ed_SetSelection(const int* ids, int count)
+{
+    if (s_edBooted)
+        VKEditor::HostSetSelection(ids, count);
+}
+
+// Defined in the VK renderer's ImGui overlay (Layers/xrRenderVulkan/vk_imgui.cpp).
+namespace VK { namespace ImGuiVK {
+void PushEditorLog(const char* text, bool isError);
+void PushEditorStats(float fps, float rfps, int verts, int tris, int dips, int lights, int totalLights);
+void SetGizmo(int op, int mode, const float* snap, const Fmatrix& xform);
+int GizmoResult(Fmatrix& out_xform, Fmatrix& out_delta);
+bool GizmoIsUsing();
+bool GizmoWantsMouse();
+} }
+
+void Ed_SetGizmo(int op, int mode, const float* snap, const float* xform16)
+{
+    if (!s_edBooted || !xform16)
+        return;
+
+    Fmatrix xf;
+    CopyMemory(&xf, xform16, sizeof(float) * 16);
+    VK::ImGuiVK::SetGizmo(op, mode, snap, xf);
+}
+
+int Ed_GizmoResult(float* out_xform16, float* out_delta16)
+{
+    if (!s_edBooted || !out_xform16 || !out_delta16)
+        return 0;
+
+    Fmatrix xf, d;
+    const int changed = VK::ImGuiVK::GizmoResult(xf, d);
+    CopyMemory(out_xform16, &xf, sizeof(float) * 16);
+    CopyMemory(out_delta16, &d, sizeof(float) * 16);
+    return changed;
+}
+
+int Ed_GizmoIsUsing() { return (s_edBooted && VK::ImGuiVK::GizmoIsUsing()) ? 1 : 0; }
+int Ed_GizmoWantsMouse() { return (s_edBooted && VK::ImGuiVK::GizmoWantsMouse()) ? 1 : 0; }
+
+void Ed_PushLog(const char* text, int isError)
+{
+    if (s_edBooted)
+        VK::ImGuiVK::PushEditorLog(text, isError != 0);
+}
+
+void Ed_SetStats(float fps, float rfps, int verts, int tris, int dips, int lights, int total_lights)
+{
+    if (s_edBooted)
+        VK::ImGuiVK::PushEditorStats(fps, rfps, verts, tris, dips, lights, total_lights);
+}
+
+void Ed_Resize(int width, int height)
+{
+    if (!s_edBooted || !g_ed_embedded || width <= 0 || height <= 0)
+        return;
+
+    SetWindowPos(s_edChildWnd, nullptr, 0, 0, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+
+    // Device::Reset feeds dwWidth/dwHeight straight into Swapchain.Recreate — the
+    // renderer does NOT re-read the window here (only Create does), so publish the new
+    // size ourselves, exactly like the resolution-change path does.
+    RECT cr{};
+    GetClientRect(s_edChildWnd, &cr);
+    extern u32 psCurrentVidMode[2];
+    Device.dwWidth = u32(cr.right - cr.left);
+    Device.dwHeight = u32(cr.bottom - cr.top);
+    Device.fWidth_2 = float(Device.dwWidth) * 0.5f;
+    Device.fHeight_2 = float(Device.dwHeight) * 0.5f;
+    psCurrentVidMode[0] = Device.dwWidth;
+    psCurrentVidMode[1] = Device.dwHeight;
+
+    Device.Reset(false);
+    Msg("[Ed] resized embedded viewport to %ux%u", Device.dwWidth, Device.dwHeight);
+}
+
+void Ed_Shutdown()
+{
+    if (!s_edBooted)
+        return;
+    s_edBooted = false;
+
+    // Mirrors Startup()'s post-loop teardown.
+    xr_delete(g_SpatialSpacePhysic);
+    xr_delete(g_SpatialSpace);
+    xr_delete(g_pGamePersistent);
+    xr_delete(pApp);
+    Engine.Event.Dump();
+    destroyInput();
+    destroySettings();
+    LALib.OnDestroy();
+    destroyConsole();
+    destroySound();
+    destroyEngine();
+    Core._destroy();
+
+    // The engine's atexit guard R_ASSERTs on ExitFromWinMain to catch abnormal exits.
+    // When hosted, the engine's WinMain never runs (we boot via Ed_Init), so the guard
+    // would false-fire "Unexpected application exit" on the host's clean shutdown. We
+    // reached Ed_Shutdown normally — mark the exit as expected.
+    ExitFromWinMain = true;
+
+    if (s_edChildWnd)
+    {
+        DestroyWindow(s_edChildWnd);
+        s_edChildWnd = nullptr;
+        Device.m_hWnd = nullptr;
+        g_ed_embedded = false;
+    }
 }
 
 CApplication::CApplication() : loadingScreen(nullptr)
@@ -502,18 +909,31 @@ void CApplication::OnEvent(EVENT E, u64 P1, u64 P2)
         R_ASSERT(0 == g_pGameLevel);
         R_ASSERT(g_pGamePersistent);
 
+        // An exception escaping level creation would be swallowed by the pureFrame
+        // guard, leaving a half-initialized g_pGameLevel and a disconnect/reconnect
+        // livelock (seen 16-07: frozen game, 1200+ per-frame Disconnects). Unrecoverable
+        // either way — die loudly with the cause instead.
+        try
         {
             Console->Execute("main_menu off");
             Console->Hide();
-            
+
             g_pGamePersistent->PreStart(op_server);
-            
+
             g_pGameLevel = (IGame_Level*)NEW_INSTANCE(CLSID_GAME_LEVEL);
 
             pApp->LoadBegin();
             g_pGamePersistent->Start(op_server);
             g_pGameLevel->net_Start(op_server, op_client);
             pApp->LoadEnd();
+        }
+        catch (const std::exception& e)
+        {
+            FATAL("level start threw [%s: %s] — state unrecoverable", typeid(e).name(), e.what());
+        }
+        catch (...)
+        {
+            FATAL("level start threw [non-std; lua top: %s] — state unrecoverable", g_lua_error_peek ? g_lua_error_peek() : "<no hook>");
         }
         xr_free(op_server);
         xr_free(op_client);
@@ -525,8 +945,22 @@ void CApplication::OnEvent(EVENT E, u64 P1, u64 P2)
             Console->Execute("main_menu off");
             Console->Hide();
 
-            g_pGameLevel->net_Stop();
-            xr_delete(g_pGameLevel);
+            // Same as eStart: a throw mid-teardown (e.g. a Lua error raised while level
+            // members release luabind refs after the script-engine restart) leaves a
+            // dangling half-destroyed level → per-frame Disconnect livelock. Die loudly.
+            try
+            {
+                g_pGameLevel->net_Stop();
+                xr_delete(g_pGameLevel);
+            }
+            catch (const std::exception& e)
+            {
+                FATAL("level unload threw [%s: %s] — state unrecoverable", typeid(e).name(), e.what());
+            }
+            catch (...)
+            {
+                FATAL("level unload threw [non-std; lua top: %s] — state unrecoverable", g_lua_error_peek ? g_lua_error_peek() : "<no hook>");
+            }
 
             Console->Show();
 
@@ -542,6 +976,13 @@ void CApplication::OnEvent(EVENT E, u64 P1, u64 P2)
 
 static CTimer phase_timer;
 extern ENGINE_API BOOL g_appLoaded = FALSE;
+
+const char* (*g_lua_error_peek)() = nullptr;
+
+// Per-member seqFrame profiling (see pure.h). The VK profiler installs the
+// hook; device.cpp arms the live cb around seqFrame.Process only.
+seq_profile_cb g_seq_profile_cb   = nullptr;
+seq_profile_cb g_seq_profile_hook = nullptr;
 
 void CApplication::LoadBegin(bool quick)
 {

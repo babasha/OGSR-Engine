@@ -38,13 +38,14 @@ out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[4]; };
 void main()
 {
     vUV = aUV * pc.uvScale;
-    uint slot = casterPages[gl_InstanceIndex];
+    uint entry = casterPages[gl_InstanceIndex];   // arena entry = (treeIdx<<13)|slot (vsm_tree_bin)
+    uint slot  = entry & 0x1FFFu;
     if (slot >= uint(TV_MAX_PHYS)) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         gl_ClipDistance[0] = gl_ClipDistance[1] = gl_ClipDistance[2] = gl_ClipDistance[3] = -1.0;
         return;
     }
-    uint treeIdx = gl_InstanceIndex / pc.cap;
+    uint treeIdx = entry >> 13u;
     mat4 X = inst[treeIdx].xform;
     vec3 wp = (X * vec4(aPos, 1.0)).xyz;
     // World-space wind displacement (dyn wrapper; static passes zeros → rigid).

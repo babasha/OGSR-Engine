@@ -4,9 +4,14 @@
 // (Environment.wind_anim.xy) — pass the CURRENT drift for the rendered pose and
 // the PREVIOUS-frame drift (wind_anim_old) to get the previous pose for motion
 // vectors (SSFX's `prev` flag). Shared by detail.vert (forward) + the grass MV
-// pass. Requires the flow map bound at set 0, binding 1.
+// pass. Requires the flow map bound at set SSFX_WIND_SET (default 0), binding 1
+// — vsm_grass_page has page data at set 0, so it #defines SSFX_WIND_SET 1 (the
+// detail manager's per-type set, where s_waves lives at binding 1).
 
-layout(set = 0, binding = 1) uniform sampler2D s_waves;   // wind_wave.dds flow map (RGB)
+#ifndef SSFX_WIND_SET
+#define SSFX_WIND_SET 0
+#endif
+layout(set = SSFX_WIND_SET, binding = 1) uniform sampler2D s_waves;   // wind_wave.dds flow map (RGB)
 
 struct WindSetup {
     vec2  dir;        // wind direction (unit)

@@ -32,8 +32,29 @@ static void* ode_alloc(size_t size) { return xr_malloc(size); }
 static void* ode_realloc(void* ptr, size_t oldsize, size_t newsize) { return xr_realloc(ptr, newsize); }
 static void ode_free(void* ptr, size_t size) { return xr_free(ptr); }
 
+#include "script_engine.h"
+#include "ai_space.h"
+// Engine-side guards catch raw LuaJIT unwinds only as `catch(...)`; the error text
+// sits on the lua stack top. This hook lets them name the script error they caught.
+static const char* lua_error_peek()
+{
+    try
+    {
+        lua_State* L = ai().script_engine().lua();
+        if (L && lua_gettop(L) > 0 && lua_isstring(L, -1))
+            return lua_tostring(L, -1);
+        return "<no lua error on stack>";
+    }
+    catch (...)
+    {
+        return "<lua peek failed>";
+    }
+}
+
 CGamePersistent::CGamePersistent(void)
 {
+    g_lua_error_peek = &lua_error_peek;
+
     m_game_params.m_e_game_type = GAME_ANY;
     ambient_effect_next_time = 0;
     ambient_effect_stop_time = 0;
@@ -458,6 +479,9 @@ void CGamePersistent::start_logo_intro()
     if (!strstr(Core.Params, "-intro"))
     {
         m_intro_event = 0;
+        // PHASE B (editor-on-Vulkan): -vk_editor boots straight into the no-menu
+        // editor viewport (a VK render sink drives the frame) — don't raise the menu.
+        if (strstr(Core.Params, "-vk_editor")) { Console->Hide(); return; }
         Console->Show();
         Console->Execute("main_menu on");
         return;
@@ -555,6 +579,39 @@ void CGamePersistent::OnFrame()
 
     if (!m_pMainMenu->IsActive())
         m_pMainMenu->DestroyInternal(false);
+
+    // PHASE B (editor-on-Vulkan): with -vk_editor there is no level, so the normal
+    // environment tick (__super::OnFrame -> Environment().OnFrame) never runs — the
+    // early return below skips it. Drive a fixed midday environment ourselves so the
+    // full HDR pipeline (sky, auto-exposure, tonemap, colour-grading) has valid
+    // lighting; a degenerate CurrentEnv makes the tonemap crush the whole frame to
+    // black. This teaches the editor to render THROUGH the real HDR path, as in-game.
+    if (strstr(Core.Params, "-vk_editor"))
+    {
+        CEnvironment& env = Environment();
+        static bool s_envInit = false;
+        if (!s_envInit)
+        {
+            s_envInit = true;
+            if (env.WeatherCycles.empty())
+                env.load(); // OnAppStart normally does this; force it if it hasn't run
+            if (!env.WeatherCycles.empty())
+            {
+                // Prefer a clear daytime cycle; fall back to the first available.
+                shared_str wname = "default_np_clear";
+                if (env.WeatherCycles.find(wname) == env.WeatherCycles.end())
+                    wname = env.WeatherCycles.begin()->first;
+                env.SetGameTime(12.f * 3600.f, 0.f); // noon, time frozen (factor 0)
+                env.SetWeather(wname, true);
+                Msg("[VK][editor] environment: weather='%s' @ noon (%u cycles)", wname.c_str(), (u32)env.WeatherCycles.size());
+            }
+            else
+                Msg("![VK][editor] no weather cycles available — sky will stay degenerate");
+        }
+        env.SetGameTime(12.f * 3600.f, 0.f); // keep the sun pinned at noon
+        env.OnFrame();
+        return;
+    }
 
     if (!g_pGameLevel)
         return;

@@ -28,7 +28,8 @@ layout(push_constant) uniform PC {
     vec4 camRightT;  // xyz = right * tan(fovX/2),         w = eye.y
     vec4 camTopT;    // xyz = top   * tan(fovY/2),         w = eye.z
     vec4 zp;         // x = proj _33, y = proj _43, z = 1/width, w = 1/height
-    mat4 prevVP;     // previous-frame view-proj (row-major Fmatrix → GLSL reads as transpose, like world.vert pc.mvp)
+    mat4 prevVP;     // previous-frame view-proj, UNJITTERED (row-major Fmatrix → GLSL reads as transpose)
+    vec4 jitter;     // xy = this frame's sub-pixel jitter in D3D-NDC (0 when DLSS off)
 } pc;
 
 void main()
@@ -36,9 +37,14 @@ void main()
     vec2  uv   = gl_FragCoord.xy * pc.zp.zw;
     float zndc = texture(uDepth, uv).r;
 
-    // View ray for this pixel (GTAO/sunshafts basis): camDir + right·tanX·ndc.x +
-    // top·tanY·ndc.y is a world-space direction; eye is packed in the .w lanes.
-    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y);   // D3D ndc (y up)
+    // JITTER-FREE MV (Option A): the depth was rasterised at the JITTERED projection,
+    // so this pixel sits at the jittered NDC. The same surface projects to
+    // (ndcPix − jitter) under the UNJITTERED view-proj — reconstruct + reproject in
+    // that unjittered space so the motion vector carries NO sub-pixel jitter wobble
+    // (DLSS applies the jitter itself from the offset we pass to Evaluate). The camDir/
+    // right/top basis is derived from the UNJITTERED cur view-proj on the C++ side.
+    vec2 ndcPix = vec2(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y);   // D3D ndc (y up) at the jittered pixel
+    vec2 ndc    = ndcPix - pc.jitter.xy;                       // unjittered ndc for this surface
     vec3 ray = pc.camDir.xyz + pc.camRightT.xyz * ndc.x + pc.camTopT.xyz * ndc.y;
     vec3 eye = vec3(pc.camDir.w, pc.camRightT.w, pc.camTopT.w);
 
@@ -59,5 +65,7 @@ void main()
     vec2 pndc   = pclip.xy / pclip.w;
     vec2 prevUV = vec2(pndc.x * 0.5 + 0.5, 0.5 - 0.5 * pndc.y);   // inverse of the ndc map above
 
-    outMV = prevUV - uv;   // where the pixel WAS minus where it IS (UV space)
+    // Current (unjittered) position of this surface — NOT the jittered pixel uv.
+    vec2 curUV = vec2(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y);
+    outMV = prevUV - curUV;   // where the pixel WAS minus where it IS (UV space), jitter-free
 }

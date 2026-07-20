@@ -23,7 +23,8 @@ namespace VK
     {
         VkCommandBuffer cmd          = VK_NULL_HANDLE;
         u32             imageIndex   = 0;
-        VkExtent2D      extent       = { 0, 0 };
+        VkExtent2D      extent       = { 0, 0 };   // SCENE render resolution (< display when DLSS upscaling)
+        VkExtent2D      displayExtent= { 0, 0 };   // swapchain / present resolution (== extent unless upscaling)
 
         // Render targets. Passes render to THESE, never to Swapchain.m_Images[...]
         // directly — so when the framegraph repoints them at an offscreen HDR /

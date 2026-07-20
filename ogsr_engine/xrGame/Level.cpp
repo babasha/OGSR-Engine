@@ -374,22 +374,32 @@ void CLevel::ProcessGameEvents()
         Device.add_to_seq_parallel(fastdelegate::MakeDelegate(this, &CLevel::ProcessGameSpawns));
 }
 
+// RAII section meter feeding the seqFrame profiler hook (pure.h): names which
+// part of CLevel::OnFrame the growing seq:CLevel time goes to. Armed only while
+// the VK profiler runs (g_seq_profile_cb non-null inside seqFrame.Process).
+struct SeqSectionProbe
+{
+    const char* n; CTimer t; bool on;
+    explicit SeqSectionProbe(const char* name) : n(name), on(g_seq_profile_cb != nullptr) { if (on) t.Start(); }
+    ~SeqSectionProbe() { if (on && g_seq_profile_cb) g_seq_profile_cb(n, t.GetElapsed_sec() * 1000.f); }
+};
+
 void CLevel::OnFrame()
 {
-    m_feel_deny.update();
+    { SeqSectionProbe _p("Lvl/feel");      m_feel_deny.update(); }
 
     // commit events from bullet manager from prev-frame
     Device.Statistic->BulletManager.Begin();
-    BulletManager().CommitEvents();
+    { SeqSectionProbe _p("Lvl/bullets");   BulletManager().CommitEvents(); }
     Device.Statistic->BulletManager.End();
 
-    ClientReceive();
+    { SeqSectionProbe _p("Lvl/netRecv");   ClientReceive(); }
 
-    ProcessGameEvents();
+    { SeqSectionProbe _p("Lvl/gameEv");    ProcessGameEvents(); }
 
-    MapManager().Update();
-    // Inherited update
-    inherited::OnFrame();
+    { SeqSectionProbe _p("Lvl/map");       MapManager().Update(); }
+    // Inherited update (objects/scheduler/space)
+    { SeqSectionProbe _p("Lvl/inherited"); inherited::OnFrame(); }
 
     extern bool s_ScriptTime;
 
@@ -398,12 +408,12 @@ void CLevel::OnFrame()
         g_pGamePersistent->Environment().SetGameTime(GetEnvironmentGameDayTimeSec(), game->GetEnvironmentGameTimeFactor());
     }
 
-    m_ph_commander->update();
-    m_ph_commander_scripts->update();
+    { SeqSectionProbe _p("Lvl/phCmd");     m_ph_commander->update(); }
+    { SeqSectionProbe _p("Lvl/phCmdScr");  m_ph_commander_scripts->update(); }
 
     //просчитать полет пуль
     Device.Statistic->BulletManager.Begin();
-    BulletManager().CommitRenderSet();
+    { SeqSectionProbe _p("Lvl/bullets2");  BulletManager().CommitRenderSet(); }
     Device.Statistic->BulletManager.End();
 
     // update static sounds

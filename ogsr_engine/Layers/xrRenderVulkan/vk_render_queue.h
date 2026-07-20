@@ -18,6 +18,7 @@
 #include "vk_pass_context.h"
 
 class vkRender_Visual;
+class CFrustum;
 
 namespace VK {
 
@@ -50,6 +51,10 @@ class RenderQueue
 {
 public:
     void Push(const DrawItem& item);
+    // Raw append for REPLAYING items captured from a prior Push (rain AT-caster
+    // cache): skips the hemi stamp and glass routing — the stored item already
+    // went through them. Items appended in pre-sorted order need no SortByKey.
+    void PushPresorted(const DrawItem& item) { m_Items.push_back(item); }
     void Clear();
     void SortByKey();
     void Flush(FrameContext& ctx);
@@ -84,8 +89,12 @@ public:
     // alphaTestedOnly=true skips OPAQUE casters (they're rendered by the
     // GPU-driven compute-cull + indirect path, vk_shadow_gpu) — the CPU queue
     // then draws only the alpha-tested cutout casters the GPU path can't.
+    // cull (optional): per-item bounding-sphere vs frustum test — spot tiles /
+    // point-cube faces collect their queue by range-SPHERE, but the actual
+    // cone/face frustum is a small slice of it; this skips the rest.
     void FlushDepth(VkCommandBuffer cmd, const Fmatrix& vp, bool skipAlphaTested = false,
-                    bool alphaTestedOnly = false, bool displaceTerrain = false);
+                    bool alphaTestedOnly = false, bool displaceTerrain = false,
+                    const CFrustum* cull = nullptr);
 
     size_t Size() const { return m_Items.size(); }
 

@@ -15,6 +15,9 @@ class CPHCondition : public CPHReqBase
 {
 public:
     virtual bool is_true() = 0;
+    // Diagnostics: where this condition came from ("script.lua:123" for Lua
+    // conditions; empty otherwise). Feeds the CPHCommander leak histogram.
+    virtual void dump_source(char* buf, u32 n) const { if (n) buf[0] = 0; }
 };
 
 class CPHAction : public CPHReqBase
@@ -64,6 +67,8 @@ public:
     bool isNeedRemove();
     void removeLater();
     void setPause(u32 ms);
+
+    CPHCondition* condition() const { return m_condition; }   // diagnostics (leak histogram)
 };
 
 DEFINE_VECTOR(std::unique_ptr<CPHCall>, PHCALL_STORAGE, PHCALL_I);

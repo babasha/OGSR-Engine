@@ -57,9 +57,11 @@ void CScriptEngine::unload()
 }
 
 // [VK-PROBE] downgrade FATAL to Msg so script asserts (e.g. door init failures from inert objects) don't kill the run while we verify rendering. Revert when guards are in place.
+// The extra Msg is gated on print_output's "printed" return — a repeat-suppressed
+// error must not keep writing its own line either (see the throttle in print_output).
 #define DEF_LUA_ERROR_TEMPLATE(L) \
-    print_output(L, "[" __FUNCTION__ "]", LUA_ERRRUN); \
-    Msg("![%s]: %s", __FUNCTION__, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
+    if (print_output(L, "[" __FUNCTION__ "]", LUA_ERRRUN)) \
+        Msg("![%s]: %s", __FUNCTION__, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
 
 int CScriptEngine::lua_panic(lua_State* L)
 {
@@ -68,14 +70,21 @@ int CScriptEngine::lua_panic(lua_State* L)
 }
 
 #ifdef LUABIND_NO_EXCEPTIONS
-void CScriptEngine::lua_error(lua_State* L) { DEF_LUA_ERROR_TEMPLATE(L) }
+void CScriptEngine::lua_error(lua_State* L)
+{
+    DEF_LUA_ERROR_TEMPLATE(L)
+    // Если просто вернуться, luabind безусловно зовёт std::terminate() (call_member.hpp и родня) —
+    // никакой try/catch выше не спасает. Бросаем сами: охраняемые места (OGSR_GUARD_BINDER и т.п.)
+    // ловят и продолжают; неохраняемые заканчиваются terminate ровно как раньше.
+    throw std::runtime_error("lua error (see log above)");
+}
 #endif
 
 int CScriptEngine::lua_pcall_failed(lua_State* L)
 {
     // [VK-PROBE] downgrade FATAL to Msg so script asserts (e.g. door init failures from inert objects) don't kill the run while we verify rendering. Revert when guards are in place.
-    print_output(L, "[" __FUNCTION__ "]", LUA_ERRRUN);
-    Msg("![lua_pcall_failed] %s", lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
+    if (print_output(L, "[" __FUNCTION__ "]", LUA_ERRRUN))
+        Msg("![lua_pcall_failed] %s", lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
     if (lua_isstring(L, -1))
         lua_pop(L, 1);
     return LUA_ERRRUN;
@@ -735,19 +744,61 @@ bool CScriptEngine::print_output(lua_State* L, const char* caScriptFileName,
         }
     }
 
-    auto traceback = get_lua_traceback(L);
+    // Repeat-offender throttle: a broken mod script erroring every server tick
+    // (foreign-map smart terrains: ~600 identical errors/s while flying across the
+    // map) turns traceback building + log flushing into 100+ ms/frame of pure
+    // logging. Same error => full print for the first 3 occurrences, then one
+    // reminder per 500. Returns whether anything was printed so callers can gate
+    // their own per-error Msg lines on it.
+    static xr_map<u32, u32> s_seen;
+    if (s_seen.size() > 256)
+        s_seen.clear();
 
     if (!lua_isstring(L, -1)) // НЕ УДАЛЯТЬ! Иначе будут вылeты без лога!
     {
+        // No message string to key on — key on the topmost script frame
+        // (source:line, cheap via lua_getinfo); the full traceback is built only
+        // when we actually print.
+        string256 key = { '?', 0 };
+        lua_Debug ar;
+        for (int lvl = 0; lvl < 4; ++lvl)
+        {
+            if (!lua_getstack(L, lvl, &ar) || !lua_getinfo(L, "Sl", &ar))
+                break;
+            if (ar.currentline > 0)
+            {
+                xr_sprintf(key, "%s:%d", ar.short_src, ar.currentline);
+                break;
+            }
+        }
+        u32& n = s_seen[crc32(key, (u32)xr_strlen(key))];
+        ++n;
+        if (n > 3 && (n % 500) != 0)
+            return false;
+
+        auto traceback = get_lua_traceback(L);
         Msg("*********************************************************************************");
-        Msg("[print_output(%s)] %s!\n%s", caScriptFileName, Prefix, traceback);
+        if (n > 3)
+            Msg("[print_output(%s)] %s! (repeat #%u, most suppressed)\n%s", caScriptFileName, Prefix, n, traceback);
+        else
+            Msg("[print_output(%s)] %s!\n%s", caScriptFileName, Prefix, traceback);
         Msg("*********************************************************************************");
-        return false;
+        return true;
     }
 
     auto S = lua_tostring(L, -1);
+
+    u32& n = s_seen[crc32(S, (u32)xr_strlen(S))];
+    ++n;
+    if (n > 3 && (n % 500) != 0)
+        return false;
+
+    auto traceback = get_lua_traceback(L);
     Msg("*********************************************************************************");
-    Msg("[print_output(%s)] %s:\n%s\n%s", caScriptFileName, Prefix, S, traceback);
+    if (n > 3)
+        Msg("[print_output(%s)] %s (repeat #%u, most suppressed):\n%s\n%s", caScriptFileName, Prefix, n, S, traceback);
+    else
+        Msg("[print_output(%s)] %s:\n%s\n%s", caScriptFileName, Prefix, S, traceback);
     Msg("*********************************************************************************");
     return true;
 }

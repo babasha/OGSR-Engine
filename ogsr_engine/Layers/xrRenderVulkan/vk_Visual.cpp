@@ -184,9 +184,22 @@ void vkRender_Visual::LoadTexture(IReader* data)
         {
             xr_string sn_lower = shader_name;
             std::transform(sn_lower.begin(), sn_lower.end(), sn_lower.begin(), ::tolower);
+            // NOTE: this is a NAME heuristic, not the truth. The alpha reference really
+            // lives in the blender definition in shaders.xr; matching substrings only
+            // works for shaders whose name happens to say so. Anything alpha-tested whose
+            // name does not contain one of these renders OPAQUE — foliage then shows the
+            // black backing of its cards instead of being cut out.
+            //
+            // "leaf"        — flora\leaf_wave, the standard foliage blender (trunk_wave is
+            //                 bark and correctly stays opaque, hence matching "leaf" and
+            //                 not "flora").
+            // "objects_lod" — def_shaders\def_objects_lod, the tree LOD billboards.
+            // Both were missing and made every tree in a level render as black quads.
             if (sn_lower.find("aref") != xr_string::npos ||
                 sn_lower.find("alpha") != xr_string::npos ||
-                sn_lower.find("trans") != xr_string::npos)
+                sn_lower.find("trans") != xr_string::npos ||
+                sn_lower.find("leaf") != xr_string::npos ||
+                sn_lower.find("objects_lod") != xr_string::npos)
             {
                 m_fAlphaRef = 200.0f / 255.0f;  // DX11 def_aref uses oAREF=200
             }
@@ -327,7 +340,24 @@ void vkRender_Visual::LoadTexture(IReader* data)
                 dbg_name.c_str() ? dbg_name.c_str() : "(null)", ogf_shader, lvl_shader,
                 diffuse_name ? diffuse_name : "-", (u32)Type, m_fAlphaRef, emis ? 1 : 0);
     }
-    m_pWorldMaterial = VK::WorldMaterialCache::GetOrCreate(diffuse_name, lmap_name, m_fAlphaRef, wmark);
+    // Level-shader name rides along for terrain materials: mask-less maps
+    // regionalize terrain by SHADER (pripyat_asfalt/earth/grass), and the cache
+    // synthesizes the one-hot splat mask from it (see GetOrCreate).
+    const char* lvl_shader_name = nullptr;
+    if (!ogf_diffuse[0] && shader_id < (u16)RImplementation.Shaders.size() && RImplementation.Shaders[shader_id])
+        lvl_shader_name = RImplementation.Shaders[shader_id]->m_Name.c_str();
+    // HOST-DRIVEN SCENES (the SDK editor): the guard above consults the level shader
+    // table only when the OGF carries no diffuse of its own — but a host-exported
+    // .ogf always does, so this stayed null and terrain lost its regionalization.
+    // No shader name → no one-hot splat mask → the white fallback → all four detail
+    // layers averaged at 0.25 each, which cancels their high-frequency content and
+    // renders the ground as mush. The OGF's OWN shader name is right here and serves
+    // exactly the same purpose, so fall back to it. Even when it matches no keyword
+    // the heuristic still picks ONE channel — one detail at full strength beats a
+    // four-way blur.
+    if ((!lvl_shader_name || !lvl_shader_name[0]) && ogf_shader && ogf_shader[0])
+        lvl_shader_name = ogf_shader;
+    m_pWorldMaterial = VK::WorldMaterialCache::GetOrCreate(diffuse_name, lmap_name, m_fAlphaRef, wmark, lvl_shader_name);
 }
 
 // ============================================================================
@@ -805,7 +835,7 @@ void vkFVisual::LoadGeometry(IReader* data, u32 flags)
             m_mesh.p_rm_Vertices->Create(
                 data_size,
                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true
             );
             m_mesh.p_rm_Vertices->Upload(converted.data(), data_size);
         }
@@ -827,7 +857,7 @@ void vkFVisual::LoadGeometry(IReader* data, u32 flags)
         m_mesh.p_rm_Indices->Create(
             data_size,
             VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true
         );
 
         // Read and upload index data
@@ -1327,7 +1357,7 @@ static void vkUploadConvertedVertices(VK_Render_Mesh& mesh, void* dst, u32 vStri
     mesh.p_rm_Vertices = xr_new<VK::CVulkanBuffer>();
     mesh.p_rm_Vertices->Create(vertCount * vStride,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     mesh.p_rm_Vertices->Upload(dst, vertCount * vStride);
     mesh.vStride = vStride;
 }

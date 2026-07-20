@@ -32,7 +32,10 @@
 #endif
 #define LUABIND_NO_EXCEPTIONS //Не рекомендую закомментировать.
 #ifdef LUABIND_NO_EXCEPTIONS
-#	define LUABIND_DTOR_NOEXCEPT noexcept
+// noexcept(false), не noexcept: колбэк ошибки (CScriptEngine::lua_error) кидает C++-исключение,
+// чтобы охраняемые вызыватели (OGSR_GUARD_BINDER) могли пережить Lua-ошибку. Void-вызовы luabind
+// исполняются в деструкторах прокси — noexcept здесь превращал бы этот выброс в std::terminate.
+#	define LUABIND_DTOR_NOEXCEPT noexcept(false)
 #else
 #	define LUABIND_DTOR_NOEXCEPT
 #endif

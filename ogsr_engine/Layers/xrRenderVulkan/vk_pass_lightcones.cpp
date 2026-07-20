@@ -11,7 +11,8 @@
 #include "vk_swapchain.h"               // Swapchain.m_DepthImage/m_DepthView
 #include "vk_scene_color.h"             // HDR scene target format
 #include "vk_shaders.h"                 // g_ShaderManager (SPIRV loader)
-#include "vk_shadow.h"                  // ShadowMap::GetSampler (reused for depth)
+#include "vk_shadow.h"                  // ShadowMap::GetSampler / GetSpotTileVP (pool tiles)
+#include "vk_pass_shadow.h"             // SpotShadow_TileOfLight — per-cone shadow tile
 #include "vk_barriers.h"                // ImageBarrier
 #include "vk_pass_ssao.h"               // DeriveProjTerms (Device.mProject is identity on this path)
 #include "vk_command_buffer.h"          // CommandManager.GetCurrentFrame()
@@ -40,6 +41,8 @@ extern float ps_r_light_cone_reach;     // beam/light reach = fan length × this
 extern float ps_r_light_cone_power;     // synthesized-light surface intensity (0 = beam only)
 extern float ps_r_light_cone_fade;      // synth beams: exp fade length after the lamp-face glow (m)
 extern float ps_r_light_cone_soft;      // per-step shadow-tap disc radius, texels (beam penumbra; 0 = hard)
+extern int   ps_r_light_cone_torch;     // draw the analytic cone for ordinary torches (0 = R4: froxel shaft only)
+extern float ps_r_flashlight_glow;      // bright lamp-face glow for a torch aimed at the camera (0 = off)
 
 namespace VK {
 
@@ -181,11 +184,16 @@ namespace {
         blend.alphaBlendOp        = VK_BLEND_OP_ADD;
         blend.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        // Cones are a LOW-FREQUENCY participating-media effect (smooth in-scatter) — 2x2
+        // coarse shading (pipelineFragmentShadingRate) quarters the fragment cost of the
+        // 24-step march with no meaningful visual change. Falls back to per-pixel where the
+        // device lacks pipeline-rate VRS. This attacks the on-screen-overlap peak that the
+        // frustum cull can't (frustum only drops off-screen cones).
         s_pipeline = Fullscreen::CreatePipeline(vs, fs, VK::SceneColor::Format(), s_layout,
-                                                blend, "Cones");
+                                                blend, "Cones", VkExtent2D{ 2, 2 });
         if (s_pipeline == VK_NULL_HANDLE) { s_failed = true; return false; }
 
-        Msg("[VK Cones] init OK");
+        Msg("[VK Cones] init OK (VRS 2x2: %s)", VulkanHW.m_bVRSPipelineSupported ? "on" : "off");
         return true;
     }
 }  // anon namespace
@@ -210,12 +218,31 @@ void Pass_LightCones(FrameContext& ctx)
     // EnvLight already collected the same set this frame).
     const Fvector eye = Device.vCameraPosition;
     const auto& FL = Lights::CollectFrame(eye);
-    struct Cone { Fvector pos, dir; float len, tanH, apexR, fadeLen; Fvector3 rgb; float fade; bool spotShadow; };
+    struct Cone { Fvector pos, dir; float len, tanH, apexR, fadeLen; Fvector3 rgb; float fade; int tile; float range; };
     Cone cones[kMaxCones];
     u32  nCones = 0;
+    u32  nCulled = 0;   // bounding sphere missed the camera frustum (off-screen / behind) — triage
+    // A cone whose bounding sphere misses the camera frustum entirely contributes zero
+    // on-screen pixels, yet each cone still issues a full-res fullscreen-triangle draw +
+    // depth fetch per pixel before the shader's per-pixel sphere reject. Cull it here.
+    // Synth beams' backing spot light is managed above (surfaces stay lit) — this only
+    // skips the invisible CONE draw. Same sphere the shader / triage self-test intersect.
+    auto coneInFrustum = [](const Fvector& pos, const Fvector& dir, float len, float tanH) -> bool {
+        const float baseR = len * tanH;
+        Fvector C = dir; C.mul(len * 0.5f); C.add(pos);
+        const float R = std::sqrt(len * len * 0.25f + baseR * baseR) * 1.02f;
+        return RImplementation.ViewBase.testSphere_dirty(C, R) != FALSE;
+    };
+    // R4 behaviour by default: ordinary dynamic torches (CTorch — the player's and
+    // NPCs' head-lamps) are NOT searchlights. Their volumetric shaft comes from the
+    // froxel fog (r_vol), not from this analytic cone — otherwise a distant NPC's
+    // head-lamp reads as a big white projector cone at night. The synthesized lamp/
+    // headlight beams (synthFlag) are a separate path below and stay on. Flip
+    // r_light_cone_torch 1 to bring the old analytic torch cones back.
     for (u32 i = 0; i < FL.count && nCones < kMaxCones; ++i) {
         if (!FL.volFlag[i]) continue;
         if (FL.synthFlag[i]) continue;   // our beam lights: SynthCones draws their cone itself
+        if (!ps_r_light_cone_torch) continue;   // torches → froxel shaft only (R4 look)
         const auto& gl = FL.gpu[i];
         if (gl.color[3] < 0.5f) continue;                       // spots only (w: 1 spot / 0 point)
         Fvector pos{ gl.pos[0], gl.pos[1], gl.pos[2] };
@@ -237,14 +264,53 @@ void Pass_LightCones(FrameContext& ctx)
         // wide light pool, like a real headlight). Most game lights sit at the
         // 120° default, which as a media volume reads "blob", not "beam".
         c.tanH = std::sqrt(std::max(1.f - cosH * cosH, 0.f)) / cosH * ps_r_light_cone_narrow;
+        if (!coneInFrustum(c.pos, c.dir, c.len, c.tanH)) { --nCones; ++nCulled; continue; }
         c.apexR = 0.08f;    // real lights: small bulb face
         c.fadeLen = 0.f;    // classic axial falloff (game lights keep their look)
-        c.spotShadow = (FL.spotIdx == (int)i);   // this cone owns the spot map (e.g. flashlight)
+        c.tile  = SpotShadow_TileOfLight(FL.src[i]);   // pooled → its tile cuts the beam per step
+        c.range = gl.pos[3];
         // Beam luminance premultiplied here (the shader has no free push slot):
         // ~2.2 ≈ sun-lit scene level in our HDR units; raise for day visibility.
         const float lum = fade * ps_r_light_cone_lum;
         c.rgb  = Fvector3{ gl.color[0] * lum, gl.color[1] * lum, gl.color[2] * lum };
         c.fade = fade;
+    }
+
+    // Flashlight SOURCE GLOW (R4 lens-flare analog). A torch's analytic cone is off
+    // (r_light_cone_torch) so it doesn't read as a searchlight — but a torch AIMED AT
+    // the camera (an NPC facing you) still needs a bright lamp "bulb", else the light
+    // hits the scene while the lamp itself looks switched off. Draw a SHORT bright glow
+    // at the source, gated by how squarely the beam points at the eye: 0 when aimed
+    // away, so the player's own torch (points where you look, and sits at the eye) never
+    // flares in your face.
+    if (ps_r_flashlight_glow > 0.f) {
+        for (u32 i = 0; i < FL.count && nCones < kMaxCones; ++i) {
+            if (!FL.flashFlag[i]) continue;
+            const auto& gl = FL.gpu[i];
+            if (gl.color[3] < 0.5f) continue;                       // spots only
+            Fvector pos{ gl.pos[0], gl.pos[1], gl.pos[2] };
+            const float dist = pos.distance_to(eye);
+            if (dist < 0.75f || dist > kMaxConeDist) continue;      // skip our own (at the eye)
+            Fvector ld{ gl.dir[0], gl.dir[1], gl.dir[2] };
+            if (ld.magnitude() < 1e-5f) continue; ld.normalize();
+            Fvector toEye = eye; toEye.sub(pos);
+            const float d = toEye.magnitude(); if (d < 1e-4f) continue; toEye.mul(1.f / d);
+            const float facing = ld.dotproduct(toEye);              // 1 = aimed straight at the camera
+            if (facing < 0.15f) continue;                           // aimed away → no bulb
+            const float fade = std::clamp((dist - 0.5f) / 1.0f, 0.f, 1.f);
+            Cone& c = cones[nCones++];
+            c.pos = pos; c.dir = ld;
+            c.len = std::clamp(gl.pos[3] * 0.15f, 0.5f, 3.0f);      // short stub toward the eye
+            c.tanH = 0.35f;                                         // compact bulb glow, not a cone
+            if (!coneInFrustum(c.pos, c.dir, c.len, c.tanH)) { --nCones; ++nCulled; continue; }
+            c.apexR = 0.12f;                                        // the lamp face
+            c.fadeLen = 0.4f;                                       // exp lamp-face glow (synth-style)
+            c.tile = SpotShadow_TileOfLight(FL.src[i]);
+            c.range = gl.pos[3];
+            const float g = ps_r_flashlight_glow * facing * facing * fade;
+            c.rgb = Fvector3{ gl.color[0] * g, gl.color[1] * g, gl.color[2] * g };
+            c.fade = fade;
+        }
     }
 
     // Beams synthesized from lightplanes geometry (R4 bakes headlight/searchlight
@@ -327,17 +393,16 @@ void Pass_LightCones(FrameContext& ctx)
             c.dir  = R.dir;
             c.len  = R.len;
             c.tanH = R.tanH;   // the fan IS the visible beam — no narrow factor
+            if (!coneInFrustum(c.pos, c.dir, c.len, c.tanH)) { --nCones; ++nCulled; continue; }
             // Lamp-face radius from the fan geometry × live multiplier:
             // the whole headlight glows, not a point.
             c.apexR = R.apexR * ps_r_light_cone_base;
             // Synth beams: only a short lamp-face glow (~15 cm + exp fade) — the
             // LONG beam shape comes from the fog (vol boost), like the flashlight.
             c.fadeLen = ps_r_light_cone_fade;
-            // Our backing light may have WON the spot-shadow budget — then the
-            // visible beam is cut per-step by its map.
-            c.spotShadow = FL.spotIdx >= 0
-                        && FL.spotPos.distance_to_sqr(R.apex) < 1.f
-                        && FL.spotDir.dotproduct(R.dir) > 0.8f;
+            // The backing light's pool tile cuts the visible beam per step.
+            c.tile  = SpotShadow_TileOfLight(R.L);
+            c.range = R.len;
             const float lum = fade * ps_r_light_cone_lum;
             c.rgb  = Fvector3{ R.rgb.x * lum, R.rgb.y * lum, R.rgb.z * lum };
             c.fade = fade;
@@ -360,6 +425,7 @@ void Pass_LightCones(FrameContext& ctx)
         Msg("[VK Cones] basis: pt.dir=(%.2f,%.2f,%.2f) camDir=(%.2f,%.2f,%.2f) dot=%.3f tan=(%.2f,%.2f) p33=%.4f p43=%.4f",
             pt.dir.x, pt.dir.y, pt.dir.z, camDir.x, camDir.y, camDir.z,
             pt.dir.dotproduct(camDir), pt.tanX, pt.tanY, pt.p33, pt.p43);
+        Msg("[VK Cones] %u drawn, %u frustum-culled (off-screen/behind camera)", nCones, nCulled);
         if (nCones == 0)
             Msg("[VK Cones] 0 vol-spots this frame (of %u collected lights)", FL.count);
         for (u32 i = 0; i < nCones; ++i) {
@@ -449,10 +515,10 @@ void Pass_LightCones(FrameContext& ctx)
         // treats w >= 99.5 as debug mode, keyed vs the [VK Cones] log).
         push.lightCol[3] = ps_r_light_cones >= 2 ? (float)i + 100.f : ps_r_light_cone_soft;
         push.beamPrm[0] = c.apexR;
-        push.beamPrm[1] = c.spotShadow ? 1.f : 0.f;
-        push.beamPrm[2] = FL.spotRange;   // spot far plane for the linear-depth compare
-        push.beamPrm[3] = c.fadeLen;      // >0: lamp-face glow with exp fade (synth beams)
-        std::memcpy(push.spotVP, &ShadowMap::GetSpotVP(), sizeof(push.spotVP));
+        push.beamPrm[1] = float(c.tile + 1);   // pool tile + 1 (0 = no per-step shadow)
+        push.beamPrm[2] = c.range;             // this light's far plane (linear-depth compare)
+        push.beamPrm[3] = c.fadeLen;           // >0: lamp-face glow with exp fade (synth beams)
+        std::memcpy(push.spotVP, &ShadowMap::GetSpotTileVP(c.tile >= 0 ? u32(c.tile) : 0u), sizeof(push.spotVP));
         vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }

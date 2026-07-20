@@ -95,6 +95,32 @@ public:
     int   m_GpuProgram = -2;
     float m_GpuAccum   = 0.0f;
 
+    // #6: group-owned emitters with on-birth/on-play/on-dead children must keep
+    // the CPU sim — child spawning hangs off the CPU per-particle callbacks.
+    // Set by vkCParticleGroup::Compile; GpuClaimed() refuses these.
+    bool  m_GpuNoRoute = false;
+
+    // #5 per-instance spawn ownership (small-budget effects, maxP <= 8): each
+    // sub-slot holds the spawn time of the particle occupying it; a new spawn
+    // is only allowed into a slot whose occupant expired (one lifetime). This
+    // mirrors the CPU per-instance pool for 1-billboard flames/glows — without
+    // it, freed units of the SHARED program budget get snapped up by whichever
+    // visible emitter wins the frame's race (stacked double flames on lucky
+    // campfires, starvation on the rest).
+    static constexpr u32 kGpuOwnSlots = 8;
+    float m_GpuSpawnT[kGpuOwnSlots] = { -1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f, -1e9f };
+
+    // Off-screen emission gate: the game can keep an effect PLAYING while
+    // never submitting its visual to the render lists (burn/smoke attached to
+    // the hidden first-person actor) — the CPU path simulated those invisibly.
+    // The registry emits off-frustum only for STATIONARY emitters (campfires)
+    // or effects the game submitted recently. Stamped by Pass_Particles.
+    float   m_GpuLastSubmitT = -1e9f;
+    Fvector m_GpuLastPos     = {};
+    float   m_GpuLastMoveT   = -1e9f;
+    float   m_GpuLastTickT   = -1e9f;   // OnFrame ran — the game still owns/updates this effect
+    bool    m_GpuHiddenKill  = false;   // one-shot: particles killed when ticking stopped (dead-queued object)
+
 public:
     vkCParticleEffect();
     virtual ~vkCParticleEffect();

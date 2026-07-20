@@ -56,7 +56,7 @@ namespace {
     VkShaderModule        s_normalFS   = VK_NULL_HANDLE;  // ... + AT FS writing worldN*0.5+0.5
     VkShaderModule        s_mvVS       = VK_NULL_HANDLE;  // motion-vector VS (skins cur+prev pose, optional)
     VkShaderModule        s_mvFS       = VK_NULL_HANDLE;  // ... â†’ RG16F screen motion
-    VkPipelineLayout      s_mvLayout   = VK_NULL_HANDLE;  // set0 = bones + 144B push (cur/prev VP + bases)
+    VkPipelineLayout      s_mvLayout   = VK_NULL_HANDLE;  // set0 = bones + 152B push (cur/prev VP + bases + jitter)
     CVulkanBuffer         s_boneSSBO;
     Fmatrix*              s_boneMapped = nullptr;
     std::unordered_map<u32, VkPipeline> s_pipelines;        // keyed by vertex stride (36/40/44)
@@ -71,6 +71,10 @@ namespace {
     // so the MV vertex shader can skin the previous pose for true animation motion.
     std::unordered_map<CKinematics*, std::pair<u32, u32>> s_curBoneMap;   // K -> {baseBone, boneCount}
     std::unordered_map<CKinematics*, std::pair<u32, u32>> s_prevBoneMap;
+    // Same, but for the first-person HUD skeletons (drawn with the HUD-FOV
+    // projection at near depth) — the HUD MV overlay needs its own prev poses.
+    std::unordered_map<CKinematics*, std::pair<u32, u32>> s_curBoneMapHud;
+    std::unordered_map<CKinematics*, std::pair<u32, u32>> s_prevBoneMapHud;
 
     // Per-frame upload registry: every skeleton whose bones landed in the SSBO
     // this frame. Bones are stored PRE-MULTIPLIED by the object's world matrix,
@@ -89,10 +93,12 @@ namespace {
     // by the fragment) flags first-person HUD so it gets sun-direction-independent light.
     struct SkinPush { Fmatrix mvp; u32 skinMode; u32 baseBone; u32 boneCount; float hudMode; float hemi; };
 
-    // Motion-vector push â€” must match motion_vec_skinned.vert. 144 B (device max is
-    // 256 here, see vk_pipeline.cpp). curVP/prevVP project the cur/prev poses.
-    struct MVSkinPush { Fmatrix curVP; Fmatrix prevVP; u32 skinMode; u32 curBase; u32 prevBase; u32 boneCount; };
-    static_assert(sizeof(MVSkinPush) == 144, "must match motion_vec_skinned.vert PC block");
+    // Motion-vector push â€” must match motion_vec_skinned.vert. 152 B (device max is
+    // 256 here, see vk_pipeline.cpp). curVP/prevVP are UNJITTERED and project the
+    // cur/prev poses (jitter-free MV); jitter re-applies the sub-pixel offset to
+    // gl_Position only, so depth still bit-matches the jittered forward geometry.
+    struct MVSkinPush { Fmatrix curVP; Fmatrix prevVP; u32 skinMode; u32 curBase; u32 prevBase; u32 boneCount; float jitterX; float jitterY; };
+    static_assert(sizeof(MVSkinPush) == 152, "must match motion_vec_skinned.vert PC block");
 
     // Vertex input for the vertHW_* layouts. loc0 pos FLOAT4; loc1/3/4 packed
     // normal/tangent/binormal (UBYTE4N); loc2 = FLOAT2 (36/40) or FLOAT4 (44);
@@ -205,6 +211,11 @@ namespace {
         cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         cb.attachmentCount = 1; cb.pAttachments = &ba;
 
+        // VRS: variants 0/1/2 draw inside the world-color pass with the SRI
+        // attached — STATIC {1x1, KEEP, REPLACE} state so distant NPCs coarse-
+        // shade with the world (static, not dynamic: see vk_pipeline_cache.cpp —
+        // a dynamic rate gets invalidated by unrelated binds). The distort
+        // variant renders into the haze RT (no SRI) and stays full-rate.
         VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
         VkPipelineDynamicStateCreateInfo dynState{};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -217,6 +228,11 @@ namespace {
         prci.colorAttachmentCount    = 1;
         prci.pColorAttachmentFormats = &colorFormat;
         prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
+        VkPipelineFragmentShadingRateStateCreateInfoKHR fsrState{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
+        fsrState.fragmentSize   = { 1, 1 };
+        fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;   // SRI attachment wins
+        if (VulkanHW.m_bVRSSupported && !distort) prci.pNext = &fsrState;
 
         VkGraphicsPipelineCreateInfo pi{};
         pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -227,6 +243,9 @@ namespace {
         pi.pMultisampleState   = &ms;        pi.pDepthStencilState  = &ds;
         pi.pColorBlendState    = &cb;        pi.pDynamicState       = &dynState;
         pi.layout              = s_layout;
+
+        if (VulkanHW.m_bVRSSupported && !distort)
+            pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
         VkPipeline h = VK_NULL_HANDLE;
         VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
@@ -865,6 +884,8 @@ void Skinned_UploadBones()
     // pass (its SSBO regions are still live), and we rebuild "current" below.
     s_prevBoneMap = std::move(s_curBoneMap);
     s_curBoneMap.clear();
+    s_prevBoneMapHud = std::move(s_curBoneMapHud);
+    s_curBoneMapHud.clear();
 
     // Pick THIS frame's bone-SSBO region by the fence-guarded in-flight slot, so the
     // CPU never writes matrices a still-in-flight frame's GPU may be reading.
@@ -907,6 +928,10 @@ void Skinned_UploadBones()
     // previous pose (HUD excluded â€” it never enters the MV pass).
     for (const SkelUpload& u : s_uploads)
         s_curBoneMap[u.K] = { u.baseBone, (u32)u.boneCount };
+    // HUD weapon now has its own MV overlay (Skinned_RenderMotionHud), so track
+    // its prev poses too — last frame's SSBO region stays live (FRAMES_IN_FLIGHT>=2).
+    for (const SkelUpload& u : s_uploadsHud)
+        s_curBoneMapHud[u.K] = { u.baseBone, (u32)u.boneCount };
 }
 
 void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet)
@@ -1039,8 +1064,19 @@ void Skinned_CollectProps(xr_vector<Fvector>& out, u32 maxProps)
     }
 }
 
+// Same filter uploadList() uses to decide what this path owns. Kept next to it so the
+// rigid sun-caster pass (vk_pass_shadow.cpp) can ask instead of repeating the test —
+// change the filter and both follow.
+bool Skinned_HandlesVisual(IRenderVisual* v)
+{
+    if (!v)
+        return false;
+    CKinematics* K = dynamic_cast<CKinematics*>(v);
+    return K && !K->children.empty();
+}
+
 void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
-                          const Fvector* cullPos, float cullRange)
+                          const Fvector* cullPos, float cullRange, const CFrustum* frustum)
 {
     if (!s_inited || s_failed || s_shadowVS == VK_NULL_HANDLE) return;
     if (s_uploads.empty()) return;   // HUD never casts
@@ -1058,6 +1094,9 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
             if (cullPos) {
                 const float rr = cullRange + bs.R;
                 if (cullPos->distance_to_sqr(c) > rr * rr) continue;
+                // Per-face frustum (point cube): skip the ~4 of 6 faces the NPC
+                // isn't in — the sphere test alone drew it into all six.
+                if (frustum && !frustum->testSphere_dirty(c, bs.R)) continue;
             } else if (!ShadowMap::SphereVisible(c, bs.R)) continue;
         }
 
@@ -1194,7 +1233,8 @@ void Skinned_RenderNormalPrepass(VkCommandBuffer cmd, const Fmatrix& viewProj)
 // complete scene depth (LEQUAL, no write) â†’ only visible NPC pixels overwrite the
 // camera/static field. Caller owns render begin/end + the negative-height viewport
 // (MotionVec::ExecuteDynamic). HUD excluded. prevVP = last frame's view-proj.
-void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP)
+void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP,
+                          float jitterNdcX, float jitterNdcY)
 {
     if (!Init()) return;
     if (s_mvVS == VK_NULL_HANDLE || s_mvFS == VK_NULL_HANDLE || s_mvLayout == VK_NULL_HANDLE) return;
@@ -1244,7 +1284,7 @@ void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatr
             }
 
             const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
-            MVSkinPush pc{ curVP, prevVP, skinMode, u.baseBone, prevBase, (u32)u.boneCount };
+            MVSkinPush pc{ curVP, prevVP, skinMode, u.baseBone, prevBase, (u32)u.boneCount, jitterNdcX, jitterNdcY };
             vkCmdPushConstants(cmd, s_mvLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
 
             VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
@@ -1258,6 +1298,82 @@ void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatr
 
     static bool s_diag = false;
     if (!s_diag && nDraw) { s_diag = true; Msg("[VK Skinned] first MV render: skeletons=%zu draws=%u", s_uploads.size(), nDraw); }
+}
+
+// First-person HUD weapon MV overlay. Same mechanism as Skinned_RenderMotion, but
+// for the HUD list and with the HUD-FOV projection (curHudVP/prevHudVP) at the
+// near-depth viewport [0,0.02] the forward HUD pass used — so the weapon's clip
+// depth bit-matches the HUD depth already in the buffer and LEQUAL passes. Without
+// this the viewmodel (the closest, fastest-moving thing on screen) carries the
+// fullscreen pass's bogus camera-reprojection MV and would ghost under DLSS/TAA.
+// Caller (MotionVec::ExecuteDynamic) owns render begin/end; we restore the range.
+void Skinned_RenderMotionHud(VkCommandBuffer cmd, const VkExtent2D& ext,
+                             const Fmatrix& curHudVP, const Fmatrix& prevHudVP,
+                             float jitterNdcX, float jitterNdcY)
+{
+    if (!Init()) return;
+    if (s_mvVS == VK_NULL_HANDLE || s_mvFS == VK_NULL_HANDLE || s_mvLayout == VK_NULL_HANDLE) return;
+    Skinned_UploadBones();   // idempotent; ensures s_uploadsHud + the prev HUD map
+    if (s_uploadsHud.empty()) return;
+
+    SetViewportDepth(cmd, ext, 0.0f, 0.02f);   // match the forward HUD near-depth range
+
+    VkPipeline      lastPipe   = VK_NULL_HANDLE;
+    VkDescriptorSet lastMatSet = VK_NULL_HANDLE;
+    bool            boundBones = false;
+    u32             nDraw      = 0;
+
+    for (const SkelUpload& u : s_uploadsHud)
+    {
+        // Previous pose: same HUD skeleton last frame (SSBO region still live).
+        u32 prevBase = u.baseBone;
+        auto it = s_prevBoneMapHud.find(u.K);
+        if (it != s_prevBoneMapHud.end() && it->second.second == (u32)u.boneCount)
+            prevBase = it->second.first;
+
+        for (auto* child : u.K->children)
+        {
+            VK_Render_Mesh* mesh = nullptr;
+            u16 rmode = 0;
+            if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+            if (child->m_bEmissiveAdd || child->m_bModelGlass || child->m_bLitBlend) continue;   // marks/glass: skip
+
+            VkPipeline pipe = GetMotionPipeline(mesh->vStride);
+            if (pipe == VK_NULL_HANDLE) continue;
+            if (pipe != lastPipe) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+                lastPipe = pipe; boundBones = false; lastMatSet = VK_NULL_HANDLE;
+            }
+            if (!boundBones) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_mvLayout, 0, 1, &s_set, 0, nullptr);
+                boundBones = true;
+            }
+
+            WorldMaterial* mat = child->m_pWorldMaterial ? child->m_pWorldMaterial : WorldMaterialCache::GetDefault();
+            VkDescriptorSet matSet = (mat && mat->set != VK_NULL_HANDLE) ? mat->set : VK_NULL_HANDLE;
+            if (matSet == VK_NULL_HANDLE) continue;
+            if (matSet != lastMatSet) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_mvLayout, 1, 1, &matSet, 0, nullptr);
+                lastMatSet = matSet;
+            }
+
+            const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+            MVSkinPush pc{ curHudVP, prevHudVP, skinMode, u.baseBone, prevBase, (u32)u.boneCount, jitterNdcX, jitterNdcY };
+            vkCmdPushConstants(cmd, s_mvLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+
+            VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
+            VkDeviceSize vbOff = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+            vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
+            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+            ++nDraw;
+        }
+    }
+
+    SetViewportDepth(cmd, ext, 0.0f, 1.0f);   // restore full-depth range
+
+    static bool s_diagHud = false;
+    if (!s_diagHud && nDraw) { s_diagHud = true; Msg("[VK Skinned] first HUD MV render: huds=%zu draws=%u", s_uploadsHud.size(), nDraw); }
 }
 
 bool Skinned_AnyCasterInSphere(const Fvector& pos, float range)
@@ -1376,6 +1492,7 @@ void Skinned_Destroy()
     s_prepassVS = VK_NULL_HANDLE; s_prepassFS = VK_NULL_HANDLE;
     s_mvVS = VK_NULL_HANDLE; s_mvFS = VK_NULL_HANDLE;
     s_curBoneMap.clear(); s_prevBoneMap.clear();
+    s_curBoneMapHud.clear(); s_prevBoneMapHud.clear();
     s_uploads.clear(); s_uploadsHud.clear(); s_uploadFrame = u32(-1);
     if (s_mvLayout)  { vkDestroyPipelineLayout(VulkanHW.m_Device, s_mvLayout, nullptr); s_mvLayout = VK_NULL_HANDLE; }
     if (s_layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_layout, nullptr); s_layout = VK_NULL_HANDLE; }

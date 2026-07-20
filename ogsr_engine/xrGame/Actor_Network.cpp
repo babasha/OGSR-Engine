@@ -119,6 +119,9 @@ BOOL CActor::net_Spawn(CSE_Abstract* DC)
     character_physics_support()->movement()->ActivateBox(m_loaded_ph_box_id);
     if (E->m_holderID != u16(-1))
     {
+        // Foreign-map hazard: a bogus holderID destroys the capsule expecting a vehicle
+        // attach that may never come — see the self-heal in CActor::shedule_Update.
+        Msg("! [Actor] net_Spawn with holderID=%u — physics character destroyed until the holder attaches", (u32)E->m_holderID);
         character_physics_support()->movement()->DestroyCharacter();
     }
     if (m_bOutBorder)

@@ -13,6 +13,7 @@
 #include "vk_buffer.h"           // CVulkanBuffer
 #include "vk_command_buffer.h"   // CVulkanCommandManager::FRAMES_IN_FLIGHT
 #include "vk_shaders.h"          // g_ShaderManager (SPIR-V loader)
+#include "vk_compute_util.h"     // VK::MakePipelineLayout / CreateComputePipeline
 #include <cmath>
 
 extern int ps_r_clustered_debug;   // gate the per-frame cull diag behind the debug cvar
@@ -91,9 +92,9 @@ bool Init()
 
     // Device-local grid + index list (written by compute, read by the fragments).
     s_grid.Create((VkDeviceSize)kClusters * sizeof(u32),
-                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     s_indices.Create((VkDeviceSize)kClusters * kMaxPerCluster * sizeof(u32),
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     // Compute set layout: 0 = lights (in), 1 = grid (out), 2 = indices (out).
     VkDescriptorSetLayoutBinding b[3]{};
@@ -130,16 +131,11 @@ bool Init()
         vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
     }
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_layout) != VK_SUCCESS) { Msg("![VK Clustered] pipeline layout create failed"); s_failed = true; return false; }
+    s_layout = VK::MakePipelineLayout({ s_setL }, sizeof(CullPush));
+    if (s_layout == VK_NULL_HANDLE) { s_failed = true; return false; }
 
-    VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module = cs; cp.stage.pName = "main";
-    cp.layout = s_layout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &s_pipe) != VK_SUCCESS) { Msg("![VK Clustered] compute pipeline create failed"); s_failed = true; return false; }
+    s_pipe = VK::CreateComputePipeline(cs, s_layout, "Clustered.Cull");
+    if (s_pipe == VK_NULL_HANDLE) { s_failed = true; return false; }
 
     s_ready = true;
     Msg("[VK Clustered] init OK — grid %ux%ux%u (%u clusters), %u lights/cluster, %u max lights",

@@ -7,6 +7,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D uDepth;                 // scene depth (D32)
 layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D uRate;   // shading-rate image
+// Diagnostics: per-frame tile histogram (0 = 1x1, 1 = 2x2, 2 = 4x4). CPU zeroes
+// the slot before dispatch and logs it N frames later ([VK VRS] tiles ...).
+layout(set = 0, binding = 2) buffer Hist { uint cnt[3]; } uHist;
 
 layout(push_constant) uniform PC {
     vec2  invScreen;   // 1/screenW, 1/screenH
@@ -49,4 +52,5 @@ void main()
     else if (nearest > pc.nearFar.x) { w = 2u; h = 2u; }
 
     imageStore(uRate, t, uvec4(encRate(w, h), 0u, 0u, 0u));
+    atomicAdd(uHist.cnt[(w >= 4u) ? 2u : ((w >= 2u) ? 1u : 0u)], 1u);
 }

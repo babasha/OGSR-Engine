@@ -43,8 +43,19 @@ public:
      *                 - VMA_MEMORY_USAGE_AUTO (рекомендуется)
      *                 - VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE (GPU-only, быстро)
      *                 - VMA_MEMORY_USAGE_AUTO_PREFER_HOST (CPU-доступ, медленно)
+     * @param gpuOnly TRUE = требовать DEVICE_LOCAL и НЕ запрашивать host-доступ.
+     *                ВАЖНО: без этого ЛЮБОЙ storage-буфер получает
+     *                HOST_ACCESS_SEQUENTIAL_WRITE (см. Create) — VMA тогда обязан
+     *                выбрать HOST_VISIBLE память, т.е. 256MB BAR-кучу или, когда она
+     *                занята, СИСТЕМНУЮ RAM: шейдер читает такой буфер по PCIe
+     *                (диагноз Bins/Tree* 20-30ms на Припяти). Ставь TRUE для буферов,
+     *                которые пишет/читает только GPU (CPU-путь — через Upload/Fill).
+     *                Map() у такого буфера вернёт nullptr (Upload сам уйдёт в staging).
      */
-    void Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage);
+    void Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage, bool gpuOnly = false);
+
+    /** VMA allocation handle (диагностика размещения: vmaGetAllocationMemoryProperties). */
+    VmaAllocation GetAllocation() const { return m_Allocation; }
 
     /**
      * Уничтожить буфер
@@ -112,6 +123,16 @@ public:
      * Get buffer device address (requires VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
      */
     VkDeviceAddress GetDeviceAddress() const;
+
+    /**
+     * Заменить содержимое ЭТОГО объекта буфером other (in-place swap для
+     * компакции пулов): наш старый VkBuffer уничтожается, все поля (включая
+     * usage/memUsage) переезжают из other, other обнуляется. Держатели
+     * указателя CVulkanBuffer* автоматически видят новый буфер; сырые
+     * VkBuffer-снапшоты (GetHandle) должны патчиться отдельно.
+     * ВНИМАНИЕ: GPU обязан не читать старый буфер (queue idle / load-time).
+     */
+    void AdoptFrom(CVulkanBuffer& other);
 
 private:
     /**

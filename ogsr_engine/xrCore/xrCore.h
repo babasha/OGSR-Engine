@@ -207,7 +207,15 @@ public:
                              actor_thirst = 1ull << 42, no_progress_bar_animation = 1ull << 43;
     };
 
-    void _initialize(LPCSTR ApplicationName, LogCallback cb = 0, BOOL init_fs = TRUE, LPCSTR fs_fname = 0);
+    // app_path_override: when non-null, used as ApplicationPath instead of the host
+    // process's exe directory (GetModuleFileName(nullptr)). The editor-host facade
+    // (Ed_Init) passes the xrEngine_VK.dll's own directory so the FS resolves fs_root
+    // = the engine folder, no matter which process loaded the DLL. Must end with '\\'.
+    // params_override: when non-null, used as Core.Params instead of GetCommandLine().
+    // Same reason — the host process's flags (the SDK's `-editor -nocache …`) are not
+    // the engine's, and some of them (notably -nocache) are read during FS init.
+    void _initialize(LPCSTR ApplicationName, LogCallback cb = 0, BOOL init_fs = TRUE, LPCSTR fs_fname = 0, LPCSTR app_path_override = nullptr,
+                     LPCSTR params_override = nullptr);
     void _destroy();
 
     constexpr const char* GetBuildConfiguration();

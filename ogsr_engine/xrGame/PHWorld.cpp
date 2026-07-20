@@ -185,6 +185,14 @@ void CPHWorld::OnFrame()
 static u32 start_time = 0;
 void CPHWorld::Step()
 {
+    // [mod-compat diag] heartbeat: is the physics world stepping at all? ("actor
+    // frozen in mcFall" hunt — remove once the foreign-map freeze is understood)
+    {
+        static u32 s_steps = 0;
+        if ((++s_steps % 1024) == 1)
+            Msg("[PHWorld] step #%u", s_steps);
+    }
+
 #ifdef DEBUG
     dbg_reused_queries_per_step = 0;
     dbg_new_queries_per_step = 0;

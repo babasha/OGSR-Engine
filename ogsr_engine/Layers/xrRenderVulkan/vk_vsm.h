@@ -31,6 +31,9 @@ void InvalidateCache();      // drop the toroidal page cache. MUST be called on 
 bool Ready();                // resources created, not dead
 bool Wanted();               // r_vsm on (cheap, NO Init dependency) — gate the Pass_World call
 bool Enabled();              // Ready() && r_vsm (post-Init; checked inside MarkPages)
+bool NightFrozen();          // sun below the horizon → the whole sun-shadow update is frozen this frame
+                             // (mask kept from the last daylit frame; receivers × sun_color≈0 → invisible).
+                             // Set by BeginFrame; gate MarkPages/RenderAtlas/ResolveMask on !NightFrozen().
 
 // Per frame, AFTER the depth prepass with `sceneDepth` in SHADER_READ_ONLY: rebuild
 // the clipmap params from camera+sun, clear the page flags, and dispatch the mark
@@ -47,6 +50,7 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
 // view/sampler are above. EnvLight binds these on set 1 for the world/skinned shaders.
 VkBuffer GetPageTableHandle();   // VK_NULL_HANDLE until Ready()
 VkBuffer GetUBOHandle();         // this frame's clipmap params UBO
+VkBuffer GetRMaskHandle();       // receiver mask (r_vsm_rmask): 2 u32/page, 8×8 sampled cells (dyn bins sub-page-cull)
 
 // After MarkPages built the per-page draw list, rasterize the casters into the
 // physical atlas (one render pass; per-page routing in vsm_page.vert). Call right
@@ -56,6 +60,13 @@ void RenderAtlas(VkCommandBuffer cmd);
 VkImageView GetAtlasView();   // physical atlas, sampled by the resolve pass; VK_NULL_HANDLE until ready
 VkSampler   GetSampler();
 bool        AtlasReady();      // true once the atlas has been rendered (valid SHADER_READ to sample)
+
+// DYNAMIC atlas (NPC + grass casters, re-rendered per frame) + its page table —
+// GRASS receivers sample it directly at the blade's own world pos (extra bias
+// beats the blade's self-depth) so grass-on-grass / NPC-on-grass shadows work
+// without the screen-space mask's parallax. Valid once AtlasReady().
+VkImageView GetDynAtlasView();
+VkBuffer    GetDynPageTableHandle();
 
 // Temporal resolve (TAA-for-shadows): after RenderAtlas, with `sceneDepth` back in
 // SHADER_READ_ONLY, run the screen-space resolve — sample the atlas per pixel, blend

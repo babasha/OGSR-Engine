@@ -6,7 +6,10 @@
 // form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
+#include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_pass_particles.h"
+#include "vk_color_space.h"   // ColorSpace::LinearizeRGB — smoke media albedo
+#include "vk_image.h"      // VK::CreateImage2D / CreateImageView
 #include "vk_Particles.h"
 #include "vk_pass_world.h"        // g_DynamicVisuals / DynVisual
 #include "vk_render_queue.h"      // g_RenderQueue.GlassItems() — glass refraction into the distort RT
@@ -258,7 +261,7 @@ namespace {
     {
         if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
         if (s_DistortView) { vkDestroyImageView(VulkanHW.m_Device, s_DistortView, nullptr); s_DistortView = VK_NULL_HANDLE; }
-        if (s_DistortImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_DistortImg, s_DistortAlloc); s_DistortImg = VK_NULL_HANDLE; s_DistortAlloc = VK_NULL_HANDLE; }
+        if (s_DistortImg)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_DistortImg, s_DistortAlloc); s_DistortImg = VK_NULL_HANDLE; s_DistortAlloc = VK_NULL_HANDLE; }
         s_DistortExtent = {};
         s_DistortFirst  = true;
     }
@@ -268,32 +271,12 @@ namespace {
         if (s_DistortImg && extent.width == s_DistortExtent.width && extent.height == s_DistortExtent.height)
             return true;
         DestroyDistortRT();
-        VkImageCreateInfo ici{};
-        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = kDistortFormat;
-        ici.extent = { extent.width, extent.height, 1 };
-        ici.mipLevels = 1; ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo aci{};
-        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_DistortImg, &s_DistortAlloc, nullptr) != VK_SUCCESS) {
-            Msg("![VK Particles] distort RT create failed");
+        if (!VK::CreateImage2D(kDistortFormat, extent,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                s_DistortImg, s_DistortAlloc, "Particle.Distort"))
             return false;
-        }
-        VkImageViewCreateInfo vci{};
-        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vci.image = s_DistortImg;
-        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format = kDistortFormat;
-        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        vci.subresourceRange.levelCount = 1;
-        vci.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_DistortView) != VK_SUCCESS) {
-            Msg("![VK Particles] distort view create failed");
+        s_DistortView = VK::CreateImageView(s_DistortImg, kDistortFormat);
+        if (s_DistortView == VK_NULL_HANDLE) {
             DestroyDistortRT();
             return false;
         }
@@ -735,7 +718,11 @@ VkDescriptorSet GetTextureSet(const char* texture_name)
     PTex entry;
     if (FS.exist(full)) {
         entry.tex = xr_new<CVulkanTexture>();
-        if (!entry.tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+        // Sprite albedo — Colour. Covers both the alpha-blended and the additive
+        // (PBM_ADD) effects; additive sprites are radiance too, so they must be linear
+        // before they are summed into the HDR scene colour.
+        if (!entry.tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::UI,
+                                TexColorSpace::Color)) {
             xr_delete(entry.tex);
             entry.tex = nullptr;
         }
@@ -847,7 +834,11 @@ void CollectSmokeParticles(xr_vector<VK::Vol::SmokeParticle>& out)
                 VK::Vol::SmokeParticle sp;
                 sp.pos[0] = wp.x; sp.pos[1] = wp.y; sp.pos[2] = wp.z;
                 sp.radius = (m.size.x + m.size.y) * 0.25f;   // avg billboard half-extent
+                // Same decode as the sprite path (vk_ParticleEffect): this colour becomes
+                // participating-media albedo in the froxel volume, so it has to be in the
+                // same space as the sun/ambient radiance it scatters. [3] is density.
                 sp.color[0] = m.colorR; sp.color[1] = m.colorG; sp.color[2] = m.colorB; sp.color[3] = dens;
+                ColorSpace::LinearizeRGB(sp.color);
                 out.push_back(sp);
             }
         }
@@ -883,6 +874,10 @@ void Pass_Particles(FrameContext& ctx)
             static_cast<vkParticleVisual*>(d.vis)->CollectEffects(s_collect);
             for (vkCParticleEffect* e : s_collect) {
                 if (!e) continue;
+                // GPU-particle off-screen emission gate: "the game submitted
+                // this effect to render" — hidden 1st-person attachments never
+                // land here and must not emit on the GPU path either.
+                e->m_GpuLastSubmitT = Device.fTimeGlobal;
                 if (e->GetBlendMode() == PBM_DISTORT) s_distort.push_back(e);
                 else if (e->GetHudMode())             s_hud.push_back(e);
                 else                                  s_world.push_back(e);

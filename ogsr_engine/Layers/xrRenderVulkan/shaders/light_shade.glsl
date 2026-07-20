@@ -62,11 +62,14 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
             att *= clamp((ca - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
     }
     vec3 tint = lcol.rgb;
-    if (gi == sIdx) {
-        att *= spotShadowF(wp, r);
+    if (lcol.w > 0.5) {
+        // Spot shadow POOL: every pooled spot samples its own atlas tile —
+        // several headlights/searchlights + the flashlight all shadow at once.
+        int tile = spotTileOf(gi);
+        if (tile >= 0) att *= spotShadowF(wp, r, tile);
         // Flashlight cookie (R4 projective light texture): the beam pattern
-        // projected through the SAME spot_vp the shadow lookup uses.
-        if (L.shadow_params.z > 0.5) {
+        // projected through the cookie light's tile VP (L.spot_vp).
+        if (gi == sIdx && L.shadow_params.z > 0.5) {
             vec4 cc = L.spot_vp * vec4(wp, 1.0);
             if (cc.w > 0.0) {
                 vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
@@ -75,13 +78,16 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
             }
         }
     }
-    else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
-    // UNshadowed OMNI lamps: heightfield terrain occlusion (stops basement lamps
-    // lighting through the ground). SPOTS are exempt: the top-down map sees any
-    // fixture above them (a car hood over its headlight, a lamp shade) and calls
-    // the light "buried" → aimed projector beams were silently killed. A spot's
-    // own cone already bounds where it can leak.
-    else if (lcol.w < 0.5) att *= lightTerrainOcc(wp, lpos.xyz);
+    else {
+        // Point shadow POOL: a pooled point samples its own cube; an UNshadowed
+        // omni lamp instead gets heightfield terrain occlusion (stops basement
+        // lamps lighting through the ground). SPOTS are exempt from the latter:
+        // the top-down map sees any fixture above them and calls the light
+        // "buried" → aimed projector beams were silently killed.
+        int cube = pointCubeOf(gi);
+        if (cube >= 0) att *= pointShadowF(wp, lpos.xyz, r, cube);
+        else           att *= lightTerrainOcc(wp, lpos.xyz);
+    }
     float ndl = dot(N, ld);
     // NARROW beams (headlights/searchlights, cone < ~30°: cos(half) > 0.87):
     // wrap the diffuse — a near-horizontal beam grazes the ground at N·L ≈ 0.05

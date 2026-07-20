@@ -37,9 +37,21 @@ struct FrameContext;
 inline constexpr u32   dm_max_objects     = 64;
 inline constexpr float dm_slot_size       = DETAIL_SLOT_SIZE;   // 2.0 m
 inline constexpr u32   GPU_MAX_OBJ_TYPES  = 64;
-// Output capacity. 1.5M × 64 B = 96 MB — matches monolith default,
-// covers max-radius (250m) × max-density (0.2) without overflow.
-inline constexpr u32   GPU_OUTPUT_CAPACITY = 1500000u;
+// Output capacity — INITIAL only; the buffer AUTO-GROWS to demand at runtime
+// (m_OutputCapacity, resized in Render when the gen reports per-type section
+// overflow). The real constraint is the PER-TYPE section (capacity /
+// numObjTypes, static equal split): a 21-type GAMMA detail set at density 0.25
+// / radius 110 pushed the dominant type past 1.5M/21≈71k → the gen silently
+// dropped whole regions ("поля без травы", 10-07). Now: overflow is counted
+// per type (atomic slot GPU_MAX_OBJ_TYPES+objId), logged, and triggers a grow
+// (one-off vkDeviceWaitIdle hitch) — a modder can pour ANY density/radius and
+// the buffer follows. Ceiling below is a runaway guard, not a tuning knob.
+inline constexpr u32   GPU_OUTPUT_CAPACITY = 1500000u;   // initial: 96 MB
+inline constexpr u32   GPU_OUTPUT_CAP_MAX  = 8000000u;   // ceiling: 512 MB (logged if demand exceeds)
+// Shadow-CASTER set capacity (second gen pass, distance-only cull ≤ ~50 m
+// around the camera — no camera frustum, so a blade behind you still casts).
+// 375k × 64 B = 24 MB; covers a ~68 m disc at max density.
+inline constexpr u32   GPU_CASTER_CAPACITY = 375000u;
 inline constexpr u32   MAX_GRASS_INTERACTORS = 4;
 
 // ============================================================================
@@ -91,12 +103,13 @@ struct DetailGenPushConstants
     Fvector4 frustumPlanes[6];  // 96  (left, right, bottom, top, near, far)
     Fvector4 cameraPos;         // 16  (xyz=eye, w=fTimeGlobal)
     Fvector4 fadeParams;        // 16  (fadeStartSq, fadeLimitSq, fadeRangeSq, density)
+    Fvector4 casterParams;      // 16  (x>0 = CASTER pass: cull radiusSq, no frustum/HZB; y = capacity override)
     int      slotMinSX;
     int      slotMinSZ;
     int      slotCountX;
     int      slotCountZ;
 };
-static_assert(sizeof(DetailGenPushConstants) == 208, "Gen push must be 208 B");
+static_assert(sizeof(DetailGenPushConstants) == 224, "Gen push must be 224 B");
 
 // Generator UBO (64 B) — params that don't fit in push. Mapped host-visible
 // and rewritten each frame (or on level load if unchanging).
@@ -129,6 +142,24 @@ struct DetailGfxPushConstants
     Fvector4 vHemiColor;                           // 16  env hemi colour (rgb); w unused
 };
 static_assert(sizeof(DetailGfxPushConstants) == 224, "Gfx push must be 224 B");
+
+// Grass motion-vector push (VS-only) — pairs with detail_motion.vert. Projects the
+// cur AND prev wind-displaced pose so blades swaying in the wind carry their TRUE
+// screen motion; the fullscreen MV pass only reconstructs camera reprojection from
+// depth and misses the sway. wind_params.w = per-type wind scale (patched per draw,
+// shared by cur+prev since DO_NO_WAVING is frame-stable). 208 B.
+struct DetailMotionPushConstants
+{
+    Fmatrix  curVP;             // 0    this frame's view-proj, UNJITTERED (jitter-free MV)
+    Fmatrix  prevVP;            // 64   previous frame's view-proj, UNJITTERED
+    Fvector4 wind_params;       // 128  cur (.w = per-type wind scale, patched per draw)
+    Fvector4 wsetup_grass;      // 144  SSFX grass tunables (constant frame-to-frame)
+    Fvector4 wind_anim;         // 160  cur drift (Environment.wind_anim) + w = minWindSpeed
+    Fvector4 wind_params_prev;  // 176  previous frame's wind params
+    Fvector4 wind_anim_prev;    // 192  previous frame's drift
+    Fvector4 jitter;            // 208  xy = this frame's sub-pixel jitter (D3D-NDC), re-applied to gl_Position
+};
+static_assert(sizeof(DetailMotionPushConstants) == 224, "Grass MV push must be 224 B");
 
 // HZB build push (32 B) — matches hzb_build.comp.glsl. srcMip/dstMip select
 // levels; isFirstPass=1 reads the depth buffer, =0 reads the previous HZB mip.
@@ -177,14 +208,17 @@ public:
     float        m_global_time_old = 0.0f;
     float        fade_distance    = 60.0f;
 
-    // ----- VSM grass-shadow caster access (read-only) -----------------------
-    // vk_vsm rasterizes NEAR grass into the virtual shadow atlas from the SAME
-    // GPU-driven instance buffer (1 frame stale — grass gen runs after VSM in the
-    // frame). The normal grass gen+draw is untouched; this is a read-only side path.
-    VkBuffer Vsm_VisibleSSBO()  const;
-    VkBuffer Vsm_IndirectBuf()  const;
+    // ----- Grass-shadow caster access (read-only) ---------------------------
+    // VSM/spot/cascade/point-cube passes rasterize NEAR grass casters from the
+    // dedicated CASTER instance buffer (1 frame stale — grass gen runs after the
+    // shadow passes in the frame). The caster set is a second gen dispatch with
+    // NO camera-frustum/HZB cull (distance-only): a blade behind the camera
+    // still casts a shadow you can see (campfire dapples on the wall you walk
+    // toward). Falls back to the visible buffer if the caster set is absent.
+    VkBuffer Vsm_VisibleSSBO()  const;     // caster SSBO (visible SSBO fallback)
+    VkBuffer Vsm_IndirectBuf()  const;     // caster indirect (visible fallback)
     u32      Vsm_TypeCount()    const;
-    u32      Vsm_SectionSize()  const;     // GPU_OUTPUT_CAPACITY / max(types,1) — VisibleSSBO per-type stride
+    u32      Vsm_SectionSize()  const;     // caster capacity / max(types,1) — per-type stride
     u32      Vsm_VertexStride() const;     // grass mesh binding-0 stride (sizeof CDetail::Vertex)
     bool     Vsm_TypeMesh(u32 i, VkBuffer& vb, VkBuffer& ib, u32& indexCount) const;
     VkDescriptorSetLayout Vsm_GfxSetLayout() const;    // diffuse-sampler set layout (for the grass-page alpha test)
@@ -237,10 +271,26 @@ private:
 
     // Compute output: per-instance compacted draw stream. Bound as VB
     // binding 1 (INSTANCE rate) by the graphics draw.
-    VK::CVulkanBuffer* m_VisibleSSBO   = nullptr;     // 96 MB
+    VK::CVulkanBuffer* m_VisibleSSBO   = nullptr;     // m_OutputCapacity × 64 B (auto-grows)
     VK::CVulkanBuffer* m_IndirectCmdBuf= nullptr;     // 64 × 20 B
-    VK::CVulkanBuffer* m_AtomicCounters= nullptr;     // 132 × 4 B
+    VK::CVulkanBuffer* m_AtomicCounters= nullptr;     // 132 × 4 B ([64..127] = per-type overflow-drop counters)
     VK::CVulkanBuffer* m_GenUBO        = nullptr;     // 64 B host-visible
+    // Live output capacity (instances). Starts at GPU_OUTPUT_CAPACITY; Render
+    // grows m_VisibleSSBO when the gen reports section overflow (grass holes).
+    u32                m_OutputCapacity  = GPU_OUTPUT_CAPACITY;
+    u32                m_PendingCapacity = 0;          // grow request, applied at next Render start
+    // Usage/overflow diagnostics: host readback of counters[0..127] (used +
+    // dropped per type, a few frames stale), logged throttled from Render.
+    VK::CVulkanBuffer* m_OverflowRB    = nullptr;     // 128 × 4 B host
+    u32*               m_OverflowPtr   = nullptr;
+    u32                m_OverflowLastLog = 0;
+    u32                m_UsageLastLog    = 0;
+
+    // Shadow-CASTER instance set (second gen dispatch, distance-only cull —
+    // see the Vsm_* getter comment). Read by the spot/cascade/cube/VSM passes.
+    VK::CVulkanBuffer* m_CasterSSBO       = nullptr;  // 24 MB
+    VK::CVulkanBuffer* m_CasterIndirectBuf= nullptr;  // 64 × 20 B
+    VK::CVulkanBuffer* m_CasterAtomic     = nullptr;  // 132 × 4 B
 
     // Compute (generator) pipeline.
     VkPipeline             m_GenPipeline      = VK_NULL_HANDLE;
@@ -248,6 +298,7 @@ private:
     VkDescriptorSetLayout  m_GenDescLayout    = VK_NULL_HANDLE;
     VkDescriptorPool       m_GenDescPool      = VK_NULL_HANDLE;
     VkDescriptorSet        m_GenDescSet       = VK_NULL_HANDLE;
+    VkDescriptorSet        m_CasterDescSet    = VK_NULL_HANDLE;   // caster SSBO/atomics at bindings 3/4
 
     // 1×1 placeholder textures for HZB / TrailMap bindings (B-min skips
     // both occlusion culling and footprint memory). HZB white = depth 1.0
@@ -291,6 +342,18 @@ private:
     // One descriptor set per detail type (single sampler binding = diffuse).
     xr_vector<VkDescriptorSet> m_GfxDescSets;
 
+    // Motion-vector (wind-sway) overlay pipeline — re-draws the visible grass into
+    // the MV target with detail_motion.{vert,frag}, reusing the gfx descriptor sets
+    // (set0 = diffuse + s_waves). Lazy-created on first RenderMotion. Depth-tests
+    // (LEQUAL, no write) against the scene depth the forward grass pass wrote.
+    VkPipeline        m_MotionPipeline       = VK_NULL_HANDLE;
+    VkPipelineLayout  m_MotionPipelineLayout = VK_NULL_HANDLE;
+    // Previous-frame wind for the MV pass (the sway delta lives here). Rolled in
+    // PrepareFrame before m_GfxConstants is overwritten with this frame's wind.
+    Fvector4 m_MvWindParamsPrev{};
+    Fvector4 m_MvWindAnimPrev{};
+    bool     m_MvWindPrevValid = false;
+
     // Per-detail-type loaded diffuse textures (one entry per `objects[]`).
     xr_vector<VK::CVulkanTexture*> m_DetailTextures;
     VkSampler                      m_DetailSampler = VK_NULL_HANDLE;
@@ -312,6 +375,14 @@ public:
     // → gen dispatch → barrier → atomic→indirect copy → barrier → draw).
     // Called from CRender::Render() between Pass_World and Pass_Sky.
     void Render(struct VK::FrameContext& ctx);
+
+    // Wind-sway motion-vector overlay. Called by VK::MotionVec::ExecuteDynamic
+    // INSIDE its already-begun MV render pass (MV target + scene depth bound,
+    // negative-height full-depth viewport). curVP/prevVP are UNJITTERED (jitter-free
+    // MV); jitterNdcX/Y (D3D-NDC, 0 when DLSS off) is re-applied to gl_Position so
+    // grass depth still bit-matches the jittered forward draw. No-op until grass loaded.
+    void RenderMotion(const struct VK::FrameContext& ctx, const Fmatrix& curVP, const Fmatrix& prevVP,
+                      float jitterNdcX, float jitterNdcY);
 
     // World-slot lookup. Returns DS_empty for out-of-bounds queries
     // (id0..3 = ID_Empty marker).
@@ -347,6 +418,8 @@ private:
     void DestroyGpuGenPipeline();
     void CreateGfxPipeline();
     void DestroyGfxPipeline();
+    void CreateMotionPipeline();    // lazy grass MV overlay pipeline (detail_motion.*)
+    void DestroyMotionPipeline();
     void LoadDetailTextures();
     void DestroyDetailTextures();
 

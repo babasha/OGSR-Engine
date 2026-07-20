@@ -47,21 +47,26 @@ void main()
     if (dstCoord.x >= pc.dstSize.x || dstCoord.y >= pc.dstSize.y)
         return;
 
-    // Map dst pixel to its 2x2 region in the source mip.
-    vec2 srcUV = (vec2(dstCoord) + 0.5) / vec2(pc.dstSize);
+    // Map dst pixel to its source block. With ODD source dimensions the last
+    // row/column belongs to no 2x2 block — a plain 2x2 reduce silently DROPS
+    // that depth from the pyramid, and everything behind it gets falsely
+    // occlusion-culled (view-dependent black meshes: canopy posts, far roofs).
+    // Fold the odd remainder into the edge texels' blocks (3-wide/3-tall).
+    ivec2 base  = dstCoord * 2;
+    ivec2 srcMax = pc.srcSize - 1;
+    vec2  texelSize = 1.0 / vec2(pc.srcSize);
 
-    vec2 texelSize = 1.0 / vec2(pc.srcSize);
-    vec2 srcCenter = srcUV * vec2(pc.srcSize);
-
-    // Read the 4 covered texels at the source mip level.
-    float d00 = textureLod(uSrcDepth, (floor(srcCenter - 0.5) + 0.5)            * texelSize, float(pc.srcMip)).r;
-    float d10 = textureLod(uSrcDepth, (floor(srcCenter - 0.5) + vec2(1.5, 0.5)) * texelSize, float(pc.srcMip)).r;
-    float d01 = textureLod(uSrcDepth, (floor(srcCenter - 0.5) + vec2(0.5, 1.5)) * texelSize, float(pc.srcMip)).r;
-    float d11 = textureLod(uSrcDepth, (floor(srcCenter - 0.5) + vec2(1.5, 1.5)) * texelSize, float(pc.srcMip)).r;
-
-    // Conservative occlusion: keep the FARTHEST depth so an instance is culled
-    // only when it is behind everything in the region.
-    float maxDepth = max(max(d00, d10), max(d01, d11));
+    float maxDepth = 0.0;
+    const bool oddX = (pc.srcSize.x & 1) != 0 && dstCoord.x == pc.dstSize.x - 1;
+    const bool oddY = (pc.srcSize.y & 1) != 0 && dstCoord.y == pc.dstSize.y - 1;
+    const int nx = oddX ? 3 : 2;
+    const int ny = oddY ? 3 : 2;
+    for (int y = 0; y < ny; ++y)
+        for (int x = 0; x < nx; ++x) {
+            ivec2 c = min(base + ivec2(x, y), srcMax);
+            float d = textureLod(uSrcDepth, (vec2(c) + 0.5) * texelSize, float(pc.srcMip)).r;
+            maxDepth = max(maxDepth, d);   // MAX = conservative (cull only behind the farthest)
+        }
 
     imageStore(uDstMip, dstCoord, vec4(maxDepth, 0.0, 0.0, 0.0));
 }

@@ -400,7 +400,8 @@ void CEnvironment::SelectEnvs(float gt)
         // first or forced start
         SelectEnvs(CurrentWeather, Current[0], Current[1], gt);
         m_last_weather_shift = Device.dwFrame;
-        g_pGameLevel->OnChangeCurrentWeather(Current[0]->m_identifier.c_str());
+        if (g_pGameLevel) // null in the -vk_editor viewport (no level) — the notify is level-only
+            g_pGameLevel->OnChangeCurrentWeather(Current[0]->m_identifier.c_str());
     }
     else
     {
@@ -435,7 +436,8 @@ void CEnvironment::SelectEnvs(float gt)
             Current[0] = Current[1];
             SelectEnv(CurrentWeather, Current[1], gt);
             m_last_weather_shift = Device.dwFrame;
-            g_pGameLevel->OnChangeCurrentWeather(Current[0]->m_identifier.c_str());
+            if (g_pGameLevel) // null in the -vk_editor viewport (no level)
+                g_pGameLevel->OnChangeCurrentWeather(Current[0]->m_identifier.c_str());
 #ifdef WEATHER_LOGGING
             Msg("Weather: '%s' Desc: '%s' Time: %3.2f/%3.2f", CurrentWeatherName.c_str(), Current[1]->m_identifier.c_str(), Current[1]->exec_time, fGameTime);
 #endif
@@ -479,7 +481,10 @@ void CEnvironment::lerp(float& current_weight)
 
 void CEnvironment::OnFrame()
 {
-    if (!g_pGameLevel)
+    // The -vk_editor viewport drives the environment with NO level loaded: run as
+    // long as a weather cycle is selected (Current[0]/[1]/CurrentEnv are valid).
+    // Everything below uses CurrentEnv + eff_* (built at load), not the level.
+    if (!g_pGameLevel && !CurrentWeather)
         return;
 
     ZoneScoped;

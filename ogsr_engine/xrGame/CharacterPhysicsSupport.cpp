@@ -227,10 +227,16 @@ void CCharacterPhysicsSupport::CreateCharacter()
     m_PhysicMovementControl->CreateCharacter();
     m_PhysicMovementControl->SetPhysicsRefObject(&m_EntityAlife);
     m_PhysicMovementControl->SetPosition(m_EntityAlife.Position());
+    if (m_eType == etActor) // [mod-compat diag] actor frozen in mcFall — did the capsule get made?
+        Msg("[CharPhys] actor CreateCharacter done — exist=%d pos=(%.2f, %.2f, %.2f)", (int)m_PhysicMovementControl->CharacterExist(), m_EntityAlife.Position().x,
+            m_EntityAlife.Position().y, m_EntityAlife.Position().z);
 }
 void CCharacterPhysicsSupport::SpawnInitPhysics(CSE_Abstract* e)
 {
     // if(!m_physics_skeleton)CreateSkeleton(m_physics_skeleton);
+
+    if (m_eType == etActor) // [mod-compat diag]
+        Msg("[CharPhys] actor SpawnInitPhysics — alive=%d anim_movement=%d", (int)!!m_EntityAlife.g_Alive(), (int)!!m_EntityAlife.animation_movement_controlled());
 
     if (m_EntityAlife.g_Alive())
     {

@@ -400,6 +400,10 @@ void CObjectList::Destroy(CObject* O)
 {
     if (0 == O)
         return;
+    // A directly-destroyed object can still sit in destroy_queue: setDestroy(TRUE) queues it,
+    // and e.g. the failed-spawn path in g_sv_Spawn then destroys it immediately. Drop the queue
+    // entry, otherwise ProcessDestroyQueue later net_Destroy()s a freed pointer and FATALs here.
+    std::erase(destroy_queue, O);
     net_Unregister(O);
 
     {

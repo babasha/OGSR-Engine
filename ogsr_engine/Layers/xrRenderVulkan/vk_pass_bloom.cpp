@@ -7,11 +7,13 @@
 
 // xrRenderVulkan — bloom pass. See vk_pass_bloom.h.
 #include "stdafx.h"
+#include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_pass_bloom.h"
 #include "vk_scene_color.h"
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
+#include "vk_image.h"              // VK::CreateImage2D / CreateImageView
 #include "vk_exposure.h"           // VK::Exposure — shared auto-exposure constants (also used by tonemap)
 #include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline + draw
 #include "HW_Vulkan.h"
@@ -60,7 +62,7 @@ namespace {
         if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
         for (u32 i = 0; i < 2; ++i) {
             if (s_view[i]) { vkDestroyImageView(VulkanHW.m_Device, s_view[i], nullptr); s_view[i] = VK_NULL_HANDLE; }
-            if (s_img[i])  { vmaDestroyImage(VulkanHW.m_Allocator, s_img[i], s_alloc[i]); s_img[i] = VK_NULL_HANDLE; s_alloc[i] = VK_NULL_HANDLE; }
+            if (s_img[i])  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_img[i], s_alloc[i]); s_img[i] = VK_NULL_HANDLE; s_alloc[i] = VK_NULL_HANDLE; }
             s_first[i] = true;
         }
         s_extent = {};
@@ -75,32 +77,12 @@ namespace {
         DestroyRTs();
         s_extent = want;
         for (u32 i = 0; i < 2; ++i) {
-            VkImageCreateInfo ici{};
-            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            ici.extent = { want.width, want.height, 1 };
-            ici.mipLevels = 1; ici.arrayLayers = 1;
-            ici.samples = VK_SAMPLE_COUNT_1_BIT;
-            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VmaAllocationCreateInfo aci{};
-            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_img[i], &s_alloc[i], nullptr) != VK_SUCCESS) {
-                Msg("![VK Bloom] RT %u create failed", i); return false;
-            }
-            VkImageViewCreateInfo vci{};
-            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            vci.image = s_img[i];
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange.levelCount = 1;
-            vci.subresourceRange.layerCount = 1;
-            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_view[i]) != VK_SUCCESS) {
-                Msg("![VK Bloom] view %u create failed", i); return false;
-            }
+            if (!VK::CreateImage2D(VK_FORMAT_R16G16B16A16_SFLOAT, want,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    s_img[i], s_alloc[i], "Bloom"))
+                return false;
+            s_view[i] = VK::CreateImageView(s_img[i], VK_FORMAT_R16G16B16A16_SFLOAT);
+            if (s_view[i] == VK_NULL_HANDLE) return false;
         }
         // Blur sets point at the (new) ping-pong views.
         auto writeSet = [&](VkDescriptorSet set, VkImageView view) {

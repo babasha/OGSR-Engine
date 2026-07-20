@@ -225,6 +225,8 @@
       <AssemblerOutput Condition="'$(Configuration)|$(Platform)'=='Release|x64'">AssemblyAndSourceCode</AssemblerOutput>
       <AssemblerOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">AssemblyAndSourceCode</AssemblerOutput>
     </ClCompile>
+    <ClCompile Include="xrCDB_stress.cpp" />
+    <ClCompile Include="xrCDB_tiled.cpp" />
     <ClCompile Include="xrXRC.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -292,6 +294,7 @@
     <ClInclude Include="OpCoDe\OPC_VolumeCollider.h" />
     <ClInclude Include="StdAfx.h" />
     <ClInclude Include="xrCDB.h" />
+    <ClInclude Include="xrCDB_tiled.h" />
     <ClInclude Include="xrXRC.h" />
     <ClInclude Include="xr_collide_defs.h" />
   </ItemGroup>

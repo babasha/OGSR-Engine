@@ -20,6 +20,7 @@ public:
     virtual bool shedule_Needed() { return true; };
     virtual float shedule_Scale();
     virtual void shedule_Update(u32 dt);
+    virtual void PSI_destroy() override;
     virtual void renderable_Render(u32 context_id, IRenderable* root) override;
     void DoWork();
     virtual void PerformFrame() override;

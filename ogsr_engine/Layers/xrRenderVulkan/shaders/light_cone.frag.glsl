@@ -32,12 +32,12 @@ layout(push_constant) uniform PC {
     vec4 lightCol;    // rgb = colour × intensity (eye-fade premultiplied),
                       // w < 99.5 = shadow-tap soft radius in texels (r_light_cone_soft,
                       // area-light penumbra for grass/crown cutouts), else debug index+100
-    vec4 beamPrm;     // x = apex (lamp) radius (m) — FRUSTUM; y = 1 when THIS beam owns the
-                      // spot shadow map (per-step occlusion: fences/trees/NPC cut the beam);
-                      // z = spot far plane (range) for the linear-depth compare;
-                      // w > 0 = SYNTH beam: lamp-face glow only (full 15 cm, exp(-d/w) after)
-                      // — the LONG beam shape comes from the froxel fog, not this cone
-    mat4 spotVP;      // the spot pick's view·proj (raw Fmatrix = row-vector transform)
+    vec4 beamPrm;     // x = apex (lamp) radius (m) — FRUSTUM; y = this beam's spot-pool
+                      // TILE + 1 (0 = no shadow; per-step occlusion: fences/trees/NPC/
+                      // grass cut the beam); z = spot far plane (range) for the
+                      // linear-depth compare; w > 0 = SYNTH beam: lamp-face glow only
+                      // (full 15 cm, exp(-d/w) after) — the LONG beam comes from the fog
+    mat4 spotVP;      // this light's TILE view·proj (raw Fmatrix = row-vector transform)
 } pc;
 
 void main()
@@ -113,10 +113,18 @@ void main()
                     suv += vec2(cos(ang), sin(ang)) * rad;
                 }
                 if (suv.x >= 0.0 && suv.x <= 1.0 && suv.y >= 0.0 && suv.y <= 1.0 && sn.z <= 1.0) {
-                    const float sN = 0.5;   // ComputeSpotVP near plane
+                    // Atlas tile rect (4x2 pool, beamPrm.y = tile+1), inset one
+                    // texel so the jittered tap never reads a neighbour tile.
+                    int  tile = int(pc.beamPrm.y + 0.5) - 1;
+                    const vec2 kTileScale = vec2(0.25, 0.5);
+                    vec2 tBase = vec2(float(tile & 3), float(tile >> 2)) * kTileScale;
+                    vec2 atx   = 1.0 / vec2(textureSize(uSpotShadow, 0));
+                    vec2 auv   = clamp(tBase + suv * kTileScale,
+                                       tBase + atx, tBase + kTileScale - atx);
+                    const float sN = 0.5;   // ComputeSpotVPFor near plane
                     float sF   = max(pc.beamPrm.z, 1.0);
                     float zRef = sN * sF / max(sF - sn.z * (sF - sN), 1e-4);
-                    float zMap = sN * sF / max(sF - texture(uSpotShadow, suv).r * (sF - sN), 1e-4);
+                    float zMap = sN * sF / max(sF - texture(uSpotShadow, auv).r * (sF - sN), 1e-4);
                     if (zRef - 0.08 > zMap) continue;
                 }
             }

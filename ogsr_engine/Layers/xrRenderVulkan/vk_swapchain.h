@@ -36,6 +36,7 @@ public:
     VkImageView   m_DepthImageView  = VK_NULL_HANDLE;  // Alias for m_DepthView (for compatibility)
     VmaAllocation m_DepthAllocation = VK_NULL_HANDLE;
     VkFormat      m_DepthFormat     = VK_FORMAT_D32_SFLOAT;
+    VkExtent2D    m_DepthExtent     = { 0, 0 };        // depth may be < m_Extent when DLSS renders below display
 
     bool m_IsMinimized = false;
 
@@ -51,6 +52,12 @@ public:
     void Create(u32 width, u32 height);
     void Destroy();
     void Recreate(u32 width, u32 height);
+
+    // Recreate the scene depth at a specific extent (DLSS render<display). No-op when
+    // unchanged. Caller (CRender::Begin) MUST ensure the GPU is idle w.r.t. the old
+    // depth (quality/size change only — rare). Updates m_DepthView/m_DepthImage;
+    // depth-sampling passes rebind the view every frame, so they pick up the new handle.
+    void ResizeDepth(VkExtent2D extent);
 
     u32 AcquireNextImage(VkSemaphore semaphore, VkFence fence = VK_NULL_HANDLE);
     void Present(VkSemaphore waitSemaphore, u32 imageIndex);

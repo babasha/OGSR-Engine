@@ -32,6 +32,35 @@ namespace VK { namespace ImGuiVK {
 // seconds (Device.fTimeDeltaReal).
 void DrawOverlay(VkCommandBuffer cmd, VkImageView swapchainView, VkExtent2D extent, float dt);
 
+// A2.4 (editor): append one line to the editor Log window (shown over the viewport in
+// -vk_editor mode). `isError` tints it red. The host (SDK) mirrors its own log here via
+// the Ed_PushLog facade — only text crosses the module boundary, so the SDK's ImGui
+// version (1.92) and the engine's (1.89) never have to agree on ABI.
+void PushEditorLog(const char* text, bool isError);
+
+// Update the editor Statistics overlay (mirrored from the SDK's IM_Stats each frame).
+void PushEditorStats(float fps, float rfps, int verts, int tris, int dips, int lights, int totalLights);
+
+// True while the editor overlay's ImGui has the mouse captured (pointer over the Log
+// window or a gizmo handle). The orbit camera reads this to yield the mouse to the UI.
+bool EditorWantsMouse();
+
+// ---- transform gizmo, driven by the host ----------------------------------------
+// We are only the widget: the host picks the operation, the space and the snap, owns the
+// objects and the undo stack, and applies the result. It runs here because a gizmo has to
+// be drawn with the matrices that drew the frame — the host's own ImGuizmo lives on its
+// DX9 surface, which is underneath our Vulkan child and therefore invisible.
+//
+// SetGizmo arms one frame; the host re-arms every frame it wants a gizmo, and simply
+// stops calling when nothing is selected. GizmoResult reports the LAST serviced frame,
+// so the host reads one frame behind — invisible during a drag.
+//
+// op: 0 translate, 1 rotate, 2 scale.  mode: 0 local, 1 world.  snap: null for none.
+void SetGizmo(int op, int mode, const float* snap, const Fmatrix& xform);
+int GizmoResult(Fmatrix& out_xform, Fmatrix& out_delta); // 1 = the manipulation changed it
+bool GizmoIsUsing();     // a drag is in progress
+bool GizmoWantsMouse();  // hovering a handle or dragging — suppress picking behind it
+
 void Shutdown();
 
 }} // namespace VK::ImGuiVK

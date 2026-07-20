@@ -4,6 +4,7 @@
 class CPHScriptCondition : public CPHCondition, public CPHReqComparerV
 {
     luabind::functor<bool>* m_lua_function;
+    u16 m_fails{}; // Lua errors so far; the call is purged after kMaxConditionFails (retry-until-ready mods survive transient errors, but a permanently broken call can't leak forever)
 
     CPHScriptCondition(const CPHScriptCondition& func);
 
@@ -12,6 +13,7 @@ public:
     virtual ~CPHScriptCondition();
     virtual bool is_true();
     virtual bool obsolete() const;
+    virtual void dump_source(char* buf, u32 n) const;   // "script.lua:line" of the Lua condition
     virtual bool compare(const CPHReqComparerV* v) const { return v->compare(this); }
     virtual bool compare(const CPHScriptCondition* v) const { return *m_lua_function == *(v->m_lua_function); }
 };
@@ -35,6 +37,7 @@ class CPHScriptObjectCondition : public CPHCondition, public CPHReqComparerV
 {
     luabind::object* m_lua_object;
     shared_str m_method_name;
+    u16 m_fails{};
 
 public:
     CPHScriptObjectCondition(const luabind::object& lua_object, LPCSTR method);
@@ -68,6 +71,7 @@ public:
 class CPHScriptObjectConditionN : public CPHCondition, public CPHReqComparerV
 {
     CScriptCallbackEx<bool> m_callback;
+    u16 m_fails{};
 
 public:
     CPHScriptObjectConditionN(const luabind::object& object, const luabind::functor<bool>& functor);
@@ -112,7 +116,7 @@ public:
     }
     virtual bool compare(const CObject* v) const { return m_obj->ID() == v->ID(); }
     virtual bool compare(const CPHReqComparerV* v) const { return v->compare(this); }
-    virtual bool obsolete() const { return b_obsolete; }
+    virtual bool obsolete() const { return b_obsolete || CPHScriptObjectConditionN::obsolete(); } // fail-counter purge must apply here too
 };
 
 class CPHScriptGameObjectAction : public CPHScriptObjectActionN

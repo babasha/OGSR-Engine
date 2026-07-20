@@ -57,7 +57,9 @@ static void _draw_cam_pos(CGameFont* pFont)
 
 void CStats::Show()
 {
-    if (psDeviceFlags.test(rsCameraPos) || psDeviceFlags.test(rsStatistic) || !errors.empty())
+    // g_bForceStatGather: the VK profiler wants the timer bookkeeping (FrameEnd →
+    // .result → FrameStart) without the on-screen overlay — see [VK CPU] in MaybeLog.
+    if (psDeviceFlags.test(rsCameraPos) || psDeviceFlags.test(rsStatistic) || g_bForceStatGather || !errors.empty())
     {
         // Stop timers
         {
@@ -120,6 +122,11 @@ void CStats::Show()
             }
         }
 
+        // No stats font under the Vulkan renderer (OnDeviceCreate is only called by
+        // the DX dxRenderDeviceRender) — skip ALL the on-screen text, but fall
+        // through to the FrameStart block below: the timer bookkeeping must keep
+        // running (it is what fills CStatTimer::result for the [VK CPU] log).
+        if (pFont) {
         CGameFont& F = *pFont;
         float f_base_size = 0.01f;
         F.SetHeightI(f_base_size);
@@ -289,6 +296,7 @@ void CStats::Show()
             F.OnRender();
         }
 #endif
+        }   // if (pFont) — end of the on-screen text (see the guard above)
 
         {
             EngineTOTAL.FrameStart();
@@ -339,6 +347,7 @@ void CStats::Show()
 
 void CStats::Show_HW()
 {
+    if (!pFontHW) return;   // no stats font under the Vulkan renderer (display-only path)
     if (psDeviceFlags.test(rsHWInfo))
     {
         static DWORD dwLastFrameTime = 0;

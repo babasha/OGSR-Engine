@@ -162,6 +162,10 @@
 		///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 		inline_			void				SetMeshInterface(const MeshInterface* imesh)	{ mIMesh = imesh;	}
 
+		// X-Ray CDB disk cache: adopt a deserialized optimized tree instead of Build().
+		// Only valid on a freshly constructed model (mTree==null); takes ownership.
+		inline_			void				AdoptTree(AABBOptimizedTree* tree, udword model_code)	{ mTree = tree; mModelCode = model_code; }
+
 		protected:
 				const	MeshInterface*		mIMesh;			//!< User-defined mesh interface
 						udword				mModelCode;		//!< Model code = combination of ModelFlag(s)

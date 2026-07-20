@@ -1241,7 +1241,9 @@ private:
 				throw luabind::error(L);
 #else
 				error_callback_fun e = get_error_callback();
-				if (e) e(L);
+				// Историческое поведение OGSR: void-вызов после error-колбэка ПРОДОЛЖАЕТ работу.
+				// Колбэк (CScriptEngine::lua_error) теперь бросает — глотаем, см. call_member.hpp.
+				if (e) { try { e(L); } catch (...) {} }
                 else
                 {
 

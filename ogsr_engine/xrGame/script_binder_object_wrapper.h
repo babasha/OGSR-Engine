@@ -15,6 +15,8 @@ class CScriptGameObject;
 
 class CScriptBinderObjectWrapper : public CScriptBinderObject, public luabind::wrap_base
 {
+    u16 m_update_fails{}; // consecutive Lua-update failures; the binder is muted at kBinderMuteAfter (mod-compat, see .cpp)
+
 public:
     CScriptBinderObjectWrapper(CScriptGameObject* object);
     virtual ~CScriptBinderObjectWrapper();

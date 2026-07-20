@@ -14,6 +14,8 @@
 #include "string_table.h"
 #include "..\xr_3da\DiscordRPC.hpp"
 #include "object_broker.h"
+#include "script_engine.h"
+#include "ai_space.h"
 
 string128 ErrMsgBoxTemplate[] = {"message_box_session_full", "msg_box_error_loading"};
 
@@ -110,6 +112,11 @@ extern ENGINE_API BOOL bShowPauseString;
 
 void CMainMenu::Activate(bool bActivate)
 {
+    // PHASE B (editor-on-Vulkan): in -vk_editor mode the viewport owns the frame;
+    // never raise the game menu (boot, ESC, or disconnect).
+    if (bActivate && Core.Params && strstr(Core.Params, "-vk_editor"))
+        return;
+
     if (!!m_Flags.test(flActive) == bActivate)
         return;
 
@@ -319,15 +326,41 @@ void CMainMenu::OnRender()
     if (m_Flags.test(flGameSaveScreenshot))
         return;
 
- //   if (g_pGameLevel)
+    // After an in-process level teardown ai().unload() restarts the Lua VM; a menu
+    // dialog then raises a raw LuaJIT error EVERY frame. Letting it unwind into the
+    // pureRender guard abandons the error mid-flight (illegal for LuaJIT — state
+    // degrades, ends in heap corruption: AVs 16-07 02:34/14:29). Catch at this
+    // boundary instead: log the actual error text and finish it like pcall would.
+    try
+    {
+        //   if (g_pGameLevel)
         Render->Calculate();
 
-    Render->Render();
- //   if (!OnRenderPPUI_query())
+        Render->Render();
+        //   if (!OnRenderPPUI_query())
+        {
+            DoRenderDialogs();
+            UI()->RenderFont();
+            draw_wnds_rects();
+        }
+    }
+    catch (const std::exception& e)
     {
-        DoRenderDialogs();
-        UI()->RenderFont();
-        draw_wnds_rects();
+        static u32 s_throws = 0;
+        const u32 n = ++s_throws;
+        if ((n & (n - 1)) == 0)
+            Msg("!![CMainMenu::OnRender] threw [%s: %s] (total %u)", typeid(e).name(), e.what(), n);
+    }
+    catch (...)
+    {
+        lua_State* L = ai().script_engine().lua();
+        const char* err = (L && lua_gettop(L) > 0 && lua_isstring(L, -1)) ? lua_tostring(L, -1) : "<no lua error on stack>";
+        static u32 s_throws = 0;
+        const u32 n = ++s_throws;
+        if ((n & (n - 1)) == 0)
+            Msg("!![CMainMenu::OnRender] threw [non-std, lua top: %s] (total %u)", err, n);
+        if (L)
+            lua_settop(L, 0);
     }
 }
 

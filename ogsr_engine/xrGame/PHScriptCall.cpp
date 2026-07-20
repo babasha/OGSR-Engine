@@ -17,9 +17,55 @@ CPHScriptCondition::CPHScriptCondition(const CPHScriptCondition& func) { m_lua_f
 
 CPHScriptCondition::~CPHScriptCondition() { xr_delete(m_lua_function); }
 
-bool CPHScriptCondition::is_true() { return (*m_lua_function)(); }
+// Mod-compat guard (see [[pripyat-mod-compat]]): CScriptEngine::lua_error now THROWS a
+// C++ exception so guarded call-sites survive a script runtime error instead of
+// std::terminate. The physics commander runs these callbacks every frame from
+// CLevel::OnFrame — an unguarded throw here unwinds straight to WinMain (crash). A
+// mod's story-script (e.g. ogse_signals.script) erroring on a foreign map must NOT
+// take the whole game down: log + fall back (condition→false, action→obsolete/skip).
+// Errors don't kill the call immediately — "retry until game state is ready" is a
+// legitimate mod pattern and transient nil-errors during level init must survive. But
+// a PERMANENTLY broken call can't stay immortal either: scripts (ogse_signals) keep
+// adding new calls while broken ones pile up, and the leaked luabind refs blow up the
+// LuaJIT heap in minutes ("not enough memory" in lj_tab_resize). 30 straight failures
+// (≈ half a second of frames) => obsolete => purged by CPHCommander.
+static constexpr u16 kMaxConditionFails = 30;
 
-bool CPHScriptCondition::obsolete() const { return false; }
+bool CPHScriptCondition::is_true()
+{
+    try
+    {
+        const bool r = (*m_lua_function)();
+        m_fails = 0;
+        return r;
+    }
+    catch (...)
+    {
+        if (++m_fails == kMaxConditionFails)
+            Msg("![PHScript] condition failed %u times — dropping command (mod-compat)", (u32)m_fails);
+        return false;
+    }
+}
+
+bool CPHScriptCondition::obsolete() const { return m_fails >= kMaxConditionFails; }
+
+// "script.lua:line" of the wrapped Lua function — names WHO leaked when the
+// commander's call list grows (see the histogram in CPHCommander::update).
+void CPHScriptCondition::dump_source(char* buf, u32 n) const
+{
+    if (!n) return;
+    buf[0] = 0;
+    if (!m_lua_function || !m_lua_function->is_valid()) return;
+    lua_State* L = m_lua_function->lua_state();
+    if (!L) return;
+    m_lua_function->pushvalue();
+    lua_Debug ar{};
+    if (lua_getinfo(L, ">S", &ar))   // ">" pops the pushed function
+    {
+        _snprintf(buf, n - 1, "%s:%d", ar.short_src, ar.linedefined);
+        buf[n - 1] = 0;
+    }
+}
 
 //
 CPHScriptAction::CPHScriptAction(const luabind::functor<void>& func)
@@ -38,8 +84,9 @@ CPHScriptAction::~CPHScriptAction() { xr_delete(m_lua_function); }
 
 void CPHScriptAction::run()
 {
-    (*m_lua_function)();
-    b_obsolete = true;
+    try { (*m_lua_function)(); }
+    catch (...) { Msg("![PHScript] action Lua error — skipping command (mod-compat)"); }
+    b_obsolete = true;   // mark done regardless so a broken command isn't re-run every frame
 }
 
 bool CPHScriptAction::obsolete() const { return b_obsolete; }
@@ -64,7 +111,8 @@ CPHScriptObjectAction::~CPHScriptObjectAction() { xr_delete(m_lua_object); }
 bool CPHScriptObjectAction::compare(const CPHScriptObjectAction* v) const { return m_method_name == v->m_method_name && compare_safe(*m_lua_object, *(v->m_lua_object)); }
 void CPHScriptObjectAction::run()
 {
-    luabind::call_member<void>(*m_lua_object, *m_method_name);
+    try { luabind::call_member<void>(*m_lua_object, *m_method_name); }
+    catch (...) { Msg("![PHScript] object-action '%s' Lua error — skipping (mod-compat)", m_method_name.c_str()); }
     b_obsolete = true;
 }
 
@@ -86,8 +134,22 @@ CPHScriptObjectCondition::CPHScriptObjectCondition(const CPHScriptObjectConditio
 CPHScriptObjectCondition::~CPHScriptObjectCondition() { xr_delete(m_lua_object); }
 bool CPHScriptObjectCondition::compare(const CPHScriptObjectCondition* v) const { return m_method_name == v->m_method_name && compare_safe(*m_lua_object, *(v->m_lua_object)); }
 
-bool CPHScriptObjectCondition::is_true() { return luabind::call_member<bool>(*m_lua_object, *m_method_name); }
-bool CPHScriptObjectCondition::obsolete() const { return false; }
+bool CPHScriptObjectCondition::is_true()
+{
+    try
+    {
+        const bool r = luabind::call_member<bool>(*m_lua_object, *m_method_name);
+        m_fails = 0;
+        return r;
+    }
+    catch (...)
+    {
+        if (++m_fails == kMaxConditionFails)
+            Msg("![PHScript] object-condition '%s' failed %u times — dropping command (mod-compat)", m_method_name.c_str(), (u32)m_fails);
+        return false;
+    }
+}
+bool CPHScriptObjectCondition::obsolete() const { return m_fails >= kMaxConditionFails; }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 CPHScriptObjectActionN::CPHScriptObjectActionN(const luabind::object& object, const luabind::functor<void>& functor)
@@ -100,7 +162,8 @@ CPHScriptObjectActionN::~CPHScriptObjectActionN() { m_callback.clear(); }
 
 void CPHScriptObjectActionN::run()
 {
-    m_callback();
+    try { m_callback(); }
+    catch (...) { Msg("![PHScript] object-action-N Lua error — skipping (mod-compat)"); }
     b_obsolete = true;
 }
 
@@ -110,5 +173,19 @@ CPHScriptObjectConditionN::CPHScriptObjectConditionN(const luabind::object& obje
 
 CPHScriptObjectConditionN::~CPHScriptObjectConditionN() { m_callback.clear(); }
 
-bool CPHScriptObjectConditionN::is_true() { return m_callback(); }
-bool CPHScriptObjectConditionN::obsolete() const { return false; }
+bool CPHScriptObjectConditionN::is_true()
+{
+    try
+    {
+        const bool r = m_callback();
+        m_fails = 0;
+        return r;
+    }
+    catch (...)
+    {
+        if (++m_fails == kMaxConditionFails)
+            Msg("![PHScript] object-condition-N failed %u times — dropping command (mod-compat)", (u32)m_fails);
+        return false;
+    }
+}
+bool CPHScriptObjectConditionN::obsolete() const { return m_fails >= kMaxConditionFails; }

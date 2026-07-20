@@ -14,6 +14,8 @@
 
 #include "../xrRender/xrRender_console.h"
 #include "vk_profiler.h"   // VK::Prof::RequestMark — the `vk_perf` MARK command
+#include "vk_texture_stream.h"   // VK::TextureStreamer — video_memory_stats / r_txstream_stats
+#include "vk_vram_stats.h"       // VK::Vram::DumpVmaJson — r_vram_dump
 
 // DLSS preset enum values used in default initializers; pull them in directly
 // rather than depending on the Vulkan-side DLSS wrapper.
@@ -64,7 +66,9 @@ constexpr xr_token pp_aa_mode_token[] = {
     {nullptr, 0},
 };
 
-u32 ps_r_dlss_preset = NVSDK_NGX_DLSS_Hint_Render_Preset_F;
+// Preset K = the DLSS 4 transformer model (best quality, esp. Perf/UltraPerf —
+// UltraPerf otherwise DEFAULTS to the old CNN preset F = «мыло»). 0 = driver default.
+u32 ps_r_dlss_preset = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
 constexpr xr_token dlss_mode_token[]{
     {"st_opt_dlss_default", NVSDK_NGX_DLSS_Hint_Render_Preset_Default}, // default behavior, may or may not change after OTA
     {"st_opt_dlss_f", NVSDK_NGX_DLSS_Hint_Render_Preset_F},
@@ -131,10 +135,10 @@ float ps_r_ssao_strength = 2.0f;
 // horizon also bounces its colour), gathered from the PREVIOUS frame's lit scene
 // (history buffer — also the temporal foundation). Requires r_ssao on (shared
 // pass). Reach = the GTAO radius.
-// Default OFF: the v2 horizon-folded IL still bands a little at half-res without
-// temporal accumulation (the planned next step), so it ships opt-in — r_ssil 1
-// to A/B. AO is unaffected either way.
-int   ps_r_ssil_enable   = 0;     // r_ssil — global on/off (gates the prev-colour taps in the GTAO march)
+// DEFAULT ON (2026-07-04): temporal accumulation (r_ssil_temporal, below) resolves
+// the half-res banding, user-verified clean in-game → shipped on. r_ssil 0 to A/B
+// against the no-bounce look. AO is unaffected either way.
+int   ps_r_ssil_enable   = 1;     // r_ssil — global on/off (gates the prev-colour taps in the GTAO march)
 int   ps_r_ssil_debug    = 0;     // r_ssil_debug — 1 = show ONLY the indirect bounce field
 // Strength multiplies the gathered radiance at composite. IL is an occluder-colour
 // AVERAGE gated by (1-AO)² (≈0 on open surfaces, only fills real recesses), added
@@ -153,7 +157,9 @@ float ps_r_ssil_strength = 0.5f;
 // history weight α (0 = OFF → byte-identical to the spatial-only path; ~0.9 =
 // strong smoothing). Needs r_motion_vectors on for reprojection (falls back to
 // same-pixel EMA when MV is unavailable).
-float ps_r_ssil_temporal = 0.0f;
+// DEFAULT ON 0.9 (2026-07-04): this is what lets r_ssil ship on (kills the IL bands);
+// verified clean, no ghosting. Set 0 to inspect the raw spatial-only IL.
+float ps_r_ssil_temporal = 0.9f;
 
 // r_ssao_temporal — the SAME temporal accumulation, but as a first-class control
 // for the AO channel (so it works WITHOUT r_ssil). Value = history weight α. The
@@ -192,7 +198,22 @@ float ps_r_dither = 1.0f;
 // world (the dominant motion); self-moving geometry is a later phase. Default
 // ON (cheap fullscreen pass, no result consumer yet — harmless until DLSS lands).
 int   ps_r_motion_vectors  = 1;     // r_motion_vectors — global MV pass on/off
+u32   ps_r_dlss            = 0;     // r_dlss — DLSS Super Resolution; needs r_motion_vectors + NGX available
+u32   ps_r_dlss_quality    = 0;     // r_dlss_quality — 0=DLAA(native),1=Quality,2=Balanced,3=Performance,4=UltraPerf (render<display upscale = the fps win)
+float ps_r_dlss_sharp      = 0.3f;  // r_dlss_sharp — CAS sharpen on the DLSS output in the tonemap (0 = off; NGX dropped built-in sharpening)
+int   ps_r_dlss_debug      = 0;     // r_dlss_debug — 1=CAS delta heatmap, 2=split (left=no-DLSS bilinear, right=composite), 3=gate flag (green=DLSS output live, red=plain scene)
+int   ps_r_dlss_jitter_flip= 2;     // r_dlss_jitter_flip — sign of the jitter REPORTED to DLSS Evaluate: bit0=flip X, bit1=flip Y. DEFAULT 2 (flip Y): the scene rasterizes through a D3D negative-height viewport, so our +jy clip jitter moves the image UP while DLSS pixel space is y-down — user A/B-verified 2026-07-07 (flip 2 = «намного лучше, практически без апскейлинга»)
+int   ps_r_dlss_exp        = 1;     // r_dlss_exp — 1 = feed DLSS the real tonemap exposure (1x1 texture; fixes black undershoot blotches on distant foliage), 0 = NGX AutoExposure flag (old)
+float ps_r_dlss_bias       = 1.0f;  // r_dlss_bias — scale of the material mip-LOD bias under upscaling (1 = full log2(render/display); sharpens alpha mips → foliage coverage holes; 0 = off A/B)
+int   ps_r_dlss_sl         = 0;     // r_dlss_sl — Stage B: route the SR evaluate through Streamline sl.dlss (FG prerequisite); 0 = raw NGX (proven default)
+int   ps_r_dlss_sl_flip    = 2;     // r_dlss_sl_flip — SL-reported jitter sign (bit0=X, bit1=Y); SL convention may differ from NGX's verified flip 2
+int   ps_r_dlss_sl_mv      = 0;     // r_dlss_sl_mv — 1 = negate mvecScale (SL MV direction A/B)
+int   ps_r_dlss_fg         = 0;     // r_dlss_fg — Stage C: DLSS Frame Generation (MFG); needs r_dlss 1 + r_dlss_sl 1 + Reflex (auto). 0 = off
+int   ps_r_dlss_fg_mult    = 2;     // r_dlss_fg_mult — frame multiplier 2..6 (2 = 1 interpolated frame; up to 6x if the GPU supports MFG)
+int   ps_r_dlss_fg_debug   = 0;     // r_dlss_fg_debug — 1 = periodic [VK SL FG] log of DLSS-G state (status/frames presented/VRAM) + Reflex state (low-latency avail/latency); 2 = every frame
 int   ps_r_mv_debug        = 0;     // r_mv_debug       — false-colour overlay (verify sign/Y-flip/magnitude)
+int   ps_r_mv_trees        = 1;     // r_mv_trees       — tree wind-sway MV overlay on/off (A/B: is the sway MV better than none under DLSS?)
+int   ps_r_mv_grass        = 1;     // r_mv_grass       — grass wind-sway MV overlay on/off (same A/B)
 float ps_r_mv_debug_scale  = 30.0f; // r_mv_debug_scale — overlay magnitude (per-frame UV motion is tiny)
 
 // SSFX tree wind (live tuning). Trunk bend defaulted DOWN from the SSFX 0.5 —
@@ -212,11 +233,137 @@ float ps_r_wind_shadow_dist  = 40.0f; // r_wind_shadow_dist  — radius (m) wher
 // wind phase = the "jelly" shadows. Costs: near trees re-raster into the dyn atlas per
 // frame (bounded by the distance). Default ON (VSM itself is the opt-in Ultra path).
 int   ps_r_vsm_tree_wind      = 1;
+// 2x2 coarse shading (pipelineFragmentShadingRate) on the near-tree DYNAMIC crown-shadow
+// raster — cuts the fill-bound VSM/DynTrees cost that persists UNDER WIND (can't be cached).
+// A/B knob: 1 = on (2x2), 0 = per-pixel. Falls back to per-pixel where HW lacks pipeline-rate.
+// PARKED at 0: measured A/B (2026-07-04) showed NO gain — the crown raster is geometry/raster-
+// bound, not fragment-bound, so coarse shading does nothing. Kept as a knob; infra reused by cones.
+int   ps_r_vsm_tree_vrs       = 0;
+// DYNAMIC-pass cadence (decoupled, Level 1): the sun/clipmap + the cheap STATIC atlas run
+// EVERY frame (wall/terrain/ground shadows track the sun smoothly, no strobe); only the
+// EXPENSIVE dynamic pass (NPC + grass + near-tree wind crowns) updates every Nth frame, its
+// atlas preserved (world-anchored) between. 0/1 = every frame (off); 2-3 ≈ 30-45 Hz; dyn
+// shadows go 1..N-1 frames stale (EMA r_vsm_ta_blend_dyn smooths). Default off.
+int   ps_r_vsm_cadence        = 1;
+// Camera-motion deadband for the dyn cadence: the frozen dyn atlas is world-anchored → only
+// aligned while (nearly) stationary, so the skip is allowed ONLY when the camera moved less
+// than this (metres/frame) AND barely turned. Walking closer/farther otherwise scrolls dyn
+// pages + batches near-set transitions → the crown/NPC shadows flicker. Moving = full-rate
+// dyn (correct, no flicker); standing = the cadence perf saving. 0 = never skip while moving.
+float ps_r_vsm_cadence_still  = 0.02f;
+// Second half of the cadence alignment gate: the frozen dyn atlas is valid only for the SUN
+// angle it was rendered at. The living sun — especially env time-of-day KEYFRAME STEPS (diag
+// measured ~18-22° jumps across a few frames) — misaligns it → the "тени пропали на кадр"
+// flicker. Force a full-rate dyn update when the sun rotated more than this (degrees) since the
+// last dyn update. Small enough to catch steps (normal drift is ~0.03°/3-frames), large enough
+// not to fire on smooth motion. Window page-snaps are always caught regardless. 0 = sun gate off.
+float ps_r_vsm_cadence_sun    = 0.30f;
 // Near-set radius (m) — LATERAL light-space distance from the camera to the tree's shadow
 // COLUMN (not trunk distance: a low sun lands a tree's shadow tens of metres down-sun, and
 // what must sway is the shadow NEAR THE PLAYER regardless of where its tree stands). Trees
 // whose column passes within this radius (and within 3× world distance) cast dynamically.
 float ps_r_vsm_tree_wind_dist = 40.0f;
+// Impostor crown shadows: replace the near-tree DYNAMIC crown MESH raster with ONE baked
+// sun-facing billboard/tree (2 tris vs thousands of crown verts every frame under wind).
+// Kills the geometry/raster-bound VSM/DynTrees cost. Trades dappling fidelity for speed —
+// eyeball. Default 0 (PENDING quality/perf sign-off). _scale tunes the shadow footprint.
+int   ps_r_vsm_tree_impostor       = 0;
+float ps_r_vsm_tree_impostor_scale = 1.0f;
+// Crown-HULL caster LOD (the "AC Shadows" shadow LOD, 2026-07-11): near trees BEYOND
+// r_vsm_tree_hull_dist cast into the dyn atlas from a baked low-poly OPAQUE hull
+// (ellipsoid lobes over k-means vertex clusters) instead of the full alpha-tested crown
+// mesh; only the closest trees keep the real crown (dappling perfect where the player
+// looks). Unlike the rejected FLAT impostor, the hull is a 3D volume — correct on walls
+// and at any sun elevation. This is the first lever aimed at the PROVEN alpha-test-fill
+// bound of VSM/DynTrees (no texture fetch / no discard / early-Z). Geometry is always
+// baked at load (~a few hundred KB) → toggles LIVE for the A/B. Default 0 pending the
+// perf/quality sign-off (A/B: stand in a forest, r_profiler 1, flip r_vsm_tree_hull,
+// watch VSM/DynTrees + the shadow look; r_vsm_debug 1 logs "hull=N" in the hybrid line).
+// 2 = ALSO hull the FAR/STATIC foliage beyond _dist (crowns only, same lateral metric):
+// closes the non-monotonic LOD hole (a 60 m tree casting a MORE detailed shadow than a
+// 25 m one) and cuts the full-crown re-raster on dirty cache refreshes (sun-move spikes).
+// NOTE: flipping 2 on/off converts the static cache via invalidation circles (≤4/frame)
+// + the moving-sun round-robin — expect the far shadows to transition over ~10-30 s.
+int   ps_r_vsm_tree_hull      = 0;
+float ps_r_vsm_tree_hull_dist = 18.0f;
+// Crown VOXELIZATION (baked at load → level reload to change): 0 = PCA ellipsoid LOBES
+// only (the original "AC Shadows" clusters). >0 bakes TWO things per crown, UE Nanite-
+// foliage style: (a) a modest merged shell for the depth-only SHADOW caster (solid
+// silhouette, resolution auto-clamped ~8–20 regardless of this value), and (b) the
+// VISUAL voxel CLOUD — individual small colored cubes on the leaf cards (per-voxel
+// palette/AO/height tint, size jitter), kHullLods LOD levels with the voxel edge
+// DOUBLING per level. The value = level-0 cells across the crown's largest axis
+// (64 ≈ 10–20 cm cubes on a full tree — the "Witcher 4 demo" look; higher = finer).
+int   ps_r_vsm_tree_hull_vox  = 64;
+// LIVE coarseness bias for the voxel viewmode: added to the screen-size-picked LOD level
+// (0 = as graded; negative → force finer/smaller; positive → coarser/bigger). No rebake.
+int   ps_r_vsm_tree_hull_lod  = 0;
+// Target PROJECTED voxel size in PIXELS — the rendered cube edge is CONTINUOUS
+// (dist × this angular size, clamped below by the finest baked cell), so voxels grow
+// smoothly from tiny near to huge far with no size steps; the baked grids only supply
+// positions/density (largest cell ≤ the current cube size). Smaller = finer/more
+// instances; live, no rebake.
+float ps_r_vsm_tree_hull_vox_px = 4.0f;
+// Distance GAIN for the target pixel size: +this many px per 100 m. 0 = constant screen
+// size (uniform fine grain everywhere — reads as if "nothing changes" while flying);
+// >0 = far crowns become VISIBLY chunkier blocks, a continuous small→huge gradient.
+float ps_r_vsm_tree_hull_vox_far = 4.0f;
+// SHADOW-only floor on the voxel cube edge (meters). The caster instances every cube
+// LEGACY (36-vert-cube caster era, superseded by the brick caster's shadow-view LOD):
+// kept registered so the persisted user.ltx line still parses, but the code no longer
+// reads it — _stex/_sfloor below replaced it. The 0.35 m floor is exactly what made
+// the brick shadows read as solid boxes (0.28+ m cells hold no leaf gaps).
+float ps_r_vsm_tree_hull_vox_smin = 0.35f;
+// UE-style SHADOW voxel LOD (brick caster): page texels per voxel edge. The caster
+// picks the baked grid whose cell ≈ stex × the page texel of the tree's clipmap level
+// (texel(L) = r_vsm_base·2^L / 4096, level from the same lateral shadow-column metric
+// the residency uses) — the shadow view drives the LOD, NOT the camera (UE
+// NaniteClusterCulling LODScale). Near rings → finest bake (real leaf gaps), far rings
+// → coarse bricks that stay sub-texel-ish. Smaller = finer/costlier. Live.
+float ps_r_vsm_tree_hull_vox_stex = 3.0f;
+// Safety floor on the caster voxel edge (m) for weak HW — 0 disables. Live.
+float ps_r_vsm_tree_hull_vox_sfloor = 0.05f;
+// Hard cap on the caster slice per tree (BRICK count of the picked baked level, ~×14
+// fewer units than cubes at 6 verts each); telemetry `slice=` in [VK VoxLOD]. Live.
+int ps_r_vsm_tree_hull_vox_cap = 1500;
+// STATIC-tier proxy pick: 0 (default) = the merged watertight SHELL (~96 tris/tree —
+// the blind-test-verified far representation; crowns there get meshlet per-page
+// culling, bricks do NOT, so full brick slices into every dirty page measurably LOST
+// to the shell on living-sun cache refreshes: VSM/Static 0.42-0.60 vs 0.13-0.44);
+// 1 = bricks in the static tier too (visual parity with the dyn band; costs the
+// missing per-page brick cull — the planned stage-2 refinement). Live.
+int ps_r_vsm_tree_hull_vox_static = 0;
+// Stage-2 per-page brick cull (vsm_vox_cull.comp) — the UE-parity piece: only bricks
+// overlapping a shadow page rasterize into it (compacted (tree,page) draws + a
+// surviving-brick remap list), instead of the full slice sweeping the VS for every
+// page of the tree's column. This is what the crown path already had via the meshlet
+// stage 2 — and what makes static-tier bricks (vox_static 1) affordable. Live.
+int ps_r_vsm_tree_hull_vox_cull = 1;
+// UE WPODisableDistance analog (needs r_vsm_tree_hull 2): past the hull boundary a
+// brick's wind amp has ramped to 0 across the crossfade band — the shadow is rigid,
+// so the tree is DEMOTED from the per-frame dyn atlas into the cached static tier.
+// The dyn near set shrinks to the real-crown ring + the band (the main perf win);
+// wind ALU on voxel casters drops to zero (the VS skips ssfxTreeWind at amp 0). Live;
+// toggling converts the cache through the usual invalidation circles over a few sec.
+int ps_r_vsm_tree_hull_vox_wpo = 1;
+// SHADOW crossfade band (voxel caster): fraction of r_vsm_tree_hull_dist just inside the
+// boundary where a tree's shadow hands over to true leaves in TWO stages (fade 1 → 0):
+// the outer half thins the cubes one-by-one in leaf-coverage order (the UE close-up
+// look — "extras removed", survivors sit on the leaf clumps), the inner half adds the
+// real alpha-tested crown while the remaining cubes dissolve out. 0.5 default so both
+// stages read (at _dist 18 m the band spans 9–18 m of lateral shadow-column distance).
+float ps_r_vsm_tree_hull_band = 0.5f;
+// Dithered LOD crossfade: within this fraction of the handover distance BEFORE a level
+// switch, both levels draw with complementary screen-door masks (fine dissolves out,
+// coarse dissolves in — exactly one survives per pixel), so flying the camera never
+// pops between voxel sizes. Instance cost doubles only inside the band. 0 = hard cut.
+// Same infra the future SHADOW-side voxel LOD will need (depth-only discard works too).
+float ps_r_vsm_tree_hull_vox_fade = 0.25f;
+// Voxel viewmode ("voxels instead of leaves"): crowns drawn as their baked voxel cloud
+// (face-shaded colored cubes; falls back to the shaded hull overlay when _vox = 0).
+// 1 = only hull-TIER trees (shows the _dist boundary); 2 = EVERY tree with a baked
+// cloud, so you can walk up to a near tree and inspect its voxel crown.
+int   ps_r_vsm_tree_hull_debug = 0;
 // ============================================================================================
 // ⛔ "VSM tree perf" arc — MEASURED NO NET GAIN on dGPU (2026-07-02), KEPT BUT DISABLED, DO NOT RE-CHASE.
 // Both cvars below default 0 = OFF (zero cost, picture identical). Code is intentionally retained (not
@@ -230,8 +377,10 @@ float ps_r_vsm_tree_wind_dist = 40.0f;
 // ============================================================================================
 // r_vsm_meshlet — per-page MESHLET culling of VSM tree casters (Phase A+B). Dices trees into ~128-tri
 // clusters at load; a 2nd bin stage draws only clusters overlapping each atlas page. Correct, picture
-// identical. NO NET GAIN (VSMrender fill-bound). Default 0 = OFF, kept for reference / iGPU.
-int   ps_r_vsm_meshlet        = 0;
+// identical. 2026-07-05: VSM/DynTrees is geometry-bound (VRS/HZB no help) → meshlet cull is the one
+// caster-tri lever, so DEFAULT ON on the chance it helps dense forest; user measured NEUTRAL in a
+// moderate view. NET-0/NET− per the old audit → if VSM/DynTrees ever WORSENS with it, set 0 to revert.
+int   ps_r_vsm_meshlet        = 1;
 // r_vsm_hzb — shadow-HZB occlusion cull (static + Option A dyn-vs-static-occluder). Reduce maxes prior
 // static-page depth; caster bins skip pairs fully behind cached walls/terrain. Correct, picture identical.
 // NO NET GAIN (reduce costs > the little hidden it culls). Default 0 = OFF, kept for reference / interiors.
@@ -247,6 +396,35 @@ float ps_r_vsm_hzb_margin     = 0.002f;
 // look can be A/B'd in-game: r_sun_boost 1 + r_ambient_floor 0 = raw env values.
 float ps_r_sun_boost     = 1.25f;
 float ps_r_ambient_floor = 0.05f;
+
+// LINEAR COLOUR PIPELINE — 0 = the historical gamma-space pipeline (albedo sampled
+// raw from UNORM textures, lighting maths done on gamma-encoded values, tonemap
+// output passed through unencoded); 1 = physically correct linear (Colour textures
+// loaded as _SRGB so the sampler decodes on fetch, CPU-side light/env colours
+// linearised on upload, and the tonemap applies the real sRGB OETF at the end).
+//
+// NOT live-switchable: the colourspace is baked into each texture's VkFormat at load
+// time, so a change only affects textures loaded afterwards and needs a level reload
+// to be coherent. Kept as a cvar anyway because it is the only honest A/B for a change
+// that touches every lit pixel — and because the mod's art was authored against the
+// gamma-space look, so "correct" and "what it used to look like" genuinely differ.
+int ps_r_linear_color = 0;
+
+// Gate the FLAT sky ambient (L.ambient.rgb) by sky visibility (rainVis) on static
+// world surfaces. The flat sky-coloured fill was added everywhere ungated → houses
+// and basements looked "lit by the sky". 0 = old ungated look; 1 = covered surfaces
+// get NO flat sky fill (only baked hemi + local lights). Live-tunable to taste.
+float ps_r_ambient_sky_gate = 0.7f;
+
+// NIGHT SUN FREEZE: when the sun gives effectively no light (below the horizon),
+// its shadows contribute nothing (every sun receiver multiplies by ~0 sun_color),
+// so re-rasterizing them is pure waste. This freezes the VSM DYNAMIC atlas (NPC /
+// grass / near-tree crowns — the dominant per-frame shadow cost) at night, reusing
+// the existing cadence freeze. r_sun_night_freeze 0 = off; r_sun_night_lum = the
+// sun_color luminance below which "night" kicks in (0.02 ≈ deep dusk).
+int   ps_r_sun_night_freeze = 1;
+float ps_r_sun_night_lum    = 0.05f;   // secondary: freeze if sun_color luminance drops below this
+float ps_r_sun_night_alt    = 0.02f;   // primary: freeze when to-sun.y (sun altitude) drops below this (below horizon)
 
 // Grass alpha-test cutoff (live). Lower = fatter/denser blades (less "see-through"),
 // higher = thinner. Was hard-coded 0.5 in detail.frag → blades too thin, you could
@@ -267,6 +445,13 @@ float ps_r_glass_opacity = 0.55f;
 // the heat-haze distortion RT and the tonemap bends the scene behind them.
 // Strength multiplier; 0 = off. Live.
 float ps_r_glass_refr    = 0.5f;   // user-tuned default (2026-07-02)
+
+// Animated cloud layer in the sky pass (R4 RenderClouds port): two scrolling
+// cloud textures composited over the static cubemap sky. r_clouds on/off,
+// r_clouds_intensity = additive brightness, r_clouds_speed = UV scroll rate.
+int   ps_r_clouds           = 1;
+float ps_r_clouds_intensity = 1.0f;
+float ps_r_clouds_speed     = 1.0f;
 
 // r_light_debug — dump the dynamic-light registry + collected set to the log every
 // ~2 s (diagnose "lamp lights in R4 but not here": absent from registry = game never
@@ -321,16 +506,149 @@ float ps_r_light_cone_fade = 0.8f;
 // steps integrate the jittered disc into a soft penumbra (no temporal needed).
 float ps_r_light_cone_soft = 6.0f;
 
+// Analytic visible cones for ordinary dynamic torches (CTorch — the player's
+// and NPCs' head-lamps). Default 0 = R4 behaviour: a torch is just a lit spot
+// whose volumetric shaft comes from the froxel fog (r_vol), NOT a hard searchlight
+// cone. The synthesized lamp/headlight beams (from lightplanes geometry) are a
+// SEPARATE path and are unaffected by this flag. 1 = also draw the analytic cone
+// for torches (old behaviour — NPC head-lamps read as projectors at night).
+int   ps_r_light_cone_torch = 0;
+
+// Bright lamp-face glow for a FLASHLIGHT aimed at the camera (R4 lens-flare analog).
+// The torch cone is off (not a searchlight), but an NPC pointing its head-lamp AT you
+// should show a bright "bulb" — otherwise the beam lights the scene while the lamp
+// reads as switched off. Facing-gated (0 when aimed away → your own torch never flares
+// in-face). 0 = off. Higher = brighter bulb. (5.0 was too hot — 2.0 reads as a lamp.)
+float ps_r_flashlight_glow = 2.0f;
+
 // Grass casters into the SPOT shadow map: blades cut a beam's light pool and
 // its visible volumetric cone (headlight/searchlight/flashlight through a
 // grass field). Same 1-frame-stale GPU instance buffer the VSM grass uses.
 int   ps_r_spot_grass    = 1;
+
+// Grass casters into the SUN cascades (r_sun_grass): swaying blades cast real
+// sun shadows — drawn into the per-frame dynamic overlay (with the NPCs and
+// wind trees) of BOTH near cascades. dist = instance-cull radius around the
+// camera; blades beyond it are subpixel in the map anyway.
+int   ps_r_sun_grass      = 1;
+float ps_r_sun_grass_dist = 30.f;
+
+// Grass casters into the POINT (campfire) cubes: blades around a near fire cut
+// its light into swaying dapples (surfaces + froxel fog). Adds a cadence
+// re-render for in-view fires closer than ~40 m — same LOD as the NPC overlay.
+int   ps_r_point_grass    = 1;
+
+// GPU per-light grass caster cull + compaction (Phase 1 of "grass × dynamic
+// lights"): one compute counting-sort compacts near blades into per-(light,type)
+// arena regions so each spot-beam / campfire-cube depth draw is a few-hundred-
+// instance indirect instead of a full grass VS pass (×6 for a cube). A/B with 0
+// = the old brute-force DrawGrassSpotCasters. See vk_pass_shadow.cpp (GrassCull).
+int   ps_r_grass_cull       = 1;
+int   ps_r_grass_cull_debug = 0;   // [VK GrassCull] per-call lights/types/cells log
+
+// Spot shadow POOL size: how many spots get their own shadow tile per frame
+// (atlas holds 8). Nearest-first, narrow beams keep a 4× distance advantage.
+// Tiles are cached — a static lamp renders its tile once — so 8 costs little.
+int   ps_r_spot_pool = 8;
+
+// Campfire/brazier glow tuning (VOLUMETRIC-flagged point lights only — fires,
+// pole lamps; plain table lamps stay untouched). boost = light intensity ×,
+// range = reach ×. Applied consistently to shading, fog AND the shadow cube.
+// range default 2 = stock fires light twice as far (user-tuned 2026-07-03).
+float ps_r_point_boost = 1.0f;
+float ps_r_point_range = 2.0f;
+
+// Point-shadow DEBUG overlay: paint opaque receivers by pooled-point coverage —
+// GREEN = lit by a pooled point light, RED = that light's shadow on this pixel.
+// Instantly shows whether a campfire casts a light pool and an NPC shadow in it.
+int   ps_r_point_debug = 0;
+
+// Grass self-shadow anti-acne slack (m, along the sun ray): grass receivers sample
+// the DYN VSM atlas (which contains the blades themselves) at their own position —
+// occluders closer than this don't shadow (kills self-acne), further ones do
+// (clump-on-clump dapples, NPC shadows). Lower = fuller grass shadows but risk of
+// dark sparkle; higher = cleaner but shadows start further from the caster's base.
+float ps_r_grass_self_bias = 0.15f;
+
+// Sun-beam ground recovery (r_sun_beam). The volumetric shaft samples the crisp VSM
+// ATLAS; surfaces sample the temporally-SMEARED screen mask (vsm_resolve), which
+// closes the thin sun gap a crown casts — so the beam "dissolves" on the ground
+// instead of landing as a lit pool. Terrain re-samples the crisp atlas at its own
+// world pos and takes the max, recovering the gap so the ground lights up in
+// agreement with the shaft; boost adds a small extra sun kick in the recovered gap
+// for a cinematic splash (bloom then picks up the bright pool). dist caps it to near
+// ground (resident pages + where it reads); bias = anti-acne slack (m along sun ray).
+// Only active under r_vsm (crisp atlas source). 0 = off (old smeared-mask behaviour).
+// ================================ PARKED 2026-07-06 ================================
+// SUN-BEAM ground-lighting arc (r_sun_beam* family) — PARKED by user ("что-то не то").
+// Goal was: a sunbeam cutting through a tree should "разбиваться о терейн" (land as a lit
+// pool) instead of dissolving. Three approaches tried, ALL default 0 now (inert), code
+// kept behind the cvars as scaffolding (do NOT delete — see the memory note + world_
+// terrain.frag / tonemap.frag / vk_env_light.cpp PARKED comments):
+//   (1) r_sun_beam        — crisp-atlas gap RECOVERY on terrain. Dead end: r_terrain_debug
+//                           7 proved the ground is genuinely sun-occluded (no atlas gap).
+//   (2) r_sun_beam_splash — tonemap in-scatter/surface splash. Read as AIR haze, not ground.
+//   (3) r_sun_beam_ground — forward deposit (albedo×sun) driven by a shadow-march overhead.
+//                           View-independent dapple, but user still "не то". Parked here.
+// r_terrain_debug 5/6/7 (recovery probes) + 8/9 (deposit probes) left wired for a revisit.
+// ===================================================================================
+// Terrain recovery (r_sun_beam): DEFAULT 0 — proven a no-op in dappled-crown scenes
+// (r_terrain_debug 7 showed gap≈0: the ground under a visible shaft is genuinely sun-
+// occluded, so the crisp atlas agrees with the smeared mask — nothing to recover).
+// Kept behind the cvar for wide gaps where the atlas DOES resolve a lit patch.
+float ps_r_sun_beam        = 0.0f;
+float ps_r_sun_beam_dist   = 40.0f;
+float ps_r_sun_beam_boost  = 1.6f;
+float ps_r_sun_beam_bias   = 0.10f;
+
+// God-ray GROUND SPLASH (r_sun_beam_splash, tonemap.frag). The real fix for "луч
+// растворяется у земли": the visible shaft is lit air your view ray gathered through
+// the crown gap — bright integrated in-scatter that, at the ground, reads as thin
+// haze. Where that beam luminance outshines the (shadowed, dark) ground it lands on,
+// add the excess back boosted so the contact pops and bloom flares it into a splash.
+// strength scales it (0 = off); thr = the in-scatter luminance below which it's just
+// ambient fog and stays untouched (raise if general fog brightens; lower for subtler
+// beams to splash). Aesthetic, not a relight — the sun does not physically reach there.
+float ps_r_sun_beam_splash     = 0.0f;   // superseded by the forward GROUND deposit below (kept for A/B)
+float ps_r_sun_beam_splash_thr = 0.12f;
+
+// Sun-beam GROUND DEPOSIT (r_sun_beam_ground, world_terrain.frag — the "for real" fix).
+// The visible god-ray is lit air the view ray gathered through the crown gap; the
+// integrated froxel in-scatter at the pixel is bright even though the sun is occluded on
+// the ground there (proven r_terrain_debug 7). Instead of the tonemap haze-splash (which
+// read as air), the FORWARD terrain shader deposits the sun the SHADOW removed — gated by
+// that beam, shaped by the ground's own N.L — into the sun lighting bucket, so it gets
+// ×albedo and reads as REAL sunlight on the terrain. strength lerps the ground from
+// shadowed toward fully sunlit under the shaft (0 = off = A side of the A/B); thr = the
+// in-scatter luminance below which it's just ambient fog and stays untouched. Needs r_vol.
+float ps_r_sun_beam_ground     = 0.0f;    // PARKED (was 1.5) — user "что-то не то"; kept behind cvar
+float ps_r_sun_beam_ground_thr = 0.05f;
+
+// Grass lighting-component debug (detail.frag): paint the grass ONLY with one
+// isolated term, greyscale — attributes any pattern "seen through the bush" to
+// its real source. 1=applied sun shadow, 2=VSM mask R (full, ground-behind),
+// 3=mask B (static-only), 4=channel pick weights, 5=GTAO-behind, 6=SSIL-behind,
+// 7=baked slot sun occlusion, 8=baked slot hemi, 9=full ambient, 10=dyn lights,
+// 11=shadow source split (grey=static shadow, RED=dyn/grass-atlas shadow).
+int   ps_r_grass_debug = 0;
+
+// Point shadow POOL size: how many campfires/lamps get their own shadow cube
+// per frame (array holds kMaxShadowPoints). Cubes are 6× a spot tile, so the
+// cap is smaller; cached + LOD-gated like spots (static fire = one render).
+int   ps_r_point_pool = 4;
 
 // Grass shadow strength on SURFACES (spotShadowF blends the clean spot map
 // with the spot+grass beam map). 0 = grass never shadows surfaces (sterile
 // pool), 1 = full blanket (dense grass eats the headlight's ground pool);
 // mid = translucent dapples — light scatters through grass IRL.
 float ps_r_spot_grass_shadow = 0.55f;
+
+// Grass shadow strength for FLASHLIGHT tiles only (handheld/worn torch — CTorch
+// head-lamp, weapon light), SEPARATE from the wide-fixture blend above. A torch
+// beam raking through a grass field at night should throw CRISP blade shadows on
+// the ground (the "wow"), so flashlight tiles default to FULL grass shadow (1.0)
+// while lamps/searchlights stay at the subtle r_spot_grass_shadow. Needs r_spot_grass.
+float ps_r_flashlight_grass = 1.0f;
 
 // Respect the DO_NO_WAVING detail flag (1) or force SSFX wind on every detail type
 // (0, the old behaviour). R4 keeps flagged micro-plants (tiny shoots in asphalt)
@@ -359,6 +677,11 @@ int   ps_r_rain_enable = 1;
 // 0 = off (CPU PAPI path draws everything), 1 = GPU test effect at the camera.
 int   ps_r_gpu_particles     = 0;       // r_gpu_particles — master GPU-particles switch
 int   ps_r_gpu_particles_max = 1 << 16; // r_gpu_particles_max — particle pool cap (64K)
+int   ps_r_gpu_particles_sort = 1;      // r_gpu_particles_sort — Phase 4 depth sort of alpha smoke (back-to-front)
+float ps_r_gpu_particles_life_cap = 5.0f;  // r_gpu_particles_life_cap — clamp GPU particle lifetime (s): "immortal"
+                                           // flames (KillOld 1000s) would hold their #5 alive budget forever and
+                                           // starve every other instance of the program. 0 = off. Applied at
+                                           // translate time (cached per program — takes effect on restart/new level).
 
 int   ps_r_profiler = 1;
 
@@ -366,6 +689,9 @@ int   ps_r_profiler = 1;
 // near/far = distance (m) thresholds: below near stays 1x1, above far goes coarsest.
 // (Live — tune without restart. Level 2 pulls them ~closer.)
 int   ps_r_vrs      = 0;
+int   ps_r_vrs_force = 0;   // diag: force pipeline-rate NxN on the world pass (2 or 4), ignoring the SRI
+int   ps_r_vrs_static = 0;  // diag: bake a STATIC 2x2 rate into world pipelines at creation (set BEFORE loading a level)
+int   ps_r_uber_variants = 1; // Inc 1: 1 = lean world uber-FS spec variants (POM/SNOW/WET/IBL/DEBUG); 0 = A/B the old monolithic uber (force WS_ALL). Live-switchable.
 float ps_r_vrs_near = 40.0f;
 float ps_r_vrs_far  = 75.0f;
 
@@ -405,7 +731,12 @@ int   ps_r_vsm       = 0;
 int   ps_r_vsm_debug = 0;
 // VSM receiver depth-compare bias (normalized clipmap Z, range ~2000 m). Larger =
 // less acne but more light-leak (small/thin caster shadows fade). Live-tunable.
-float ps_r_vsm_bias  = 0.0003f;
+int   ps_r_vsm_grass_static = 1;  // far-grass hybrid: L1/L2 (12..48 m) grass RIGID into the cached static atlas
+                                  // (dirty pages only ≈ free standing); L0 (±12 m) stays dynamic with live wind.
+                                  // 0 = old behaviour: ALL grass every-frame dynamic, L0..L2.
+float ps_r_vsm_bias  = 0.0003f;   // STATIC atlas (terrain in it → needs acne slack; 0.0003 = 0.6 m at the ±1000 m z-range)
+float ps_r_vsm_bias_dyn = 0.00002f;   // DYNAMIC atlas (casters only, ground never in it → epsilon over D16 quantization
+                                      // + write-side raster bias; the shared 0.6 m ate grass shadows below knee height)
 // VSM clipmap detail: base extent (m) of clipmap level 0 → finest texel = base/4096.
 // 24 m ≈ the old 4096² cascade (5.9 mm), balanced. Smaller = sharper but more pages
 // (the 2048-page atlas can overflow on wide vistas → distant pages drop, graceful).
@@ -424,12 +755,29 @@ float ps_r_vsm_ta_blend = 0.9f;
 // the shadow. Low weight = crisp sway; the edge moves anyway, so the texel crawl the EMA
 // exists to hide is imperceptible there. Static-shadow pixels keep r_vsm_ta_blend. Live.
 float ps_r_vsm_ta_blend_dyn = 0.35f;
-// Grass casts VSM shadows (near + L0 only; reads the GPU-driven detail instance buffer
-// 1 frame stale). DEFAULT OFF: grass blades are thinner than the shadow texel (blobby) and
-// the static-caster temporal filter ghosts the near-static grass ("see-through"). Kept,
-// gated, for experimentation — see [[vulkan-vsm]]. Live-tunable.
-int   ps_r_vsm_grass      = 0;
-float ps_r_vsm_grass_dist = 12.0f;   // max grass cast distance from camera (m)
+// Foliage-shadow "каша" fix (3 knobs on the temporal resolve). The 0.9 EMA above is great
+// for STILL scenes but smears high-frequency leaf/bush shadows into mush under CAMERA
+// motion (bilinear history reproject blurs a bit more each frame; the distance reject only
+// catches disocclusion, not same-surface shadow change). These target that without losing
+// the still-scene detail:
+// (1) neighbourhood clamp — history bound to the current shadow ±tol (kills the trail, keeps
+//     sub-texel jitter averaging). 0 = off (raw EMA). ~0.2-0.3 = crisp, higher = softer.
+float ps_r_vsm_ta_clamp = 0.24f;
+// (2) motion-adaptive — fade the history weight to a floor by reprojected screen motion:
+//     ta_motion = px of motion to reach the floor; ta_motion_floor = weight there. Still
+//     camera keeps the full EMA; moving camera stops compounding the blur.
+float ps_r_vsm_ta_motion = 6.0f;
+float ps_r_vsm_ta_motion_floor = 0.30f;
+// (3) DLSS-aware — when r_dlss is on, DLSS ALSO temporally resolves the shadow (baked into
+//     the colour it upscales) → scale the VSM history weight down to avoid a double blur.
+float ps_r_vsm_ta_blend_dlss = 0.6f;
+// Grass casts VSM shadows (near + L0 only; reads the GPU-driven detail CASTER buffer
+// 1 frame stale). DEFAULT ON since 2026-07-03: the two blockers that parked it are gone —
+// dyn pages now resolve with the low adaptive history weight (r_vsm_ta_blend_dyn kills the
+// "see-through" ghosting) and the caster buffer is frustum-independent (blades behind the
+// camera still cast). Pages also get SSFX wind now — the shadow sways with the blade.
+int   ps_r_vsm_grass      = 1;
+float ps_r_vsm_grass_dist = 20.0f;   // max grass cast distance from camera (m)
 float ps_r_vsm_npc_dist   = 50.0f;   // max NPC shadow-cast distance into the VSM atlas (m); 0 = no cull (NPC shadows tiny past ~50m)
 float ps_r_vsm_lod_dist   = 0.0f;    // VSM caster-LOD: opaque casters draw coarse slice past this (m); 0 = off (measured marginal in village, like the cascade; kept for open maps)
 int   ps_r_vsm_mark_half  = 1;       // page-mark at half-res (4x fewer threads/atomics); 0 = full-res
@@ -454,6 +802,35 @@ int   ps_r_vsm_cache     = 1;
 // frame ~1/N of the resident static pages re-render to track the creeping sun smoothly (no
 // jump). Smaller = fresher but costlier; only active while the sun moves (paused sun → 0). Live.
 int   ps_r_vsm_cache_refresh = 8;
+// THROTTLE (UE5 VirtualShadowMapThrottle port): feed last frame's World/VSMrender GPU ms
+// back into a clipmap LOD bias — over budget marks pages 1-2 levels COARSER (each level
+// quarters the marked pages = the only lever that cuts alpha-test FILL), under budget
+// recovers slowly. Engages only when the scene actually exceeds the budget; 0 = off (A/B).
+int   ps_r_vsm_throttle        = 1;
+float ps_r_vsm_throttle_budget = 3.0f;   // target VSMrender ms (default clips only the heavy scenes/spikes)
+float ps_r_vsm_throttle_max    = 2.0f;   // max bias in clipmap levels (2 = up to 16x fewer pages)
+// DIRTY BUDGET (UE5 DeferredInvalidationBudget analog): cap the scrolled-in (wrong-tile)
+// static pages re-rendered per frame — the toroidal-scroll eviction bursts behind the
+// 7+ ms VSMrender spikes. Excess pages defer (receivers fall back a level for a frame
+// or two via the vsm_resolve walk). Inval circles/refresh are NOT budgeted. 0 = off (A/B).
+int   ps_r_vsm_dirty_budget    = 128;
+// RECEIVER MASK (UE5 VSM): vsm_mark records per page an 8×8 bitmask of the 16-texel
+// cells visible receivers actually sample; the DYNAMIC tree bins (crown pass + voxel
+// bricks) drop (caster, page) pairs whose footprint misses every sampled cell — culls
+// instances AND alpha-test fill at sub-page granularity. Static cached pages are never
+// masked (a partial page would cache incomplete). 0 = off (A/B); diag = rmaskCulled in
+// the [VK Trees] hybrid/vox-cull log lines.
+int   ps_r_vsm_rmask           = 1;
+
+// GAZE refresh (vsm_mark + vsm_resid): while the sun moves, static-atlas pages the
+// player is actually looking at re-render on a cadence proportional to their
+// on-screen footprint (sampled-pixel count from the mark) — big/near shadows glide
+// every frame like the dynamic atlas, small/far ones tick on the round-robin where
+// the jump is sub-noticeable. Budget = max gaze pages/frame; px = mark samples
+// (half-res: screen px / 4) for the every-frame tier, cadence = ceil(px/hits).
+int   ps_r_vsm_gaze            = 1;
+int   ps_r_vsm_gaze_pages      = 96;
+int   ps_r_vsm_gaze_px         = 4096;
 
 // GPU-driven world forward pass (vk_world_gpu): static opaque/AT meshes are
 // compute-culled + drawn via indirect (1 draw/material group) instead of the
@@ -463,25 +840,120 @@ int   ps_r_vsm_cache_refresh = 8;
 // (CPU ~halved, World/Statics ~5× lower) + user-verified visually identical.
 int   ps_r_gpu_world = 1;
 
+// Cluster (meshlet) granularity for the GPU world cull (vk_world_gpu): static
+// meshes above r_cluster_tris triangles are split at level load into ~128-tri
+// clusters (meshoptimizer), so the compute frustum + Hi-Z cull operates on
+// cluster spheres instead of whole material fragments — a building wall no
+// longer draws entirely because one corner peeks into view. Foundation of the
+// cluster-LOD (Nanite-like) system, Phase 1. Takes effect on level (re)load.
+int   ps_r_cluster = 1;
+int   ps_r_cluster_tris = 256;   // 256 = 2+ meshlets → the mesh can LOD at all
+// Phase 2 — cluster DAG LOD: clusters carry a simplification error + their
+// birth-group sphere; the cull shader picks the DAG cut whose projected error
+// stays under r_cluster_lod PIXELS (live knob: smaller = finer, 1.0 ≈ visually
+// lossless; 4.0 with the dither crossfade reads clean and lets trims/frames
+// dissolve into facades at gameplay distances — user-tuned on Кордон).
+// r_cluster_debug: 1 = clusters as flat colors (UE-style cluster
+// view), 2 = colored wireframe over the scene — both show density fall off
+// with distance in real time.
+float ps_r_cluster_lod = 4.0f;
+int   ps_r_cluster_debug = 0;
+// Phase 3 — cluster-LOD SHADOW casters. For an ORTHO light the DAG cut is a
+// constant world-error budget = target texel size × r_vsm_cluster_lod (in
+// texels, live) — camera distance does not participate, so cached shadow
+// content (VSM static pages, cascade static maps) never changes as the player
+// moves: shadow LOD is invalidation-free by construction.
+// r_shadow_cluster: sun far map + cascades draw the cluster cut instead of the
+// per-mesh ShadowGPU set. r_vsm_cluster: the VSM static-atlas bin walks cluster
+// entries with a per-clipmap-level budget (coarse levels render coarse DAG
+// levels — the geometry win). Both fall back to the per-mesh path when off or
+// when the cluster set is unavailable.
+int   ps_r_shadow_cluster   = 1;
+// r_gpu_shadows_at: alpha-tested casters (fences, bush/crown cutouts) draw
+// through the SAME cluster shadow cull/indirect path as the opaques — the cull
+// stops skipping meta flag bit0 and DrawShadow binds the material's diffuse for
+// the discard (mirrors WorldGPU::DrawDepth). With it, the CPU shadow caster
+// queues (far/cascade/fog/rain-AT/spot/point statics) stop being built at all.
+// 0 = legacy split: GPU opaques + CPU FlushDepth(alphaTestedOnly) cutouts.
+int   ps_r_gpu_shadows_at   = 1;
+// r_vsm_at: alpha-tested statics cast into the VSM STATIC atlas (they never did
+// before — fences/grates had no shadow under r_vsm). Cluster path only: the AT
+// groups become per-material buffer combos and draw with a discard page
+// pipeline (vsm_page_at) binding the material's diffuse. Flip invalidates the
+// toroidal cache (page content changes). A/B live.
+int   ps_r_vsm_at           = 1;
+int   ps_r_vsm_cluster      = 1;
+float ps_r_vsm_cluster_lod  = 1.0f;
+// Crossfade band for DAG-cut transitions, as a fraction of the px threshold:
+// within the band BOTH levels draw with complementary Bayer screen-door masks
+// (prepass + color dither identically), so the swap reads as a short dissolve
+// instead of a pop. 0 = hard cut (old behavior). Live.
+float ps_r_cluster_fade = 0.25f;
+// Phase 2.5 — component merge: SOLID fragments of one building whose AABBs
+// touch are merged into a single cluster DAG, so low-poly parts (doors, window
+// frames, trims) dissolve into the facade at distance instead of collapsing
+// onto themselves (their own DAG has nowhere to dissolve to). Alpha-tested
+// meshes stay on the per-mesh path. Takes effect on level (re)load; the DAG
+// disk cache is keyed on this flag.
+int   ps_r_cluster_merge = 1;
+
 // Clustered forward (Forward+, vk_clustered): a compute pass bins the active
 // dynamic lights into a 16x9x24 froxel grid; each fragment iterates only the
 // few lights touching its cluster instead of all 16 with zero culling. Raises
 // the light cap 16 -> 256 AND makes shaded pixels cheaper (the structural gap
-// vs R4 deferred). Default OFF for A/B + safety: r_clustered 0 keeps the exact
-// old per-fragment 16-light loop. v1 covers world (lmap/vlit/terrain) + skinned;
-// foliage stays on the 16-light path. r_clustered_debug draws a per-cluster
+// vs R4 deferred). DEFAULT ON (2026-07-04): Release A/B verified identical picture,
+// no perf regression, and it unlocks the 256-light cap. r_clustered 0 falls back to
+// the exact old per-fragment 16-light loop. v1 covers world (lmap/vlit/terrain) +
+// skinned; foliage stays on the 16-light path. r_clustered_debug draws a per-cluster
 // light-count heatmap (validates the cull).
-int   ps_r_clustered       = 0;
+int   ps_r_clustered       = 1;
 int   ps_r_clustered_debug = 0;
+
+// Framegraph depth-thrash coalescing (vk_barriers ImageState): the prepass depth
+// is sampled in a RUN by SSAO -> VRS -> VSM-mark -> VSM-resolve. Each used to do
+// its own ATTACHMENT<->SHADER_READ round-trip (4 round-trips = 8 depth barriers
+// serializing the GPU). With this ON the depth flips to SHADER_READ once, all
+// consumers run, then it flips back once (VSM::RenderAtlas uses its own atlas
+// depth, so it rides inside the read window). r_fg_coalesce 0 = per-consumer
+// round-trips via the SAME tracker (≈ the old behaviour, marginally stricter/safer
+// barriers). DEFAULT ON (2026-07-05): user ran with it in-game, renders correctly.
+// Fallback r_fg_coalesce 0 kept as the A/B safety net.
+int   ps_r_fg_coalesce     = 1;
+
+// Async compute (vk_async): record compute work into a SECOND command buffer on the
+// dedicated compute queue, ordered to graphics via a timeline semaphore, so compute
+// overlaps graphics raster. INCREMENT 1 = machinery + INERT probe (empty compute
+// submit the graphics frame waits on) to prove the cross-queue path is stable on
+// this GPU before real passes move over. Default 0 (dormant = exact single-queue
+// path). Needs a dedicated compute family (else no-op). See vk_async.h.
+int   ps_r_async           = 0;
+
+// Sky specular IBL (vk_ibl): prefiltered sky-cube reflections (roughness mips) +
+// a real sun GGX glint on the forward surfaces (the world sun path was diffuse-
+// only). DEFAULT ON (2026-07-04): verified across world lmap/vlit/terrain + tuned
+// (matte-dry ground, sky-visibility gate keeps indoor floors dry, wet gloss toned,
+// ~1 s fade-in). r_ibl 0 to A/B. r_ibl_spec scales it, r_ibl_debug = spec field only.
+int   ps_r_ibl             = 1;
+float ps_r_ibl_spec        = 1.0f;
+int   ps_r_ibl_debug       = 0;
 
 // Hi-Z occlusion cull for the GPU-driven static color pass (vk_world_gpu, Phase A
 // of cluster cull). Pass_World builds a depth pyramid from this frame's PREPASS
 // depth, then a compute pass frustum+occlusion-tests the static set into a second
 // indirect buffer drawn only in the (heavy forward) color pass — meshes fully
 // behind nearer geometry skip shading. The depth prepass still draws the full
-// frustum set (builds the pyramid), so this never over-culls. Default OFF (A/B);
-// needs r_gpu_world 1. No effect if the occlusion pipeline failed to build.
-int   ps_r_hzb_cull = 0;
+// frustum set (builds the pyramid), so this never over-culls. Needs r_gpu_world 1.
+// No effect if the occlusion pipeline failed to build.
+// Default ON since 17-07: the footprint math got its missing focal scale
+// (lodParams.w) — the old understated footprint picked too fine a mip and
+// false-culled (vanishing walls/terrain tiles, why this stayed situational).
+// Measured on Pripyat: color-pass draws 11118 → 3704 (×3 fewer). 0 to A/B.
+int   ps_r_hzb_cull = 1;
+
+// GPU-driven LOD imposters (vk_LODManager): compute cull (distance + frustum +
+// shared HZB) + vertex-pulling draw replace the CPU per-frame FLOD walk that
+// cost 6-9.4 ms on Pripyat. 0 = the original CPU path (instant A/B, no rebuild).
+int   ps_r_lods_gpu = 1;
 
 // Froxel volumetric lighting (vk_volumetrics, r_vol) — P1. A 3D froxel grid over
 // the frustum: compute injects sun in-scatter (Henyey-Greenstein phase × cascade
@@ -495,9 +967,46 @@ float ps_r_vol_height    = 0.10f;   // height-fog falloff above eye level (0 = u
 float ps_r_vol_g         = 0.80f;   // Henyey-Greenstein anisotropy (forward scatter)
 float ps_r_vol_intensity = 3.0f;    // in-scatter brightness multiplier (raised: fog must GLOW more than it dims to read as haze)
 float ps_r_vol_amb       = 0.60f;   // indoor ambient floor: fraction of sky ambient kept under a roof (0=pitch-dark interior, 1=no occlusion)
+// Fog AMBIENT (sky-fill) in-scatter tint scale. The fog's ambient term used to
+// inherit the SURFACE receiver floor (r_ambient_floor) — a flat white lift that
+// keeps lit geometry off pure black. In the fog that neutral floor integrates
+// along the sightline into a whitish haze that LIFTS the whole night scene (the
+// air self-glows even with the sun down). The fog now tracks the env's real
+// ambient (dark/blue at night) scaled by this instead: 1.0 = env ambient as-is,
+// lower = darker night air, 0 = no ambient fog (sun beam + local lights only).
+float ps_r_vol_ambient   = 1.0f;
 float ps_r_vol_indoor    = 6.0f;    // indoor density boost: fog ×(1+this) under a roof — short interior sightlines need denser air to show
 float ps_r_vol_sun       = 3.0f;    // sun-beam in-scatter boost: directional shaft brightness (pops the god-ray through the ambient haze)
+
+// Atmospheric scattering (r_atmo): physical Rayleigh (blue distance) + Mie (warm
+// sun halo) in-scatter in the froxel fog = aerial perspective. NEEDS r_vol on.
+// DEFAULT ON (2026-07-05): verified in-game ("вроде прикольно", nice lightning
+// interaction). Sun-relative → dawn/dusk warm. r_atmo_rayleigh/_mie tune it live.
+int   ps_r_atmo          = 1;
+float ps_r_atmo_rayleigh = 2.0f;    // blue-distance strength
+float ps_r_atmo_mie      = 0.6f;    // warm sun-halo strength
+float ps_r_atmo_mie_g    = 0.76f;   // Mie forward anisotropy
+
+// Auto-exposure TEMPORAL adaptation (eye adaptation): time constant in seconds for
+// the exposure to ease toward the metered target. 0 = instant (old snappy behaviour
+// where the image visibly darkens/brightens as you tilt between sky and ground).
+float ps_r_exp_adapt     = 1.0f;
 float ps_r_vol_lights    = 2.5f;    // P2: local light (flashlight/lamp/campfire) in-scatter in fog — glow/cone strength; 0 = off
+// Forward-scatter anisotropy for LOCAL lights only (torches/lamps/campfires),
+// SEPARATE from the sun's r_vol_g (0.80). The sun's sharp forward peak is the
+// god-ray halo; reusing it for local lights made a torch shone AT the camera
+// spike into a blinding, HDR-desaturated (cold-white) glare — an NPC head-lamp
+// read as a searchlight, not the soft R4 shaft. 0.35 = gentle bias (R4-like).
+float ps_r_vol_lights_g  = 0.35f;
+// Fog in-scatter multiplier for HANDHELD/WORN torches only (CTorch head-lamp,
+// weapon light) — kept SEPARATE from fixtures (hanging lamps, searchlights,
+// campfires) which keep the ×3 lamp beam boost. In practice this is the NPC
+// head-lamp knob: the actor's own torch (volumetric_for_actor) and weapon lights
+// (volumetric_enabled) default OFF, so only AI head-lamps scatter in the fog. A
+// group of standing NPCs was flooding the air with light (scene read over-bright),
+// so the shaft is dialed well below a fixture's: 0.4 = restrained R4 haze. Raise
+// for a punchier beam; 0 = torches light surfaces but cast no fog shaft.
+float ps_r_torch_vol     = 0.4f;
 float ps_r_vol_smoke     = 1.0f;    // Stage-0: light smoke billboards with the froxel in-scatter (sun shaft/flashlight/campfire catch the smoke); 0 = off (old flat look)
 float ps_r_vol_smoke_clamp = 6.0f;  // Stage-0: upper bound on the per-froxel radiance added to smoke (keeps it from blowing to white next to a campfire/sun beam)
 float ps_r_vol_smoke_inject  = 1.0f; // Stage-1 VMS: inject smoke-particle density into the froxel grid → smoke becomes real participating media (lit/shadowed like fog); 0 = off
@@ -553,7 +1062,7 @@ float ps_r_tess_height = 1.0f;
 int   ps_r_pom        = 1;
 float ps_r_pom_height = 0.02f;
 float ps_r_pom_steps  = 24.0f;
-float ps_r_pom_far    = 12.0f;
+float ps_r_pom_far    = 30.0f;
 // Extra mip blur on the POM heightfield: removes fine albedo speckle (which
 // the diffuse-luminance height would otherwise turn into "spikes" on brick
 // faces) while the large-scale mortar grid survives. Visible texture stays
@@ -564,10 +1073,10 @@ float ps_r_pom_blur   = 0.5f;
 float ps_r_pom_normal = 1.0f;
 // POM self-shadow strength: contact shadows the relief casts in its own grooves
 // toward the sun. 0 = off, 1 = default. Adds 8 height taps on sun-facing pixels.
-float ps_r_pom_shadow = 1.0f;
+float ps_r_pom_shadow = 3.0f;
 // POM contact AO: view-independent groove darkening on the AMBIENT term, so the
 // relief reads with depth even out of direct sun. 0 = off, 1 = default.
-float ps_r_pom_ao     = 1.0f;
+float ps_r_pom_ao     = 0.3f;
 // r_pom_debug 1 = world shaders draw the POM occlusion mask (AO × self-shadow)
 // grayscale — white = lit/open, dark = occluded grooves. Like r_ssao_debug but
 // for the per-pixel POM contributions (which the GTAO debug view can't show).
@@ -578,6 +1087,11 @@ int   ps_r_pom_debug  = 0;
 // can see how much each occlusion source contributes. The baked lightmap is the
 // dominant interior AO and this is the only way to neutralize it at runtime.
 int   ps_r_ao_flat    = 0;
+// r_shade_debug — lighting-component isolation in world_lmap/world_vlit/world_terrain:
+// 1 albedo, 2 baked lmap/vertex data, 3 hemi-occ scalar, 4 GTAO, 5 ambient sky gate,
+// 6 sky hemisphere colour, 7 total lighting (no albedo), 8 flat-ambient term, 9 sun
+// term, 10 wetness factor. 0 = off.
+int   ps_r_shade_debug = 0;
 // Per-orientation POM strength. Walls/fences (horizontal normal) always full;
 // floors (normal up) scale toward r_pom_floor; ceilings (normal down) toward
 // r_pom_ceil. Defaults: floor 0.75, ceiling 0.25 (overhead POM reads strong).
@@ -587,23 +1101,54 @@ float ps_r_pom_floor  = 0.75f;
 // angles almost always and its base texture is high-contrast, so POM there
 // "swims"/mirrors. Walls/fences/floors-of-structures (lmap/vlit) keep POM.
 int   ps_r_pom_terrain = 0;
+// Terrain POM DEPTH OFFSET (SSFX deffer_terrain_high_flat_d.ps port): sink the
+// terrain gl_FragDepth into the parallax cracks in the depth prepass AND the
+// color pass, so GTAO and the VSM screen resolve see the carved micro-surface —
+// AO darkens the pits, sun shadows wrap into them ("cut-in" ground, not painted).
+// 1 = SSFX strength (0.11 m max sink along the view ray). Needs r_pom_terrain 1.
+float ps_r_pom_zoff = 1.0f;
+// TERRAIN COMPOSITE CACHE (vk_terrain_cache): compute-bakes the 4-channel splat
+// ground (mask x heights x offsets x height-blend) into a camera-anchored
+// height+weights clipmap once per camera-window move; the terrain POM then
+// marches ONE texture instead of four (color pass AND depth prepass). Pure
+// perf/architecture — the picture should be near-identical to the 4-march path.
+// 0 = off (old path), 1 = on when the cache module is alive.
+int   ps_r_terra_cache = 1;
+// Cone-step marching on the composite cache: the bake also stores a
+// conservative "empty cone" ratio per texel (height .g) and the POM march
+// leaps guaranteed-free gaps instead of walking 24 fixed layers - crisper
+// cracks at grazing angles (no stair-stepping / missed thin walls), usually
+// cheaper. 0 = fixed-layer walk on the cache (A/B fallback).
+int   ps_r_terra_cone = 1;
+// Terrain detail-blend transition depth. 0 = plain mask cross-fade — asphalt
+// fades SMOOTHLY into soil, the GAMMA/SSFX look (their HeightBlending() ships
+// commented out). >0 = Mishkinis height blend: the RAISED material wins
+// per-texel with this transition width — sharp interlocking edges (0.25 = the
+// old hard look; the sharpness was OURS, not GAMMA's).
+float ps_r_terra_blend = 1.f;
+// Sun-horizon channel in the cache bake (needs r_terra_cone's pass): per-texel
+// max slope toward the CURRENT sun azimuth -> POM self-shadow becomes a
+// geometric one-tap tan(sun) vs tan(horizon) test instead of an 8-tap march
+// (exact over 32 texels, re-baked when the sun drifts ~2.5 deg). Strength
+// still rides r_pom_shadow. 0 = old march (A/B fallback).
+int   ps_r_terra_horizon = 1;
 // Terrain DETAIL NORMAL MAPPING strength (independent of POM). Perturbs the
 // ground normal from the per-channel <detail>_bump maps (grass/asphalt/earth/
 // gravel), blended by the splat mask — feeds sun + dyn lights only (the sharp
 // sky cube stays on the flat geometric normal, else up-facing ground mirrors).
 // No UV march → no grazing-angle "swim". 0 = off; 1 = full.
-float ps_r_terrain_normal = 1.0f;
+float ps_r_terrain_normal = 3.0f;
 // Terrain MICRO contact AO: darkens micro-grooves using the detail-normal tilt
 // (cavity) AND the detail height (R4 terrain AO = detail diffuse alpha). Cheap,
 // no UV march, no swim — deepens the relief the detail normals create. 0 = off.
-float ps_r_terrain_ao    = 0.5f;
+float ps_r_terrain_ao    = 0.125f;   // SSFX TERRAIN_POM_AO parity
 // Terrain debug view: 0 off, 1 = world normal (Nw*0.5+0.5), 2 = micro-AO,
 // 3 = detail height (splat-blended detail alpha).
 int   ps_r_terrain_debug = 0;
 // Terrain DRY sun gloss: a material-aware specular highlight from the bump .r
 // channel (R4 gloss). Asphalt/gravel catch the sun even when dry; grass stays
 // matte. Fades out as the ground wets (the wet reflection takes over). 0 = off.
-float ps_r_terrain_gloss = 0.5f;
+float ps_r_terrain_gloss = 2.0f;
 int   ps_r_puddle_debug  = 0;       // puddle/water debug: 0 off, 1 = coverage, 2 = micro-height / sim flow
 
 // SURFACE FIELD (the "smart heightmap"): metre-scale ground height/slope/curvature/
@@ -911,6 +1456,63 @@ float ps_pnv_params_4_2 = 1;
 // textures
 int psTextureLOD = 0;
 
+// Texture streamer (vk_texture_stream.{h,cpp}).
+//  r_txstream          — 1 enables dynamic per-frame mip promote/demote (opt-in;
+//                        the load-time budget cap + memory_priority are always on).
+//  r_txstream_budget   — texture VRAM budget in MB (0 = auto: device budget − headroom
+//                        − non-texture usage).
+//  r_txstream_headroom — MB of device VRAM kept free (never filled by textures) so
+//                        render targets / FG buffers / spikes always fit.
+// Default ON since 16-07: Stage A verified in-game (Pripyat marathon 15-07) —
+// GPU feedback + idle-free swaps + VMA-aware budget + 256px visible floor. On
+// light maps the streamer idles by design (everything fits, zero swaps).
+int ps_r_txstream          = 1;
+int ps_r_txstream_budget   = 0;
+int ps_r_txstream_headroom = 512;
+//  r_txstream_reserve  — MB of device VRAM that must be FREE after a level finishes
+//                        loading. If less is free, the streamer trims the largest
+//                        world textures (at the load-end idle point) until it is.
+//                        Leaves room for Streamline Frame-Gen buffers / spikes so a
+//                        heavy map (Pripyat) doesn't crash Streamline at first present.
+int ps_r_txstream_reserve  = 1024;
+
+// Cluster-LOD page streaming (vk_cluster_stream, Stage B of the streaming world).
+//  r_clpage        — 1 = keep only a budgeted pool of cluster-IB pages resident
+//                    (pinned roots/coarse always in VRAM; GPU feedback streams the
+//                    rest from the cluster cache file, coarser DAG levels cover
+//                    while pages arrive). 0 = eager install-all (pre-Stage-B
+//                    behavior/VRAM). Read at level load.
+//  r_clpage_budget — resident page-pool budget in MB (pinned pages always fit).
+// Default ON since 16-07: verified on Pripyat (resident ~85 vs 326 MB, request
+// feedback converges to zero, no holes/flicker; self-loop cut closed the last
+// stuck-request tail). 0 = eager install-all remains the parity fallback.
+int ps_r_clpage        = 1;
+int ps_r_clpage_budget = 160;
+// r_cl_audit — heavyweight streaming/draw forensics (the 17-07 white-polygon
+// hunt): install-time page payload validation, per-frame GPU slot copy-back
+// hash audit, 3s draw-contract validation, and the full indirect-set draw
+// audit (cmds+counts readback, CPU cut replica, HZB cross-diff). Costs host
+// memory (~35 MB on Pripyat) + a few ms every 3 s. Read at LEVEL LOAD (the
+// audit buffers are created then) — set it before loading. Logs: [VK ClPage]
+// gpu-audit / [VK ClVB-RT] / [VK CmdAudit] / [VK ClChain].
+int ps_r_cl_audit      = 0;
+
+// Pool compaction (Stage B increment (б)): after WorldGPU::Build the vertex/
+// index slices of fully-repacked clustered meshes are duplicates of the
+// ClusterStream page pools — rebuild the level VB/IB pools with only the
+// slices CPU paths still need (plain meshes, alpha-tested casters, terrain,
+// trees, CPU leaves) and free the rest. While active, the always-CPU static
+// shadow consumers (rain/ground map, spot/point lights) draw the statics via
+// the cluster shadow targets, and the CPU fallbacks (r_gpu_world 0,
+// r_gpu_shadows 0, r_shadow_cluster 0) are forced to the GPU paths — set
+// r_pool_compact 0 (+ level reload) for a true A/B of those. Read at load.
+int ps_r_pool_compact  = 1;
+
+// Stage D world composition: total chunk count (home + clones of the loaded
+// level tiled on a grid). 0/1 = off. Render-only replication slice — clones
+// have no collision/AI; statics only (trees/grass/LODs home-only for now).
+int ps_r_compose = 0;
+
 float ps_r2_img_exposure = 1.0f; // r2-only
 float ps_r2_img_gamma = 1.0f; // r2-only
 float ps_r2_img_saturation = 1.0f; // r2-only
@@ -1010,7 +1612,16 @@ class CCC_VideoMemoryStats : public IConsole_Command
 {
 public:
     CCC_VideoMemoryStats(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; };
-    virtual void Execute(LPCSTR /*args*/) { Msg("[VK] video_memory_stats — not implemented"); }
+    virtual void Execute(LPCSTR /*args*/) { VK::TextureStreamer::Instance().DumpStats(); }
+};
+
+// `r_vram_dump` — full VMA allocator JSON (every pool/block/allocation with
+// names) to _appdata_\vma_stats.json. The scalpel for "who owns the vma-slack".
+class CCC_VramDump : public IConsole_Command
+{
+public:
+    CCC_VramDump(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = true; };
+    virtual void Execute(LPCSTR /*args*/) { VK::Vram::DumpVmaJson(); }
 };
 
 // `vk_perf` — force the global profiler to print an immediate [VK Perf] MARK
@@ -1080,7 +1691,7 @@ public:
 // GPU-particles Phase 3 — `gp_mirror <effect>` translates a real .pe into the
 // GPU action program and runs it on the camera-pinned test path; no arg reverts
 // to the authored campfire. Forward-declared to keep the GP module headers out.
-namespace VK { namespace GPUParticles { bool MirrorEffect(const char* name); } }
+namespace VK { namespace GPUParticles { bool MirrorEffect(const char* name); void DebugEffect(const char* name); void DumpStats(); } }
 class CCC_GP_Mirror : public IConsole_Command
 {
 public:
@@ -1093,6 +1704,30 @@ public:
         char* p = name;
         while (*p == ' ') ++p;
         VK::GPUParticles::MirrorEffect(p);
+    }
+};
+
+// `gp_stats` — per-program budget/alive counters to the log.
+class CCC_GP_Stats : public IConsole_Command
+{
+public:
+    CCC_GP_Stats(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; }
+    virtual void Execute(LPCSTR /*args*/) { VK::GPUParticles::DumpStats(); }
+};
+
+// `gp_debug <effect>` — dump the .pe def + its GPU translation to the log.
+class CCC_GP_Debug : public IConsole_Command
+{
+public:
+    CCC_GP_Debug(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; }
+    virtual void Execute(LPCSTR args)
+    {
+        string_path name;
+        xr_strcpy(name, args ? args : "");
+        char* p = name;
+        while (*p == ' ') ++p;
+        if (!*p) { Msg("![VK GP] gp_debug: usage 'gp_debug <effect>' (see gp_list)"); return; }
+        VK::GPUParticles::DebugEffect(p);
     }
 };
 
@@ -1344,7 +1979,23 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_ssil_strength", &ps_r_ssil_strength, 0.f, 8.f);  // IL intensity multiplier
     CMD4(CCC_Float, "r_ssil_temporal", &ps_r_ssil_temporal, 0.f, 0.97f);  // GTAO temporal accumulation α (0=off; lets r_ssil ship clean)
     CMD4(CCC_Integer, "r_motion_vectors", &ps_r_motion_vectors, 0, 1);  // screen-space MV pass on/off (DLSS/FSR/PT foundation)
+    CMD4(CCC_Integer, "r_dlss", (int*)&ps_r_dlss, 0, 1);                 // DLSS Super Resolution; needs r_motion_vectors + NGX available
+    CMD4(CCC_Integer, "r_dlss_quality", (int*)&ps_r_dlss_quality, 0, 4); // 0=DLAA 1=Quality 2=Balanced 3=Performance 4=UltraPerf (render<display upscale)
+    CMD4(CCC_Integer, "r_dlss_preset", (int*)&ps_r_dlss_preset, 0, 15);  // DLSS model preset hint: 0=driver default, 6=F (CNN), 10=J, 11=K (transformer, default)
+    CMD4(CCC_Float,   "r_dlss_sharp", &ps_r_dlss_sharp, 0.0f, 1.0f);     // CAS sharpen on the DLSS output (tonemap), 0 = off
+    CMD4(CCC_Integer, "r_dlss_debug", &ps_r_dlss_debug, 0, 4);           // 1=CAS heatmap, 2=split no-DLSS|composite, 3=gate flag, 4=input sanitizer (NaN/neg/huge in the render-res scene)
+    CMD4(CCC_Integer, "r_dlss_jitter_flip", &ps_r_dlss_jitter_flip, 0, 3); // reported-jitter sign A/B: bit0=X, bit1=Y
+    CMD4(CCC_Integer, "r_dlss_exp", &ps_r_dlss_exp, 0, 1);               // 1=real exposure texture (default), 0=AutoExposure flag
+    CMD4(CCC_Float,   "r_dlss_bias", &ps_r_dlss_bias, 0.0f, 1.0f);       // material mip-bias scale under upscaling (0=off A/B)
+    CMD4(CCC_Integer, "r_dlss_sl", &ps_r_dlss_sl, 0, 1);                 // SR via Streamline sl.dlss (Stage B, FG prerequisite)
+    CMD4(CCC_Integer, "r_dlss_sl_flip", &ps_r_dlss_sl_flip, 0, 3);       // SL jitter sign A/B (bit0=X, bit1=Y)
+    CMD4(CCC_Integer, "r_dlss_sl_mv", &ps_r_dlss_sl_mv, 0, 1);           // SL MV direction A/B (1 = negate)
+    CMD4(CCC_Integer, "r_dlss_fg", &ps_r_dlss_fg, 0, 1);                 // DLSS Frame Generation (Stage C, MFG); needs r_dlss + r_dlss_sl
+    CMD4(CCC_Integer, "r_dlss_fg_mult", &ps_r_dlss_fg_mult, 2, 6);       // FG frame multiplier 2..6 (2x default, up to 6x MFG)
+    CMD4(CCC_Integer, "r_dlss_fg_debug", &ps_r_dlss_fg_debug, 0, 2);     // DLSS-G + Reflex state log (1=periodic, 2=every frame)
     CMD4(CCC_Integer, "r_mv_debug", &ps_r_mv_debug, 0, 1);              // false-colour MV overlay (grey=still, R=+x, G=+y)
+    CMD4(CCC_Integer, "r_mv_trees", &ps_r_mv_trees, 0, 1);              // tree wind-sway MV overlay (A/B under DLSS)
+    CMD4(CCC_Integer, "r_mv_grass", &ps_r_mv_grass, 0, 1);              // grass wind-sway MV overlay (A/B under DLSS)
     CMD4(CCC_Float, "r_mv_debug_scale", &ps_r_mv_debug_scale, 1.f, 500.f); // MV overlay magnitude scale
     CMD4(CCC_Float, "r_wind_tree_bend", &ps_r_wind_tree_bend, 0.f, 2.f);   // tree trunk sway intensity (0 = rigid)
     CMD4(CCC_Float, "r_wind_tree_anim", &ps_r_wind_tree_anim, 0.f, 40.f);  // tree branch/leaf flutter speed
@@ -1357,7 +2008,29 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_vsm_hzb",            &ps_r_vsm_hzb,            0, 1);            // shadow-HZB occlusion cull of VSM casters (kills VSMrender overdraw)
     CMD4(CCC_Float,   "r_vsm_hzb_margin",     &ps_r_vsm_hzb_margin,     0.0f, 0.05f);     // depth slack for the shadow-HZB occluder (stale-sun safety)
     CMD4(CCC_Float,   "r_vsm_tree_wind_dist", &ps_r_vsm_tree_wind_dist, 8.0f, 200.0f);    // near set radius (m)
+    CMD4(CCC_Integer, "r_vsm_tree_impostor",       &ps_r_vsm_tree_impostor,       0, 1);         // near crown mesh → baked sun-facing billboard in the dyn atlas
+    CMD4(CCC_Float,   "r_vsm_tree_impostor_scale", &ps_r_vsm_tree_impostor_scale, 0.3f, 3.0f);   // billboard size vs crown sphere (shadow footprint)
+    CMD4(CCC_Integer, "r_vsm_tree_hull",      &ps_r_vsm_tree_hull,      0, 2);                   // caster LOD: 1 = near trees beyond _dist cast the baked opaque crown hull; 2 = far/static foliage too (monotonic LOD)
+    CMD4(CCC_Float,   "r_vsm_tree_hull_dist", &ps_r_vsm_tree_hull_dist, 4.0f, 200.0f);           // crown-mesh tier radius (m); the rest of the near set uses the hull
+    CMD4(CCC_Integer, "r_vsm_tree_hull_vox",  &ps_r_vsm_tree_hull_vox,  0, 128);                 // crown voxelization: 0 = lobes only, >0 = level-0 voxel-cloud resolution (cells across the crown); baked → level reload
+    CMD4(CCC_Integer, "r_vsm_tree_hull_lod",  &ps_r_vsm_tree_hull_lod, -4, 8);                   // LIVE LOD bias for the voxel viewmode (- = finer, + = coarser); no rebake
+    CMD4(CCC_Float,   "r_vsm_tree_hull_vox_px", &ps_r_vsm_tree_hull_vox_px, 1.0f, 32.0f);        // target projected voxel size in px (Nanite screen-error LOD cut); live
+    CMD4(CCC_Float,   "r_vsm_tree_hull_vox_far", &ps_r_vsm_tree_hull_vox_far, 0.0f, 32.0f);      // +px per 100m: far cubes visibly chunkier (0 = constant screen size); live
+    CMD4(CCC_Float,   "r_vsm_tree_hull_vox_smin", &ps_r_vsm_tree_hull_vox_smin, 0.0f, 2.0f);     // LEGACY no-op (cube era) — kept so persisted user.ltx lines parse
+    CMD4(CCC_Float,   "r_vsm_tree_hull_vox_stex", &ps_r_vsm_tree_hull_vox_stex, 0.5f, 16.0f);    // SHADOW voxel LOD: page texels per voxel edge (UE shadow-view metric); live
+    CMD4(CCC_Float,   "r_vsm_tree_hull_vox_sfloor", &ps_r_vsm_tree_hull_vox_sfloor, 0.0f, 2.0f); // SHADOW-only safety floor on voxel edge (m); live
+    CMD4(CCC_Integer, "r_vsm_tree_hull_vox_cap",  &ps_r_vsm_tree_hull_vox_cap, 200, 20000);      // SHADOW-only max bricks per tree slice (perf); live
+    CMD4(CCC_Integer, "r_vsm_tree_hull_vox_wpo",  &ps_r_vsm_tree_hull_vox_wpo, 0, 1);            // UE WPO-off: rigid voxel trees → static cache (needs hull 2); live
+    CMD4(CCC_Integer, "r_vsm_tree_hull_vox_static", &ps_r_vsm_tree_hull_vox_static, 0, 1);       // static-tier proxy: 0=shell (cheap, per-page-friendly) 1=bricks; live
+    CMD4(CCC_Integer, "r_vsm_tree_hull_vox_cull",  &ps_r_vsm_tree_hull_vox_cull, 0, 1);          // stage-2 per-page brick compaction (UE-parity cull); live
+    CMD4(CCC_Float,   "r_vsm_tree_hull_band",   &ps_r_vsm_tree_hull_band, 0.02f, 0.9f);          // shadow crossfade band: crown↔voxels dither inside this fraction of _dist; live
+    CMD4(CCC_Float,   "r_vsm_tree_hull_vox_fade", &ps_r_vsm_tree_hull_vox_fade, 0.0f, 0.6f);     // dithered voxel-LOD crossfade band, fraction of handover dist (0 = hard cut); live
+    CMD4(CCC_Integer, "r_vsm_tree_hull_debug", &ps_r_vsm_tree_hull_debug, 0, 2);                 // 1 = shaded hull over hull-tier trees (_dist boundary); 2 = over EVERY hulled tree (walk-up voxel inspect)
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
+    CMD4(CCC_Integer, "r_linear_color", &ps_r_linear_color, 0, 1);                // linear colour pipeline; needs a level reload (format baked at texture load)
+    CMD4(CCC_Integer, "r_sun_night_freeze", &ps_r_sun_night_freeze, 0, 1);        // freeze the sun-shadow (VSM) update when the sun is down (no light → no cost)
+    CMD4(CCC_Float,   "r_sun_night_lum",    &ps_r_sun_night_lum,    0.f, 0.5f);   // sun_color luminance threshold for "night" (secondary)
+    CMD4(CCC_Float,   "r_sun_night_alt",    &ps_r_sun_night_alt,   -0.2f, 0.5f);  // to-sun.y (sun altitude) below which it's "night" (primary; 0 = horizon)
     CMD4(CCC_Float, "r_grass_aref", &ps_r_grass_aref, 0.05f, 0.9f);
     CMD4(CCC_Float, "r_grass_asharp", &ps_r_grass_asharp, 0.0f, 2.0f);   // mip alpha compensation (far grass density)
     CMD4(CCC_Integer, "r_light_debug", &ps_r_light_debug, 0, 1);         // dump dynamic lights to the log (~2 s)
@@ -1374,12 +2047,39 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_light_cone_power",   &ps_r_light_cone_power,   0.0f, 10.0f);   // synthesized-light surface intensity (0 = beam only)
     CMD4(CCC_Float,   "r_light_cone_fade",    &ps_r_light_cone_fade,    0.05f, 10.0f);  // synth lamp-face glow fade length (m)
     CMD4(CCC_Integer, "r_spot_grass",         &ps_r_spot_grass,         0, 1);          // grass casters into the spot shadow map (beam cutouts)
+    CMD4(CCC_Integer, "r_sun_grass",          &ps_r_sun_grass,          0, 1);          // grass casters into the sun cascades (swaying blade shadows)
+    CMD4(CCC_Float,   "r_sun_grass_dist",     &ps_r_sun_grass_dist,     5.f, 100.f);    // sun grass-shadow cull radius around the camera (m)
+    CMD4(CCC_Integer, "r_point_grass",        &ps_r_point_grass,        0, 1);          // grass casters into the campfire point cubes (dapples)
+    CMD4(CCC_Integer, "r_grass_cull",         &ps_r_grass_cull,         0, 1);          // GPU per-light grass cull+compaction (A/B: 0 = brute-force full VS pass)
+    CMD4(CCC_Integer, "r_grass_cull_debug",   &ps_r_grass_cull_debug,   0, 1);          // [VK GrassCull] per-call lights/types/cells log
     CMD4(CCC_Float,   "r_light_cone_soft",    &ps_r_light_cone_soft,    0.0f, 32.0f);   // beam shadow penumbra radius (spot-map texels)
+    CMD4(CCC_Integer, "r_light_cone_torch",   &ps_r_light_cone_torch,   0, 1);          // analytic cone for ordinary torches (0 = R4: froxel shaft only, no searchlight cone)
+    CMD4(CCC_Float,   "r_flashlight_glow",    &ps_r_flashlight_glow,    0.0f, 20.0f);   // bright lamp-face glow for a torch aimed at the camera (0 = off)
     CMD4(CCC_Float,   "r_spot_grass_shadow",  &ps_r_spot_grass_shadow,  0.0f, 1.0f);    // grass shadow strength on surfaces (0 off, 1 full blanket)
+    CMD4(CCC_Float,   "r_flashlight_grass",   &ps_r_flashlight_grass,   0.0f, 1.0f);    // grass shadow strength for FLASHLIGHT tiles only (night wow; lamps keep r_spot_grass_shadow)
+    CMD4(CCC_Integer, "r_spot_pool",          &ps_r_spot_pool,          1, 8);          // spot shadow tiles per frame (each light = own map)
+    CMD4(CCC_Integer, "r_point_pool",         &ps_r_point_pool,         1, 4);          // point shadow cubes per frame (each campfire = own cube)
+    CMD4(CCC_Integer, "r_point_debug",        &ps_r_point_debug,        0, 1);          // debug overlay: green=lit by pooled point, red=its shadow
+    CMD4(CCC_Integer, "r_grass_debug",        &ps_r_grass_debug,        0, 11);         // grass component isolation (1..11, see decl)
+    CMD4(CCC_Float,   "r_grass_self_bias",    &ps_r_grass_self_bias,    0.0f, 1.0f);    // grass-on-grass anti-acne slack (m along sun ray)
+    CMD4(CCC_Float,   "r_sun_beam",           &ps_r_sun_beam,           0.0f, 1.0f);    // ground beam-gap recovery strength (0 = off)
+    CMD4(CCC_Float,   "r_sun_beam_dist",      &ps_r_sun_beam_dist,      5.0f, 120.0f);  // beam-recovery max distance (m)
+    CMD4(CCC_Float,   "r_sun_beam_boost",     &ps_r_sun_beam_boost,     1.0f, 4.0f);    // extra sun in the recovered gap (cinematic splash)
+    CMD4(CCC_Float,   "r_sun_beam_bias",      &ps_r_sun_beam_bias,      0.0f, 1.0f);    // beam-recovery atlas self-bias (m along sun ray)
+    CMD4(CCC_Float,   "r_sun_beam_splash",     &ps_r_sun_beam_splash,     0.0f, 8.0f);   // god-ray ground-splash strength (0 = off)
+    CMD4(CCC_Float,   "r_sun_beam_splash_thr", &ps_r_sun_beam_splash_thr, 0.0f, 2.0f);   // in-scatter luminance threshold before the splash kicks in
+    CMD4(CCC_Float,   "r_sun_beam_ground",     &ps_r_sun_beam_ground,     0.0f, 4.0f);   // forward sun-beam GROUND deposit strength (0 = off, A/B)
+    CMD4(CCC_Float,   "r_sun_beam_ground_thr", &ps_r_sun_beam_ground_thr, 0.0f, 2.0f);   // in-scatter luminance threshold for the ground deposit
+    CMD4(CCC_Float,   "r_point_boost",        &ps_r_point_boost,        0.1f, 8.0f);    // campfire/brazier glow intensity multiplier (volumetric points)
+    CMD4(CCC_Float,   "r_point_range",        &ps_r_point_range,    0.5f, 4.0f);    // campfire/brazier light reach multiplier (volumetric points)
     CMD4(CCC_Float,   "r_glass_opacity", &ps_r_glass_opacity, 0.05f, 1.0f); // glass opacity ceiling (1 = texture alpha as in R4)
     CMD4(CCC_Float,   "r_glass_refr",    &ps_r_glass_refr,    0.0f,  3.0f); // glass refraction wobble strength (0 = off)
+    CMD4(CCC_Integer, "r_clouds",           &ps_r_clouds,           0, 1);         // animated cloud layer on/off
+    CMD4(CCC_Float,   "r_clouds_intensity", &ps_r_clouds_intensity, 0.0f, 4.0f);   // cloud additive brightness
+    CMD4(CCC_Float,   "r_clouds_speed",     &ps_r_clouds_speed,     0.0f, 8.0f);   // cloud UV scroll speed
     CMD4(CCC_Integer, "r_grass_nowave", &ps_r_grass_nowave, 0, 1);
     CMD4(CCC_Float, "r_ambient_floor", &ps_r_ambient_floor, 0.f, 0.5f);
+    CMD4(CCC_Float, "r_ambient_sky_gate", &ps_r_ambient_sky_gate, 0.f, 1.f);   // gate flat sky ambient by sky visibility (0=old leak, 1=dark interiors)
     CMD4(CCC_Float, "r_wet_darken", &ps_r_wet_darken, 0.f, 1.f);
     CMD4(CCC_Float, "r_wet_refl", &ps_r_wet_refl, 0.f, 3.f);
     CMD4(CCC_Integer, "r_wet_debug", &ps_r_wet_debug, 0, 1);
@@ -1390,10 +2090,14 @@ void xrRender_initconsole()
     // runs the GPU-resident test effect (emit/simulate/draw) at the camera.
     CMD4(CCC_Integer, "r_gpu_particles", &ps_r_gpu_particles, 0, 1);
     CMD4(CCC_Integer, "r_gpu_particles_max", &ps_r_gpu_particles_max, 1024, 1 << 24);
+    CMD4(CCC_Integer, "r_gpu_particles_sort", &ps_r_gpu_particles_sort, 0, 1);
+    CMD4(CCC_Float,   "r_gpu_particles_life_cap", &ps_r_gpu_particles_life_cap, 0.0f, 300.0f);
     CMD1(CCC_GP_Mirror, "gp_mirror");       // Phase 3: mirror a real .pe onto the camera emitter
     CMD1(CCC_GP_Spawn,  "gp_spawn");        // Phase 3.2: place a persistent world emitter
     CMD1(CCC_GP_SpawnClear, "gp_spawn_clear"); // Phase 3.2: remove world emitters
     CMD1(CCC_GP_List,   "gp_list");         // Phase 3: list loaded .pe names (optional substr filter)
+    CMD1(CCC_GP_Debug,  "gp_debug");        // dump a .pe def + its GPU translation to the log
+    CMD1(CCC_GP_Stats,  "gp_stats");        // per-program budget/alive counters
 
     // Global render profiler (vk_profiler): r_profiler 0/1/2, vk_perf = MARK dump.
     CMD4(CCC_Integer, "r_profiler", &ps_r_profiler, 0, 2);
@@ -1401,6 +2105,9 @@ void xrRender_initconsole()
 
     // Variable Rate Shading (vk_vrs): 0 off / 1 mild / 2 aggressive + distance thresholds.
     CMD4(CCC_Integer, "r_vrs", &ps_r_vrs, 0, 2);
+    CMD4(CCC_Integer, "r_vrs_force", &ps_r_vrs_force, 0, 4);
+    CMD4(CCC_Integer, "r_vrs_static", &ps_r_vrs_static, 0, 1);
+    CMD4(CCC_Integer, "r_uber_variants", &ps_r_uber_variants, 0, 1);   // A/B: 0 = old monolithic world uber-FS
     CMD4(CCC_Float, "r_vrs_near", &ps_r_vrs_near, 0.f, 300.f);
     CMD4(CCC_Float, "r_vrs_far",  &ps_r_vrs_far,  0.f, 500.f);
 
@@ -1424,29 +2131,77 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_vsm_debug",    &ps_r_vsm_debug,    0, 1);
     CMD4(CCC_Float,   "r_vsm_base",     &ps_r_vsm_base,     8.0f, 64.0f);
     CMD4(CCC_Float,   "r_vsm_bias",     &ps_r_vsm_bias,     0.0f, 0.02f);
+    CMD4(CCC_Float,   "r_vsm_bias_dyn", &ps_r_vsm_bias_dyn, 0.0f, 0.02f);
+    CMD4(CCC_Integer, "r_vsm_grass_static", &ps_r_vsm_grass_static, 0, 1);   // far-grass static-cache hybrid (0 = all-dynamic L0..L2)
     CMD4(CCC_Integer, "r_vsm_temporal", &ps_r_vsm_temporal, 0, 1);
     CMD4(CCC_Float,   "r_vsm_ta_blend", &ps_r_vsm_ta_blend, 0.0f, 0.98f);
     CMD4(CCC_Float,   "r_vsm_ta_blend_dyn", &ps_r_vsm_ta_blend_dyn, 0.0f, 0.98f);
+    CMD4(CCC_Float,   "r_vsm_ta_clamp",        &ps_r_vsm_ta_clamp,        0.0f, 1.0f);   // (1) history clamp tol (0 = off)
+    CMD4(CCC_Float,   "r_vsm_ta_motion",       &ps_r_vsm_ta_motion,       0.5f, 64.0f);  // (2) px of reproj motion to reach the floor
+    CMD4(CCC_Float,   "r_vsm_ta_motion_floor", &ps_r_vsm_ta_motion_floor, 0.0f, 0.98f);  // (2) history weight at full motion
+    CMD4(CCC_Float,   "r_vsm_ta_blend_dlss",   &ps_r_vsm_ta_blend_dlss,   0.0f, 1.0f);   // (3) history-weight scale when r_dlss on
     CMD4(CCC_Integer, "r_vsm_grass",      &ps_r_vsm_grass,      0, 1);
     CMD4(CCC_Float,   "r_vsm_grass_dist", &ps_r_vsm_grass_dist, 4.0f, 48.0f);
+    CMD4(CCC_Integer, "r_vsm_tree_vrs",   &ps_r_vsm_tree_vrs,   0, 1);   // 2x2 coarse crown-shadow shading (A/B; parked — no gain)
+    CMD4(CCC_Integer, "r_vsm_cadence",    &ps_r_vsm_cadence,    0, 4);   // DYN pass update every Nth frame (0/1 = off; 2-3 ≈ 30-45Hz); static+sun always live
+    CMD4(CCC_Float,   "r_vsm_cadence_still", &ps_r_vsm_cadence_still, 0.0f, 1.0f);   // dyn-skip only when cam moved < this (m/frame); moving = full-rate (no flicker)
+    CMD4(CCC_Float,   "r_vsm_cadence_sun",   &ps_r_vsm_cadence_sun,   0.0f, 45.0f);  // force dyn update when sun rotated > this (deg) since last update (env-step flicker fix)
     CMD4(CCC_Float,   "r_vsm_npc_dist",   &ps_r_vsm_npc_dist,   0.0f, 500.0f);
     CMD4(CCC_Float,   "r_vsm_lod_dist",   &ps_r_vsm_lod_dist,   0.0f, 500.0f);
     CMD4(CCC_Integer, "r_vsm_mark_half",  &ps_r_vsm_mark_half,  0, 1);
     CMD4(CCC_Integer, "r_vsm_dyn_gate",   &ps_r_vsm_dyn_gate,   0, 1);
-    CMD4(CCC_Integer, "r_vsm_debug_dyn",  &ps_r_vsm_debug_dyn,  0, 1);   // red overlay: dyn-atlas (NPC/grass) shadows
+    CMD4(CCC_Integer, "r_vsm_debug_dyn",  &ps_r_vsm_debug_dyn,  0, 3);   // red overlay: dyn-atlas (NPC/grass) shadows; 2 = RAW occlusion (no static/orientation gate); 3 = PRESENCE (any dyn depth, no z-test)
     CMD4(CCC_Integer, "r_vsm_cache",      &ps_r_vsm_cache,      0, 1);
     CMD4(CCC_Integer, "r_vsm_cache_refresh", &ps_r_vsm_cache_refresh, 1, 64);
+    CMD4(CCC_Integer, "r_vsm_throttle",        &ps_r_vsm_throttle, 0, 1);                 // cost-feedback LOD bias (A/B)
+    CMD4(CCC_Float,   "r_vsm_throttle_budget", &ps_r_vsm_throttle_budget, 0.5f, 20.0f);   // target VSMrender ms
+    CMD4(CCC_Float,   "r_vsm_throttle_max",    &ps_r_vsm_throttle_max, 0.0f, 4.0f);       // max bias (clipmap levels)
+    CMD4(CCC_Integer, "r_vsm_dirty_budget",    &ps_r_vsm_dirty_budget, 0, 4096);          // wrong-tile pages/frame, 0 = off (A/B)
+    CMD4(CCC_Integer, "r_vsm_rmask",           &ps_r_vsm_rmask, 0, 1);                    // receiver-mask sub-page cull (A/B)
+    CMD4(CCC_Integer, "r_vsm_gaze",            &ps_r_vsm_gaze, 0, 1);                     // gaze refresh: looked-at pages re-render ∝ footprint (A/B)
+    CMD4(CCC_Integer, "r_vsm_gaze_pages",      &ps_r_vsm_gaze_pages, 0, 1024);            // gaze budget, pages/frame
+    CMD4(CCC_Integer, "r_vsm_gaze_px",         &ps_r_vsm_gaze_px, 64, 65536);             // mark samples for every-frame tier
 
     // GPU-driven world forward pass (vk_world_gpu) — A/B with r_gpu_world 0.
     CMD4(CCC_Integer, "r_gpu_world", &ps_r_gpu_world, 0, 1);
+    // Cluster-granularity world cull (Phase 1 of the cluster-LOD system) —
+    // takes effect on level (re)load. r_cluster_tris = min mesh size to split.
+    CMD4(CCC_Integer, "r_cluster",      &ps_r_cluster,      0, 1);
+    CMD4(CCC_Integer, "r_cluster_tris", &ps_r_cluster_tris, 128, 65536);
+    // Cluster DAG LOD (Phase 2): px error threshold (live) + debug view (live).
+    CMD4(CCC_Float,   "r_cluster_lod",   &ps_r_cluster_lod,   0.05f, 64.0f);
+    CMD4(CCC_Integer, "r_cluster_debug", &ps_r_cluster_debug, 0, 4);   // 3 = path view (red plain / green per-mesh / blue component), 4 = LOD health (red = can never coarsen)
+    CMD4(CCC_Float,   "r_cluster_fade",  &ps_r_cluster_fade,  0.0f, 1.0f);
+    // Phase 2.5: merge touching solid fragments into one DAG (level reload).
+    CMD4(CCC_Integer, "r_cluster_merge", &ps_r_cluster_merge, 0, 1);
+    // Phase 3: cluster-LOD shadow casters (live gates) + LOD budget in target
+    // texels (live; VSM invalidates its static cache on change).
+    CMD4(CCC_Integer, "r_shadow_cluster",  &ps_r_shadow_cluster,  0, 1);
+    // Alpha-tested casters via the cluster shadow indirect path (live A/B).
+    CMD4(CCC_Integer, "r_gpu_shadows_at",  &ps_r_gpu_shadows_at,  0, 1);
+    // Alpha-tested statics into the VSM static atlas (live A/B; cache reset on flip).
+    CMD4(CCC_Integer, "r_vsm_at",          &ps_r_vsm_at,          0, 1);
+    CMD4(CCC_Integer, "r_vsm_cluster",     &ps_r_vsm_cluster,     0, 1);
+    CMD4(CCC_Float,   "r_vsm_cluster_lod", &ps_r_vsm_cluster_lod, 0.1f, 16.0f);
 
     // Clustered forward / Forward+ (vk_clustered) — A/B with r_clustered 0.
     // r_clustered_debug 1 = per-cluster light-count heatmap on the world.
     CMD4(CCC_Integer, "r_clustered",       &ps_r_clustered,       0, 1);
     CMD4(CCC_Integer, "r_clustered_debug", &ps_r_clustered_debug, 0, 1);
+    // Framegraph: coalesce the SSAO/VRS/VSM depth-read round-trips into one (A/B with 0).
+    CMD4(CCC_Integer, "r_fg_coalesce",     &ps_r_fg_coalesce,     0, 1);
+    // Async compute: run compute on a dedicated queue overlapping graphics (vk_async).
+    CMD4(CCC_Integer, "r_async",           &ps_r_async,           0, 1);
+    // Sky specular IBL (vk_ibl): prefiltered sky reflections + sun GGX glint.
+    CMD4(CCC_Integer, "r_ibl",             &ps_r_ibl,             0, 1);
+    CMD4(CCC_Float,   "r_ibl_spec",        &ps_r_ibl_spec,        0.f, 4.f);
+    CMD4(CCC_Integer, "r_ibl_debug",       &ps_r_ibl_debug,       0, 1);
 
     // Hi-Z occlusion cull of the GPU-driven static color pass (vk_world_gpu).
     CMD4(CCC_Integer, "r_hzb_cull", &ps_r_hzb_cull, 0, 1);
+
+    // GPU-driven LOD imposters (vk_LODManager): 0 = CPU walk (A/B).
+    CMD4(CCC_Integer, "r_lods_gpu", &ps_r_lods_gpu, 0, 1);
 
     // Froxel volumetric lighting (vk_volumetrics) — P1: sun god rays + depth fog.
     CMD4(CCC_Integer, "r_vol",           &ps_r_vol,           0, 1);
@@ -1454,10 +2209,20 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vol_height",    &ps_r_vol_height,    0.0f, 2.0f);
     CMD4(CCC_Float,   "r_vol_g",         &ps_r_vol_g,         0.0f, 0.95f);
     CMD4(CCC_Float,   "r_vol_intensity", &ps_r_vol_intensity, 0.0f, 8.0f);
+    // Atmospheric scattering (r_atmo) — Rayleigh/Mie aerial perspective (needs r_vol).
+    CMD4(CCC_Integer, "r_atmo",          &ps_r_atmo,          0, 1);
+    CMD4(CCC_Float,   "r_atmo_rayleigh", &ps_r_atmo_rayleigh, 0.0f, 8.0f);
+    CMD4(CCC_Float,   "r_atmo_mie",      &ps_r_atmo_mie,      0.0f, 8.0f);
+    CMD4(CCC_Float,   "r_atmo_mie_g",    &ps_r_atmo_mie_g,    0.0f, 0.95f);
+    // Auto-exposure temporal adaptation (eye adaptation) — seconds; 0 = instant.
+    CMD4(CCC_Float,   "r_exp_adapt",     &ps_r_exp_adapt,     0.0f, 5.0f);
     CMD4(CCC_Float,   "r_vol_amb",       &ps_r_vol_amb,       0.0f, 1.0f);
+    CMD4(CCC_Float,   "r_vol_ambient",   &ps_r_vol_ambient,   0.0f, 4.0f);   // fog sky-fill tint scale (lower = darker night air; was tied to r_ambient_floor)
     CMD4(CCC_Float,   "r_vol_indoor",    &ps_r_vol_indoor,    0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_sun",       &ps_r_vol_sun,       0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_lights",    &ps_r_vol_lights,    0.0f, 16.0f);
+    CMD4(CCC_Float,   "r_vol_lights_g",  &ps_r_vol_lights_g,  0.0f, 0.95f);   // local-light forward scatter (torch-into-camera glare; sep. from sun r_vol_g)
+    CMD4(CCC_Float,   "r_torch_vol",     &ps_r_torch_vol,     0.0f, 8.0f);    // fog shaft strength for handheld torches only (fixtures keep the ×3 lamp boost)
     CMD4(CCC_Float,   "r_vol_smoke",     &ps_r_vol_smoke,     0.0f, 16.0f);
     CMD4(CCC_Float,   "r_vol_smoke_clamp", &ps_r_vol_smoke_clamp, 0.0f, 64.0f);
     CMD4(CCC_Float,   "r_vol_smoke_inject",  &ps_r_vol_smoke_inject,  0.0f, 16.0f);
@@ -1495,14 +2260,20 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_pom_normal", &ps_r_pom_normal, 0.f, 4.f);
     CMD4(CCC_Float, "r_pom_shadow", &ps_r_pom_shadow, 0.f, 3.f);
     CMD4(CCC_Float, "r_pom_ao", &ps_r_pom_ao, 0.f, 3.f);
-    CMD4(CCC_Integer, "r_pom_debug", &ps_r_pom_debug, 0, 1);
+    CMD4(CCC_Integer, "r_pom_debug", &ps_r_pom_debug, 0, 2);    // 1 = AO x shadow, 2 = self-shadow only
     CMD4(CCC_Integer, "r_ao_flat", &ps_r_ao_flat, 0, 1);   // debug: kill ALL ambient occlusion (incl. baked lmap)
+    CMD4(CCC_Integer, "r_shade_debug", &ps_r_shade_debug, 0, 10);   // debug: isolate lighting components (see ps_r_shade_debug)
     CMD4(CCC_Float, "r_pom_ceil", &ps_r_pom_ceil, 0.f, 1.f);     // POM strength on ceilings (down-facing)
     CMD4(CCC_Float, "r_pom_floor", &ps_r_pom_floor, 0.f, 1.f);   // POM strength on floors (up-facing)
     CMD4(CCC_Integer, "r_pom_terrain", &ps_r_pom_terrain, 0, 1); // terrain POM (experimental, default off)
+    CMD4(CCC_Float,   "r_pom_zoff", &ps_r_pom_zoff, 0.f, 3.f);   // terrain POM depth offset (SSFX; 1 = 0.11 m sink)
+    CMD4(CCC_Integer, "r_terra_cache", &ps_r_terra_cache, 0, 1); // terrain composite cache (1 march vs 4; perf)
+    CMD4(CCC_Integer, "r_terra_cone", &ps_r_terra_cone, 0, 1);   // cone-step march on the cache (vs fixed layers)
+    CMD4(CCC_Float, "r_terra_blend", &ps_r_terra_blend, 0.f, 1.f); // detail blend: 0 = GAMMA soft mask, 0.25 = sharp height-blend
+    CMD4(CCC_Integer, "r_terra_horizon", &ps_r_terra_horizon, 0, 1); // baked sun-horizon self-shadow (vs 8-tap march)
     CMD4(CCC_Float, "r_terrain_normal", &ps_r_terrain_normal, 0.f, 3.f); // terrain detail normal-mapping strength
     CMD4(CCC_Float, "r_terrain_ao", &ps_r_terrain_ao, 0.f, 1.f);         // terrain micro contact AO strength
-    CMD4(CCC_Integer, "r_terrain_debug", &ps_r_terrain_debug, 0, 4);     // 0 off,1 normal,2 AO,3 height,4 mud deform field
+    CMD4(CCC_Integer, "r_terrain_debug", &ps_r_terrain_debug, 0, 9);     // ...5 beam directLit,6 beam mask,7 beam gap(red),8 ground-deposit sampled in-scatter,9 deposit gate(red)/inscat(green)
     CMD4(CCC_Float, "r_terrain_gloss", &ps_r_terrain_gloss, 0.f, 2.f);   // terrain dry sun-gloss strength
     CMD4(CCC_Integer, "r_puddle_debug", &ps_r_puddle_debug, 0, 2);       // 0 off, 1 coverage, 2 micro-height/flow
     CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS puddles (default puddle source)
@@ -1675,8 +2446,26 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "ssfx_gamma", &ps_r2_img_gamma, 0.5f, 1.5f);
     CMD4(CCC_Float, "ssfx_saturation", &ps_r2_img_saturation, 0.5f, 1.5f);
 
-#pragma todo("Simp: В общем эта настройка работает, но надо убирать мипмапы у текстур ui. Да и заметного влияния на fps я не вижу.")
-    //CMD4(CCC_Integer, "texture_lod", &psTextureLOD, 0, 2);
+    // Texture quality slider — reinstated for the Vulkan streamer. Skips the top N
+    // mips of WORLD/MODEL diffuse at load (UI/detail/lmap/terrain stay full-res). Each
+    // step ≈ −75% of that texture's VRAM. Live: takes effect on the next level load
+    // (already-resident textures keep their mips until reloaded / streamed).
+    CMD4(CCC_Integer, "texture_lod", &psTextureLOD, 0, 3);
+
+    // Texture streamer knobs (see globals above).
+    CMD4(CCC_Integer, "r_txstream",          &ps_r_txstream,          0, 1);
+    CMD4(CCC_Integer, "r_txstream_budget",   &ps_r_txstream_budget,   0, 16384);
+    CMD4(CCC_Integer, "r_txstream_headroom", &ps_r_txstream_headroom, 0, 4096);
+    CMD4(CCC_Integer, "r_txstream_reserve",  &ps_r_txstream_reserve,  0, 8192);
+    CMD1(CCC_VideoMemoryStats, "r_txstream_stats");
+    CMD1(CCC_VramDump,         "r_vram_dump");
+
+    // Cluster-LOD page streaming (Stage B; read at level load).
+    CMD4(CCC_Integer, "r_clpage",        &ps_r_clpage,        0, 1);
+    CMD4(CCC_Integer, "r_clpage_budget", &ps_r_clpage_budget, 32, 4096);
+    CMD4(CCC_Integer, "r_cl_audit",      &ps_r_cl_audit,      0, 1);
+    CMD4(CCC_Integer, "r_pool_compact",  &ps_r_pool_compact,  0, 1);
+    CMD4(CCC_Integer, "r_compose",       &ps_r_compose,       0, 25);
 
     CMD1(CCC_PART_Export, "particles_export");
     CMD1(CCC_PART_Import, "particles_import");

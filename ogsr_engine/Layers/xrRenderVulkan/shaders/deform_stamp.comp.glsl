@@ -1,46 +1,38 @@
 #version 450
-// xrRenderVulkan - SNOW deform texture: stamp / decay / reproject (compute).
+// xrRenderVulkan - SNOW/MUD deform texture: stamp / decay (compute, TOROIDAL in-place).
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
 // SPDX-License-Identifier: MIT
 //
-// A PERSISTENT, player-centred top-down compression field. SIGNED R16F: + = pressed
-// DOWN (foot dent), − = pushed UP (the displaced-snow BERM around it). Each frame:
-// reproject the previous field (box follows the camera), decay toward 0, then stamp this
-// frame's contacts (feet + landed items). Stamps come from a BUFFER (no push-constant
-// count cap, so many NPCs all print). Each stamp is GROUND-GATED against the actual
-// terrain height (rain map) so a lifted foot / airborne item doesn't stamp. A
-// DIRECTIONAL berm (bigger ahead of movement) models snow plowed forward. Read by
-// snow_displace.glsl + the snow mesh.
+// A PERSISTENT top-down compression field, WORLD-ANCHORED (toroidal). SIGNED R16F:
+// + = pressed DOWN (foot dent), − = pushed UP (the displaced-snow BERM around it).
+// Each texel maps to a fixed WORLD XZ (mod kWorld) — so a print stays put in the world
+// and NO per-frame reprojection is needed (that was the camera-centred design's cost).
+// As the camera moves, only the thin leading strip of texels whose world identity just
+// flipped (scrolled in from kWorld away) is CLEARED; everything else just decays toward
+// 0. The whole thing runs IN PLACE on one image (imageLoad -> imageStore), so the old
+// scratch + 8 MB copy-back is gone too. Stamps come from a BUFFER (no push-constant
+// count cap, so many NPCs all print) and are GROUND-GATED against the terrain height
+// (rain map) so a lifted foot / airborne item doesn't stamp. A DIRECTIONAL berm (bigger
+// ahead of movement) models material plowed forward. Sampled by snow_displace.glsl
+// (SnowDeformPress: uv = worldXZ / kWorld, REPEAT wrap, windowed to ±kHalf of the eye).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(push_constant) uniform PC {
-    mat4 curInvVP;    // cell ndc -> world (current)
-    mat4 prevVP;      // world -> previous ndc (reproject)
     mat4 rainVP;      // world -> rain ndc (terrain-height gate)
-    vec4 p0;          // x=N, y=decay (dt/life), z=hasPrev, w=stampCount
+    vec4 p0;          // x=kSize, y=decay (dt/life), z=kWorld (m), w=stampCount
     vec4 p1;          // xy=movement dir (world XZ), z=berm max (frac), w=ground gate (m)
-    vec4 p2;          // x=rain eyeY, y=rain zRange, z/w unused
+    vec4 p2;          // x=rain eyeY, y=rain zRange, z=rough, w=unused
+    vec4 p3;          // xy=cam window min (camXZ-kHalf), zw=prev cam window min
 } pc;
 
-layout(set = 0, binding = 0) uniform sampler2D uPrev;                 // previous press field
-layout(set = 0, binding = 1, r16f) writeonly uniform image2D uOut;    // new press field (scratch)
+layout(set = 0, binding = 0, r16f) uniform image2D uField;            // press field (read+write, in place)
 layout(set = 0, binding = 2) uniform Stamps {
     vec4 sPos[64];   // xyz = world pos, w = radius (m)
     vec4 sPar[64];   // x = press strength (1 foot .. ~0.34 item), yz = facing (boot dir; 0,0 = round)
 };
 layout(set = 0, binding = 3) uniform sampler2D uRain;                 // terrain height (rain ortho depth)
 
-vec2 cellWorldXZ(vec2 uv) {
-    vec2 ndc = vec2(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
-    vec4 w   = pc.curInvVP * vec4(ndc, 0.0, 1.0);
-    return w.xz / w.w;
-}
-vec2 toPrevUV(vec2 wxz) {
-    vec4 c = pc.prevVP * vec4(wxz.x, 0.0, wxz.y, 1.0);
-    vec2 p = c.xy / c.w * 0.5 + 0.5; p.y = 1.0 - p.y;
-    return p;
-}
 // Value noise for per-print / per-edge irregularity (so the trail isn't a perfect repeat).
 float cHash(vec2 p) { p = fract(p * vec2(127.1, 311.7)); p += dot(p, p + 34.23); return fract(p.x * p.y); }
 float cNoise(vec2 p) {
@@ -58,19 +50,23 @@ float terrainY(vec2 xz) {
 }
 
 void main() {
-    int N = int(pc.p0.x + 0.5);
+    int   S    = int(pc.p0.x + 0.5);
     ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
-    if (cell.x >= N || cell.y >= N) return;
-    vec2 uv  = (vec2(cell) + 0.5) / float(N);
-    vec2 wxz = cellWorldXZ(uv);
+    if (cell.x >= S || cell.y >= S) return;
 
-    // Reproject previous press (box translated with the camera), decay toward 0.
-    float prev = 0.0;
-    if (pc.p0.z > 0.5) {
-        vec2 p = toPrevUV(wxz);
-        if (all(greaterThanEqual(p, vec2(0.0))) && all(lessThanEqual(p, vec2(1.0))))
-            prev = textureLod(uPrev, p, 0.0).r;
-    }
+    // ---- TOROIDAL texel -> world. A texel encodes a world XZ up to a kWorld period; pick
+    // the representative inside the camera's ±kHalf window. wxz stays FIXED per texel until
+    // the window edge scrolls past it, at which point it jumps by kWorld (= a new world
+    // point rotated in from behind) — that flip is the "entered" test that clears it.
+    const float kWorld = pc.p0.z;
+    vec2 phase  = ((vec2(cell) + 0.5) / pc.p0.x - 0.5) * kWorld;      // world XZ mod kWorld (centred)
+    vec2 camMin = pc.p3.xy;
+    vec2 wxz    = camMin      + mod(phase - camMin,      vec2(kWorld));
+    vec2 wprev  = pc.p3.zw    + mod(phase - pc.p3.zw,    vec2(kWorld));
+    bool entered = (abs(wxz.x - wprev.x) > kWorld * 0.5) || (abs(wxz.y - wprev.y) > kWorld * 0.5);
+
+    // Newly-scrolled-in texels start clean; the rest keep their stored press and decay it.
+    float prev = entered ? 0.0 : imageLoad(uField, cell).r;
     const float dec = pc.p0.y;
     prev = (prev > 0.0) ? max(prev - dec, 0.0) : min(prev + dec, 0.0);
 
@@ -85,15 +81,21 @@ void main() {
     for (int i = 0; i < sc; ++i) {
         vec4  sp = sPos[i];
         float r  = max(sp.w, 0.05);
+        vec2  o = wxz - sp.xz;
+        float d = length(o);
+        // Conservative reach cull BEFORE the noise. rEff <= r*1.4 (worst-case rough/wv), so
+        // nothing beyond r*2.8 can be touched by this stamp. This skips the two cNoise taps
+        // for the ~4M texels outside every stamp — they used to run for ALL texels (the
+        // dominant cost); now only the ~1k texels near a stamp pay them. Output is identical
+        // (the exact rEff*2 reach test still runs below).
+        if (d > r * 2.8) continue;
         // Per-PRINT variation (noise keyed by the stamp position): the whole print is a
         // bit wider/narrower + deeper/shallower + its berm higher/lower -> no ctrl-c look.
         float wv     = cNoise(sp.xz * 0.8);
         float dv     = cNoise(sp.xz * 0.8 + vec2(19.3, 7.1));
         float rEff   = r * mix(1.0, 0.60 + 0.80 * wv, rough);
         float pressV = mix(1.0, 0.55 + 0.85 * dv, rough);
-        vec2  o = wxz - sp.xz;
-        float d = length(o);
-        if (d > rEff * 2.0) continue;                            // out of this stamp's reach
+        if (d > rEff * 2.0) continue;                            // exact reach (after noise)
         if (abs(sp.y - terrainY(sp.xz)) > gate) continue;        // GROUND GATE: skip airborne/lifted
         float press = sPar[i].x * pressV;
         // Per-TEXEL rim wobble (2 octaves -> coarse waviness + fine ragged edge) plus a
@@ -154,5 +156,5 @@ void main() {
         }
     }
     float press = (dent > 0.0) ? dent : berm;
-    imageStore(uOut, cell, vec4(press, 0.0, 0.0, 0.0));
+    imageStore(uField, cell, vec4(press, 0.0, 0.0, 0.0));
 }

@@ -25,15 +25,31 @@ void main()
     if (r == 0xFFFFFFFFu) return;       // gap (shouldn't happen — ranges are dense)
     SpawnRequest sr = spawnReqs[r];
 
+    // program low 31 bits = registry index; bit31 = HUD emitter (muzzle flash).
+    uint pi = sr.program & 0x7FFFFFFFu;
+
+    // ---- #5 per-program alive budget (claim BEFORE the free-list pop) -----
+    // cap = m_MaxParticles × live instances (CPU-computed, in sr.pos.w).
+    // At the cap the birth is dropped — exactly what PAPI does at max_particles.
+    uint cap = floatBitsToUint(sr.pos.w);
+    if (cap != 0u) {
+        uint aprev = atomicAdd(progAlive[pi], 1u);
+        if (aprev >= cap) { atomicAdd(progAlive[pi], uint(-1)); return; }
+    }
+
     // ---- Free-list pop (stack) --------------------------------------------
     // prev = old freeCount; decrement (unsigned wrap). If it was empty (0) or
-    // a concurrent underflow wrapped it past maxParticles, roll back and bail.
+    // a concurrent underflow wrapped it past maxParticles, roll back and bail
+    // (returning the budget claim too).
     uint prev = atomicAdd(counters[0], uint(-1));
-    if (prev == 0u || prev > pc.maxParticles) { atomicAdd(counters[0], 1u); return; }
+    if (prev == 0u || prev > pc.maxParticles) {
+        atomicAdd(counters[0], 1u);
+        if (cap != 0u) atomicAdd(progAlive[pi], uint(-1));
+        return;
+    }
     uint slot = freeList[prev - 1u];
 
     // ---- Sample the Source domains (from this request's program) ----------
-    uint pi = sr.program;
     EmitDesc e = programs[pi].emit;
     uint local = gid - sr.firstSlot;
     uint seed  = sr.seed + local * 9277u + 0x9E3779B9u;
@@ -53,8 +69,10 @@ void main()
     p.colorRGBA = gp_packBGRA(vec4(col, e.sc.x));
     p.rot       = rt.x;
     p.size      = siz.xy;
-    p.defId     = pi;           // particle carries its program for gp_simulate
-    p.flags     = 0u;
+    p.defId     = sr.program;   // low 31 bits = program; bit31 = HUD (draw routing)
+    p.origin_x  = sr.pos.x;     // emitter world origin (for positional force fields)
+    p.origin_y  = sr.pos.y;
+    p.origin_z  = sr.pos.z;
 
     pool[slot] = p;
 }

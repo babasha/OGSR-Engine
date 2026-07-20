@@ -38,3 +38,7 @@
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #define VMA_VULKAN_VERSION           1003000
 #include <vk_mem_alloc.h>
+
+// VRAM attribution wrappers (VK::Vram::*) — in the PCH so every converted
+// vmaCreate/Destroy(Buffer|Image) call site sees the declarations.
+#include "vk_vram_stats.h"

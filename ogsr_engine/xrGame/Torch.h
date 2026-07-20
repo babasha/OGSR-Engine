@@ -23,6 +23,13 @@ protected:
     float m_delta_h;
     Fvector2 m_prev_hp;
     bool m_switched_on;
+    // NPC head-lamp low-pass: the guide bone jitters every frame with the idle
+    // animation, so a bare copy made the projected (grass) shadow tremble as if the
+    // NPC twitched. Smooth the light pos/dir toward the bone (actor uses its own cam
+    // inertia). m_npc_light_valid seeds on first use so there's no start-up lerp.
+    Fvector m_npc_light_pos{};
+    Fvector m_npc_light_dir{};
+    bool    m_npc_light_valid{ false };
     ref_light light_render;
     ref_light light_omni;
 

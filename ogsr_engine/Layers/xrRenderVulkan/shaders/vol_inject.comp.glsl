@@ -40,12 +40,18 @@ layout(set = 0, binding = 0) uniform Vol {
     vec4 prevCamDir;   // xyz prev cam forward, w = prev log2(far/near)
     vec4 temporal;     // xyz = froxel jitter (−0.5..0.5), w = history blend (0 = off)
     mat4 fog_shadow_vp; // r_vol_shadow: dedicated per-frame fog sun-shadow VP
-    vec4 lightParams;  // P2: x = count, y = boost, z = spot-shadowed idx (-1), w = point-shadowed idx (-1)
+    vec4 lightParams;  // P2: x = count, y = boost, z = unused (-1), w = point-shadowed idx (-1)
     VolLight lights[8];
     vec4 noiseParams;  // P3: x = amount, y = scale, z = speed, w = time
-    mat4 spot_vp;      // spot (flashlight) shadow VP
+    // Spot shadow POOL: per-tile VP. A light's tile rides in color.w bits 2+
+    // (tile+1, <<2) — every pooled spot's fog cone is cut by its own tile.
+    mat4 spot_pool_vp[8];
     vec4 smokeParams;  // Stage-1 VMS: x = smoke-inject strength (0 = no injected smoke)
     vec4 light_occ;    // r_light_occ: x = enable, y = bury bias, z = frag-below band, w = strength
+    // Atmospheric scattering (r_atmo): physical Rayleigh (blue) + Mie (forward halo)
+    // in-scatter of the sun → aerial perspective. Appended last (integrate prefix-safe).
+    vec4 atmo;         // x = enable, y = Rayleigh strength, z = Mie strength, w = Mie g
+    vec4 atmoR;        // rgb = Rayleigh scattering tint (blue-heavy), w unused
 } V;
 
 layout(set = 0, binding = 1) uniform sampler2D uShadowNear; // cascade 0
@@ -64,7 +70,7 @@ layout(set = 0, binding = 9) uniform VsmClipmap {
 } vsmC;
 layout(set = 0, binding = 10) uniform sampler2D uFogShadow;  // dedicated per-frame fog sun-shadow
 layout(set = 0, binding = 11) uniform sampler2D   uSpotShadow;  // spot (flashlight) shadow — occlude the fog cone
-layout(set = 0, binding = 12) uniform samplerCube uPointShadow; // point (campfire) shadow cube
+layout(set = 0, binding = 12) uniform samplerCubeArray uPointShadow; // point shadow cube POOL
 layout(set = 0, binding = 13) uniform sampler3D   uSmokeMedia;  // Stage-1 VMS: splatted+resolved smoke (rgb=albedo, a=density)
 
 const float PI = 3.14159265;
@@ -126,8 +132,17 @@ float sampleVSMStatic(vec3 wp)
     vec2 luv; ivec2 page;
     int  L = vsmSelect(lp.xy, vsmC.level, luv, page);
     if (L < 0) return -1.0;                       // outside the clipmap → cascade fallback
-    uint slot = vsmPageTable[vsmPageIndex(L, page)];
-    if (slot >= uint(VSM_MAX_PHYS_S)) return -1.0; // page not resident → cascade fallback
+    // Coarser-level fallback (mirrors vsm_resolve): the throttle LOD bias marks pages
+    // coarser and the dirty budget can unmap one for a frame — walk up before giving
+    // the froxel to the cascade path. Steady state exits on the first iteration.
+    uint slot = VSM_UNMAPPED;
+    for (; L < VSM_LEVELS; ++L) {
+        vec2 t = (lp.xy - vsmC.level[L].xy) / vsmC.level[L].z;
+        page   = clamp(ivec2(floor(t * float(VSM_PAGES_AXIS))), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));
+        slot   = vsmPageTable[vsmPageIndex(L, page)];
+        if (slot < uint(VSM_MAX_PHYS_S)) { luv = t; break; }
+    }
+    if (L >= VSM_LEVELS) return -1.0;              // page not resident → cascade fallback
 
     vec2  pageLocal = luv * float(VSM_PAGES_AXIS) - vec2(page);
     vec2  base  = vec2(float(slot % uint(VSM_ATLAS_W_S)), float(slot / uint(VSM_ATLAS_W_S)));
@@ -228,31 +243,47 @@ float hgPhase(float cosT, float g)
     return (1.0 - g2) / (4.0 * PI * pow(max(d, 1e-4), 1.5));
 }
 
-// Spot (flashlight) shadow — 3x3 PCF, ported from world_lmap.frag. Occludes the fog
-// cone so it stops at walls instead of leaking through.
-float spotShadowF(vec3 wp)
+// Spot shadow POOL — 3x3 PCF in the light's own atlas tile (4x2 of 1024², see
+// shadow_common.glsl), LINEAR-depth compare with a world epsilon. Occludes the
+// fog cone of EVERY pooled spot so beams stop at walls / grass cuts them.
+float spotLinZ(float zndc, float f)
 {
-    vec4 c = V.spot_vp * vec4(wp, 1.0);
+    const float n = 0.5;   // ComputeSpotVPFor near plane
+    return n * f / max(f - zndc * (f - n), 1e-4);
+}
+float spotShadowF(vec3 wp, float range, int tile)
+{
+    vec4 c = V.spot_pool_vp[tile] * vec4(wp, 1.0);
     if (c.w <= 0.0) return 1.0;
     vec3 ndc = c.xyz / c.w;
     vec2 uv = ndc.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.002;
+    float f    = max(range, 1.0);
+    float zRef = spotLinZ(ndc.z, f) - 0.08;
+    const vec2 kTileScale = vec2(0.25, 0.5);
     vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
+    vec2  tBase = vec2(float(tile & 3), float(tile >> 2)) * kTileScale;
+    vec2  tMin  = tBase + texel * 1.5;
+    vec2  tMax  = tBase + kTileScale - texel * 1.5;
+    vec2  auv   = tBase + uv * kTileScale;
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
     for (int x = -1; x <= 1; ++x)
-        sum += (ref <= texture(uSpotShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
+        sum += (zRef <= spotLinZ(texture(uSpotShadow, clamp(auv + vec2(x, y) * texel, tMin, tMax)).r, f)) ? 1.0 : 0.0;
     return sum * (1.0 / 9.0);
 }
-// Point (campfire) cube shadow — 1 tap (ported).
-float pointShadowF(vec3 wp, vec3 lp, float range)
+// Point POOL (cube array) shadow — 1 tap. `cube` = the light's cube-array index.
+float pointShadowF(vec3 wp, vec3 lp, float range, int cube)
 {
+    // LINEAR-depth compare, world epsilon (same fix as the spot pool) — the old
+    // 0.01 NDC bias grew to metres at the range edge and ate far NPC shadows.
     vec3 d = wp - lp;
     float z = max(max(abs(d.x), abs(d.y)), abs(d.z));
-    const float n = 0.1;
-    float refD = range * (z - n) / (max(z, n) * max(range - n, 1e-3));
-    return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
+    const float n = 0.1;                 // kPointNear
+    float f = max(range, 1.0);
+    float zMap = texture(uPointShadow, vec4(d, float(cube))).r;
+    zMap = n * f / max(f - zMap * (f - n), 1e-4);
+    return (z - 0.08 <= zMap) ? 1.0 : 0.0;
 }
 
 // Terrain/static occlusion for an UN-shadowed lamp (r_light_occ) — ported verbatim
@@ -282,8 +313,6 @@ float lightTerrainOcc(vec3 wp, vec3 lpos)
 vec3 localLights(vec3 world, vec3 viewDir)
 {
     int n = int(V.lightParams.x);
-    int spotIdx = int(V.lightParams.z);
-    int pointIdx = int(V.lightParams.w);
     vec3 acc = vec3(0.0);
     for (int i = 0; i < n; ++i) {
         vec3  toL   = V.lights[i].pos.xyz - world;
@@ -303,22 +332,33 @@ vec3 localLights(vec3 world, vec3 viewDir)
         }
         // color.w: bit0 = spot, bit1 = VOLUMETRIC-flagged lamp (R4 shows a beam
         // for these — pole lamps / headlights); boost their in-scatter so the
-        // shaft reads even in light haze.
+        // shaft reads even in light haze. bits 2+ = pool index+1 (spot tile OR
+        // point cube — a light is one or the other, so the bits never collide).
         int   lw    = int(V.lights[i].color.w + 0.5);
-        if ((lw & 1) == 1) {                              // spot cone
+        bool  isSpot = (lw & 1) == 1;
+        if (isSpot) {                                     // spot cone
             float cosCone = V.lights[i].dir.w;
             float d = dot(-Ld, V.lights[i].dir.xyz);
             if (d < cosCone) continue;
             atten *= smoothstep(cosCone, mix(cosCone, 1.0, 0.5), d);
         }
-        if (lw >= 2) atten *= 3.0;                        // volumetric lamp beam boost
-        if (i == spotIdx)        atten *= spotShadowF(world);
-        else if (i == pointIdx)  atten *= pointShadowF(world, V.lights[i].pos.xyz, range);
-        // Un-shadowed OMNI lamp → no leak through roof/floor. SPOTS exempt (matches
-        // light_shade.glsl): a fixture above the emitter (car hood over a headlight)
-        // reads as "buried" in the top-down map and killed the whole beam.
-        else if (V.lights[i].color.w < 0.5) atten *= lightTerrainOcc(world, V.lights[i].pos.xyz);
-        float ph = hgPhase(dot(viewDir, Ld), V.fog.w);    // scatter toward the camera
+        if ((lw & 2) == 2) atten *= 3.0;                  // volumetric lamp beam boost
+        int pool = (lw >> 2) - 1;                         // pool index (bits 2+, idx+1)
+        if (isSpot) {
+            if (pool >= 0) atten *= spotShadowF(world, range, pool);
+        } else if (pool >= 0) {
+            atten *= pointShadowF(world, V.lights[i].pos.xyz, range, pool);   // pooled campfire cube
+        } else {
+            // Un-shadowed OMNI lamp → no leak through roof/floor (matches
+            // light_shade.glsl): the top-down heightfield buries basement lamps.
+            atten *= lightTerrainOcc(world, V.lights[i].pos.xyz);
+        }
+        // Local lights use their OWN anisotropy (lightParams.z), gentler than the
+        // sun's sharp forward peak (V.fog.w) — a torch shone AT the camera would
+        // otherwise spike into a blinding, HDR-desaturated (cold-white) glare.
+        // clamp keeps hgPhase valid if the value ever arrives out of range.
+        float gL = clamp(V.lightParams.z, 0.0, 0.95);
+        float ph = hgPhase(dot(viewDir, Ld), gL);          // scatter toward the camera
         acc += V.lights[i].color.rgb * (atten * ph);
     }
     return acc * V.lightParams.y;                          // r_vol_lights boost
@@ -414,6 +454,21 @@ void main()
     vec3  inscatter  = sunScatter * V.fog2.x * extinction
                      + ambient    * V.fog2.x * ambDens
                      + localL * extinction;
+
+    // Atmospheric scattering (r_atmo): Rayleigh (blue, wavelength-dependent) + Mie
+    // (forward halo toward the sun) in-scatter of the SUN's light along the sightline.
+    // Distant surfaces gain a BLUE veil away from the sun and a WARM halo toward it
+    // (aerial perspective) — and since sun_color is the time-of-day colour, dawn/dusk
+    // read warm automatically. Sun-shadowed (stops at terrain), rides the base air
+    // density so it accumulates with distance through the Z-integration.
+    if (V.atmo.x > 0.0) {
+        float cosT = dot(viewDir, toSun);
+        float pR   = 0.05968310 * (1.0 + cosT * cosT);   // Rayleigh phase 3/(16π)(1+cos²)
+        float pM   = hgPhase(cosT, V.atmo.w);            // Mie forward halo
+        vec3  atmoScatter = V.sun_color.rgb * occ
+                          * (V.atmoR.rgb * (pR * V.atmo.y) + vec3(pM * V.atmo.z));
+        inscatter += atmoScatter * V.fog2.x * extinction;
+    }
 
     // ---- Stage-1 VMS: smoke as participating media. Sample the splatted+resolved
     // smoke media at this froxel (same normalized frustum coords as the fog, so it

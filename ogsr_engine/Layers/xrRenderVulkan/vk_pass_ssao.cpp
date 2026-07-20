@@ -12,9 +12,11 @@
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
+#include "vk_image.h"              // VK::CreateImage2D / CreateImageView
 #include "vk_buffer.h"             // CVulkanBuffer (debug AO readback)
 #include "vk_command_buffer.h"     // CommandManager.GetCurrentFrame()
 #include "vk_fullscreen.h"         // VK::Fullscreen — shared fullscreen pipeline + draw
+#include "vk_profiler.h"           // VK::Prof::NameImage — TEMP VUID-hunt instrumentation
 #include "vk_motionvec.h"          // VK::MotionVec — temporal reprojection of the IL/AO history
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"   // Device camera basis + mProject
@@ -175,22 +177,22 @@ namespace {
         if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
         for (u32 i = 0; i < 2; ++i) {
             if (s_view[i]) { vkDestroyImageView(VulkanHW.m_Device, s_view[i], nullptr); s_view[i] = VK_NULL_HANDLE; }
-            if (s_img[i])  { vmaDestroyImage(VulkanHW.m_Allocator, s_img[i], s_alloc[i]); s_img[i] = VK_NULL_HANDLE; s_alloc[i] = VK_NULL_HANDLE; }
+            if (s_img[i])  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_img[i], s_alloc[i]); s_img[i] = VK_NULL_HANDLE; s_alloc[i] = VK_NULL_HANDLE; }
             s_first[i] = true;
         }
         if (s_normView) { vkDestroyImageView(VulkanHW.m_Device, s_normView, nullptr); s_normView = VK_NULL_HANDLE; }
-        if (s_normImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_normImg, s_normAlloc); s_normImg = VK_NULL_HANDLE; s_normAlloc = VK_NULL_HANDLE; }
+        if (s_normImg)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_normImg, s_normAlloc); s_normImg = VK_NULL_HANDLE; s_normAlloc = VK_NULL_HANDLE; }
         for (u32 i = 0; i < 2; ++i) {
             if (s_ilView[i]) { vkDestroyImageView(VulkanHW.m_Device, s_ilView[i], nullptr); s_ilView[i] = VK_NULL_HANDLE; }
-            if (s_ilImg[i])  { vmaDestroyImage(VulkanHW.m_Allocator, s_ilImg[i], s_ilAlloc[i]); s_ilImg[i] = VK_NULL_HANDLE; s_ilAlloc[i] = VK_NULL_HANDLE; }
+            if (s_ilImg[i])  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_ilImg[i], s_ilAlloc[i]); s_ilImg[i] = VK_NULL_HANDLE; s_ilAlloc[i] = VK_NULL_HANDLE; }
         }
         if (s_prevColorView) { vkDestroyImageView(VulkanHW.m_Device, s_prevColorView, nullptr); s_prevColorView = VK_NULL_HANDLE; }
-        if (s_prevColor)     { vmaDestroyImage(VulkanHW.m_Allocator, s_prevColor, s_prevColorAlloc); s_prevColor = VK_NULL_HANDLE; s_prevColorAlloc = VK_NULL_HANDLE; }
+        if (s_prevColor)     { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_prevColor, s_prevColorAlloc); s_prevColor = VK_NULL_HANDLE; s_prevColorAlloc = VK_NULL_HANDLE; }
         s_prevColorCleared = false;
         if (s_aoHistView) { vkDestroyImageView(VulkanHW.m_Device, s_aoHistView, nullptr); s_aoHistView = VK_NULL_HANDLE; }
-        if (s_aoHist)     { vmaDestroyImage(VulkanHW.m_Allocator, s_aoHist, s_aoHistAlloc); s_aoHist = VK_NULL_HANDLE; s_aoHistAlloc = VK_NULL_HANDLE; }
+        if (s_aoHist)     { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_aoHist, s_aoHistAlloc); s_aoHist = VK_NULL_HANDLE; s_aoHistAlloc = VK_NULL_HANDLE; }
         if (s_ilHistView) { vkDestroyImageView(VulkanHW.m_Device, s_ilHistView, nullptr); s_ilHistView = VK_NULL_HANDLE; }
-        if (s_ilHist)     { vmaDestroyImage(VulkanHW.m_Allocator, s_ilHist, s_ilHistAlloc); s_ilHist = VK_NULL_HANDLE; s_ilHistAlloc = VK_NULL_HANDLE; }
+        if (s_ilHist)     { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_ilHist, s_ilHistAlloc); s_ilHist = VK_NULL_HANDLE; s_ilHistAlloc = VK_NULL_HANDLE; }
         s_histCleared = false; s_histValid = false;
         s_normExtent = {};
         s_extent = {};
@@ -204,163 +206,66 @@ namespace {
             return true;
         DestroyRTs();
         s_extent = want;
+        // AO only (R16F kills R8 contouring; bent normal retired → 4× less bandwidth than the old RGBA16F)
+        const char* const kAoName[2] = { "SSAO.AO0", "SSAO.AO1" };
         for (u32 i = 0; i < 2; ++i) {
-            VkImageCreateInfo ici{};
-            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = VK_FORMAT_R16_SFLOAT;   // AO only (R16F kills R8 contouring; bent normal retired → 4× less bandwidth than the old RGBA16F)
-            ici.extent = { want.width, want.height, 1 };
-            ici.mipLevels = 1; ici.arrayLayers = 1;
-            ici.samples = VK_SAMPLE_COUNT_1_BIT;
-            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // debug readback
-            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VmaAllocationCreateInfo aci{};
-            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_img[i], &s_alloc[i], nullptr) != VK_SUCCESS) {
-                Msg("![VK SSAO] RT %u create failed", i); return false;
-            }
-            VkImageViewCreateInfo vci{};
-            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            vci.image = s_img[i];
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_R16_SFLOAT;
-            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange.levelCount = 1;
-            vci.subresourceRange.layerCount = 1;
-            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_view[i]) != VK_SUCCESS) {
-                Msg("![VK SSAO] view %u create failed", i); return false;
-            }
+            if (!VK::CreateImage2D(VK_FORMAT_R16_SFLOAT, want,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,   // debug readback
+                    s_img[i], s_alloc[i], kAoName[i]))
+                return false;
+            s_view[i] = VK::CreateImageView(s_img[i], VK_FORMAT_R16_SFLOAT);
+            if (s_view[i] == VK_NULL_HANDLE) return false;
         }
         // SSIL ping-pong (half-res RGBA16F, MRT target 1 alongside AO). [0]=final, [1]=raw.
+        const char* const kIlName[2] = { "SSAO.IL0", "SSAO.IL1" };
         for (u32 i = 0; i < 2; ++i) {
-            VkImageCreateInfo ici{};
-            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = kILFormat;
-            ici.extent = { want.width, want.height, 1 };
-            ici.mipLevels = 1; ici.arrayLayers = 1;
-            ici.samples = VK_SAMPLE_COUNT_1_BIT;
-            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // [0] copied into the temporal IL history
-            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VmaAllocationCreateInfo aci{};
-            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_ilImg[i], &s_ilAlloc[i], nullptr) != VK_SUCCESS) {
-                Msg("![VK SSAO] IL RT %u create failed", i); return false;
-            }
-            VkImageViewCreateInfo vci{};
-            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            vci.image = s_ilImg[i];
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = kILFormat;
-            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange.levelCount = 1;
-            vci.subresourceRange.layerCount = 1;
-            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_ilView[i]) != VK_SUCCESS) {
-                Msg("![VK SSAO] IL view %u create failed", i); return false;
-            }
+            if (!VK::CreateImage2D(kILFormat, want,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,   // [0] copied into the temporal IL history
+                    s_ilImg[i], s_ilAlloc[i], kIlName[i]))
+                return false;
+            s_ilView[i] = VK::CreateImageView(s_ilImg[i], kILFormat);
+            if (s_ilView[i] == VK_NULL_HANDLE) return false;
         }
         // Persistent half-res PREV-frame colour (linear HDR) — the IL gather source.
         // blit dst (capture) + sampled (gather). Cleared to black on first Execute.
         {
-            VkImageCreateInfo ici{};
-            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = kILFormat;
-            ici.extent = { want.width, want.height, 1 };
-            ici.mipLevels = 1; ici.arrayLayers = 1;
-            ici.samples = VK_SAMPLE_COUNT_1_BIT;
-            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VmaAllocationCreateInfo aci{};
-            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_prevColor, &s_prevColorAlloc, nullptr) != VK_SUCCESS) {
-                Msg("![VK SSAO] prevColor create failed"); return false;
-            }
-            VkImageViewCreateInfo vci{};
-            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            vci.image = s_prevColor;
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = kILFormat;
-            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange.levelCount = 1;
-            vci.subresourceRange.layerCount = 1;
-            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_prevColorView) != VK_SUCCESS) {
-                Msg("![VK SSAO] prevColor view create failed"); return false;
-            }
+            if (!VK::CreateImage2D(kILFormat, want,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    s_prevColor, s_prevColorAlloc, "SSAO.PrevColor"))
+                return false;
+            s_prevColorView = VK::CreateImageView(s_prevColor, kILFormat);
+            if (s_prevColorView == VK_NULL_HANDLE) return false;
             s_prevColorCleared = false;
         }
         // Temporal history pair (half-res): AO history = R16F (matches s_img[0]),
         // IL history = kILFormat (matches s_ilImg[0]). copy dst (capture the final
         // result) + sampled (reproject next frame). Cleared to black on first Execute.
         {
-            struct { VkImage* img; VmaAllocation* alloc; VkImageView* view; VkFormat fmt; } hist[2] = {
-                { &s_aoHist, &s_aoHistAlloc, &s_aoHistView, VK_FORMAT_R16_SFLOAT },
-                { &s_ilHist, &s_ilHistAlloc, &s_ilHistView, kILFormat },
+            struct { VkImage* img; VmaAllocation* alloc; VkImageView* view; VkFormat fmt; const char* name; } hist[2] = {
+                { &s_aoHist, &s_aoHistAlloc, &s_aoHistView, VK_FORMAT_R16_SFLOAT, "SSAO.AOHist" },
+                { &s_ilHist, &s_ilHistAlloc, &s_ilHistView, kILFormat,            "SSAO.ILHist" },
             };
             for (auto& h : hist) {
-                VkImageCreateInfo ici{};
-                ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-                ici.imageType = VK_IMAGE_TYPE_2D;
-                ici.format = h.fmt;
-                ici.extent = { want.width, want.height, 1 };
-                ici.mipLevels = 1; ici.arrayLayers = 1;
-                ici.samples = VK_SAMPLE_COUNT_1_BIT;
-                ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-                ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-                ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                VmaAllocationCreateInfo aci{};
-                aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-                if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, h.img, h.alloc, nullptr) != VK_SUCCESS) {
-                    Msg("![VK SSAO] temporal history create failed"); return false;
-                }
-                VkImageViewCreateInfo vci{};
-                vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-                vci.image = *h.img;
-                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                vci.format = h.fmt;
-                vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                vci.subresourceRange.levelCount = 1;
-                vci.subresourceRange.layerCount = 1;
-                if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, h.view) != VK_SUCCESS) {
-                    Msg("![VK SSAO] temporal history view create failed"); return false;
-                }
+                if (!VK::CreateImage2D(h.fmt, want,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        *h.img, *h.alloc, h.name))
+                    return false;
+                *h.view = VK::CreateImageView(*h.img, h.fmt);
+                if (*h.view == VK_NULL_HANDLE) return false;
             }
             s_histCleared = false; s_histValid = false;
         }
         // FULL-res NPC normal G-buffer (skinned pass renders into it, GTAO samples it).
         s_normExtent = sceneExtent;
         {
-            VkImageCreateInfo ici{};
-            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            ici.imageType = VK_IMAGE_TYPE_2D;
-            ici.format = kNormalFormat;
-            ici.extent = { sceneExtent.width, sceneExtent.height, 1 };
-            ici.mipLevels = 1; ici.arrayLayers = 1;
-            ici.samples = VK_SAMPLE_COUNT_1_BIT;
-            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VmaAllocationCreateInfo aci{};
-            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-            if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &s_normImg, &s_normAlloc, nullptr) != VK_SUCCESS) {
-                Msg("![VK SSAO] normal RT create failed"); return false;
-            }
-            VkImageViewCreateInfo vci{};
-            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            vci.image = s_normImg;
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = kNormalFormat;
-            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange.levelCount = 1;
-            vci.subresourceRange.layerCount = 1;
-            if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &s_normView) != VK_SUCCESS) {
-                Msg("![VK SSAO] normal view create failed"); return false;
-            }
+            if (!VK::CreateImage2D(kNormalFormat, sceneExtent,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    s_normImg, s_normAlloc, "SSAO.NPCNormal"))
+                return false;
+            s_normView = VK::CreateImageView(s_normImg, kNormalFormat);
+            if (s_normView == VK_NULL_HANDLE) return false;
         }
 
         // Host buffer for the debug readback (R16F = one half per AO texel).

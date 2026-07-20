@@ -65,7 +65,10 @@ CSE_Abstract::CSE_Abstract(LPCSTR caSection)
     m_bALifeControl = false;
     m_wVersion = 0;
     m_script_version = 0;
-    m_tClassID = TEXT2CLSID(pSettings->r_string(caSection, "class"));
+    // Compatibility: foreign spawns (Living Zone / era2) reference sections absent from this
+    // config. F_entity_Create substitutes an inert graph_point for them; here we must avoid the
+    // fatal config read too — default the class id instead of reading the missing section.
+    m_tClassID = pSettings->section_exist(caSection) ? TEXT2CLSID(pSettings->r_string(caSection, "class")) : CLSID_SPACE_RESTRICTOR;
 
     //	m_spawn_probability			= 1.f;
     m_spawn_flags.zero();
@@ -202,6 +205,15 @@ BOOL CSE_Abstract::Spawn_Read(NET_Packet& tNetPacket)
     tNetPacket.r_u16(m_wVersion);
 
     ASSERT_FMT(m_wVersion && m_wVersion >= 118, "Invalid spawn version: [%u]", m_wVersion);
+
+    // Compatibility: non-OGSR (era2/Borscht-edition) spawns write an extra m_gameType u16
+    // right after m_wVersion when SPAWN_VERSION > 120 (e.g. Living Zone, v124/128). OGSR-edition
+    // spawns are v118 and don't have it. Read & discard so foreign spawns parse без сдвига байт.
+    if (m_wVersion > 120)
+    {
+        u16 foreign_game_type;
+        tNetPacket.r_u16(foreign_game_type);
+    }
 
     m_script_version = tNetPacket.r_u16();
 

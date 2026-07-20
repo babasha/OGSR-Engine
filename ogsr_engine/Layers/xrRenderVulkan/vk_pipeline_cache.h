@@ -20,6 +20,36 @@
 namespace VK {
 namespace PipelineCache {
 
+// World uber-FS variant bits (Inc 1). Baked as specialization constants so the
+// driver dead-code-eliminates unused features (POM march, snow, wet, IBL, debug)
+// per pipeline — killing their VGPR pressure, not just their runtime cost. Bit
+// layout MUST match the SpecId decorations in shaders/world_variants.glsl.
+enum WorldSpec : u8
+{
+    WS_POM   = 1u << 0,   // material has a real `#` height (per-material: mat->tessellated)
+    WS_SNOW  = 1u << 1,   // snow accumulation active this frame (frame-global)
+    WS_WET   = 1u << 2,   // rain/wetness active this frame (frame-global)
+    WS_IBL   = 1u << 3,   // sky specular IBL active this frame (frame-global, r_ibl)
+    WS_DEBUG = 1u << 4,   // any r_*_debug view active (frame-global, 0 in normal play)
+    WS_ALL   = WS_POM | WS_SNOW | WS_WET | WS_IBL | WS_DEBUG,   // full uber path (safe default)
+    WS_FRAME = WS_SNOW | WS_WET | WS_IBL | WS_DEBUG,            // the frame-global subset
+};
+
+// Per-frame value of the frame-global variant bits (WS_FRAME subset). Get() ORs
+// this into every world key so callers only supply the per-material POM bit; the
+// terrain pipeline reads it too. Defaults to WS_FRAME (full path) until Pass_World
+// stamps it each frame. Weather/debug flips lazily create + cache new variants.
+void SetFrameSpecMask(u8 mask);
+u8   GetFrameSpecMask();
+
+// Pre-create the WET / SNOW / WET|SNOW variants of every world + terrain pipeline
+// built so far, so the first rain/snowfall doesn't stall compiling them mid-gameplay.
+// INCREMENTAL: the first call snapshots the work list; each call then creates up to
+// `budget` pipelines. Cold-compile of the uber-FS is ~300ms each, so creating all at
+// once froze a whole frame — spread it (budget 1/frame) instead. Returns true while
+// work remains (keep calling); false when the queue is drained.
+bool PrewarmWeatherVariants(u32 budget);
+
 struct Key
 {
     u32             stride       = 0;       // vertex stride in bytes (32 / 36 / 40 / 44)
@@ -39,12 +69,30 @@ struct Key
     // model parts — lamp halos/projector faces): blend (SRC_ALPHA, ONE), depth
     // test but NO write, no bias. The FS goes unlit via the aref == -3 marker.
     bool            emis         = false;
+    // VRS diag (r_vrs_static): bake a hard static 2x2 rate (KEEP/KEEP). In the
+    // key so the cvar can flip mid-game — Get() stamps it, distinct pipelines.
+    bool            vrsStatic    = false;
+    // World uber-FS variant mask (Inc 1). Callers set only the per-material POM bit
+    // (WS_POM); Get() stamps the frame-global bits (WS_FRAME) from SetFrameSpecMask().
+    // Baked into the FS as specialization constants in CreatePipeline. Default WS_ALL
+    // reproduces the monolithic shader (safe for any key that never gets stamped).
+    u8              specMask     = WS_ALL;
+    // Host-driven INSTANCED variant (vk_instance_gpu): adds a second, INSTANCE-rate
+    // vertex binding carrying the model matrix as four vec4 attributes (locations
+    // 6..9), consumed by the INSTANCED shader bodies. Everything else — layout,
+    // descriptor sets, push range, blend/depth state, spec constants — is identical
+    // to the normal world pipeline, which is exactly why this rides PipelineCache
+    // instead of duplicating that state. Kept an explicit key field rather than
+    // inferred from `vs`: the vertex input layout must stay a stated property.
+    bool            instanced    = false;
 
     bool operator==(const Key& o) const noexcept
     {
         return stride == o.stride && tcOffset == o.tcOffset
             && vs == o.vs && fs == o.fs && depthTest == o.depthTest
-            && wmark == o.wmark && tess == o.tess && emis == o.emis;
+            && wmark == o.wmark && tess == o.tess && emis == o.emis
+            && vrsStatic == o.vrsStatic && specMask == o.specMask
+            && instanced == o.instanced;
     }
 };
 
@@ -79,6 +127,16 @@ VkShaderModule WorldLmapVS();
 VkShaderModule WorldLmapFS();
 VkShaderModule WorldVlitVS();
 VkShaderModule WorldVlitFS();
+// Cluster-LOD crossfade variants (r_cluster_fade): fade bits via gl_InstanceIndex
+// + Bayer screen-door discard. Only the GPU-driven world path binds these.
+// Instanced world VS variants (Key::instanced) — VK_NULL_HANDLE when the modules
+// are absent, in which case the host scene stays on the CPU RenderQueue.
+VkShaderModule WorldLmapInstVS();
+VkShaderModule WorldVlitInstVS();
+VkShaderModule WorldLmapFadeVS();
+VkShaderModule WorldLmapFadeFS();
+VkShaderModule WorldVlitFadeVS();
+VkShaderModule WorldVlitFadeFS();
 
 // World heightmap tessellation (R4 TESS_HM): true when the device feature is
 // enabled AND all four world TCS/TES modules loaded. Callers must not build
@@ -109,6 +167,9 @@ VkPipeline       GetTerrainDepthPipeline();
 // missing. The pipelines render into the shadow map's D32 format.
 VkPipelineLayout GetDepthLayout();
 VkPipeline       GetDepthPipeline(u32 stride);
+// Solid depth + crossfade dither FS (cluster-LOD transitions) — same layout/state
+// as GetDepthPipeline; vk_world_gpu::DrawDepth swaps to it when r_cluster_fade > 0.
+VkPipeline       GetDepthFadePipeline(u32 stride);
 
 // Alpha-tested shadow caster variant (bushes, grates): VS passes the base UV,
 // FS samples the material diffuse (set 0 = WorldMaterial set) and discards
@@ -136,6 +197,9 @@ struct hash<VK::PipelineCache::Key>
         h ^= std::hash<bool>{}(k.wmark)               + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(k.tess)                + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(k.emis)                + 0x517cc1b7 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.vrsStatic)           + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<u32>{}(k.specMask)             + 0x85ebca6b + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.instanced)           + 0x27d4eb2f + (h << 6) + (h >> 2);
         return h;
     }
 };

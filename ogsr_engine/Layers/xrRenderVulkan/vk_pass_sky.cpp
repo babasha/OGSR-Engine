@@ -7,6 +7,7 @@
 
 #include "stdafx.h"
 #include "vk_pass_sky.h"
+#include "vk_color_space.h"   // ColorSpace::LinearizeRGB — sky/clouds/sun tints are authored sRGB
 #include "vk_swapchain.h"
 #include "vk_scene_color.h"                // HDR scene target format
 #include "vk_shaders.h"
@@ -22,6 +23,11 @@
 #include <unordered_map>
 #include <string>
 
+// Cloud cvars (declared in vk_console_min.cpp).
+extern int   ps_r_clouds;            // r_clouds — animated cloud layer on/off
+extern float ps_r_clouds_intensity;  // r_clouds_intensity — additive brightness multiplier
+extern float ps_r_clouds_speed;       // r_clouds_speed — UV scroll speed multiplier
+
 namespace VK {
 
 namespace {
@@ -35,20 +41,27 @@ namespace {
     VkDescriptorSetLayout s_SetLayout      = VK_NULL_HANDLE;
     VkDescriptorPool      s_Pool           = VK_NULL_HANDLE;
     VkDescriptorSet       s_Set[kFramesInFlight] = {};  // one per in-flight slot (no in-place rewrite)
-    VkSampler             s_Sampler        = VK_NULL_HANDLE;
+    VkSampler             s_Sampler        = VK_NULL_HANDLE;  // CLAMP — cubemaps (bindings 0,1)
+    VkSampler             s_CloudSampler   = VK_NULL_HANDLE;  // REPEAT — tiling clouds (bindings 2,3)
 
     // Cubemap cache — names are the keys (X-Ray sky_texture_name strings).
     // Lifetime = SkyPass lifetime; freed in Destroy. Lookup is rare so the
     // map cost is negligible.
     std::unordered_map<std::string, CVulkanTexture*> s_CubeCache;
 
-    CVulkanTexture* s_FallbackCube = nullptr;  // 1×1×6 mid-blue
+    // 2D cloud-texture cache — keyed by clouds_texture_name. Same lifetime rules.
+    std::unordered_map<std::string, CVulkanTexture*> s_Tex2DCache;
+
+    CVulkanTexture* s_FallbackCube  = nullptr;  // 1×1×6 mid-blue
+    CVulkanTexture* s_FallbackTex2D = nullptr;  // 1×1 black (no clouds when unbound)
 
     // What each in-flight slot's descriptor set currently holds. Empty = fallback
     // bound to both bindings. A slot is rewritten only when its own names diverge
     // from CEnv, so the GPU never reads a set mid-rewrite (see EnsureCurrentCubes).
     std::string s_BoundName0[kFramesInFlight];
     std::string s_BoundName1[kFramesInFlight];
+    std::string s_BoundCloud0[kFramesInFlight];
+    std::string s_BoundCloud1[kFramesInFlight];
 
     // Push must match shaders/sky.{vert,frag}.glsl exactly. Layout = 4×vec4
     // with manual packing (vec3 + scalar trailing). vec3+float push_constant
@@ -63,8 +76,18 @@ namespace {
         float _pad0;           //  4
         float skyColor[3];     // 12
         float _pad1;           //  4
+        float sunDir[3];       // 12 — sun TRAVEL dir (to-sun = -sunDir), for the sun disk
+        float _pad2;           //  4
+        float sunColor[3];     // 12 — env sun colour (time-of-day)
+        float _pad3;           //  4
+        float cloudsColor[3];  // 12 — clouds_color tint
+        float cloudsWeight;    //  4 — clouds_color.w (intensity / weather cloud weight)
+        float cloudTime;       //  4 — fTimeGlobal/10 * r_clouds_speed (UV scroll)
+        float cloudEnable;     //  4 — r_clouds (0/1)
+        float cloudIntensity;  //  4 — r_clouds_intensity
+        float _pad4;           //  4
     };
-    static_assert(sizeof(SkyPush) == 64, "SkyPush mismatch with GLSL push block");
+    static_assert(sizeof(SkyPush) == 128, "SkyPush mismatch with GLSL push block");
 
     // Resolve sky_texture_name → "$game_textures$\<name>.dds".
     bool ResolveCubePath(const char* name, string_path& out)
@@ -92,6 +115,18 @@ namespace {
         return tex;
     }
 
+    // 1×1 black 2D — bound to the cloud slots when a weather has no cloud
+    // texture (or clouds are disabled). Sampling returns 0 → no cloud added.
+    CVulkanTexture* CreateFallbackTex2D()
+    {
+        auto* tex = xr_new<CVulkanTexture>();
+        tex->Create(1, 1, VK_FORMAT_R8G8B8A8_UNORM, 1);
+        if (!tex->IsValid()) { xr_delete(tex); return nullptr; }
+        const u8 px[4] = { 0, 0, 0, 0 };
+        tex->UploadData(px, sizeof(px));
+        return tex;
+    }
+
     // Load (or fetch from cache) a cubemap by `sky_texture_name`. Returns
     // fallback on miss / failure. Reads are cached so we never hit disk twice
     // for the same sky.
@@ -109,7 +144,10 @@ namespace {
         }
 
         auto* tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDSCubemap(full, /*applyBCSwizzle*/ false)) {
+        // Sky cube is Colour: it is sampled both as the visible sky AND, at a blurred
+        // high mip, as the hemisphere ambient / specular IBL source — so it feeds the
+        // lighting maths directly and must be linear radiance there.
+        if (!tex->LoadDDSCubemap(full, /*applyBCSwizzle*/ false, TexColorSpace::Color)) {
             Msg("![VK Sky] LoadDDSCubemap failed: %s", full);
             xr_delete(tex);
             s_CubeCache.emplace(name, s_FallbackCube);
@@ -121,18 +159,49 @@ namespace {
         return tex;
     }
 
-    void WriteSet(VkDescriptorSet set, VkImageView v0, VkImageView v1)
+    // Load (or fetch from cache) a 2D cloud texture by `clouds_texture_name`.
+    // Returns the black fallback on miss / failure (→ no clouds drawn).
+    CVulkanTexture* LoadOrGet2D(const char* name)
     {
-        VkDescriptorImageInfo ii[2]{};
-        for (int i = 0; i < 2; ++i) {
-            ii[i].sampler     = s_Sampler;
-            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        }
-        ii[0].imageView = v0;
-        ii[1].imageView = v1;
+        if (!name || !name[0]) return s_FallbackTex2D;
+        auto it = s_Tex2DCache.find(name);
+        if (it != s_Tex2DCache.end()) return it->second;
 
-        VkWriteDescriptorSet w[2]{};
-        for (int i = 0; i < 2; ++i) {
+        string_path full;
+        if (!ResolveCubePath(name, full)) {  // same $game_textures$\<name>.dds resolve
+            Msg("![VK Sky] clouds_texture '%s' not found — no clouds", name);
+            s_Tex2DCache.emplace(name, s_FallbackTex2D);  // negative cache
+            return s_FallbackTex2D;
+        }
+
+        auto* tex = xr_new<CVulkanTexture>();
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::UI,
+                          TexColorSpace::Color)) {   // cloud layer albedo
+            Msg("![VK Sky] LoadDDS (clouds) failed: %s", full);
+            xr_delete(tex);
+            s_Tex2DCache.emplace(name, s_FallbackTex2D);
+            return s_FallbackTex2D;
+        }
+
+        Msg("[VK Sky] Loaded clouds: '%s' (%ux%u)", name, tex->GetWidth(), tex->GetHeight());
+        s_Tex2DCache.emplace(name, tex);
+        return tex;
+    }
+
+    // Bindings 0,1 = sky cubemaps (CLAMP sampler); 2,3 = cloud 2D (REPEAT sampler).
+    void WriteSet(VkDescriptorSet set, VkImageView sky0, VkImageView sky1,
+                  VkImageView cloud0, VkImageView cloud1)
+    {
+        const VkImageView views[4]    = { sky0, sky1, cloud0, cloud1 };
+        const VkSampler    samplers[4] = { s_Sampler, s_Sampler, s_CloudSampler, s_CloudSampler };
+
+        VkDescriptorImageInfo ii[4]{};
+        VkWriteDescriptorSet  w[4]{};
+        for (int i = 0; i < 4; ++i) {
+            ii[i].sampler     = samplers[i];
+            ii[i].imageView   = views[i];
+            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
             w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet          = set;
             w[i].dstBinding      = i;
@@ -140,7 +209,7 @@ namespace {
             w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[i].pImageInfo      = &ii[i];
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
     }
 
     // Fetch [name0, name1] for the active weather interval. Empty strings
@@ -157,17 +226,37 @@ namespace {
             *outName1 = env.Current[1]->sky_texture_name.c_str();
     }
 
+    // Fetch [cloud0, cloud1] for the active weather interval. Empty when env
+    // hasn't populated (or a weather with no cloud texture).
+    void GetCurrentCloudNames(const char** outName0, const char** outName1)
+    {
+        *outName0 = nullptr;
+        *outName1 = nullptr;
+        if (!g_pGamePersistent) return;
+        auto& env = g_pGamePersistent->Environment();
+        if (env.Current[0] && env.Current[0]->clouds_texture_name.size() > 0)
+            *outName0 = env.Current[0]->clouds_texture_name.c_str();
+        if (env.Current[1] && env.Current[1]->clouds_texture_name.size() > 0)
+            *outName1 = env.Current[1]->clouds_texture_name.c_str();
+    }
+
     void EnsureCurrentCubes(u32 slot)
     {
         const char* n0 = nullptr;
         const char* n1 = nullptr;
         GetCurrentSkyNames(&n0, &n1);
+        const char* cn0 = nullptr;
+        const char* cn1 = nullptr;
+        GetCurrentCloudNames(&cn0, &cn1);
 
         // Treat null/empty as "keep current". On the very first call before
-        // env is up we leave the fallback bound (s_BoundName*[slot] are empty).
+        // env is up we leave the fallback bound (s_Bound*[slot] are empty).
         const std::string newN0 = n0 ? std::string(n0) : s_BoundName0[slot];
         const std::string newN1 = n1 ? std::string(n1) : s_BoundName1[slot];
-        if (newN0 == s_BoundName0[slot] && newN1 == s_BoundName1[slot]) return;
+        const std::string newC0 = cn0 ? std::string(cn0) : s_BoundCloud0[slot];
+        const std::string newC1 = cn1 ? std::string(cn1) : s_BoundCloud1[slot];
+        if (newN0 == s_BoundName0[slot] && newN1 == s_BoundName1[slot] &&
+            newC0 == s_BoundCloud0[slot] && newC1 == s_BoundCloud1[slot]) return;
 
         // No vkDeviceWaitIdle: WaitForFence(slot) in CRender::Begin already proved
         // the GPU finished the previous frame that used s_Set[slot], so rewriting
@@ -180,9 +269,16 @@ namespace {
         if (!t0) t0 = s_FallbackCube;
         if (!t1) t1 = t0;
 
-        WriteSet(s_Set[slot], t0->GetView(), t1->GetView());
-        s_BoundName0[slot] = newN0;
-        s_BoundName1[slot] = newN1;
+        CVulkanTexture* ct0 = cn0 ? LoadOrGet2D(cn0) : s_FallbackTex2D;
+        CVulkanTexture* ct1 = cn1 ? LoadOrGet2D(cn1) : ct0;
+        if (!ct0) ct0 = s_FallbackTex2D;
+        if (!ct1) ct1 = ct0;
+
+        WriteSet(s_Set[slot], t0->GetView(), t1->GetView(), ct0->GetView(), ct1->GetView());
+        s_BoundName0[slot]  = newN0;
+        s_BoundName1[slot]  = newN1;
+        s_BoundCloud0[slot] = newC0;
+        s_BoundCloud1[slot] = newC1;
     }
 }
 
@@ -226,10 +322,10 @@ bool Init()
         return false;
     }
 
-    // Set 0: bindings 0+1 — two combined image samplers (cubemaps), FS only.
+    // Set 0: bindings 0+1 = sky cubemaps, 2+3 = cloud 2D textures. FS only.
     {
-        VkDescriptorSetLayoutBinding b[2]{};
-        for (int i = 0; i < 2; ++i) {
+        VkDescriptorSetLayoutBinding b[4]{};
+        for (int i = 0; i < 4; ++i) {
             b[i].binding         = i;
             b[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             b[i].descriptorCount = 1;
@@ -237,7 +333,7 @@ bool Init()
         }
         VkDescriptorSetLayoutCreateInfo lci{};
         lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        lci.bindingCount = 2;
+        lci.bindingCount = 4;
         lci.pBindings    = b;
         if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
             Msg("![VK Sky] CreateDescriptorSetLayout failed");
@@ -248,7 +344,7 @@ bool Init()
     {
         VkDescriptorPoolSize ps{};
         ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ps.descriptorCount = 2 * kFramesInFlight;  // 2 bindings × FRAMES_IN_FLIGHT sets
+        ps.descriptorCount = 4 * kFramesInFlight;  // 4 bindings × FRAMES_IN_FLIGHT sets
 
         VkDescriptorPoolCreateInfo pci{};
         pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -290,6 +386,15 @@ bool Init()
             Msg("![VK Sky] CreateSampler failed");
             return false;
         }
+
+        // Cloud sampler — REPEAT so the scrolling cloud UVs tile seamlessly.
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        if (vkCreateSampler(VulkanHW.m_Device, &si, nullptr, &s_CloudSampler) != VK_SUCCESS) {
+            Msg("![VK Sky] CreateSampler (clouds) failed");
+            return false;
+        }
     }
 
     s_FallbackCube = CreateFallbackCube();
@@ -297,8 +402,14 @@ bool Init()
         Msg("![VK Sky] Failed to create fallback cubemap");
         return false;
     }
+    s_FallbackTex2D = CreateFallbackTex2D();
+    if (!s_FallbackTex2D) {
+        Msg("![VK Sky] Failed to create fallback 2D texture");
+        return false;
+    }
     for (u32 i = 0; i < kFramesInFlight; ++i)
-        WriteSet(s_Set[i], s_FallbackCube->GetView(), s_FallbackCube->GetView());
+        WriteSet(s_Set[i], s_FallbackCube->GetView(), s_FallbackCube->GetView(),
+                 s_FallbackTex2D->GetView(), s_FallbackTex2D->GetView());
 
     // Pipeline layout — set 0 + push range, VS|FS (push struct is shared).
     VkPushConstantRange pc{};
@@ -413,14 +524,28 @@ void Destroy()
         }
     }
     s_CubeCache.clear();
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_BoundName0[i].clear(); s_BoundName1[i].clear(); }
 
-    if (s_FallbackCube) { s_FallbackCube->Destroy(); xr_delete(s_FallbackCube); }
+    for (auto& kv : s_Tex2DCache) {
+        if (kv.second && kv.second != s_FallbackTex2D) {
+            kv.second->Destroy();
+            xr_delete(kv.second);
+        }
+    }
+    s_Tex2DCache.clear();
+
+    for (u32 i = 0; i < kFramesInFlight; ++i) {
+        s_BoundName0[i].clear();  s_BoundName1[i].clear();
+        s_BoundCloud0[i].clear(); s_BoundCloud1[i].clear();
+    }
+
+    if (s_FallbackCube)  { s_FallbackCube->Destroy();  xr_delete(s_FallbackCube); }
+    if (s_FallbackTex2D) { s_FallbackTex2D->Destroy(); xr_delete(s_FallbackTex2D); }
 
     if (s_Pipeline)       { vkDestroyPipeline(VulkanHW.m_Device, s_Pipeline, nullptr);             s_Pipeline = VK_NULL_HANDLE; }
     if (s_PipelineLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_PipelineLayout, nullptr); s_PipelineLayout = VK_NULL_HANDLE; }
     if (s_Pool)           { vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr);            s_Pool = VK_NULL_HANDLE; }
     if (s_Sampler)        { vkDestroySampler(VulkanHW.m_Device, s_Sampler, nullptr);                s_Sampler = VK_NULL_HANDLE; }
+    if (s_CloudSampler)   { vkDestroySampler(VulkanHW.m_Device, s_CloudSampler, nullptr);           s_CloudSampler = VK_NULL_HANDLE; }
     if (s_SetLayout)      { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_SetLayout, nullptr);  s_SetLayout = VK_NULL_HANDLE; }
     s_VS = VK_NULL_HANDLE;
     s_FS = VK_NULL_HANDLE;
@@ -513,6 +638,30 @@ void Pass_Sky(FrameContext& ctx)
     push.skyColor[0]   = 1.0f;
     push.skyColor[1]   = 1.0f;
     push.skyColor[2]   = 1.0f;
+    // Sun disk defaults: pointing down, colour black (no disk) until env is up.
+    push.sunDir[0] = 0.0f; push.sunDir[1] = -1.0f; push.sunDir[2] = 0.0f;
+    push.sunColor[0] = push.sunColor[1] = push.sunColor[2] = 0.0f;
+    push._pad2 = push._pad3 = push._pad4 = 0.0f;
+
+    // Cloud defaults: no clouds until env is up. Time = fTimeGlobal/10 (matches
+    // R4 timers.z) scaled by r_clouds_speed; the shader multiplies by the
+    // per-layer CLOUD_SPEED constants.
+    push.cloudsColor[0] = push.cloudsColor[1] = push.cloudsColor[2] = 0.0f;
+    push.cloudsWeight   = 0.0f;
+    push.cloudTime      = Device.fTimeGlobal * 0.1f * ps_r_clouds_speed;
+    push.cloudEnable    = ps_r_clouds ? 1.0f : 0.0f;
+    push.cloudIntensity = ps_r_clouds_intensity;
+    // Sun DISK direction/colour are LATCHED against sudden jumps: a thunderbolt
+    // momentarily hijacks the env sun_dir/sun_color (the lightning flash is driven
+    // as a directional light), which would teleport the disk. The real sun drifts
+    // only fractions of a degree per frame, so reject any large frame-to-frame jump
+    // (keep the last stable sun) and otherwise follow — the disk stays put through
+    // the flash, then tracks time-of-day. (Scene lighting still flashes as before;
+    // only the drawn sun disk is stabilised.)
+    static Fvector s_sunDir = { 0.f, -1.f, 0.f };
+    static Fvector s_sunCol = { 0.f,  0.f, 0.f };
+    static bool    s_sunInit = false;
+    static int     s_sunReject = 0;   // consecutive frames the live sun disagreed with the latch
     if (g_pGamePersistent) {
         if (auto* mix = g_pGamePersistent->Environment().CurrentEnv) {
             push.skyRotation = mix->sky_rotation;
@@ -520,6 +669,46 @@ void Pass_Sky(FrameContext& ctx)
             push.skyColor[1] = mix->sky_color.y;
             push.skyColor[2] = mix->sky_color.z;
             push.blendWeight = mix->weight;
+
+            // Clouds tint + weight (clouds_color.w). R4 skips clouds when w≈0;
+            // the shader gates on this too.
+            push.cloudsColor[0] = mix->clouds_color.x;
+            push.cloudsColor[1] = mix->clouds_color.y;
+            push.cloudsColor[2] = mix->clouds_color.z;
+            push.cloudsWeight   = mix->clouds_color.w;
+
+            Fvector tgt = mix->sun_dir;
+            if (tgt.square_magnitude() > 1e-6f) tgt.normalize(); else tgt.set(0.f, -1.f, 0.f);
+            const bool follow = mix->sun_dir.square_magnitude() > 1e-6f &&
+                                s_sunDir.dotproduct(tgt) > 0.99f;   // < ~8° change = real sun drift
+            if (!s_sunInit || follow) {
+                // First valid sample, or normal frame-to-frame drift → track live.
+                s_sunInit = true; s_sunReject = 0;
+                s_sunDir = tgt;
+                s_sunCol.set(mix->sun_color.x, mix->sun_color.y, mix->sun_color.z);
+            } else if (++s_sunReject > 6) {
+                // The disagreement PERSISTED — this is not a 1-2 frame thunderbolt
+                // flash but a genuine discontinuity (time skip / sleep / level load /
+                // weather keyframe step, which can jump 18-22°) or a bad initial latch.
+                // Snap to the live sun so the disk can never stay stuck (e.g. frozen
+                // at the straight-down default → drawn at the zenith while the real
+                // sun is at the horizon). A real thunderbolt clears in far fewer frames.
+                s_sunReject = 0;
+                s_sunDir = tgt;
+                s_sunCol.set(mix->sun_color.x, mix->sun_color.y, mix->sun_color.z);
+            }
+            // else: a brief big jump (thunderbolt) → keep the last stable sun a few frames.
+            push.sunDir[0]   = s_sunDir.x; push.sunDir[1] = s_sunDir.y; push.sunDir[2] = s_sunDir.z;
+            push.sunColor[0] = s_sunCol.x; push.sunColor[1] = s_sunCol.y; push.sunColor[2] = s_sunCol.z;
+
+            // The sky tints are authored sRGB like every other env colour. Converted
+            // here, AFTER the sun latch, so the latch keeps comparing/storing values in
+            // the one space it was tuned in — s_sunCol persists across frames, and
+            // decoding before it would make the stored latch and the live sample
+            // incomparable on the frame the pipeline mode changes.
+            ColorSpace::LinearizeRGB(push.skyColor);
+            ColorSpace::LinearizeRGB(push.cloudsColor);
+            ColorSpace::LinearizeRGB(push.sunColor);
         }
     }
 

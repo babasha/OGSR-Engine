@@ -67,6 +67,15 @@ BOOL CClimableObject::net_Spawn(CSE_Abstract* DC)
 {
     CSE_Abstract* e = (CSE_Abstract*)(DC);
     CSE_ALifeObjectClimable* CLB = smart_cast<CSE_ALifeObjectClimable*>(e);
+    // The server entity can arrive as an "unknown section" inert placeholder (broken
+    // content / missing configs) while the client clsid still maps here — refuse the
+    // spawn instead of dereferencing a null cast or an empty shape list.
+    if (!CLB || CLB->shapes.empty())
+    {
+        Msg("!![CClimableObject::net_Spawn] '%s': server entity is not climable or has no shapes — spawn refused",
+            e ? e->name_replace() : "?");
+        return FALSE;
+    }
     const Fmatrix& b = CLB->shapes[0].data.box;
     m_box.m_halfsize.set(b._11, b._22, b._33);
     m_radius = _max(_max(m_box.m_halfsize.x, m_box.m_halfsize.y), m_box.m_halfsize.z);
@@ -114,8 +123,13 @@ BOOL CClimableObject::net_Spawn(CSE_Abstract* DC)
 void CClimableObject::net_Destroy()
 {
     inherited::net_Destroy();
-    m_pStaticShell->Deactivate();
-    xr_delete(m_pStaticShell);
+    // A refused net_Spawn (broken server entity, see the guard there) destroys the
+    // object before the physics shell ever existed.
+    if (m_pStaticShell)
+    {
+        m_pStaticShell->Deactivate();
+        xr_delete(m_pStaticShell);
+    }
 }
 void CClimableObject::shedule_Update(u32 dt) // Called by shedule
 {

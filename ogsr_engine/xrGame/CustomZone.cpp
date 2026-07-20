@@ -1503,6 +1503,13 @@ void CCustomZone::CreateHit(u16 id_to, u16 id_from, const Fvector& hit_dir, floa
 void CCustomZone::net_Relcase(CObject* O)
 {
     CGameObject* GO = smart_cast<CGameObject*>(O);
+    // The destroy queue broadcasts every CObject, not only CGameObjects (e.g. particle
+    // objects) — those can't be in the zone map or own it, so just pass them down.
+    if (!GO)
+    {
+        inherited::net_Relcase(O);
+        return;
+    }
     OBJECT_INFO_VEC_IT it = std::find(m_ObjectInfoMap.begin(), m_ObjectInfoMap.end(), GO);
     if (it != m_ObjectInfoMap.end())
     {

@@ -99,25 +99,38 @@ void           ComputeRainVP();               // straight-down ortho box at the 
 const Fmatrix& GetRainVP();
 bool           RainSphereVisible(const Fvector& center, float radius);
 
-// ---- Dynamic light shadows (STEP 3b): 1 spot + 1 point cube per frame. ----
-// Spot (flashlight): perspective map along the light cone.
-VkImage        GetSpotImage();
+// ---- Dynamic light shadows (STEP 3b): spot POOL + 1 point cube per frame. ----
+// Spot pool: ONE atlas of SpotAtlasX×SpotAtlasY tiles (SpotSize² each), one tile
+// per pooled spot light (Lights::kMaxShadowSpots). vk_pass_shadow owns the tile
+// assignment/caching; consumers look tiles up via SpotShadow_TileOfLight.
+VkImage        GetSpotImage();                // CLEAN atlas (static copy + NPC overlay) — surfaces
 VkImageView    GetSpotView();
-// Spot map copy + grass casters on top — sampled by the visible beam / fog
-// only (surfaces keep the clean map so grass doesn't blanket the light pool).
+// STATIC layer (statics + trees only) — cached per tile until the light moves;
+// copy source for the clean atlas, never sampled (rests in TRANSFER_SRC).
+VkImage        GetSpotStaticImage();
+VkImageView    GetSpotStaticView();
+// Per-tile copy of the clean tile + grass casters on top — the visible beam /
+// fog sample this; surfaces blend both (r_spot_grass_shadow).
 VkImage        GetSpotBeamImage();
 VkImageView    GetSpotBeamView();
-u32            SpotSize();                    // 1024
-const Fmatrix& GetSpotVP();
-void           ComputeSpotVP(const Fvector& pos, const Fvector& dir, float range, float cone);
+u32            SpotSize();                    // tile size (1024)
+u32            SpotAtlasX();                  // tiles per row (4)
+u32            SpotAtlasY();                  // rows (2)
+const Fmatrix& GetSpotVP();                   // the COOKIE spot's VP (flashlight beam texture)
+void           SetSpotVP(const Fmatrix& vp);
+Fmatrix        ComputeSpotVPFor(const Fvector& pos, const Fvector& dir, float range, float cone);
+void           SetSpotTileVP(u32 tile, const Fmatrix& vp);
+const Fmatrix& GetSpotTileVP(u32 tile);
 
-// Point (campfire): D32 cube, 6 faces rendered with 90° perspective each.
+// Point POOL: D32 cube ARRAY (kMaxShadowPoints cubes, 6 faces each, 90° persp).
 // Face order = Vulkan cube layers (+X,-X,+Y,-Y,+Z,-Z), D3D orientation.
 constexpr float kPointNear = 0.1f;
 VkImage        GetPointImage();
-VkImageView    GetPointCubeView();            // cube view (sampling)
-VkImageView    GetPointFaceView(u32 face);    // 2D layer view (rendering), face 0..5
-u32            PointSize();                   // 512
+VkImageView    GetPointCubeView();                    // CUBE_ARRAY view (sampling)
+VkImageView    GetPointFaceView(u32 cube, u32 face);  // 2D layer view (rendering)
+VkImage        GetPointStaticImage();                 // cached statics-only cube array (copy SRC)
+VkImageView    GetPointStaticFaceView(u32 cube, u32 face);
+u32            PointSize();                            // 512
 Fmatrix        ComputePointFaceVP(const Fvector& pos, float range, u32 face);
 
 }}  // namespace VK::ShadowMap

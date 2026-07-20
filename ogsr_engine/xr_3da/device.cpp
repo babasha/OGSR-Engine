@@ -243,7 +243,7 @@ void CRenderDevice::on_idle()
         const auto FrameStartTime = std::chrono::high_resolution_clock::now();
 #endif
 
-        if (psDeviceFlags.test(rsStatistic))
+        if (psDeviceFlags.test(rsStatistic) || g_bForceStatGather)
             g_bEnableStatGather = TRUE;
         else
             g_bEnableStatGather = FALSE;
@@ -496,7 +496,11 @@ void CRenderDevice::FrameMove()
     // Frame move
     Statistic->EngineTOTAL.Begin();
 
+    // Arm per-member seq profiling for THIS Process only (see pure.h): names the
+    // seqFrame member EngineTOTAL's time goes to when every sub-timer reads 0.
+    g_seq_profile_cb = g_seq_profile_hook;
     Device.seqFrame.Process(rp_Frame);
+    g_seq_profile_cb = nullptr;
 
     Statistic->EngineTOTAL.End();
 }
@@ -626,6 +630,10 @@ void CLoadScreenRenderer::OnRender() { pApp->load_draw_internal(); }
 
 void CRenderDevice::time_factor(const float& time_factor)
 {
+    // [mod-compat diag] engine time factor ~0 freezes ALL object updates & physics
+    // (CObjectList::Update gates on fTimeDelta) while the camera stays live — the
+    // "мышь крутит, WASD мёртв" state. Every change is worth a log line.
+    Msg("[Device] time_factor %.4f -> %.4f", Timer.time_factor(), time_factor);
     Timer.time_factor(time_factor);
     TimerGlobal.time_factor(time_factor);
     psSoundTimeFactor = time_factor; //--#SM+#--

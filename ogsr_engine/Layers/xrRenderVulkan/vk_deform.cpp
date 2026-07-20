@@ -5,16 +5,21 @@
 // use only (per the X-Ray Engine license); redistribution in source or binary
 // form must keep this notice and credit the author in-game (credits or splash).
 //
-// A PERSISTENT, player-centred top-down compression field. Unlike the rain box
-// (±75 m @ 1024² = 14.6 cm/texel = too coarse for footprints), this has its OWN
-// dense ortho box (±kHalf @ kSize) so prints are sharp. Feet stamp depressions; the
-// field is reprojected as the camera moves (texel-snapped -> translation) and decays
-// slowly so prints last ~r_snow_deform_time seconds. Read by snow_displace.glsl
-// (EnvLight binding 20). Structure mirrors VK::WaterSim (persistent ping-pong +
-// per-frame reprojection); see deform_stamp.comp.glsl.
+// A PERSISTENT, WORLD-ANCHORED (toroidal) top-down compression field. Unlike the rain
+// box (±75 m @ 1024² = 14.6 cm/texel = too coarse for footprints), this has its OWN
+// dense field (±kHalf window @ kSize) so prints are sharp. Feet stamp depressions; the
+// field decays slowly so prints last ~r_snow_deform_time seconds. Each texel maps to a
+// FIXED world XZ (mod kWorld), so camera movement needs NO reprojection — only the thin
+// leading strip of texels that just scrolled in (their world identity flipped) is
+// cleared. The compute runs IN PLACE on one image (no scratch / no copy-back). Read by
+// snow_displace.glsl (EnvLight binding 20, uv = worldXZ/kWorld, REPEAT wrap, windowed to
+// ±kHalf of the eye). See deform_stamp.comp.glsl.
 
 #include "stdafx.h"
+#include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_deform.h"
+#include "vk_image.h"      // VK::CreateImage2D / CreateImageView
+#include "vk_compute_util.h" // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_shaders.h"         // g_ShaderManager
 #include "vk_pipeline_cache.h"  // shared pipeline cache object
 #include "vk_shadow.h"          // rain map view/sampler/VP + RainEyeY (terrain-height gate)
@@ -33,10 +38,10 @@ namespace {
     constexpr float kEyeUp = 100.f;
     constexpr float kZNear = 1.f;
     constexpr float kZFar  = 350.f;
-    Fmatrix       s_vp, s_prevVP;
+    Fmatrix       s_vp;   // uploaded to EnvLight deform_vp; unused by the toroidal sample path (kept for the UBO field)
 
     struct Buf { VkImage img = VK_NULL_HANDLE; VmaAllocation alloc = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
-    Buf s_state, s_scratch;
+    Buf s_state;   // the single persistent press field — TOROIDAL, updated IN PLACE (no scratch/copy)
 
     VkSampler             s_sampler    = VK_NULL_HANDLE;
     VkDescriptorSetLayout s_setLayout  = VK_NULL_HANDLE;
@@ -60,16 +65,22 @@ namespace {
     u8*            s_stampMapped = nullptr;
 
     struct PushConstants {
-        Fmatrix curInvVP;
-        Fmatrix prevVP;
         Fmatrix rainVP;               // world -> rain ndc (terrain-height gate)
-        float   p0[4];                // N, decay, hasPrev, stampCount
+        float   p0[4];                // kSize, decay (dt/life), kWorld (m), stampCount
         float   p1[4];                // xy = movement dir (world XZ), z = berm max (frac), w = ground gate (m)
-        float   p2[4];                // x = rain eyeY, y = rain zRange, z/w unused
+        float   p2[4];                // x = rain eyeY, y = rain zRange, z = rough, w = unused
+        float   p3[4];                // xy = cam window min (camXZ-kHalf), zw = prev cam window min
     };
 
     float s_prevCamX = 0.f, s_prevCamZ = 0.f;
     bool  s_haveCam  = false;
+
+    // Cache gate: the field is player-centred and must reproject/decay every frame it
+    // holds prints — but once every print has decayed it is flat ZERO, and reprojecting
+    // or decaying zero stays zero. Track how long prints may still be visible so we can
+    // skip the whole dispatch when the field is guaranteed empty (nobody stepped).
+    float s_contentUntil = 0.f;   // Device.fTimeGlobal until which the field may hold visible prints
+    bool  s_skipped      = false; // last Dispatch skipped GPU work -> resume uses a fresh window (prev is stale)
 
     void barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout oldL, VkImageLayout newL,
                  VkPipelineStageFlags srcS, VkPipelineStageFlags dstS, VkAccessFlags srcA, VkAccessFlags dstA)
@@ -86,55 +97,17 @@ namespace {
 
     bool createImage(VkImageUsageFlags usage, Buf& out)
     {
-        VkImageCreateInfo ici{};
-        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = VK_FORMAT_R16_SFLOAT;
-        ici.extent = { kSize, kSize, 1 };
-        ici.mipLevels = 1; ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = usage;
-        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo aci{};
-        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &out.img, &out.alloc, nullptr) != VK_SUCCESS)
+        if (!VK::CreateImage2D(VK_FORMAT_R16_SFLOAT, { kSize, kSize }, usage,
+                out.img, out.alloc, "Deform.Field"))
             return false;
-        VkImageViewCreateInfo vci{};
-        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vci.image = out.img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = VK_FORMAT_R16_SFLOAT;
-        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        return vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &out.view) == VK_SUCCESS;
+        out.view = VK::CreateImageView(out.img, VK_FORMAT_R16_SFLOAT);
+        return out.view != VK_NULL_HANDLE;
     }
 
     void destroyBuf(Buf& b)
     {
         if (b.view) { vkDestroyImageView(VulkanHW.m_Device, b.view, nullptr); b.view = VK_NULL_HANDLE; }
-        if (b.img)  { vmaDestroyImage(VulkanHW.m_Allocator, b.img, b.alloc); b.img = VK_NULL_HANDLE; }
-    }
-
-    // compute write (GENERAL) -> copy scratch to state -> back to working layouts.
-    void copyBack(VkCommandBuffer cmd)
-    {
-        barrier(cmd, s_scratch.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageCopy cp{};
-        cp.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        cp.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        cp.extent = { kSize, kSize, 1 };
-        vkCmdCopyImage(cmd, s_scratch.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                    | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT
-                    | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT     // TCS press-gates the mud tess
-                    | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,                  // snow mesh VS samples it
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        barrier(cmd, s_scratch.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        if (b.img)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, b.img, b.alloc); b.img = VK_NULL_HANDLE; }
     }
 
     void computeVP()
@@ -163,11 +136,11 @@ bool Init()
     if (s_inited) return true;
     if (s_failed) return false;
     if (ShadowMap::GetRainView() == VK_NULL_HANDLE) return false;   // need the rain map for the ground gate (retry next frame)
-    s_vp.identity(); s_prevVP.identity();
+    s_vp.identity();
 
-    const VkImageUsageFlags stateUse = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    const VkImageUsageFlags scrUse   = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!createImage(stateUse, s_state) || !createImage(scrUse, s_scratch)) {
+    // One image: STORAGE (compute reads+writes in place) + SAMPLED (consumers sample it).
+    const VkImageUsageFlags fieldUse = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!createImage(fieldUse, s_state)) {
         Msg("![VK Deform] image create failed"); s_failed = true; return false;
     }
 
@@ -175,7 +148,7 @@ bool Init()
     si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;   // toroidal wrap
     si.maxLod = 0.25f;
     if (vkCreateSampler(VulkanHW.m_Device, &si, nullptr, &s_sampler) != VK_SUCCESS) {
         Msg("![VK Deform] sampler create failed"); s_failed = true; return false;
@@ -194,26 +167,26 @@ bool Init()
         aci.usage = VMA_MEMORY_USAGE_AUTO;
         aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
         VmaAllocationInfo info{};
-        if (vmaCreateBuffer(VulkanHW.m_Allocator, &bci, &aci, &s_stampBuf, &s_stampAlloc, &info) != VK_SUCCESS) {
+        if (VK::Vram::CreateBuffer(VulkanHW.m_Allocator, &bci, &aci, &s_stampBuf, &s_stampAlloc, &info) != VK_SUCCESS) {
             Msg("![VK Deform] stamp buffer create failed"); s_failed = true; return false;
         }
         s_stampMapped = (u8*)info.pMappedData;
     }
 
-    VkDescriptorSetLayoutBinding b[4]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[3].descriptorCount = 1; b[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    // binding 0 = field (STORAGE, in place), 2 = stamps (dynamic UBO), 3 = rain (sampler).
+    VkDescriptorSetLayoutBinding b[3]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 2; b[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[2].binding = 3; b[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 4; slci.pBindings = b;
+    slci.bindingCount = 3; slci.pBindings = b;
     vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout);
 
     VkDescriptorPoolSize ps[3]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 2;   // prev + rain
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = 1;
-    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; ps[2].descriptorCount = 1;
+    ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[0].descriptorCount = 1;   // field (in place)
+    ps[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; ps[1].descriptorCount = 1;
+    ps[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[2].descriptorCount = 1;   // rain
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = 1; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
@@ -226,42 +199,24 @@ bool Init()
         Msg("![VK Deform] descriptor alloc failed"); s_failed = true; return false;
     }
 
-    VkDescriptorImageInfo ii[2] = {
-        { s_sampler, s_state.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },                 // 0 prev (sampled)
-        { VK_NULL_HANDLE, s_scratch.view, VK_IMAGE_LAYOUT_GENERAL },                           // 1 out (storage)
-    };
+    VkDescriptorImageInfo fieldI{ VK_NULL_HANDLE, s_state.view, VK_IMAGE_LAYOUT_GENERAL };       // 0 field (storage, in place)
     VkDescriptorImageInfo rainI{ ShadowMap::GetSampler(), ShadowMap::GetRainView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorBufferInfo sbI{ s_stampBuf, 0, sizeof(StampsUBO) };
-    VkWriteDescriptorSet w[4]{};
-    for (int i = 0; i < 2; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set; w[i].dstBinding = (u32)i; w[i].descriptorCount = 1;
-        w[i].descriptorType = (i == 0) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[i].pImageInfo = &ii[i];
-    }
-    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = s_set; w[2].dstBinding = 2; w[2].descriptorCount = 1;
-    w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; w[2].pBufferInfo = &sbI;
-    w[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[3].dstSet = s_set; w[3].dstBinding = 3; w[3].descriptorCount = 1;
-    w[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[3].pImageInfo = &rainI;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+    VkWriteDescriptorSet w[3]{};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = s_set; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[0].pImageInfo = &fieldI;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = s_set; w[1].dstBinding = 2; w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; w[1].pBufferInfo = &sbI;
+    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = s_set; w[2].dstBinding = 3; w[2].descriptorCount = 1;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[2].pImageInfo = &rainI;
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants) };
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setLayout;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_pipeLayout);
+    s_pipeLayout = VK::MakePipelineLayout({ s_setLayout }, sizeof(PushConstants));
 
     VkShaderModule cs = g_ShaderManager->Load("deform_stamp.comp.spv");
     if (cs == VK_NULL_HANDLE) { Msg("![VK Deform] deform_stamp.comp.spv load failed"); s_failed = true; return false; }
-    VkComputePipelineCreateInfo cpi{};
-    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = cs; cpi.stage.pName = "main";
-    cpi.layout = s_pipeLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &s_pipe) != VK_SUCCESS) {
-        Msg("![VK Deform] compute pipeline create failed"); s_failed = true; return false;
-    }
+    s_pipe = VK::CreateComputePipeline(cs, s_pipeLayout, "Deform.Stamp");
+    if (s_pipe == VK_NULL_HANDLE) { s_failed = true; return false; }
 
     s_inited = true; s_first = true;
     Msg("[VK Deform] init OK (%ux%u R16F, +-%.0f m, %.1f cm/texel)", kSize, kSize, kHalf, 200.f * kHalf / float(kSize));
@@ -274,18 +229,44 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
 
     computeVP();
 
-    if (s_first) {
-        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
-        barrier(cmd, s_scratch.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+    const float life = (ps_r_snow_deform_time > 0.1f) ? ps_r_snow_deform_time : 0.1f;
+    const u32   n    = (count < kMaxStamps) ? count : kMaxStamps;
+
+    // ---- CACHE GATE: skip the full-field compute when the field cannot change. ------
+    // A fresh stamp keeps the field non-empty for up to `life` seconds; after that every
+    // texel has decayed back to flat zero, and reprojecting/decaying ZERO stays ZERO. So
+    // with no active prints AND no new stamp this frame, keep the cached image and skip
+    // the whole 2048² dispatch + 8 MB copy-back. (Nobody stepped -> nothing to compute:
+    // dry areas, interiors, standing still after prints faded, no NPCs/props nearby.)
+    // Never gate the first frame (layout init) or a frame that brings a fresh stamp.
+    if (n > 0) s_contentUntil = Device.fTimeGlobal + life;
+    const bool hasContent = Device.fTimeGlobal < s_contentUntil;
+    if (!s_first && n == 0 && !hasContent) {
+        s_skipped  = true;
+        s_prevCamX = Device.vCameraPosition.x;   // keep berm-direction tracking current
+        s_prevCamZ = Device.vCameraPosition.z;
+        s_haveCam  = true;
+        return;
     }
 
-    Fmatrix curInv; curInv.invert(s_vp);
-    const float life = (ps_r_snow_deform_time > 0.1f) ? ps_r_snow_deform_time : 0.1f;
-    const float dt   = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+    // ---- Layout: the field sits in SHADER_READ_ONLY between frames (consumers sample it).
+    // Bring it to GENERAL for the compute's in-place read-modify-write; first frame comes
+    // from UNDEFINED. The consumer stages (terrain frag/tese/tesc, snow-mesh VS/FS) are the
+    // src of the read->write hazard.
+    const VkPipelineStageFlags kConsumers =
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+        | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
+    if (s_first) {
+        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+    } else {
+        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                kConsumers, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
 
-    const u32 n = (count < kMaxStamps) ? count : kMaxStamps;
+    const float dt = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+    const float camX = Device.vCameraPosition.x, camZ = Device.vCameraPosition.z;
 
     // Fill this in-flight slot's stamp region (per-slot -> no CPU/GPU overwrite race).
     const u32 slot = CommandManager.GetCurrentFrame() % kFramesInFlight;
@@ -301,26 +282,20 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
         su->sPar[i][3] = 0.f;
     }
 
-    PushConstants pc{};
-    pc.curInvVP = curInv;
-    pc.prevVP   = s_prevVP;
-    pc.rainVP   = ShadowMap::GetRainVP();
-    pc.p0[0] = float(kSize);
-    pc.p0[1] = dt / life;                  // decay this frame
-    pc.p0[2] = s_first ? 0.f : 1.f;        // hasPrev
-    pc.p0[3] = float(n);
-
     // Movement direction (world XZ) from the camera delta -> the berm is plowed forward.
     float mdx = 0.f, mdz = 0.f;
-    {
-        const float cx = Device.vCameraPosition.x, cz = Device.vCameraPosition.z;
-        if (s_haveCam) {
-            const float dx = cx - s_prevCamX, dz = cz - s_prevCamZ;
-            const float len = sqrtf(dx * dx + dz * dz);
-            if (len > 0.012f) { mdx = dx / len; mdz = dz / len; }   // ignore tiny jitter / standing still
-        }
-        s_prevCamX = cx; s_prevCamZ = cz; s_haveCam = true;
+    if (s_haveCam) {
+        const float dx = camX - s_prevCamX, dz = camZ - s_prevCamZ;
+        const float len = sqrtf(dx * dx + dz * dz);
+        if (len > 0.012f) { mdx = dx / len; mdz = dz / len; }   // ignore tiny jitter / standing still
     }
+
+    PushConstants pc{};
+    pc.rainVP = ShadowMap::GetRainVP();
+    pc.p0[0] = float(kSize);
+    pc.p0[1] = dt / life;                  // decay this frame
+    pc.p0[2] = 2.f * kHalf;                // kWorld: the toroidal world period (m)
+    pc.p0[3] = float(n);
     pc.p1[0] = mdx; pc.p1[1] = mdz;
     pc.p1[2] = ps_r_snow_berm;   // berm max (× dent depth in the mesh) — front ridge ~1.5×, sides ~0.4×
     pc.p1[3] = 0.45f;            // ground gate (m): contact must be within this of the terrain to stamp
@@ -328,6 +303,15 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
     pc.p2[1] = kZFar - kZNear;   // rain ortho zRange (349)
     pc.p2[2] = ps_r_snow_rough;  // trail/print imperfection
     pc.p2[3] = 0.f;
+    // Camera windows (this frame + last) for the toroidal scroll-clear: texels whose world
+    // identity flips between the two windows are cleared. On the first frame or a resume
+    // from the cache-gate the field is flat, so using this frame's window (no flips) is
+    // correct — nothing to preserve.
+    const bool freshWindow = s_first || s_skipped || !s_haveCam;
+    pc.p3[0] = camX - kHalf;                              pc.p3[1] = camZ - kHalf;
+    pc.p3[2] = freshWindow ? (camX - kHalf) : (s_prevCamX - kHalf);
+    pc.p3[3] = freshWindow ? (camZ - kHalf) : (s_prevCamZ - kHalf);
+    s_skipped = false;
 
     const u32 dynOffset = slot * (u32)kStampStride;
     const u32 groups = (kSize + 7u) / 8u;
@@ -336,9 +320,12 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
     vkCmdPushConstants(cmd, s_pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, groups, groups, 1);
 
-    copyBack(cmd);
+    // Back to SHADER_READ_ONLY for the consumers.
+    barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kConsumers,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-    s_prevVP = s_vp;
+    s_prevCamX = camX; s_prevCamZ = camZ; s_haveCam = true;
     s_first  = false;
 }
 
@@ -350,8 +337,8 @@ void Destroy()
     if (s_pool)       { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }
     if (s_setLayout)  { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_setLayout, nullptr); s_setLayout = VK_NULL_HANDLE; }
     if (s_sampler)    { vkDestroySampler(VulkanHW.m_Device, s_sampler, nullptr); s_sampler = VK_NULL_HANDLE; }
-    if (s_stampBuf)   { vmaDestroyBuffer(VulkanHW.m_Allocator, s_stampBuf, s_stampAlloc); s_stampBuf = VK_NULL_HANDLE; s_stampMapped = nullptr; }
-    destroyBuf(s_state); destroyBuf(s_scratch);
+    if (s_stampBuf)   { VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, s_stampBuf, s_stampAlloc); s_stampBuf = VK_NULL_HANDLE; s_stampMapped = nullptr; }
+    destroyBuf(s_state);
     s_set = VK_NULL_HANDLE;
     s_inited = false; s_failed = false; s_first = true;
 }

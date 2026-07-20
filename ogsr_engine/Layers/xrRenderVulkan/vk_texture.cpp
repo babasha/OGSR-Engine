@@ -7,9 +7,17 @@
 
 #include "stdafx.h"
 #include "vk_texture.h"
+#include "vk_texture_stream.h"
 #include "vk_buffer.h"
 #include "vk_command_buffer.h"
 #include "HW_Vulkan.h"
+
+#include <utility>   // std::swap (SwapContents)
+
+// r_linear_color — 1 = load TexColorSpace::Color textures as _SRGB so the sampler
+// decodes to linear. Declared at GLOBAL scope on purpose: a namespace-scope extern
+// mangles differently and silently fails to bind (see the SSAO lesson).
+extern int ps_r_linear_color;
 
 // DDS definitions
 const u32 DDS_MAGIC = 0x20534444; // "DDS "
@@ -84,6 +92,7 @@ CVulkanTexture::~CVulkanTexture()
 void CVulkanTexture::Create(u32 width, u32 height, VkFormat format, u32 mipLevels,
                             VkImageUsageFlags usage)
 {
+    VK::Vram::Scope _vram_scope("Textures");
     if (m_Image != VK_NULL_HANDLE) {
         Msg("![Vulkan] Texture already created, call Destroy first");
         return;
@@ -134,8 +143,36 @@ void CVulkanTexture::Create(u32 width, u32 height, VkFormat format, u32 mipLevel
     // VMA allocation info - prefer device local memory
     VmaAllocationCreateInfo allocInfo = {};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    // VK_EXT_memory_priority: streamable world diffuse carries a low priority (set by
+    // LoadDDS) so the driver spills IT to system RAM first under VRAM pressure, before
+    // touching render targets / geometry. Ignored when the extension is absent.
+    allocInfo.priority = m_MemPriority;
 
-    VK_CHECK(vmaCreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
+    // Big images (ANY class) get a DEDICATED VkDeviceMemory. Sub-allocated into
+    // shared 256 MB blocks, a freed texture leaves a HOLE the driver still counts
+    // as used (measured 15-07: ~596 MB demoted → 43 MB of usage back) — that
+    // accumulated into the ~2 GB "untracked" VMA slack that starved NGX (the
+    // mid-game DLSS enable 0xbad0000d) and pushed the card into overcommit.
+    // Dedicated => destroy/demote is an actual release to the OS, for streaming
+    // swaps AND level transitions (bumps/lmaps are the biggest pooled residents).
+    // Small images stay pooled — device allocation-count hygiene (~4096 limit;
+    // blocks were ~889 on Pripyat, big textures add well under 1.5k).
+    {
+        VkDeviceSize approx = 0;
+        u32 w = width, h = height;
+        for (u32 i = 0; i < mipLevels; ++i) {
+            if (IsCompressedFormat(format))
+                approx += (VkDeviceSize)((w + 3) / 4) * ((h + 3) / 4) * GetBlockSize(format);
+            else
+                approx += (VkDeviceSize)w * h * 4;
+            if (w > 1) w >>= 1;
+            if (h > 1) h >>= 1;
+        }
+        if (approx >= (2ull << 20))
+            allocInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    }
+
+    VK_CHECK(VK::Vram::CreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
                             &m_Image, &m_Allocation, nullptr));
 
     // VK_CHECK is non-fatal (logs only). If the allocation failed, m_Image is
@@ -384,6 +421,13 @@ void CVulkanTexture::CreateSampler()
 // Уничтожение текстуры
 void CVulkanTexture::Destroy()
 {
+    // Drop out of the streamer registry first (only LoadDDS-built textures are in it;
+    // procedural / streaming-temp images never registered so this is a no-op there).
+    if (m_Registered) {
+        VK::TextureStreamer::Instance().Unregister(this);
+        m_Registered = false;
+    }
+
     if (m_Sampler != VK_NULL_HANDLE) {
         vkDestroySampler(VulkanHW.m_Device, m_Sampler, nullptr);
         m_Sampler = VK_NULL_HANDLE;
@@ -395,7 +439,7 @@ void CVulkanTexture::Destroy()
     }
 
     if (m_Image != VK_NULL_HANDLE) {
-        vmaDestroyImage(VulkanHW.m_Allocator, m_Image, m_Allocation);
+        VK::Vram::DestroyImage(VulkanHW.m_Allocator, m_Image, m_Allocation);
         m_Image = VK_NULL_HANDLE;
         m_Allocation = VK_NULL_HANDLE;
     }
@@ -440,27 +484,83 @@ static VkFormat DXGIFormatToVk(u32 dxgi)
     }
 }
 
-// Загрузка DDS
-bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
+// The _SRGB twin of a colour-capable UNORM format, or the format unchanged when it has
+// no sRGB flavour (BC4/BC5/BC6H, R8/R8G8 — single/dual-channel data that is never colour).
+//
+// Applied as ONE post-step after the format-selection chain in loadDDSFromMemory so all
+// three header paths (DX10 / legacy FourCC / uncompressed RGB) are covered by one rule
+// instead of three parallel edits. Note the sRGB twin is always block/byte-size identical
+// to its UNORM base, so every mip-size, copy-region and VRAM-accounting computation
+// downstream stays valid — IsCompressedFormat/GetBlockSize already enumerate the _SRGB
+// block formats, as do the streamer's mirrors in vk_texture_stream.cpp.
+static VkFormat ToSrgbFormat(VkFormat f)
+{
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM:       return VK_FORMAT_R8G8B8A8_SRGB;
+        case VK_FORMAT_B8G8R8A8_UNORM:       return VK_FORMAT_B8G8R8A8_SRGB;
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK:  return VK_FORMAT_BC1_RGB_SRGB_BLOCK;
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+        case VK_FORMAT_BC2_UNORM_BLOCK:      return VK_FORMAT_BC2_SRGB_BLOCK;
+        case VK_FORMAT_BC3_UNORM_BLOCK:      return VK_FORMAT_BC3_SRGB_BLOCK;
+        case VK_FORMAT_BC7_UNORM_BLOCK:      return VK_FORMAT_BC7_SRGB_BLOCK;
+        default:                             return f;
+    }
+}
+
+// Priority (VK_EXT_memory_priority) by streaming class: streamable world diffuse is
+// cheapest to evict; everything else keeps the VMA mid default.
+static float PriorityForClass(VK::TexStreamClass k)
+{
+    return (k == VK::TexStreamClass::WorldDiffuse) ? 0.25f : 0.5f;
+}
+
+// Pure DDS worker: parse header, create the image covering mips [mipSkip..end], and
+// upload it. Shared by the public LoadDDS (mipSkip resolved from the streamer plan)
+// and BuildStreamImage (explicit mipSkip for a promote/demote). Does NOT register
+// with the streamer — the caller owns that. Returns ok=false on any failure with the
+// image left as it was (unbuilt) so callers can fall back to a default.
+CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSToImage(const char* filename,
+                                                            bool applyBCSwizzle, u32 mipSkip,
+                                                            TexColorSpace colorSpace)
 {
     IReader* F = FS.r_open(filename);
     if (!F) {
         Msg("![Vulkan] Failed to open texture: %s", filename);
-        return false;
+        return {};
     }
+    // IReader is memory-backed (mapped or decompressed) — parse in place.
+    DDSLoadResult r = loadDDSFromMemory(filename, F->pointer(), (size_t)F->length(),
+                                        applyBCSwizzle, mipSkip, colorSpace);
+    FS.r_close(F);
+    return r;
+}
+
+CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* filename,
+                                                                const void* blob, size_t blobSize,
+                                                                bool applyBCSwizzle, u32 mipSkip,
+                                                                TexColorSpace colorSpace)
+{
+    const u8* cur = (const u8*)blob;
+    size_t    rem = blob ? blobSize : 0;
+    auto take = [&](void* dst, size_t n) -> bool {
+        if (rem < n) return false;
+        memcpy(dst, cur, n); cur += n; rem -= n;
+        return true;
+    };
 
     // Check magic
     u32 magic = 0;
-    F->r(&magic, 4);
-    if (magic != DDS_MAGIC) {
+    if (!take(&magic, 4) || magic != DDS_MAGIC) {
         Msg("![Vulkan] Invalid DDS magic in %s", filename);
-        FS.r_close(F);
-        return false;
+        return {};
     }
 
     // Read header
     DDS_HEADER header;
-    F->r(&header, sizeof(DDS_HEADER));
+    if (!take(&header, sizeof(DDS_HEADER))) {
+        Msg("![Vulkan] Truncated DDS header in %s", filename);
+        return {};
+    }
 
     // Determine format
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -472,12 +572,14 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
             // Reading it also advances past the 20 extra bytes so the pixel data
             // that follows is at the correct file offset.
             DDS_HEADER_DXT10 h10{};
-            F->r(&h10, sizeof(h10));
+            if (!take(&h10, sizeof(h10))) {
+                Msg("![Vulkan] Truncated DX10 header in %s", filename);
+                return {};
+            }
             format = DXGIFormatToVk(h10.dxgiFormat);
             if (format == VK_FORMAT_UNDEFINED) {
                 Msg("![Vulkan] Unsupported DXGI format %u (DX10 header) in %s", h10.dxgiFormat, filename);
-                FS.r_close(F);
-                return false;
+                return {};
             }
             // The legacy R↔B swap only applies to BGR-ordered DXT UI atlases;
             // DX10 textures encode their true channel order in dxgiFormat, so swap
@@ -499,8 +601,7 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
                     break;
                 default:
                     Msg("![Vulkan] Unsupported FourCC: %X in %s", header.ddspf.dwFourCC, filename);
-                    FS.r_close(F);
-                    return false;
+                    return {};
             }
             // X-Ray UI atlases ship with BGR-ordered BC endpoints (yellow indicators
             // come out blue without R↔B swap). Level statics are stock BC1/3 with
@@ -530,8 +631,7 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
             expand24to32 = true;
         } else {
             Msg("![Vulkan] Unsupported RGB bit count: %d in %s", header.ddspf.dwRGBBitCount, filename);
-            FS.r_close(F);
-            return false;
+            return {};
         }
     } else if (header.ddspf.dwFlags & DDPF_ALPHA) {
         // Alpha-only format (A8) — used by font textures
@@ -546,56 +646,44 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
             format = VK_FORMAT_R8G8_UNORM;
         } else {
             Msg("![Vulkan] Unsupported luminance bit count: %d in %s", header.ddspf.dwRGBBitCount, filename);
-            FS.r_close(F);
-            return false;
+            return {};
         }
     } else {
         Msg("![Vulkan] Unsupported DDS format flags: %X in %s", header.ddspf.dwFlags, filename);
-        FS.r_close(F);
-        return false;
+        return {};
     }
+
+    // LINEAR PIPELINE (r_linear_color): the single point where "this texture holds
+    // colour" turns into "the sampler decodes sRGB for us". Every branch above picked a
+    // UNORM format — historically ALL of them did, unconditionally, which is exactly why
+    // the renderer shaded on gamma-encoded albedo (see the display-encode note in
+    // vk_pass_tonemap.cpp). Flipping the format here is enough: no shader that samples a
+    // Colour texture needs to change, because the hardware does the decode on fetch.
+    //
+    // Gated so the old all-gamma pipeline stays reachable for A/B. The gate is read at
+    // LOAD time, so toggling the cvar only takes effect for textures loaded afterwards —
+    // it needs a level reload, unlike a live per-frame knob. That is inherent: the
+    // colourspace is baked into the image format, not a shader uniform.
+    if (colorSpace == TexColorSpace::Color && ps_r_linear_color)
+        format = ToSrgbFormat(format);
 
     u32 width = header.dwWidth;
     u32 height = header.dwHeight;
     u32 mipLevels = (header.dwFlags & 0x20000) ? header.dwMipMapCount : 1; // DDSD_MIPMAPCOUNT
     if (mipLevels == 0) mipLevels = 1;
 
-    // Debug: log format for magnifier texture specifically
-    if (strstr(filename, "magnifier")) {
-        Msg("[Vulkan Texture] MAGNIFIER DETAILED:");
-        Msg("  File: %s", filename);
-        Msg("  Size: %dx%d, mips=%d", width, height, mipLevels);
-        Msg("  Header size: %d", header.dwSize);
-        Msg("  Flags: 0x%X", header.dwFlags);
-        Msg("  PitchOrLinearSize: %d", header.dwPitchOrLinearSize);
-        Msg("  PixelFormat size: %d", header.ddspf.dwSize);
-        Msg("  PixelFormat flags: 0x%X", header.ddspf.dwFlags);
-        Msg("  FourCC: 0x%X ('%c%c%c%c')", header.ddspf.dwFourCC,
-            (char)(header.ddspf.dwFourCC & 0xFF),
-            (char)((header.ddspf.dwFourCC >> 8) & 0xFF),
-            (char)((header.ddspf.dwFourCC >> 16) & 0xFF),
-            (char)((header.ddspf.dwFourCC >> 24) & 0xFF));
-        Msg("  RGBBitCount: %d", header.ddspf.dwRGBBitCount);
-        Msg("  RMask: 0x%X, GMask: 0x%X, BMask: 0x%X, AMask: 0x%X",
-            header.ddspf.dwRBitMask, header.ddspf.dwGBitMask,
-            header.ddspf.dwBBitMask, header.ddspf.dwABitMask);
-        Msg("  Caps: 0x%X, Caps2: 0x%X", header.dwCaps, header.dwCaps2);
-        Msg("  VkFormat: %d", format);
-    }
+    // On-disk full-chain metadata — captured BEFORE any mip skip so the streamer
+    // knows how far a texture could still be promoted.
+    const u32 fullW    = width;
+    const u32 fullH    = height;
+    const u32 fullMips = mipLevels;
 
-    // Create texture
-    Create(width, height, format, mipLevels);
-    // Tag the VMA allocation with the source file so any leaked image is
-    // identifiable by name in the vmaDestroyAllocator leak dump (see vma_impl.cpp).
-    if (m_Allocation) vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, filename);
-
-    // Read remaining data
-    VkDeviceSize dataSize = F->length() - F->tell();
-    
-    // Allocate temp buffer
-    void* data = xr_malloc(dataSize);
-    F->r(data, dataSize);
-    FS.r_close(F);
+    // Remaining bytes = the whole mip chain, still inside the caller's blob. No
+    // copy — UploadData memcpy's into the staging ring itself. `ownsData` flips
+    // only when the 24→32 expansion below rebuilds the chain in a fresh buffer.
+    VkDeviceSize dataSize = (VkDeviceSize)rem;
+    const void*  data     = cur;
+    bool         ownsData = false;
 
     // 24-bit RGB → 32-bit RGBA expansion. Walk the mip chain exactly as
     // UploadData does (halve per level, floor at 1) so the rebuilt buffer is
@@ -619,9 +707,9 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
             if (w > 1) w >>= 1;
             if (h > 1) h >>= 1;
         }
-        xr_free(data);
         data     = dst;
         dataSize = dstSize;
+        ownsData = true;
     }
 
     // Guard against a DDS whose header over-claims its contents (truncated file
@@ -646,23 +734,153 @@ bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle)
         }
         if (expected > dataSize) {
             Msg("![Vulkan] DDS truncated/corrupt: '%s' needs %llu bytes (%ux%u mips=%u) but only %llu present — skipping (white default)",
-                filename, (unsigned long long)expected, width, height, mipLevels, (unsigned long long)dataSize);
-            xr_free(data);
-            return false;
+                filename, (unsigned long long)expected, fullW, fullH, fullMips, (unsigned long long)dataSize);
+            if (ownsData) { void* p = const_cast<void*>(data); xr_free(p); }
+            return {};
         }
     }
 
-    // Upload
-    UploadData(data, dataSize);
+    // ---- Residency: skip the top `skip` mips (quality slider / budget-fit / stream).
+    u32 skip = (mipSkip == UINT32_MAX)
+                 ? VK::TextureStreamer::Instance().PlanLoadMipSkip(fullW, fullH, fullMips, format, m_StreamClass)
+                 : mipSkip;
+    if (mipLevels <= 1)                skip = 0;
+    else if (skip > mipLevels - 1)     skip = mipLevels - 1;
+    // Defensive floor: never let the base mip fall below the format's block/pixel min.
+    {
+        const u32 minDim = IsCompressedFormat(format) ? 4u : 1u;
+        while (skip > 0) {
+            const u32 bw = (width  >> skip) ? (width  >> skip) : 1u;
+            const u32 bh = (height >> skip) ? (height >> skip) : 1u;
+            if (bw >= minDim && bh >= minDim) break;
+            --skip;
+        }
+    }
 
-    xr_free(data);
+    VkDeviceSize skipBytes = 0;
+    if (skip > 0) {
+        for (u32 w = width, h = height, i = 0; i < skip; ++i) {
+            if (IsCompressedFormat(format))
+                skipBytes += (VkDeviceSize)((w + 3) / 4) * ((h + 3) / 4) * GetBlockSize(format);
+            else {
+                const u32 bpp = (format == VK_FORMAT_R8_UNORM) ? 1u : (format == VK_FORMAT_R8G8_UNORM) ? 2u : 4u;
+                skipBytes += (VkDeviceSize)w * h * bpp;
+            }
+            if (w > 1) w >>= 1;
+            if (h > 1) h >>= 1;
+        }
+        for (u32 i = 0; i < skip; ++i) { if (width > 1) width >>= 1; if (height > 1) height >>= 1; }
+        mipLevels -= skip;
+    }
 
-    // Msg("[Vulkan] Loaded DDS: %s (%dx%d, mips=%d)", filename, width, height, mipLevels);
+    // Debug: log format for magnifier texture specifically
+    if (strstr(filename, "magnifier")) {
+        Msg("[Vulkan Texture] MAGNIFIER DETAILED: %s %ux%u mips=%u (skip=%u) fmt=%d flags=0x%X fourcc=0x%X",
+            filename, width, height, mipLevels, skip, (int)format, header.dwFlags, header.ddspf.dwFourCC);
+    }
+
+    // Create texture at the resident dimensions.
+    Create(width, height, format, mipLevels);
+    if (m_Image == VK_NULL_HANDLE) {   // allocation failed (OOM) — bail cleanly
+        if (ownsData) { void* p = const_cast<void*>(data); xr_free(p); }
+        return {};
+    }
+    // Tag the VMA allocation with the source file so any leaked image is
+    // identifiable by name in the vmaDestroyAllocator leak dump (see vma_impl.cpp).
+    if (m_Allocation) vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, filename);
+
+    // Upload from the first resident mip onward (offset past the skipped mips).
+    UploadData((const u8*)data + skipBytes, dataSize - skipBytes);
+    if (ownsData) { void* p = const_cast<void*>(data); xr_free(p); }
+
+    DDSLoadResult res;
+    res.ok            = true;
+    res.fullW         = fullW;
+    res.fullH         = fullH;
+    res.fullMips      = fullMips;
+    res.format        = format;
+    res.residentBase  = skip;
+    res.residentBytes = VK::TextureStreamer::MipChainBytes(fullW, fullH, fullMips, skip, format);
+    return res;
+}
+
+// Public DDS load: resolve residency via the streamer plan, then register so the
+// texture participates in budget accounting + (optionally) dynamic streaming.
+bool CVulkanTexture::LoadDDS(const char* filename, bool applyBCSwizzle, TexStreamClass streamClass,
+                             TexColorSpace colorSpace)
+{
+    m_StreamClass       = streamClass;
+    m_LoadSwizzleIntent = applyBCSwizzle;
+    m_LoadColorSpace    = colorSpace;
+    m_MemPriority       = PriorityForClass(streamClass);
+
+    DDSLoadResult r = loadDDSToImage(filename, applyBCSwizzle, UINT32_MAX, colorSpace);
+    if (!r.ok)
+        return false;
+
+    m_SourceFile = filename;
+    VK::TextureStreamer::Instance().Register(this, filename, r.fullW, r.fullH, r.fullMips,
+                                             r.format, r.residentBase, r.residentBytes, streamClass);
+    m_Registered = true;
     return true;
 }
 
+// Build a NEW image for `out` covering mips [mipSkip..end] from THIS texture's source
+// .dds, for a streaming promote/demote. `out` must be empty; it is NOT registered.
+bool CVulkanTexture::BuildStreamImage(CVulkanTexture& out, u32 mipSkip) const
+{
+    if (m_SourceFile.size() == 0) return false;
+    out.m_StreamClass       = m_StreamClass;
+    out.m_LoadSwizzleIntent = m_LoadSwizzleIntent;
+    // Carry the colourspace across a promote/demote. Without this the rebuilt image
+    // would re-derive its format from the default (Data → UNORM) and a texture would
+    // silently change colourspace mid-session the first time it streamed a mip.
+    out.m_LoadColorSpace    = m_LoadColorSpace;
+    out.m_MemPriority       = m_MemPriority;
+    DDSLoadResult r = out.loadDDSToImage(m_SourceFile.c_str(), m_LoadSwizzleIntent, mipSkip,
+                                         m_LoadColorSpace);
+    return r.ok;
+}
+
+// Async-IO variant: the .dds was already read (off-thread) into `blob`.
+bool CVulkanTexture::BuildStreamImageFromBlob(CVulkanTexture& out, u32 mipSkip,
+                                              const void* blob, size_t blobSize) const
+{
+    if (m_SourceFile.size() == 0 || !blob || blobSize == 0) return false;
+    out.m_StreamClass       = m_StreamClass;
+    out.m_LoadSwizzleIntent = m_LoadSwizzleIntent;
+    out.m_LoadColorSpace    = m_LoadColorSpace;   // see BuildStreamImage
+    out.m_MemPriority       = m_MemPriority;
+    DDSLoadResult r = out.loadDDSFromMemory(m_SourceFile.c_str(), blob, blobSize,
+                                            m_LoadSwizzleIntent, mipSkip, m_LoadColorSpace);
+    return r.ok;
+}
+
+// Exchange every GPU handle + descriptor-visible field with `other`. Streaming
+// metadata (source file, class, registration) stays with each object so the live
+// texture keeps its streamer identity while the old handles migrate into `other`
+// for deferred destruction. See TextureStreamer::StreamStep.
+void CVulkanTexture::SwapContents(CVulkanTexture& other)
+{
+    std::swap(m_Image,        other.m_Image);
+    std::swap(m_Allocation,   other.m_Allocation);
+    std::swap(m_ImageView,    other.m_ImageView);
+    std::swap(m_Sampler,      other.m_Sampler);
+    std::swap(m_Width,        other.m_Width);
+    std::swap(m_Height,       other.m_Height);
+    std::swap(m_MipLevels,    other.m_MipLevels);
+    std::swap(m_Format,       other.m_Format);
+    std::swap(m_CurrentLayout,other.m_CurrentLayout);
+    std::swap(m_bAlphaSwizzle,other.m_bAlphaSwizzle);
+    std::swap(m_bBCSwizzle,   other.m_bBCSwizzle);
+    std::swap(m_bCubemap,     other.m_bCubemap);
+    std::swap(m_ArrayLayers,  other.m_ArrayLayers);
+    std::swap(m_MemPriority,  other.m_MemPriority);
+}
+
 // Загрузка DDS cubemap (6 faces)
-bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle)
+bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle,
+                                    TexColorSpace colorSpace)
 {
     IReader* F = FS.r_open(filename);
     if (!F) {
@@ -691,9 +909,12 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle)
         return false;
     }
 
-    // Determine format
-    // Use UNORM (not SRGB) because swapchain is UNORM - no sRGB conversion in pipeline.
-    // This matches D3D11/R4 behavior where textures stay in gamma space throughout.
+    // Determine format. Historically this was hard-wired to UNORM ("swapchain is UNORM,
+    // no sRGB conversion in the pipeline — matches D3D11/R4 where textures stay in gamma
+    // space throughout"), which is why the sky fed gamma-encoded radiance into the sky
+    // ambient/IBL maths. Under r_linear_color a Colour cubemap now picks the _SRGB twin
+    // below, exactly like the 2D path. NOTE: this loader is a SEPARATE copy of the format
+    // logic — it never calls loadDDSFromMemory/DXGIFormatToVk, so it needs its own flip.
     VkFormat format = VK_FORMAT_UNDEFINED;
 
     if (header.ddspf.dwFlags & DDPF_FOURCC) {
@@ -727,6 +948,9 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle)
         FS.r_close(F);
         return false;
     }
+
+    if (colorSpace == TexColorSpace::Color && ps_r_linear_color)
+        format = ToSrgbFormat(format);
 
     u32 width = header.dwWidth;
     u32 height = header.dwHeight;

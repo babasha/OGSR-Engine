@@ -391,8 +391,23 @@ void CLevel::IR_OnKeyboardHold(int key)
 
     EGameActions _curr = get_binded_action(key);
 
+    // [mod-compat diag] "мышь крутит, WASD мёртв": name the exact gate that swallows
+    // movement keys. First few movement-key events only, then silent forever.
+    static u32 s_diagLeft = 6;
+    const bool diagMove = s_diagLeft && (_curr == kFWD || _curr == kBACK || _curr == kL_STRAFE || _curr == kR_STRAFE);
+    auto diag = [&](const char* why) {
+        if (diagMove)
+        {
+            --s_diagLeft;
+            Msg("[LevelInput] move key %d (act %d): %s", key, (int)_curr, why);
+        }
+    };
+
     if (m_blocked_actions.find(_curr) != m_blocked_actions.end())
+    {
+        diag("SWALLOWED by m_blocked_actions");
         return; // Real Wolf. 14.10.2014
+    }
 
     if (g_block_all_except_movement)
     {
@@ -403,11 +418,20 @@ void CLevel::IR_OnKeyboardHold(int key)
     const bool b_ui_exist = (Has_HUD() && HUD().GetUI());
 
     if (b_ui_exist && HUD().GetUI()->IR_OnKeyboardHold(key))
+    {
+        diag("SWALLOWED by UI IR_OnKeyboardHold");
         return;
+    }
     if (b_ui_exist && HUD().GetUI()->MainInputReceiver())
+    {
+        diag("SWALLOWED by UI MainInputReceiver");
         return;
+    }
     if (Device.Paused())
+    {
+        diag("SWALLOWED by Device.Paused");
         return;
+    }
 
     if ((key != DIK_LALT) && (key != DIK_RALT) && (key != DIK_F4) && Actor())
         Actor()->callback(GameObject::eOnKeyHold)(key, _curr);
@@ -416,8 +440,15 @@ void CLevel::IR_OnKeyboardHold(int key)
     {
         IInputReceiver* IR = smart_cast<IInputReceiver*>(smart_cast<CGameObject*>(CURRENT_ENTITY()));
         if (IR)
+        {
+            diag("dispatched to current entity");
             IR->IR_OnKeyboardHold(_curr);
+        }
+        else
+            diag("SWALLOWED: current entity is not an input receiver");
     }
+    else
+        diag("SWALLOWED: no CURRENT_ENTITY");
 }
 
 void CLevel::IR_OnMouseStop(int /**axis/**/, int /**value/**/) {}

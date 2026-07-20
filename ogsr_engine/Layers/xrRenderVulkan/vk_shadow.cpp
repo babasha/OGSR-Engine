@@ -8,6 +8,8 @@
 // xrRenderVulkan — sun directional shadow map. See vk_shadow.h.
 #include "stdafx.h"
 #include "vk_shadow.h"
+#include "vk_image.h"                   // VK::CreateImage / CreateImageView
+#include "vk_light.h"                   // Lights::kMaxShadowPoints (point cube array size)
 #include "vk_swapchain.h"               // (depth format reference, allocator via VulkanHW)
 #include "vk_profiler.h"                // VK::Prof::NameImage (debug-utils names)
 #include "../../xr_3da/device.h"        // Device.vCameraPosition / vCameraDirection
@@ -24,8 +26,10 @@ namespace {
     constexpr float kZNear    = 1.f;
     constexpr float kZFar     = kEyeDist + 2.f * kHalfSize + 400.f;
 
-    constexpr u32 kSpotSize  = 1024;
-    constexpr u32 kPointSize = 512;
+    constexpr u32 kSpotSize   = 1024;   // one pool tile
+    constexpr u32 kSpotAtlasX = 4;      // tiles per atlas row
+    constexpr u32 kSpotAtlasY = 2;      // rows — X*Y tiles = Lights::kMaxShadowSpots
+    constexpr u32 kPointSize  = 512;
 
     // Near sun cascades — R4 sizes (ps_ssfx_shadow_cascades 25/60, cascade 2 is
     // the cached far map above) at 4096² → ~0.61 / 1.46 cm texels. View origin
@@ -59,21 +63,43 @@ namespace {
     Fmatrix       s_lightView;   // world→light-view, kept for SphereVisible
 
     // Dynamic light shadows (STEP 3b)
-    VkImage       s_spotImage = VK_NULL_HANDLE;     // spot (flashlight) map
+    // Spot shadow POOL: ATLASES of kSpotAtlasX×kSpotAtlasY tiles (1024² each),
+    // one tile per pooled spot light (headlights, searchlights, flashlight all
+    // shadow at once). Tiles are cached VSM-style — vk_pass_shadow re-renders
+    // layers independently:
+    //   STATIC atlas (statics + trees)  → only when the light moves/casters change
+    //   CLEAN  atlas (= static + NPCs)  → copy + NPC overlay, distance/visibility LOD
+    //   BEAM   atlas (= clean + grass)  → copy + grass, near lights (wind animation)
+    // STATIC layer — never sampled, copy source only (rests in TRANSFER_SRC).
+    VkImage       s_spotStaticImage = VK_NULL_HANDLE;
+    VmaAllocation s_spotStaticAlloc = VK_NULL_HANDLE;
+    VkImageView   s_spotStaticView  = VK_NULL_HANDLE;
+    VkImage       s_spotImage = VK_NULL_HANDLE;     // CLEAN atlas — surfaces sample this
     VmaAllocation s_spotAlloc = VK_NULL_HANDLE;
     VkImageView   s_spotView  = VK_NULL_HANDLE;
-    // Spot BEAM map = copy of the spot map + grass casters on top. The visible
-    // volumetric cone / fog sample THIS (blades cut the beam); surfaces sample
-    // the clean spot map — dense grass in one shared map blanketed the ground
-    // and ate the headlight's light pool (light scatters through grass IRL).
+    // Spot BEAM atlas = per-tile copy of the clean tile + grass casters on top.
+    // The visible volumetric cone / fog sample THIS (blades cut the beam);
+    // surfaces blend both (r_spot_grass_shadow) — a single shared map let dense
+    // grass blanket the ground and eat the headlight's light pool.
     VkImage       s_spotBeamImage = VK_NULL_HANDLE;
     VmaAllocation s_spotBeamAlloc = VK_NULL_HANDLE;
     VkImageView   s_spotBeamView  = VK_NULL_HANDLE;
+    Fmatrix       s_spotTileVP[kSpotAtlasX * kSpotAtlasY];
     Fmatrix       s_spotVP;
-    VkImage       s_pointImage = VK_NULL_HANDLE;    // point cube (campfire), 6 layers
+    // Point shadow POOL: an ARRAY of kMaxShadowPoints cubes (512²×6 each). One
+    // cube per pooled point light — several campfires with NPCs around each all
+    // shadow at once. Sampled as samplerCubeArray; rendered per (cube,face).
+    VkImage       s_pointImage = VK_NULL_HANDLE;    // COMBINED cube array (sampled) = static copy + dynamics
     VmaAllocation s_pointAlloc = VK_NULL_HANDLE;
-    VkImageView   s_pointCubeView = VK_NULL_HANDLE;
-    VkImageView   s_pointFaceView[6] = {};
+    VkImageView   s_pointCubeView = VK_NULL_HANDLE;                        // CUBE_ARRAY (sampling)
+    VkImageView   s_pointFaceView[6 * Lights::kMaxShadowPoints] = {};      // 2D per (cube,face) for rendering
+    // STATIC cube array (statics/walls only, cached until the fire moves / casters
+    // change) — copy SOURCE for the combined map, never sampled. Same static/dyn
+    // split the spot pool and sun cascades use: an NPC or grass refresh copies this
+    // + draws only the dynamic overlay, instead of re-rastering all 6 static faces.
+    VkImage       s_pointStaticImage = VK_NULL_HANDLE;
+    VmaAllocation s_pointStaticAlloc = VK_NULL_HANDLE;
+    VkImageView   s_pointStaticFaceView[6 * Lights::kMaxShadowPoints] = {};
 
     // Near sun cascades. Each has a STATIC map (cached statics+trees+opaque,
     // re-rastered only on camera/sun move — see vk_pass_shadow) and a COMBINED
@@ -126,45 +152,30 @@ namespace {
     VmaAllocation s_groundAlloc = VK_NULL_HANDLE;
     VkImageView   s_groundView  = VK_NULL_HANDLE;
 
+    bool CreateDepthImageWH(u32 w, u32 h, u32 layers, VkImageCreateFlags flags, VkImageUsageFlags usage,
+                            VkImage& image, VmaAllocation& alloc)
+    {
+        VK::ImageDesc d;
+        d.format   = VK_FORMAT_D32_SFLOAT;
+        d.extent   = { w, h, 1 };
+        d.layers   = layers;
+        d.flags    = flags;
+        d.usage    = usage;
+        d.memUsage = VMA_MEMORY_USAGE_AUTO;
+        return VK::CreateImage(d, image, alloc);
+    }
+
     bool CreateDepthImageEx(u32 size, u32 layers, VkImageCreateFlags flags, VkImageUsageFlags usage,
                             VkImage& image, VmaAllocation& alloc)
     {
-        VkImageCreateInfo ici{};
-        ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        ici.flags         = flags;
-        ici.imageType     = VK_IMAGE_TYPE_2D;
-        ici.format        = VK_FORMAT_D32_SFLOAT;
-        ici.extent        = { size, size, 1 };
-        ici.mipLevels     = 1;
-        ici.arrayLayers   = layers;
-        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage         = usage;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-        VmaAllocationCreateInfo aci{};
-        aci.usage = VMA_MEMORY_USAGE_AUTO;
-        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &image, &alloc, nullptr) != VK_SUCCESS) {
-            Msg("![VK Shadow] image create failed"); return false;
-        }
-        return true;
+        return CreateDepthImageWH(size, size, layers, flags, usage, image, alloc);
     }
 
     bool CreateDepthView(VkImage image, VkImageViewType type, u32 baseLayer, u32 layers, VkImageView& view)
     {
-        VkImageViewCreateInfo vci{};
-        vci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vci.image    = image;
-        vci.viewType = type;
-        vci.format   = VK_FORMAT_D32_SFLOAT;
-        vci.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_DEPTH_BIT;
-        vci.subresourceRange.levelCount     = 1;
-        vci.subresourceRange.baseArrayLayer = baseLayer;
-        vci.subresourceRange.layerCount     = layers;
-        if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &view) != VK_SUCCESS) {
-            Msg("![VK Shadow] view create failed"); return false;
-        }
-        return true;
+        view = VK::CreateImageView(image, VK_FORMAT_D32_SFLOAT, type,
+                                   VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, baseLayer, layers);
+        return view != VK_NULL_HANDLE;
     }
 
     bool CreateDepthImage(VkImageUsageFlags usage, VkImage& image, VmaAllocation& alloc, VkImageView& view)
@@ -184,13 +195,25 @@ VkSampler   GetSampler()  { return s_sampler; }
 u32         Size()        { return kSize; }
 VkImage     GetSpotImage()    { return s_spotImage; }
 VkImageView GetSpotView()     { return s_spotView; }
+VkImage     GetSpotStaticImage() { return s_spotStaticImage; }
+VkImageView GetSpotStaticView()  { return s_spotStaticView; }
 VkImage     GetSpotBeamImage(){ return s_spotBeamImage; }
 VkImageView GetSpotBeamView() { return s_spotBeamView; }
 u32         SpotSize()        { return kSpotSize; }
+u32         SpotAtlasX()      { return kSpotAtlasX; }
+u32         SpotAtlasY()      { return kSpotAtlasY; }
 const Fmatrix& GetSpotVP()    { return s_spotVP; }
 VkImage     GetPointImage()   { return s_pointImage; }
-VkImageView GetPointCubeView(){ return s_pointCubeView; }
-VkImageView GetPointFaceView(u32 face) { return (face < 6) ? s_pointFaceView[face] : VK_NULL_HANDLE; }
+VkImageView GetPointCubeView(){ return s_pointCubeView; }   // CUBE_ARRAY (sampling)
+VkImageView GetPointFaceView(u32 cube, u32 face) {
+    const u32 idx = cube * 6 + (face % 6);
+    return (idx < 6 * Lights::kMaxShadowPoints) ? s_pointFaceView[idx] : VK_NULL_HANDLE;
+}
+VkImage     GetPointStaticImage() { return s_pointStaticImage; }
+VkImageView GetPointStaticFaceView(u32 cube, u32 face) {
+    const u32 idx = cube * 6 + face;
+    return (idx < 6 * Lights::kMaxShadowPoints) ? s_pointStaticFaceView[idx] : VK_NULL_HANDLE;
+}
 u32         PointSize()       { return kPointSize; }
 VkImage     GetRainImage()    { return s_rainImage; }
 VkImageView GetRainView()     { return s_rainView; }
@@ -233,6 +256,7 @@ bool Init()
         s_failed = true; return false;
     }
     s_spotVP.identity();
+    for (auto& m : s_spotTileVP) m.identity();
 
     // Dynamic light shadow targets: spot map + point cube (render per face,
     // sample as cube). Both attachment + sampled.
@@ -262,16 +286,28 @@ bool Init()
         s_failed = true; return false;
     }
     s_fogVP.identity();
-    if (!CreateDepthImageEx(kSpotSize, 1, 0, dynUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, s_spotImage, s_spotAlloc) ||
+    if (!CreateDepthImageWH(kSpotSize * kSpotAtlasX, kSpotSize * kSpotAtlasY, 1, 0,
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            s_spotStaticImage, s_spotStaticAlloc) ||
+        !CreateDepthView(s_spotStaticImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_spotStaticView) ||
+        !CreateDepthImageWH(kSpotSize * kSpotAtlasX, kSpotSize * kSpotAtlasY, 1, 0,
+                            dynUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            s_spotImage, s_spotAlloc) ||
         !CreateDepthView(s_spotImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_spotView) ||
-        !CreateDepthImageEx(kSpotSize, 1, 0, dynUsage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s_spotBeamImage, s_spotBeamAlloc) ||
+        !CreateDepthImageWH(kSpotSize * kSpotAtlasX, kSpotSize * kSpotAtlasY, 1, 0,
+                            dynUsage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s_spotBeamImage, s_spotBeamAlloc) ||
         !CreateDepthView(s_spotBeamImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_spotBeamView) ||
-        !CreateDepthImageEx(kPointSize, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, dynUsage, s_pointImage, s_pointAlloc) ||
-        !CreateDepthView(s_pointImage, VK_IMAGE_VIEW_TYPE_CUBE, 0, 6, s_pointCubeView)) {
+        !CreateDepthImageEx(kPointSize, 6 * Lights::kMaxShadowPoints, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+                            dynUsage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s_pointImage, s_pointAlloc) ||   // combined: + copy DEST
+        !CreateDepthView(s_pointImage, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 0, 6 * Lights::kMaxShadowPoints, s_pointCubeView) ||
+        !CreateDepthImageEx(kPointSize, 6 * Lights::kMaxShadowPoints, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,   // static: attachment + copy SRC
+                            s_pointStaticImage, s_pointStaticAlloc)) {
         s_failed = true; return false;
     }
-    for (u32 f = 0; f < 6; ++f)
-        if (!CreateDepthView(s_pointImage, VK_IMAGE_VIEW_TYPE_2D, f, 1, s_pointFaceView[f])) {
+    for (u32 f = 0; f < 6 * Lights::kMaxShadowPoints; ++f)
+        if (!CreateDepthView(s_pointImage,       VK_IMAGE_VIEW_TYPE_2D, f, 1, s_pointFaceView[f]) ||
+            !CreateDepthView(s_pointStaticImage, VK_IMAGE_VIEW_TYPE_2D, f, 1, s_pointStaticFaceView[f])) {
             s_failed = true; return false;
         }
 
@@ -299,6 +335,7 @@ bool Init()
     Prof::NameImage(s_rainImage,   "Shadow.RainOcclusion");
     Prof::NameImage(s_groundImage, "Shadow.GroundHeight");
     Prof::NameImage(s_spotImage,   "Shadow.Spot");
+    Prof::NameImage(s_spotStaticImage, "Shadow.SpotStatic");
     Prof::NameImage(s_spotBeamImage, "Shadow.SpotBeam");
     Prof::NameImage(s_pointImage,  "Shadow.PointCube");
 
@@ -454,7 +491,7 @@ bool RainSphereVisible(const Fvector& center, float radius)
     return true;
 }
 
-void ComputeSpotVP(const Fvector& pos, const Fvector& dirIn, float range, float cone)
+Fmatrix ComputeSpotVPFor(const Fvector& pos, const Fvector& dirIn, float range, float cone)
 {
     Fvector dir = dirIn;
     if (dir.magnitude() < 1e-5f) dir.set(0.f, 0.f, 1.f);
@@ -472,8 +509,23 @@ void ComputeSpotVP(const Fvector& pos, const Fvector& dirIn, float range, float 
     // beam to black. Nothing legit casts within 0.5 m of the flashlight either
     // (HUD never casts), so this only clips fixture shells.
     Fmatrix proj; proj.build_projection(fov, 1.f, 0.5f, _max(range, 1.f));
-    s_spotVP.mul(proj, view);
+    Fmatrix vp; vp.mul(proj, view);
+    return vp;
 }
+
+void SetSpotTileVP(u32 tile, const Fmatrix& vp)
+{
+    if (tile < kSpotAtlasX * kSpotAtlasY) s_spotTileVP[tile] = vp;
+}
+
+const Fmatrix& GetSpotTileVP(u32 tile)
+{
+    return s_spotTileVP[tile < kSpotAtlasX * kSpotAtlasY ? tile : 0];
+}
+
+// Legacy single-VP accessor — now the COOKIE spot's VP (vk_pass_shadow stores
+// the flashlight tile's matrix here; EnvLight projects the cookie through it).
+void SetSpotVP(const Fmatrix& vp) { s_spotVP = vp; }
 
 Fmatrix ComputePointFaceVP(const Fvector& pos, float range, u32 face)
 {
@@ -501,29 +553,34 @@ void Destroy()
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     if (s_sampler)    { vkDestroySampler(VulkanHW.m_Device, s_sampler, nullptr); s_sampler = VK_NULL_HANDLE; }
     if (s_view)       { vkDestroyImageView(VulkanHW.m_Device, s_view, nullptr); s_view = VK_NULL_HANDLE; }
-    if (s_image)      { vmaDestroyImage(VulkanHW.m_Allocator, s_image, s_alloc); s_image = VK_NULL_HANDLE; s_alloc = VK_NULL_HANDLE; }
+    if (s_image)      { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_image, s_alloc); s_image = VK_NULL_HANDLE; s_alloc = VK_NULL_HANDLE; }
     if (s_viewStatic) { vkDestroyImageView(VulkanHW.m_Device, s_viewStatic, nullptr); s_viewStatic = VK_NULL_HANDLE; }
     for (u32 i = 0; i < kNumSunCascades; ++i) {
         if (s_cascView[i])  { vkDestroyImageView(VulkanHW.m_Device, s_cascView[i], nullptr); s_cascView[i] = VK_NULL_HANDLE; }
-        if (s_cascImage[i]) { vmaDestroyImage(VulkanHW.m_Allocator, s_cascImage[i], s_cascAlloc[i]); s_cascImage[i] = VK_NULL_HANDLE; s_cascAlloc[i] = VK_NULL_HANDLE; }
+        if (s_cascImage[i]) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_cascImage[i], s_cascAlloc[i]); s_cascImage[i] = VK_NULL_HANDLE; s_cascAlloc[i] = VK_NULL_HANDLE; }
         if (s_cascStaticView[i])  { vkDestroyImageView(VulkanHW.m_Device, s_cascStaticView[i], nullptr); s_cascStaticView[i] = VK_NULL_HANDLE; }
-        if (s_cascStaticImage[i]) { vmaDestroyImage(VulkanHW.m_Allocator, s_cascStaticImage[i], s_cascStaticAlloc[i]); s_cascStaticImage[i] = VK_NULL_HANDLE; s_cascStaticAlloc[i] = VK_NULL_HANDLE; }
+        if (s_cascStaticImage[i]) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_cascStaticImage[i], s_cascStaticAlloc[i]); s_cascStaticImage[i] = VK_NULL_HANDLE; s_cascStaticAlloc[i] = VK_NULL_HANDLE; }
     }
     if (s_fogView)  { vkDestroyImageView(VulkanHW.m_Device, s_fogView, nullptr); s_fogView = VK_NULL_HANDLE; }
-    if (s_fogImage) { vmaDestroyImage(VulkanHW.m_Allocator, s_fogImage, s_fogAlloc); s_fogImage = VK_NULL_HANDLE; s_fogAlloc = VK_NULL_HANDLE; }
-    if (s_imageStatic){ vmaDestroyImage(VulkanHW.m_Allocator, s_imageStatic, s_allocStatic); s_imageStatic = VK_NULL_HANDLE; s_allocStatic = VK_NULL_HANDLE; }
+    if (s_fogImage) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_fogImage, s_fogAlloc); s_fogImage = VK_NULL_HANDLE; s_fogAlloc = VK_NULL_HANDLE; }
+    if (s_imageStatic){ VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_imageStatic, s_allocStatic); s_imageStatic = VK_NULL_HANDLE; s_allocStatic = VK_NULL_HANDLE; }
     if (s_rainView)   { vkDestroyImageView(VulkanHW.m_Device, s_rainView, nullptr); s_rainView = VK_NULL_HANDLE; }
-    if (s_rainImage)  { vmaDestroyImage(VulkanHW.m_Allocator, s_rainImage, s_rainAlloc); s_rainImage = VK_NULL_HANDLE; s_rainAlloc = VK_NULL_HANDLE; }
+    if (s_rainImage)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_rainImage, s_rainAlloc); s_rainImage = VK_NULL_HANDLE; s_rainAlloc = VK_NULL_HANDLE; }
     if (s_groundView) { vkDestroyImageView(VulkanHW.m_Device, s_groundView, nullptr); s_groundView = VK_NULL_HANDLE; }
-    if (s_groundImage){ vmaDestroyImage(VulkanHW.m_Allocator, s_groundImage, s_groundAlloc); s_groundImage = VK_NULL_HANDLE; s_groundAlloc = VK_NULL_HANDLE; }
+    if (s_groundImage){ VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_groundImage, s_groundAlloc); s_groundImage = VK_NULL_HANDLE; s_groundAlloc = VK_NULL_HANDLE; }
     if (s_spotView)   { vkDestroyImageView(VulkanHW.m_Device, s_spotView, nullptr); s_spotView = VK_NULL_HANDLE; }
-    if (s_spotImage)  { vmaDestroyImage(VulkanHW.m_Allocator, s_spotImage, s_spotAlloc); s_spotImage = VK_NULL_HANDLE; s_spotAlloc = VK_NULL_HANDLE; }
+    if (s_spotImage)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_spotImage, s_spotAlloc); s_spotImage = VK_NULL_HANDLE; s_spotAlloc = VK_NULL_HANDLE; }
+    if (s_spotStaticView)  { vkDestroyImageView(VulkanHW.m_Device, s_spotStaticView, nullptr); s_spotStaticView = VK_NULL_HANDLE; }
+    if (s_spotStaticImage) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_spotStaticImage, s_spotStaticAlloc); s_spotStaticImage = VK_NULL_HANDLE; s_spotStaticAlloc = VK_NULL_HANDLE; }
     if (s_spotBeamView)  { vkDestroyImageView(VulkanHW.m_Device, s_spotBeamView, nullptr); s_spotBeamView = VK_NULL_HANDLE; }
-    if (s_spotBeamImage) { vmaDestroyImage(VulkanHW.m_Allocator, s_spotBeamImage, s_spotBeamAlloc); s_spotBeamImage = VK_NULL_HANDLE; s_spotBeamAlloc = VK_NULL_HANDLE; }
-    for (u32 f = 0; f < 6; ++f)
-        if (s_pointFaceView[f]) { vkDestroyImageView(VulkanHW.m_Device, s_pointFaceView[f], nullptr); s_pointFaceView[f] = VK_NULL_HANDLE; }
+    if (s_spotBeamImage) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_spotBeamImage, s_spotBeamAlloc); s_spotBeamImage = VK_NULL_HANDLE; s_spotBeamAlloc = VK_NULL_HANDLE; }
+    for (auto& v : s_pointFaceView)
+        if (v) { vkDestroyImageView(VulkanHW.m_Device, v, nullptr); v = VK_NULL_HANDLE; }
+    for (auto& v : s_pointStaticFaceView)
+        if (v) { vkDestroyImageView(VulkanHW.m_Device, v, nullptr); v = VK_NULL_HANDLE; }
     if (s_pointCubeView) { vkDestroyImageView(VulkanHW.m_Device, s_pointCubeView, nullptr); s_pointCubeView = VK_NULL_HANDLE; }
-    if (s_pointImage)    { vmaDestroyImage(VulkanHW.m_Allocator, s_pointImage, s_pointAlloc); s_pointImage = VK_NULL_HANDLE; s_pointAlloc = VK_NULL_HANDLE; }
+    if (s_pointImage)    { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_pointImage, s_pointAlloc); s_pointImage = VK_NULL_HANDLE; s_pointAlloc = VK_NULL_HANDLE; }
+    if (s_pointStaticImage) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_pointStaticImage, s_pointStaticAlloc); s_pointStaticImage = VK_NULL_HANDLE; s_pointStaticAlloc = VK_NULL_HANDLE; }
     s_inited = false; s_failed = false;
 }
 

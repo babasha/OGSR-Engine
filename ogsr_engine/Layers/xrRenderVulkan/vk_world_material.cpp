@@ -8,6 +8,7 @@
 #include "stdafx.h"
 #include "vk_world_material.h"
 #include "vk_texture.h"
+#include "vk_texture_stream.h"   // TextureStreamer rebind hook (dynamic streaming)
 #include "HW_Vulkan.h"
 
 #include "../xrRender/ETextureParams.h"   // STextureParams::Load + flDiffuseDetail flag
@@ -16,6 +17,41 @@
 #include <string>
 #include <array>
 #include <set>
+#include <vector>
+#include <mutex>
+
+// An EXTRA texture search root, set by an editor host. The editor's content lives in ITS
+// own gamedata, not the engine's: a level authored against other assets (a ported map, a
+// mod's source tree) resolves its geometry through Ed_AddModelFile but would still miss
+// every texture, and a missing base map silently becomes the 1x1 white default — an
+// all-white terrain. Declared at file scope (inside `namespace VK` it would bind to a
+// non-existent VK::VKEditor).
+namespace VKEditor
+{
+static string_path s_texRoot = {0};
+
+// Anything cached during Init that depends on the host's asset root has to be
+// re-attempted once that root finally arrives — see the note in SetTextureRoot.
+void RetryTerrainBlenderMap();
+
+void SetTextureRoot(const char* dir)
+{
+    if (dir && dir[0])
+        strcpy_s(s_texRoot, sizeof(s_texRoot), dir);
+    else
+        s_texRoot[0] = 0;
+
+    // ORDERING: the host hands us this root AFTER the engine has booted, and
+    // WorldMaterial::Init already ran by then — it loads the shaders.xr blender map
+    // once and latches, roughly half a second too early to see the root. Measured on
+    // a real run: blender map at 19.343, root at 19.893. Model materials are built
+    // later still (25.1+), so THEY see it fine; only the Init-time load loses the
+    // race. Re-attempt it here rather than leaving terrain on global detail defaults.
+    RetryTerrainBlenderMap();
+}
+
+const char* TextureRoot() { return s_texRoot[0] ? s_texRoot : nullptr; }
+} // namespace VKEditor
 
 namespace VK { namespace WorldMaterialCache {
 
@@ -30,6 +66,17 @@ namespace {
     // $level$ .dds files, and this cache outlives level changes by design.
     std::string s_LevelTag;
     WorldMaterial*                                     s_Default      = nullptr;
+
+    // --- Streaming-refresh set recycling ------------------------------------
+    // A texture-streaming swap never touches a live descriptor set (in-flight
+    // frames still sample through it). Instead the material gets a FRESH set and
+    // the old one retires here; FrameTick returns it to the free list once the
+    // fence horizon passes, and AllocateSet reuses free-list sets before dipping
+    // into the pool — so streaming churn doesn't leak pool capacity.
+    struct RetiredSet { u32 frame; VkDescriptorSet set; };
+    std::vector<RetiredSet>      s_RetiredSets;
+    std::vector<VkDescriptorSet> s_FreeSets;
+    std::mutex                   s_StreamMutex;   // guards the 3 containers above
 
     // Detail-texture cache (shared by reference across materials).
     std::unordered_map<std::string, CVulkanTexture*>   s_DetailTexCache;
@@ -54,6 +101,11 @@ namespace {
     VkDescriptorSetLayout                              s_TerrainSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool                                   s_TerrainPool      = VK_NULL_HANDLE;
     CVulkanTexture*                                    s_WhiteMask        = nullptr;  // 1×1 white
+    // One-hot 1×1 splat masks (R=grass, G=asphalt, B=earth, A=yantar — the kDet
+    // channel order). Used for mask-LESS terrain regionalized by SHADER name
+    // (vanilla SoC): pripyat_asfalt gets the pure-asphalt mask instead of the
+    // white even-blend that turns the whole ground into detail mush.
+    CVulkanTexture*                                    s_ChannelMask[4]   = {};
     CVulkanTexture*                                    s_TerrainDetail[4] = {};       // R/G/B/A diffuse details
     CVulkanTexture*                                    s_TerrainNormal[4] = {};       // R/G/B/A <detail>_bump normal maps
     CVulkanTexture*                                    s_FlatNormal       = nullptr;  // 1×1 (0,0,1) tangent normal fallback
@@ -77,11 +129,31 @@ namespace {
         FS.update_path(out, "$game_textures$", leaf);
         if (FS.exist(out)) return true;
         FS.update_path(out, "$level$", leaf);
-        return FS.exist(out);
+        if (FS.exist(out)) return true;
+
+        // Last resort: an editor host's own texture store. Tested on the FILESYSTEM, not
+        // through FS.exist — that root is outside our gamedata so it was never scanned
+        // into the VFS registry. FS.r_open still opens an absolute path that exists.
+        if (const char* root = VKEditor::TextureRoot())
+        {
+            strconcat(sizeof(out), out, root, "\\", leaf);
+            if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES)
+                return true;
+        }
+        return false;
     }
 
     VkDescriptorSet AllocateSet()
     {
+        {   // Recycled set from a past streaming refresh? Fully rewritten by the
+            // caller, so reuse is safe once it cleared the fence horizon.
+            std::lock_guard<std::mutex> lk(s_StreamMutex);
+            if (!s_FreeSets.empty()) {
+                VkDescriptorSet s = s_FreeSets.back();
+                s_FreeSets.pop_back();
+                return s;
+            }
+        }
         VkDescriptorSetAllocateInfo ai{};
         ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         ai.descriptorPool     = s_Pool;
@@ -146,7 +218,7 @@ namespace {
         }
 
         auto* tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::Lmap)) {
             xr_delete(tex);
             s_LmapTexCache.emplace(std::move(key), s_WhiteLmap);
             return s_WhiteLmap;
@@ -167,9 +239,9 @@ namespace {
         bool        has_bump     = false;
     };
 
-    // Looks up `<base>.thm` in $game_textures$ (then $level$) and fills `out`.
-    // Returns false when the .thm is missing/unreadable — caller falls back
-    // to the grey detail / flat bump samplers.
+    // Looks up `<base>.thm` in $game_textures$ (then $level$, then an editor host's
+    // own texture store) and fills `out`. Returns false when the .thm is
+    // missing/unreadable — caller falls back to the grey detail / flat bump samplers.
     bool LookupTHM(const char* base_name, THMInfo& out)
     {
         if (!base_name || !base_name[0]) return false;
@@ -183,8 +255,22 @@ namespace {
         if (!F) {
             FS.update_path(full, "$level$", file_nm);
             F = FS.r_open(full);
-            if (!F) return false;
         }
+        if (!F) {
+            // SAME fallback ResolveTexturePath already had for the .dds — and its
+            // absence here was a real defect, not a missing nicety. In a host-driven
+            // editor the diffuse resolved through the editor root while its .thm did
+            // NOT, so EVERY material silently lost its detail texture, its detail
+            // scale and its bump/height: surfaces rendered as a stretched base layer
+            // with no close-range detail. Tested on the FILESYSTEM, not FS.exist —
+            // that root sits outside our gamedata and was never scanned into the VFS.
+            if (const char* root = VKEditor::TextureRoot()) {
+                strconcat(sizeof(full), full, root, "\\", file_nm);
+                if (GetFileAttributesA(full) != INVALID_FILE_ATTRIBUTES)
+                    F = FS.r_open(full);
+            }
+        }
+        if (!F) return false;
 
         // .thm structure: outer chunk THM_CHUNK_TYPE (0x0813) carries the
         // texture-class id (Image / Terrain / NormalMap). STextureParams::Load
@@ -234,7 +320,7 @@ namespace {
         }
 
         auto* tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::Detail)) {
             xr_delete(tex);
             s_DetailTexCache.emplace(detail_name, s_GreyDetail);
             return s_GreyDetail;
@@ -245,8 +331,13 @@ namespace {
 
     // Generic cached loader for a named .dds in $game_textures$ (then $level$).
     // Returns `fallback` (never null) on miss so descriptors stay valid.
+    // `colorSpace` is explicit at every call: this ONE cache serves four different roles
+    // (terrain colour detail, its _bump normals, its _height maps and the splat _mask),
+    // which is exactly why TexStreamClass could not be reused to answer colour-vs-data —
+    // all four share TexStreamClass::Terrain. Keys stay distinct via the name suffixes.
     CVulkanTexture* GetOrLoadGameTex(std::unordered_map<std::string, CVulkanTexture*>& cache,
-                                     const char* name, CVulkanTexture* fallback)
+                                     const char* name, CVulkanTexture* fallback,
+                                     TexColorSpace colorSpace = TexColorSpace::Data)
     {
         if (!name || !name[0]) return fallback;
         std::string key(name);
@@ -261,7 +352,10 @@ namespace {
             if (!FS.exist(full)) { cache.emplace(std::move(key), fallback); return fallback; }
         }
         auto* tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+        // Shared loader for terrain detail/normal/height + mask + bump# maps — all
+        // "tracked, budget-fit only, never mip-streamed" (Terrain and Bump behave
+        // identically in the streamer). Keeps them full-res unless VRAM is tight.
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::Terrain, colorSpace)) {
             xr_delete(tex);
             cache.emplace(std::move(key), fallback);
             return fallback;
@@ -299,9 +393,22 @@ namespace {
         if (!F) F = FS.r_open("$fs_root$", "gamedata\\shaders.xr");
         if (!F) F = FS.r_open("$game_config$", "..\\shaders.xr");
         if (!F) {
+            // Editor host: its gamedata is the SDK's, and shaders.xr sits at that
+            // root — one level above the texture store it hands us. A game install
+            // may not carry a loose copy at all (Gunslinger does not), so without
+            // this the editor fell back to global detail defaults for terrain.
+            if (const char* root = VKEditor::TextureRoot()) {
+                string_path p;
+                strconcat(sizeof(p), p, root, "\\..\\shaders.xr");
+                if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES)
+                    F = FS.r_open(p);
+            }
+        }
+        if (!F) {
             Msg("[VK Terrain] shaders.xr not found -> per-shader detail sets OFF (global defaults)");
             return;
         }
+        Msg("[VK Terrain] shaders.xr loaded -> per-shader detail sets ON");
 
         // Compressed-library guard (mirror ResourceManager_Loader): read 8-byte id.
         char id8[8];
@@ -362,6 +469,17 @@ namespace {
         for (const std::string& s : distinct) { Msg("[VK Terrain]   set %d: %s", n++, s.c_str()); }
     }
 
+    // Clear the one-shot latch and try again. Safe to call at any point BEFORE the
+    // first terrain material is built (the host sets its root during boot, terrain
+    // materials appear at scene push, seconds later), and a no-op once the map has
+    // actually loaded — a successful load leaves s_BlenderDet non-empty.
+    void RetryTerrainBlenderMapImpl()
+    {
+        if (!s_BlenderDet.empty()) return;   // already loaded for real
+        s_BlenderDetLoaded = false;
+        LoadTerrainBlenderMap();
+    }
+
     // Write the 15-binding terrain set: base, mask, dt_r..dt_a, lmap, dn_r..dn_a,
     // dh_r..dh_a (the 4 <detail>_height maps for SSFX-style terrain POM).
     void WriteTerrainSet(VkDescriptorSet set, const VkImageView v[15])
@@ -408,6 +526,82 @@ VkDescriptorSetLayout GetSetLayout()        { return s_SetLayout;        }
 VkDescriptorSetLayout GetTerrainSetLayout() { return s_TerrainSetLayout; }
 VkSampler             GetSampler()          { return s_Sampler;          }
 WorldMaterial*        GetDefault()          { return s_Default;          }
+
+// Rewrite binding 1 (splat mask) of every mask-less terrain material to the
+// TerrainMask bake. Level-load-end only: nothing in flight references the sets.
+void RebindTerrainMasks(VkImageView view)
+{
+    if (view == VK_NULL_HANDLE) return;
+    u32 n = 0;
+    for (auto& kv : s_Cache) {
+        WorldMaterial* m = kv.second;
+        if (!m || !m->isTerrain || m->terrainChannel == 255 || m->terrainSet == VK_NULL_HANDLE) continue;
+        VkDescriptorImageInfo ii{ s_Sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet w{};
+        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet          = m->terrainSet;
+        w.dstBinding      = 1;
+        w.descriptorCount = 1;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo      = &ii;
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        ++n;
+    }
+    Msg("[VK Terrain] baked splat mask bound to %u mask-less terrain material(s)", n);
+}
+
+// Recycle retired sets past the fence horizon (FRAMES_IN_FLIGHT=3, +1 margin).
+// Runs right after the frame fence in CRender::Begin — a set retired at frame N
+// was last bound by frame N-1's recording at the latest; by N+4 every submission
+// that could reference it has fenced out and it may be rewritten/reused.
+void FrameTick()
+{
+    std::lock_guard<std::mutex> lk(s_StreamMutex);
+    if (s_RetiredSets.empty()) return;
+    const u32 now = Device.dwFrame;
+    size_t w = 0;
+    for (size_t i = 0; i < s_RetiredSets.size(); ++i) {
+        RetiredSet& e = s_RetiredSets[i];
+        if (now < e.frame /*counter reset*/ || now - e.frame > 4)
+            s_FreeSets.push_back(e.set);
+        else
+            s_RetiredSets[w++] = e;
+    }
+    s_RetiredSets.resize(w);
+}
+
+// Streamer rebind callback: a WorldDiffuse texture `t` just changed its image (mip
+// promote/demote). NEVER rewrite the live set — in-flight frames still sample
+// through it. Each affected material gets a FRESH set (free list first) with all
+// four bindings written; the old set retires and is recycled by FrameTick after
+// the fence horizon. Runs in CRender::Begin (fence waited, nothing recording), so
+// the flipped `m->set` is what this frame's recording picks up.
+//
+// Terrain materials never come through here: their base diffuse is opted out of
+// streaming at GetOrCreate (vk_terrain_cache captures the terrain set by handle —
+// a retired handle there would dangle).
+void RebindStreamedTexture(CVulkanTexture* t)
+{
+    if (!t) return;
+    const VkImageView nv = t->GetView();
+    for (auto& kv : s_Cache) {
+        WorldMaterial* m = kv.second;
+        if (!m || m->tex != t) continue;
+        m->view = nv;
+
+        VkDescriptorSet ns = AllocateSet();
+        if (ns == VK_NULL_HANDLE) continue;   // pool exhausted — keep the old set/view pair
+        WriteSet(ns, nv, m->view_detail, m->view_lmap,
+                 m->view_bump != VK_NULL_HANDLE ? m->view_bump : s_FlatBump->GetView());
+
+        VkDescriptorSet old = m->set;
+        m->set = ns;
+        if (old != VK_NULL_HANDLE) {
+            std::lock_guard<std::mutex> lk(s_StreamMutex);
+            s_RetiredSets.push_back({ Device.dwFrame, old });
+        }
+    }
+}
 
 bool Init()
 {
@@ -527,7 +721,9 @@ bool Init()
             tb[i].binding         = (u32)i;
             tb[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             tb[i].descriptorCount = 1;
-            tb[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            // + COMPUTE: vk_terrain_cache binds this same set to its bake pipeline
+            // (reads mask + the 4 heights) — one flag here covers every pooled set.
+            tb[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
         // uMask (1) also feeds the terrain TESS EVAL: the mud footprint geometric
         // carve reads the splat softness so asphalt never dents.
@@ -558,6 +754,14 @@ bool Init()
         const u8 white[4] = { 255, 255, 255, 255 };
         s_WhiteMask = xr_new<CVulkanTexture>();
         s_WhiteMask->CreateFromData(white, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
+
+        // One-hot channel masks for shader-regionalized (mask-less) terrain.
+        for (int c = 0; c < 4; ++c) {
+            u8 onehot[4] = { 0, 0, 0, 0 };
+            onehot[c] = 255;
+            s_ChannelMask[c] = xr_new<CVulkanTexture>();
+            s_ChannelMask[c]->CreateFromData(onehot, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
+        }
 
         // Flat tangent-normal fallback (0,0,1). R4 decodes a detail-normal as
         // `n = tex.wzy*2-1` (gloss in R; tangent normal packed in A,B,G). For a
@@ -602,6 +806,10 @@ bool Init()
         // per-material lookup that consumes s_BlenderDet is the next step).
         LoadTerrainBlenderMap();
     }
+
+    // Let the texture streamer rewrite our base-diffuse descriptors when it swaps a
+    // WorldDiffuse texture's mip residency (dynamic streaming, r_txstream).
+    VK::TextureStreamer::Instance().SetRebindCallback(&RebindStreamedTexture);
 
     Msg("[VK WorldMaterial] Init OK (pool=%u sets base+detail+lmap+bump#; terrain pool x15 w/ detail-normals + detail-heights; anisotropic 16x)", kMaxSets);
     return true;
@@ -692,6 +900,13 @@ void Destroy()
         xr_delete(s_WhiteMask);
         s_WhiteMask = nullptr;
     }
+    for (int c = 0; c < 4; ++c) {
+        if (s_ChannelMask[c]) {
+            s_ChannelMask[c]->Destroy();
+            xr_delete(s_ChannelMask[c]);
+            s_ChannelMask[c] = nullptr;
+        }
+    }
     if (s_TerrainPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(VulkanHW.m_Device, s_TerrainPool, nullptr);
         s_TerrainPool = VK_NULL_HANDLE;
@@ -707,6 +922,11 @@ void Destroy()
         s_Default = nullptr;
     }
 
+    {   // Retired/free sets belong to s_Pool — the pool destroy below frees them.
+        std::lock_guard<std::mutex> lk(s_StreamMutex);
+        s_RetiredSets.clear();
+        s_FreeSets.clear();
+    }
     if (s_Pool) {
         // Frees all sets allocated from the pool — including default + cached.
         vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr);
@@ -728,10 +948,24 @@ void SetLevelTag(const char* tag)
     Msg("[VK WorldMaterial] level tag: '%s'", s_LevelTag.c_str());
 }
 
-WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark)
+WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark,
+                           const char* shader_name)
 {
     if (!s_SetLayout || !s_Default) return s_Default;
     if (!diffuse_name || !diffuse_name[0]) return s_Default;
+
+    const bool is_terrain = (strstr(diffuse_name, "terrain\\") == diffuse_name ||
+                             strstr(diffuse_name, "terrain/")  == diffuse_name);
+
+    // Mask-less terrain? (Decides the cache key below, so probed up front.) A map
+    // WITH a real `_mask` (Cordon/Bar) keeps the exact pre-existing behavior —
+    // one material, real mask, no shader keying.
+    bool terrain_maskless = false;
+    if (is_terrain) {
+        string_path mask_leaf, mask_full;
+        xr_sprintf(mask_leaf, "%s_mask", diffuse_name);
+        terrain_maskless = !ResolveTexturePath(mask_leaf, mask_full);
+    }
 
     // Same diffuse can pair with different lmaps — key on both. Lmap-bearing
     // materials are ALSO namespaced by the level tag: lmap names repeat across
@@ -740,9 +974,14 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // set — the "baked patches after a level transition" bug). Lmap-less
     // materials (weapons/NPC/props) stay global so persistent visuals keep
     // hitting their entries.
+    // MASK-LESS terrain is additionally keyed by the LEVEL SHADER: there the
+    // shader IS the region (pripyat_asfalt/earth/grass share one diffuse+lmap
+    // but must get different synthesized splat masks — one key would collapse
+    // them into a single material).
     std::string key(diffuse_name);
     key.push_back('|');
     if (lmap_name && lmap_name[0]) { key.append(lmap_name); key.push_back('|'); key.append(s_LevelTag); }
+    if (terrain_maskless && shader_name && shader_name[0]) { key.push_back('|'); key.append(shader_name); }
 
     auto it = s_Cache.find(key);
     if (it != s_Cache.end()) {
@@ -771,10 +1010,26 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     }
 
     auto* tex = xr_new<CVulkanTexture>();
-    if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+    // Base diffuse — the big VRAM consumer: eligible for the texture_lod quality
+    // slider AND dynamic mip streaming (r_txstream).
+    // Colour: this is the base albedo for BOTH world statics and every skinned visual
+    // (characters, weapons and trees all resolve through WorldMaterialCache::GetOrCreate
+    // — vk_Visual.cpp), so this one call site covers essentially all lit albedo.
+    if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::WorldDiffuse,
+                      TexColorSpace::Color)) {
         xr_delete(tex);
         s_Cache.emplace(std::move(key), s_Default);
         return s_Default;
+    }
+
+    // Terrain bases opt out of dynamic streaming (vk_terrain_cache captures the
+    // splat set by handle) — which FREEZES their residency for the session. So
+    // heal any load-time budget crush to FULL RES first, HERE, before any set
+    // captures this texture's view (the ground is the one surface that is always
+    // on screen — a frozen 256px terrain base reads as "каша", seen on Pripyat).
+    if (is_terrain) {
+        VK::TextureStreamer::Instance().EnsureMinResidency(tex, 16384);   // = full chain
+        VK::TextureStreamer::Instance().SetStreamable(tex, false);
     }
 
     // .thm lookup: R4 detail descriptor (texture + scale) and the bump
@@ -818,6 +1073,10 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     m->isGlass      = wmark && alphaRef < -1.5f && alphaRef > -2.5f;   // -2 = the glass marker (vk_Visual LoadTexture)
     m->name         = diffuse_name;
     m->tessellated  = (bumpx_tex != s_FlatBump);
+    m->view_bump    = bumpx_tex->GetView();
+    // GPU-feedback slot of the base diffuse — pushed to the world FS so it can
+    // report the actually-sampled LOD (0xFFFFFFFF = not streamable, shader skips).
+    m->streamID     = VK::TextureStreamer::Instance().GetFeedbackSlot(tex);
     m->set          = AllocateSet();
     if (m->set == VK_NULL_HANDLE) {
         Msg("![VK WorldMaterial] Pool exhausted creating '%s' — falling back to default", diffuse_name);
@@ -833,9 +1092,8 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // Mask = "<diffuse>_mask"; details = the 4 channel defaults; detail UV
     // scale reuses the base .thm detail_scale (e.g. terrain_escape = 144).
     // Falls back gracefully: missing mask → white (even blend), so terrain is
-    // never worse than the single-detail path.
-    const bool is_terrain = (strstr(diffuse_name, "terrain\\") == diffuse_name ||
-                             strstr(diffuse_name, "terrain/")  == diffuse_name);
+    // never worse than the single-detail path. (is_terrain computed above, at
+    // the load-time full-res heal.)
     if (is_terrain && s_TerrainSetLayout != VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo ai{};
         ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -847,6 +1105,29 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
             string_path mask_name;
             xr_sprintf(mask_name, "%s_mask", diffuse_name);
             CVulkanTexture* mask = GetOrLoadGameTex(s_TerrainDetCache, mask_name, s_WhiteMask);
+
+            // No real `_mask` shipped → vanilla-SoC regionalization: the LEVEL
+            // SHADER names the surface type. Synthesize a one-hot mask so this
+            // region gets its ONE proper detail (kDet order: R=grass, G=asphalt,
+            // B=earth, A=yantar) instead of an even 4-way mush.
+            if (mask == s_WhiteMask && shader_name && shader_name[0]) {
+                xr_string sl = shader_name;
+                std::transform(sl.begin(), sl.end(), sl.begin(), ::tolower);
+                int ch = 2;   // default: earth
+                if (sl.find("asfalt") != xr_string::npos || sl.find("asphalt") != xr_string::npos ||
+                    sl.find("beton")  != xr_string::npos || sl.find("road")    != xr_string::npos)
+                    ch = 1;
+                else if (sl.find("grass") != xr_string::npos || sl.find("trav") != xr_string::npos)
+                    ch = 0;
+                else if (sl.find("yantar") != xr_string::npos || sl.find("sand") != xr_string::npos ||
+                         sl.find("pesok")  != xr_string::npos)
+                    ch = 3;
+                mask = s_ChannelMask[ch];
+                m->terrainChannel = (u8)ch;   // TerrainMask bake keys regions off this
+                Msg("[VK Terrain] '%s' has no _mask - shader '%s' -> one-hot channel %d (%s)",
+                    diffuse_name, shader_name, ch,
+                    ch == 0 ? "grass" : ch == 1 ? "asphalt" : ch == 2 ? "earth" : "yantar");
+            }
 
             const VkImageView v[15] = {
                 m->view,
@@ -862,9 +1143,17 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
             WriteTerrainSet(tset, v);
             m->isTerrain  = true;
             m->terrainSet = tset;
+            // Terrain bases NEVER dynamically stream: vk_terrain_cache captures
+            // `terrainSet` by handle for its composite bake — a streaming refresh
+            // would retire that handle under it. (Load-time caps still apply.)
+            VK::TextureStreamer::Instance().SetStreamable(tex, false);
+            m->streamID = 0xFFFFFFFFu;
             // Terrain still needs a sane detail UV scale even when the base .thm
             // had none (single-detail path left it 0 → detailUV collapses).
-            if (m->detailScale <= 0.0f) m->detailScale = thm.detail_scale > 0.0f ? thm.detail_scale : 64.0f;
+            // Fallback 128: maps that DO ship a .thm sit around 144 (Cordon) — the
+            // old 64 made detail texels ~2x larger = "stretched" ground on .thm-less
+            // maps (Pripyat).
+            if (m->detailScale <= 0.0f) m->detailScale = thm.detail_scale > 0.0f ? thm.detail_scale : 128.0f;
             Msg("[VK Terrain] '%s' splat set: mask=%s scale=%.0f", diffuse_name,
                 (mask && mask != s_WhiteMask) ? "REAL" : "white", m->detailScale);
         }
@@ -875,3 +1164,10 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
 }
 
 }}  // namespace VK::WorldMaterialCache
+
+// Defined out here because the implementation lives inside WorldMaterialCache's
+// anonymous namespace, which only becomes reachable after that block closes.
+namespace VKEditor
+{
+void RetryTerrainBlenderMap() { VK::WorldMaterialCache::RetryTerrainBlenderMapImpl(); }
+} // namespace VKEditor

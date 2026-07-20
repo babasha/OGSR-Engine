@@ -95,7 +95,15 @@ bool CPHSkeleton::Spawn(CSE_Abstract* D)
             k = smart_cast<IKinematics*>(obj->Visual());
             if (k)
             {
-                k->LL_SetBoneRoot(po->saved_bones.root_bone);
+                u16 root = po->saved_bones.root_bone;
+                // Чужие спавны (era2 v124+) несут мусор в saved_bones — root_bone 0xFFFF валил
+                // LL_SetBoneRoot fatal'ом. Вне диапазона = берём настоящий корень скелета.
+                if (root >= k->LL_BoneCount())
+                {
+                    Msg("! [PHSkeleton] '%s': saved root_bone %u out of range (%u bones) — using root", D->name_replace(), root, k->LL_BoneCount());
+                    root = k->LL_GetBoneRoot();
+                }
+                k->LL_SetBoneRoot(root);
             }
         }
 

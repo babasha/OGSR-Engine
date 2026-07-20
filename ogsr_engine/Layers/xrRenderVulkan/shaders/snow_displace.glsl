@@ -42,11 +42,16 @@ float SnowDepthAt(vec3 worldPos, vec3 N, float coverage) {
 bool SnowDeformOn() { return L.deform_tex.x > 0.5; }
 
 float SnowDeformPress(vec3 wp) {
-    vec4 c = L.deform_vp * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 0.0;
-    vec2 uv = c.xy * 0.5 + 0.5; uv.y = 1.0 - uv.y;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
-    return textureLod(uDeform, uv, 0.0).r;
+    // TOROIDAL world-anchored field: uv = worldXZ / kWorld, the sampler is REPEAT so the
+    // 2048² tile wraps and a print keeps a FIXED world position (no per-frame reproject).
+    // Only the ±kHalf window around the eye is valid — beyond it a texel aliases a world
+    // point kWorld away that this frame's window doesn't own, so gate on eye distance.
+    // kHalf = 0.5*(m/texel)*size, 1/kWorld = (1/size)/(m/texel), both from deform_tex (.w,.y).
+    vec2  rel     = wp.xz - L.eye_pos.xz;
+    float winHalf = 0.5 * L.deform_tex.w / L.deform_tex.y;
+    if (max(abs(rel.x), abs(rel.y)) >= winHalf) return 0.0;
+    float invW = L.deform_tex.y / L.deform_tex.w;
+    return textureLod(uDeform, wp.xz * invW + 0.5, 0.0).r;
 }
 
 // Broad low-freq press for GEOMETRY: footprint-scale detail removed (taps ~0.55 m

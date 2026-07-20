@@ -17,6 +17,7 @@ namespace VK
 // ---------------------------------------------------------------------------
 void CFrameRingAllocator::Create()
 {
+    VK::Vram::Scope _vram_scope("Staging");
     VERIFY(m_Buffer == VK_NULL_HANDLE);
 
     m_RegionSize = TOTAL_SIZE / FRAMES_IN_FLIGHT;
@@ -38,7 +39,7 @@ void CFrameRingAllocator::Create()
                   | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
     VmaAllocationInfo allocInfo = {};
-    VK_CHECK_CRITICAL(vmaCreateBuffer(VulkanHW.m_Allocator, &bufCI, &allocCI,
+    VK_CHECK_CRITICAL(VK::Vram::CreateBuffer(VulkanHW.m_Allocator, &bufCI, &allocCI,
                                       &m_Buffer, &m_Allocation, &allocInfo));
 
     m_MappedBase = allocInfo.pMappedData;
@@ -67,7 +68,7 @@ void CFrameRingAllocator::Destroy()
 {
     if (m_Buffer == VK_NULL_HANDLE) return;
 
-    vmaDestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
+    VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
     m_Buffer     = VK_NULL_HANDLE;
     m_Allocation = VK_NULL_HANDLE;
     m_MappedBase = nullptr;

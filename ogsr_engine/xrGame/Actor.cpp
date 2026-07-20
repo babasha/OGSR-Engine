@@ -770,6 +770,16 @@ bool Is3dssZoomed{};
 
 void CActor::UpdateCL()
 {
+    // [mod-compat diag] is the actor updating at all? (foreign-map "can't walk": keys
+    // arrive but position freezes — if this line never appears, the actor fell out of
+    // the crow/update loop entirely)
+    {
+        static u32 s_n = 0;
+        if (s_n < 5 || (s_n % 500) == 0)
+            Msg("[Actor] UpdateCL #%u pos=(%.2f, %.2f, %.2f)", s_n, Position().x, Position().y, Position().z);
+        ++s_n;
+    }
+
     if (m_feel_touch_characters > 0)
     {
         for (xr_vector<CObject*>::iterator it = feel_touch.begin(); it != feel_touch.end(); it++)
@@ -923,6 +933,16 @@ float NET_Jump = 0;
 void CActor::shedule_Update(u32 DT)
 {
     setSVU(TRUE);
+
+    // [mod-compat self-heal] Foreign maps/saves can carry a bogus holderID: net_Spawn
+    // destroys the physics character expecting a vehicle attach that never comes, and
+    // the actor hangs in mcFall forever — keys arrive, position frozen. If we're
+    // alive, on our feet (no holder) and the capsule is gone, bring it back.
+    if (g_Alive() && !m_holder && !animation_movement_controlled() && !character_physics_support()->movement()->CharacterExist())
+    {
+        Msg("! [Actor] physics character missing with no holder — recreating (mod-compat)");
+        character_physics_support()->CreateCharacter();
+    }
 
     BOOL bHudView = HUDview();
     if (bHudView)

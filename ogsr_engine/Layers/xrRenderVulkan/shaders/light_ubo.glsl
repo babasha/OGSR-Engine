@@ -67,11 +67,91 @@ layout(set = ENV_SET, binding = 0) uniform Lighting {
     // Spot-light extras. x = grass shadow strength on surfaces (r_spot_grass_shadow):
     // spotShadowF blends the clean spot map (b2) with the spot+grass beam map (b22).
     vec4 spot_params;
+    // Spot shadow POOL (4×2 atlas of 1024² tiles): per-light tile assignment
+    // (packed 4 lights per vec4, value = tile+1, 0 = none) + per-tile view·proj.
+    vec4 spot_assign[4];
+    mat4 spot_pool_vp[8];
+    // Point shadow POOL: per-light cube-array index (+1, packed 4/vec4, 0 = none).
+    vec4 point_assign[4];
+    // Sky specular IBL (vk_ibl): x = enable+ready, y = spec strength (r_ibl_spec),
+    // z = max roughness mip, w = debug view (r_ibl_debug).
+    vec4 ibl_params;
+    // Sun-beam ground recovery (r_sun_beam): the volumetric shaft samples the crisp
+    // VSM ATLAS but surfaces sample the temporally-SMEARED screen mask, so a thin sun
+    // gap through a crown lands on the ground as nothing. Surfaces re-sample the crisp
+    // atlas at their own world pos and take the max, recovering the gap so the ground
+    // lights up in agreement with the shaft. x = recovery strength (0 = off), y = max
+    // distance (m), z = extra-sun boost in the recovered gap (cinematic splash),
+    // w = atlas self-bias (m along the sun ray). Appended last (prefix-safe).
+    vec4 beam_params;
+    // Sun-beam GROUND DEPOSIT (r_sun_beam_ground): x = froxel nearZ, y = log2(far/near),
+    // z = deposit strength (0 = off), w = in-scatter luminance threshold. Paired with the
+    // integrated froxel volume on binding 27 (declared by receivers that use the deposit).
+    vec4 beam2;
+    // Per-tile FLASHLIGHT grass-shadow strength (r_flashlight_grass). A handheld/worn
+    // torch (CTorch/weapon) should paint CRISP grass-blade shadows in its ground pool
+    // (the night "wow"), while wide fixtures keep the subtle spot_params.x blend. x =
+    // 8-bit mask (bit t set → pooled tile t's owner is a flashlight), y = flashlight
+    // grass strength (0..1). spotShadowF picks y for flashlight tiles, spot_params.x else.
+    // z = texture mip-LOD bias, log2(render/display) ≤ 0 — set when DLSS renders below
+    // display res so material fetches keep display-res texture detail (0 otherwise).
+    vec4 spot_flash;
+    // Terrain DEPTH OFFSET (r_pom_zoff, SSFX port): x = strength (0 = off, 1 = SSFX
+    // 0.11 m). Sinks terrain gl_FragDepth into the POM cracks in BOTH the depth
+    // prepass and the color pass, so GTAO / the VSM screen resolve shade INTO the
+    // relief. y = r_terra_blend (terrain detail-blend depth: 0 = GAMMA plain-mask
+    // cross-fade, >0 = Mishkinis height-blend width). z/w reserved. Appended last.
+    vec4 zoff_params;
+    // TERRAIN COMPOSITE CACHE (r_terra_cache, vk_terrain_cache): camera-anchored
+    // baked height+weights clipmap on ENV bindings 28/29. tcache_xform maps
+    // detail-uv -> cache-uv (cuv = duv * xy + zw); tcache_params.x = live (0/1,
+    // 0 while the cache is unbaked or the cvar is off); .y = march features of
+    // the CURRENT bake: 0 = fixed layers, 1 = cone-step (.g), 2 = cone + sun
+    // horizon self-shadow (.b, r_terra_horizon). Appended last.
+    vec4 tcache_xform;
+    vec4 tcache_params;
+    // Per-level terrain channel depth offsets (SSFX ssfx_terrain_offset, read
+    // from gamedata\config\terrain_details.ltx by vk_env_light). R/G/B/A detail
+    // heights shift by these before the POM march. Appended last (prefix-safe).
+    vec4 ch_off;
+    // BAKED terrain splat mask (mask-less maps, VK::TerrainMask): world XZ ->
+    // mask UV affine, maskUV = (wp.xz - xy) * zw. .z == 0 -> no bake (sample the
+    // material's own mask at vUV as always). Appended last (prefix-safe).
+    vec4 tmask_params;
+    // Diffuse sky irradiance via SH9 (vk_ibl + sky_sh_project.comp).
+    //   x = SH strength: r_sky_sh × "coefficients have been projected" (0 = use the
+    //       prefiltered-cube fallback instead),
+    //   y = sky_rotation (rad) — needed ONLY by the raw-cube fallback, which still
+    //       samples the weather cubes in their authoring space,
+    //   z = probe top mip (the fallback's diffuse LOD), w reserved.
+    // Appended last (prefix-safe).
+    vec4 sh_params;
 } L;
+
+// Splat-mask UV: baked world-space mask (mask-less maps) or the material's own
+// repeating detail-uv mask. Shared by the terrain color/depth/tess stages so
+// they all cut the SAME regions.
+vec2 terrainMaskUV(vec2 uv, vec3 wp)
+{
+    return (L.tmask_params.z > 0.0) ? (wp.xz - L.tmask_params.xy) * L.tmask_params.zw : uv;
+}
+
+// Atlas tile of collected light `gi` (-1 = the light casts no spot shadow).
+int spotTileOf(int gi)
+{
+    if (gi < 0 || gi >= 16) return -1;
+    return int(L.spot_assign[gi >> 2][gi & 3] + 0.5) - 1;
+}
+// Cube-array index of collected light `gi` (-1 = no point shadow).
+int pointCubeOf(int gi)
+{
+    if (gi < 0 || gi >= 16) return -1;
+    return int(L.point_assign[gi >> 2][gi & 3] + 0.5) - 1;
+}
 
 layout(set = ENV_SET, binding = 1)  uniform sampler2D   uShadow;       // far sun map (cached)
 layout(set = ENV_SET, binding = 2)  uniform sampler2D   uSpotShadow;   // spot (flashlight) shadow map
-layout(set = ENV_SET, binding = 3)  uniform samplerCube uPointShadow;  // point (campfire) shadow cube
+layout(set = ENV_SET, binding = 3)  uniform samplerCubeArray uPointShadow;  // point shadow cube POOL
 layout(set = ENV_SET, binding = 4)  uniform sampler2D   uShadowNear;   // sun cascade 0 (~0.61 cm texels)
 layout(set = ENV_SET, binding = 5)  uniform sampler2D   uShadowC1;     // sun cascade 1 (~1.46 cm texels)
 layout(set = ENV_SET, binding = 6)  uniform samplerCube uSky0;         // sky ambient cube 0 (weather A)
@@ -91,5 +171,15 @@ layout(set = ENV_SET, binding = 21) uniform sampler2D   uIL;
 // Spot BEAM map: the spot map + grass casters (see vk_pass_shadow). spotShadowF
 // blends it with the clean uSpotShadow so grass shadows surfaces partially.
 layout(set = ENV_SET, binding = 22) uniform sampler2D   uSpotShadowGrass;
+// Sky specular IBL: prefiltered environment cube (roughness mips), sampled by
+// iblSpecular() in env_common.glsl. Grey fallback until vk_ibl has a probe.
+layout(set = ENV_SET, binding = 26) uniform samplerCube uSkySpec;
+// Diffuse sky irradiance coefficients (9 × vec4, std430), projected from the
+// world-space probe once per weather change. Read by skyAmbient() in
+// env_common.glsl. Bound to a dummy buffer until the first projection lands —
+// sh_params.x gates the read, so the dummy is never actually consumed.
+layout(std430, set = ENV_SET, binding = 31) readonly buffer SkySH {
+    vec4 c[9];
+} skySH;
 
 #endif // LIGHT_UBO_GLSL

@@ -14,4 +14,9 @@
 namespace VK {
 void Pass_SunShadow(FrameContext& ctx);
 void SunShadow_Destroy();   // grass-spot caster pipeline teardown (device shutdown)
+// Spot shadow POOL: atlas tile owned by this light this frame (-1 = none).
+// Valid after Pass_SunShadow; pass the vkLight* from FrameLights::src.
+int  SpotShadow_TileOfLight(const void* light);
+// Point shadow POOL: cube-array index owned by this light this frame (-1 = none).
+int  PointShadow_CubeOfLight(const void* light);
 }

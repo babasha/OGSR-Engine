@@ -7,6 +7,9 @@
 #pragma warning(pop)
 
 #include "xrCDB.h"
+#include "xrCDB_tiled.h"
+
+#include <algorithm>
 
 using namespace CDB;
 using namespace Opcode;
@@ -270,11 +273,142 @@ public:
     }
 };
 
+// ============================================================================
+// Tiled routing: DDA over the XZ tile grid along the ray. Each visited tile is
+// pre-tested against its exact 3D geometry bounds (so a sun ray crossing the
+// tile's XZ column far above the roofs never pages it in), then made resident
+// and stabbed with the SAME collider instance — rRange keeps shrinking across
+// tiles in ONLYNEAREST mode, which also terminates the walk early.
+// ============================================================================
+template <bool bCull, bool bFirst, bool bNearest>
+static void ray_query_tiled(COLLIDER* CL, TILE_GRID& G, Fvector* verts, TRI* tris, const Fvector& start, const Fvector& dir, float range)
+{
+    ray_collider<bCull, bFirst, bNearest> RC;
+    RC._init(CL, verts, tris, start, dir, range);
+
+    // clip [0..range] against the grid rect in XZ
+    float t0 = 0.f, t1 = range;
+    const auto clip = [&](float s, float d, float lo, float hi) -> bool {
+        if (_abs(d) < 1e-8f)
+            return s >= lo && s <= hi;
+        float ta = (lo - s) / d, tb = (hi - s) / d;
+        if (ta > tb)
+            std::swap(ta, tb);
+        t0 = std::max(t0, ta);
+        t1 = std::min(t1, tb);
+        return t0 <= t1;
+    };
+    if (!clip(start.x, dir.x, G.origin_x, G.origin_x + G.nx * G.tile_size) || !clip(start.z, dir.z, G.origin_z, G.origin_z + G.nz * G.tile_size))
+        return;
+
+    // DDA (Amanatides & Woo) over XZ cells
+    const float px = start.x + dir.x * t0, pz = start.z + dir.z * t0;
+    int ix = std::clamp(G.cell_x(px), 0, (int)G.nx - 1);
+    int iz = std::clamp(G.cell_z(pz), 0, (int)G.nz - 1);
+    const int sx = dir.x > 0.f ? 1 : (dir.x < 0.f ? -1 : 0);
+    const int sz = dir.z > 0.f ? 1 : (dir.z < 0.f ? -1 : 0);
+    const float tdx = sx ? G.tile_size / _abs(dir.x) : flt_max;
+    const float tdz = sz ? G.tile_size / _abs(dir.z) : flt_max;
+    float tmx = flt_max, tmz = flt_max;
+    if (sx)
+        tmx = t0 + (G.origin_x + (ix + (sx > 0 ? 1 : 0)) * G.tile_size - px) / dir.x;
+    if (sz)
+        tmz = t0 + (G.origin_z + (iz + (sz > 0 ? 1 : 0)) * G.tile_size - pz) / dir.z;
+
+    u32 stabbed = 0;
+    for (;;)
+    {
+        TILE& t = G.cell(ix, iz);
+        if (t.file_nodes)
+        {
+            aabb_t box;
+            box.min.set(t.bb_min);
+            box.min.pad = 0;
+            box.max.set(t.bb_max);
+            box.max.pad = 0;
+            float d;
+            if (isect_sse(box, RC.ray, d) && d <= RC.rRange)
+            {
+                with_tile(G, t, [&](const AABBNoLeafNode* nodes) { RC._stab(nodes); });
+                ++stabbed;
+                if constexpr (bFirst)
+                {
+                    if (CL->r_count())
+                        return;
+                }
+            }
+        }
+        const float tn = std::min(tmx, tmz);
+        if (tn > std::min(t1, RC.rRange)) // rRange shrinks as ONLYNEAREST refines
+            break;
+        if (tmx <= tmz)
+        {
+            tmx += tdx;
+            ix += sx;
+            if (ix < 0 || ix >= (int)G.nx)
+                break;
+        }
+        else
+        {
+            tmz += tdz;
+            iz += sz;
+            if (iz < 0 || iz >= (int)G.nz)
+                break;
+        }
+    }
+    if (!bFirst && !bNearest && stabbed > 1)
+        CL->r_dedup_by_id(); // boundary tris live in 2+ tiles
+}
+
 void COLLIDER::ray_query(u32 ray_mode, const MODEL* m_def, const Fvector& r_start, const Fvector& r_dir, float r_range)
 {
     ZoneScoped;
 
     m_def->syncronize();
+
+    if (TILE_GRID* G = m_def->tiled())
+    {
+        r_clear();
+        // The sound thread queries the MODEL directly, bypassing xrXRC's NaN
+        // guard — and a NaN would spin the DDA forever, not just walk one tree.
+        if (!_valid(r_start) || !_valid(r_dir) || !_valid(r_range))
+            return;
+        if (ray_mode & OPT_CULL)
+        {
+            if (ray_mode & OPT_ONLYFIRST)
+            {
+                if (ray_mode & OPT_ONLYNEAREST)
+                    ray_query_tiled<true, true, true>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+                else
+                    ray_query_tiled<true, true, false>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+            }
+            else
+            {
+                if (ray_mode & OPT_ONLYNEAREST)
+                    ray_query_tiled<true, false, true>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+                else
+                    ray_query_tiled<true, false, false>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+            }
+        }
+        else
+        {
+            if (ray_mode & OPT_ONLYFIRST)
+            {
+                if (ray_mode & OPT_ONLYNEAREST)
+                    ray_query_tiled<false, true, true>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+                else
+                    ray_query_tiled<false, true, false>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+            }
+            else
+            {
+                if (ray_mode & OPT_ONLYNEAREST)
+                    ray_query_tiled<false, false, true>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+                else
+                    ray_query_tiled<false, false, false>(this, *G, m_def->verts, m_def->tris, r_start, r_dir, r_range);
+            }
+        }
+        return;
+    }
 
     // Get nodes
     const AABBNoLeafTree* T = (const AABBNoLeafTree*)m_def->tree->GetTree();

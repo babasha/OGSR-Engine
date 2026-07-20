@@ -16,6 +16,9 @@ void main()
     pool[i].pos_age.w = -1.0;   // dead
     freeList[i]       = i;      // every slot is free
 
+    if (i < uint(GP_MAX_PROGRAMS))
+        progAlive[i] = 0u;      // #5: per-program alive counts start empty
+
     if (i == 0u) {
         counters[0] = pc.maxParticles;  // freeCount = all slots free
         counters[1] = 0u;               // aliveCount

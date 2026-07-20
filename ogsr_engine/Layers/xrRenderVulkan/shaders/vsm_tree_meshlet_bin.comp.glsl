@@ -45,6 +45,7 @@ void main()
 
     uint pcount = pageInd[c * 5u + 1u];   // pages this tree bound in stage 1 (instanceCount)
     if (pcount == 0u) return;
+    uint pbase  = pageInd[c * 5u + 4u];   // stage-1 firstInstance = the tree's casterPages ARENA run
     Range rg = treeRange[c];
     if (rg.count == 0u) return;
 
@@ -65,7 +66,7 @@ void main()
 
         for (uint pi = 0u; pi < pcount; ++pi)
         {
-            uint  slot = casterPages[c * pc.cap + pi];
+            uint  slot = casterPages[pbase + pi] & 0x1FFFu;   // arena entry = (tree<<13)|slot
             uvec4 pg   = pageList[slot];
             int   L    = int(pg.x);
             ivec2 page = ivec2(pg.yz);

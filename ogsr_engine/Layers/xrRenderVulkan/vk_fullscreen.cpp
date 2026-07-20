@@ -38,7 +38,8 @@ VkPipelineColorBlendAttachmentState AdditiveAttachment()
 VkPipeline CreatePipeline(VkShaderModule vs, VkShaderModule fs, VkFormat colorFmt,
                           VkPipelineLayout layout,
                           const VkPipelineColorBlendAttachmentState& blend,
-                          const char* tag)
+                          const char* tag,
+                          VkExtent2D shadingRate)
 {
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -83,9 +84,23 @@ VkPipeline CreatePipeline(VkShaderModule vs, VkShaderModule fs, VkFormat colorFm
     prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
 
+    // Optional STATIC coarse shading rate (pipelineFragmentShadingRate). Combiners KEEP =
+    // ignore primitive/attachment rate, use this pipeline rate. Only when the device
+    // supports it AND the caller asked for > 1x1 (else per-pixel as before).
+    const void* head = &prci;
+    VkPipelineFragmentShadingRateStateCreateInfoKHR fsr{};
+    if (VulkanHW.m_bVRSPipelineSupported && (shadingRate.width > 1 || shadingRate.height > 1)) {
+        fsr.sType = VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR;
+        fsr.fragmentSize = shadingRate;
+        fsr.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        fsr.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        fsr.pNext = &prci;
+        head = &fsr;
+    }
+
     VkGraphicsPipelineCreateInfo pi{};
     pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = st;
+    pi.pNext = head; pi.stageCount = 2; pi.pStages = st;
     pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
     pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = layout;

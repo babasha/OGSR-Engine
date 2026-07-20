@@ -12,6 +12,22 @@ bool CRenderDevice::on_message(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         return (false);
     }
     case WM_SETCURSOR: {
+        // Embedded in the SDK: show a normal arrow over the viewport. We must set it
+        // AND consume the message — returning false would let DefWindowProc forward
+        // WM_SETCURSOR up to the parent (the SDK), whose ImGui handler hides the OS
+        // cursor (it draws a software cursor on its DX9 backbuffer, which our Vulkan
+        // child occludes → an invisible pointer). The game path is unchanged.
+        extern bool g_ed_embedded;
+        if (g_ed_embedded)
+        {
+            if (LOWORD(lParam) == HTCLIENT)
+            {
+                SetCursor(LoadCursor(nullptr, IDC_ARROW));
+                result = TRUE;
+                return (true);
+            }
+            return (false); // non-client (borders) — default handling
+        }
         result = 1;
         return (true);
     }

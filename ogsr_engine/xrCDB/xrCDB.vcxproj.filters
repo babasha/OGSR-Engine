@@ -33,6 +33,12 @@
     <ClCompile Include="xrCDB_ray.cpp">
       <Filter>Kernel</Filter>
     </ClCompile>
+    <ClCompile Include="xrCDB_stress.cpp">
+      <Filter>Kernel</Filter>
+    </ClCompile>
+    <ClCompile Include="xrCDB_tiled.cpp">
+      <Filter>Kernel</Filter>
+    </ClCompile>
     <ClCompile Include="ISpatial.cpp">
       <Filter>Kernel</Filter>
     </ClCompile>
@@ -168,6 +174,9 @@
       <Filter>Kernel</Filter>
     </ClInclude>
     <ClInclude Include="xrCDB.h">
+      <Filter>Kernel</Filter>
+    </ClInclude>
+    <ClInclude Include="xrCDB_tiled.h">
       <Filter>Kernel</Filter>
     </ClInclude>
     <ClInclude Include="ISpatial.h">

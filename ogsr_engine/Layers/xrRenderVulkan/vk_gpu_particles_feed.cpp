@@ -18,44 +18,117 @@
 
 #include "stdafx.h"
 #include "vk_Particles.h"
-#include "vk_pass_world.h"            // g_DynamicVisuals / DynVisual
 #include "vk_gpu_particles.h"         // EmitterSample / Enabled / ResolveProgram / ProgramRate
-#include "../../xr_3da/fmesh.h"       // MT_PARTICLE_EFFECT / MT_PARTICLE_GROUP
+#include "../../xr_3da/device.h"      // Device.fTimeGlobal — per-instance spawn-slot expiry
+#include <mutex>
+
+// Registry of live GPU-claimed effects. Emission runs from HERE (not from the
+// frustum-visible visual lists): the CPU path keeps simulating off-screen
+// emitters via shedule_Update, so a campfire is already burning when you
+// arrive — the GPU path matches that by emitting for every live claimed
+// effect regardless of visibility (the draw was never CPU-culled anyway, and
+// the #5 budgets already count live OBJECTS, not visible ones).
+// Registered by vkCParticleEffect::GpuClaimed on resolve, unregistered in its
+// destructor (game thread) — hence the mutex.
+namespace {
+    std::mutex                       s_liveFxMx;
+    xr_vector<vkCParticleEffect*>    s_liveFx;
+}
+
+void VK_GP_RegisterEffect(vkCParticleEffect* e)
+{
+    if (!e) return;
+    std::lock_guard<std::mutex> g(s_liveFxMx);
+    s_liveFx.push_back(e);
+}
+
+void VK_GP_UnregisterEffect(vkCParticleEffect* e)
+{
+    std::lock_guard<std::mutex> g(s_liveFxMx);
+    for (size_t i = 0; i < s_liveFx.size(); ++i)
+        if (s_liveFx[i] == e) { s_liveFx[i] = s_liveFx.back(); s_liveFx.pop_back(); return; }
+}
 
 void VK_GP_CollectWorldEmitters(xr_vector<VK::GPUParticles::EmitterSample>& out, float dt)
 {
     using namespace VK::GPUParticles;
     if (!Enabled() || dt <= 0.0f) return;
 
-    static xr_vector<vkCParticleEffect*> leaves;
-    for (const VK::DynVisual& d : VK::g_DynamicVisuals)
+    std::lock_guard<std::mutex> g(s_liveFxMx);
+    const float now = Device.fTimeGlobal;
+    for (vkCParticleEffect* e : s_liveFx)
     {
-        if (!d.vis) continue;
-        const u32 t = d.vis->Type;
-        if (t != MT_PARTICLE_EFFECT && t != MT_PARTICLE_GROUP) continue;
+        if (!e || !e->IsPlaying()) continue;
+        if (e->m_GpuProgram < 0) continue;           // registry only holds claimed, but be safe
 
-        leaves.clear();
-        static_cast<vkParticleVisual*>(d.vis)->CollectEffects(leaves);
-        for (vkCParticleEffect* e : leaves)
-        {
-            if (!e || !e->IsPlaying()) continue;
-            if (!e->GpuClaimed()) continue;          // not GPU-routed smoke (or failed → CPU)
-
-            const float rate = ProgramRate(e->m_GpuProgram);
-            if (rate <= 0.0f) continue;
-
-            e->m_GpuAccum += rate * dt;
-            u32 cnt = (u32)e->m_GpuAccum;
-            e->m_GpuAccum -= (float)cnt;
-            if (cnt == 0) continue;
-
-            EmitterSample es;
-            es.program = (u32)e->m_GpuProgram;
-            es.count   = cnt;
-            es.pos     = e->m_RT_Flags.is(vkCParticleEffect::flRT_XFORM) ? e->m_XFORM.c
-                                                                         : e->m_InitialPosition;
-            es.vel.set(0, 0, 0);
-            out.push_back(es);
+        // Off-screen emission is for effects the game actually shows:
+        // STATIONARY emitters (campfires keep burning behind your back) or
+        // anything submitted to render recently. A PLAYING but never-submitted
+        // MOVING emitter is a hidden attachment (burn/smoke stuck to the
+        // first-person actor) — the CPU path simulated those invisibly, so
+        // emitting them here would show smoke the game deliberately hides.
+        const Fvector pos = e->m_RT_Flags.is(vkCParticleEffect::flRT_XFORM) ? e->m_XFORM.c
+                                                                            : e->m_InitialPosition;
+        if (!pos.similar(e->m_GpuLastPos, 0.02f)) { e->m_GpuLastPos = pos; e->m_GpuLastMoveT = now; }
+        // Dead-queued objects stop being ticked (OnFrame): the game hides them
+        // from render instantly (CPU wipes their particles with the object),
+        // so besides stopping emission, kill their remaining particles. Safe
+        // against false positives now: the kill has an age floor (gp_simulate)
+        // and we reset the victim's own spawn ring, so a still-living effect
+        // that trips this simply respawns next frame instead of blanking 10 s.
+        // 3 s threshold: the off-screen scheduler can tick sparsely.
+        const bool ticked = (now - e->m_GpuLastTickT) < 3.0f;
+        if (!ticked) {
+            if (!e->m_GpuHiddenKill) {
+                e->m_GpuHiddenKill = true;
+                QueueKill(e->m_GpuProgram, pos, 1.5f);
+                for (u32 s = 0; s < vkCParticleEffect::kGpuOwnSlots; ++s) e->m_GpuSpawnT[s] = -1e9f;
+            }
+            continue;
         }
+        e->m_GpuHiddenKill = false;
+        const bool submitted  = (now - e->m_GpuLastSubmitT) < 1.0f;
+        const bool stationary = (now - e->m_GpuLastMoveT)   > 1.0f;
+        if (!submitted && !stationary) continue;
+
+        const float rate = ProgramRate(e->m_GpuProgram);
+        if (rate <= 0.0f) continue;
+
+        e->m_GpuAccum += rate * dt;
+        u32 cnt = (u32)e->m_GpuAccum;
+        e->m_GpuAccum -= (float)cnt;
+
+        // #5 per-instance ownership for small budgets (flames = ONE
+        // billboard): only spawn into an OWN slot whose previous
+        // occupant has lived out its lifetime. Refused spawns are
+        // dropped, not banked — exactly PAPI's at-max birth drop.
+        const u32 ownMax = ProgramMaxP(e->m_GpuProgram);
+        if (cnt && ownMax && ownMax <= vkCParticleEffect::kGpuOwnSlots) {
+            const float life = ProgramLife(e->m_GpuProgram);
+            const float now  = Device.fTimeGlobal;
+            u32 allow = 0;
+            for (u32 k = 0; k < cnt; ++k) {
+                bool found = false;
+                for (u32 s = 0; s < ownMax; ++s)
+                    if (now - e->m_GpuSpawnT[s] >= life) { e->m_GpuSpawnT[s] = now; found = true; break; }
+                if (!found) break;
+                ++allow;
+            }
+            cnt = allow;
+        }
+
+        // count == 0 samples still matter: the per-program alive cap (#5) =
+        // m_MaxParticles × instance count, and an instance whose fractional
+        // accumulator skipped this frame is still alive. Zero-count samples
+        // never become spawn requests.
+
+        EmitterSample es;
+        es.program = (u32)e->m_GpuProgram;
+        es.count   = cnt;
+        es.pos     = e->m_RT_Flags.is(vkCParticleEffect::flRT_XFORM) ? e->m_XFORM.c
+                                                                     : e->m_InitialPosition;
+        es.vel.set(0, 0, 0);
+        es.hud     = e->GetHudMode();
+        out.push_back(es);
     }
 }

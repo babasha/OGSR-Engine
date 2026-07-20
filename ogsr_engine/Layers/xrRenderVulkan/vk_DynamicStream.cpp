@@ -43,6 +43,7 @@ _VertexStream_vk::~_VertexStream_vk()
 
 void _VertexStream_vk::Create()
 {
+    VK::Vram::Scope _vram_scope("DynStream");
     if (m_Buffer != VK_NULL_HANDLE) {
         Msg("![Vulkan] _VertexStream_vk::Create() - buffer already created");
         return;
@@ -65,7 +66,7 @@ void _VertexStream_vk::Create()
                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
     // Create buffer
-    VkResult result = vmaCreateBuffer(
+    VkResult result = VK::Vram::CreateBuffer(
         VulkanHW.m_Allocator,
         &bufferInfo,
         &allocInfo,
@@ -86,7 +87,7 @@ void _VertexStream_vk::Create()
 
     if (!m_MappedData) {
         Msg("![Vulkan] Dynamic vertex buffer mapping failed");
-        vmaDestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
+        VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
         m_Buffer = VK_NULL_HANDLE;
         m_Allocation = VK_NULL_HANDLE;
         return;
@@ -104,7 +105,7 @@ void _VertexStream_vk::Destroy()
 {
     if (m_Buffer != VK_NULL_HANDLE) {
         // No need to unmap - VMA handles it automatically with MAPPED_BIT
-        vmaDestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
+        VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, m_Buffer, m_Allocation);
         m_Buffer = VK_NULL_HANDLE;
         m_Allocation = VK_NULL_HANDLE;
         m_MappedData = nullptr;

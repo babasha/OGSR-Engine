@@ -10,6 +10,8 @@ class Model;
 
 namespace CDB
 {
+class TILE_GRID;
+
 // Triangle
 class alignas(16) XRCDB_API TRI //*** 16 bytes total (was 32 :)
 {
@@ -48,6 +50,7 @@ class XRCDB_API MODEL : Noncopyable
 
 private:
     Opcode::Model* tree{};
+    TILE_GRID* tiles_{}; // tiled residency mode (streaming-world Stage C); tree==null then
     std::atomic<u32> status{S_INIT}; // 0=init, 1=build, 2=ready
 
     // tris
@@ -77,6 +80,26 @@ public:
 
     void build(const Fvector* V, const size_t Vcnt, const TRI* T, const size_t Tcnt, build_callback* bc = nullptr, void* bcp = nullptr);
     u32 memory();
+
+    // Disk cache of the BUILT model (verts + tris + OPCODE no-leaf tree). The OPCODE
+    // builder is single-threaded and O(minutes) on 60M-tri levels with a multi-GB
+    // temporary tree — caching the finished product skips all of it. `key` must fold
+    // in everything the built data depends on (cform bytes AND whatever the build
+    // callback consumed — it already ran on the cached tris, it is NOT re-run on load).
+    // cache_load: on success the model is READY and build() must not be called.
+    bool cache_load(const char* path, u64 key);
+    bool cache_save(const char* path, u64 key); // call after build(); best-effort
+
+    // Tiled residency mode (see xrCDB_tiled.h): verts/tris resident, OPCODE
+    // tree split into XZ tiles streamed from `cache_path`. Same key contract
+    // as cache_load/cache_save. build_tiled bakes + saves + adopts (false =
+    // caller should fall back to the monolithic build); cache_load_tiled
+    // loads header/verts/tris/directory, tile trees stay lazy.
+    IC TILE_GRID* tiled() const { return tiles_; }
+    bool build_tiled(const Fvector* V, size_t Vcnt, const TRI* T, size_t Tcnt, const Fbox& aabb, build_callback* bc, void* bcp, const char* cache_path, u64 key);
+    bool cache_load_tiled(const char* cache_path, u64 key);
+    void update_streaming(const Fvector& focus, size_t budget_mb, float bubble_radius, BOOL verbose); // no-op unless tiled
+
 private:
 
     void build_internal(const Fvector* V, const size_t Vcnt, const TRI* T, const size_t Tcnt, build_callback* bc = nullptr, void* bcp = nullptr);
@@ -130,6 +153,7 @@ public:
     ICF RESULT* r_begin() { return std::data(rd); }
     ICF RESULT* r_end() { return std::data(rd) + std::size(rd); }
     RESULT& r_add();
+    void r_dedup_by_id(); // tiled queries: a boundary tri lives in 2+ tiles and would double contacts
     ICF size_t r_count() { return rd.size(); };
     ICF void r_clear() { rd.clear(); };
 };

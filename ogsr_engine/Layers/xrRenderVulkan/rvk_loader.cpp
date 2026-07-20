@@ -28,6 +28,7 @@
 #include "vk_shadow_gpu.h"      // VK::ShadowGPU (GPU-driven sun shadow casters)
 #include "vk_world_gpu.h"       // VK::WorldGPU (GPU-driven world forward pass)
 #include "vk_vsm.h"             // VK::VSM::InvalidateCache (world-anchored page cache vs level change)
+#include "vk_terrain_cache.h"   // TerrainCache::OnLevelUnload (forget captured terrain)
 #include "vk_world_material.h"  // VK::WorldMaterialCache::SetLevelTag (per-level lightmap namespacing)
 #include "HW_Vulkan.h"          // VulkanHW (vkDeviceWaitIdle in level_Unload)
 #include "vk_command_buffer.h"  // CommandManager.FlushUploadsAndWait (drain async uploads)
@@ -52,6 +53,13 @@ void CRender::level_Load(IReader* fs)
 
     Msg("[Vulkan] CRender::level_Load() started");
     pApp->LoadBegin();
+
+    // Open the texture streamer's per-level bracket (budget snapshot + demotion tally
+    // + end-of-load residency report). Mirrors r4_loader.cpp:35. The matching
+    // DeferredLoad(FALSE)/ResourcesDeferredUpload closing it come from the shared
+    // level-start path (Level_network_start_client). Level textures are created just
+    // below (the "Loading N level shaders" pass), so this must precede them.
+    Device.m_pRender->DeferredLoad(TRUE);
 
     // Namespace the material cache's lightmap keys by THIS level ($level$ is
     // already mounted here): lmap names repeat across levels, and the cache
@@ -117,10 +125,11 @@ void CRender::level_Load(IReader* fs)
         LoadSWIs(geom);
         FS.r_close(geom);
 
-        geom = FS.rs_open("$level$", "level.geomx");
-        R_ASSERT2(geom, "level.geomx not found");
-        LoadBuffers(geom, TRUE);
-        FS.r_close(geom);
+        // level.geomx (fast-path shadow geometry) is deliberately NOT loaded:
+        // vkFVisual::LoadFastPath is a stub, the extended pool registers nowhere
+        // and nothing binds it — it was hundreds of MB of dead VRAM per level
+        // (shadows draw the cluster-LOD / meshlet paths instead). xVB/xIB stay
+        // empty; release_bufs() on unload handles that fine.
     }
 
     g_pGamePersistent->LoadTitle("");
@@ -144,10 +153,29 @@ void CRender::level_Load(IReader* fs)
     if (!Details) Details = xr_new<VK::CDetailManager>();
     Details->Load();
 
+    // ----- GPU-driven world forward pass -----------------------------------
+    // Extract opaque/AT static world meshes grouped by material for compute-cull
+    // + indirect draw (moves per-object CPU submission off the CPU so detail-rich
+    // levels stop hitting the draw-call wall). See vk_pass_world / vk_world_gpu.
+    // Runs BEFORE ShadowGPU so the caster build can report cluster-shadow
+    // coverage (casters outside the WorldGPU set, WorldGPU::InSet).
+    VK::WorldGPU::Build();
+
+    // ----- Pool compaction (Stage B increment (б)) --------------------------
+    // Free the nVB/nIB slices of cluster-repacked meshes (their draw data lives
+    // in the ClusterStream page pools). MUST run after WorldGPU::Build (needs
+    // the cluster/repack refs) and BEFORE Trees->Build / ShadowGPU::Build —
+    // both snapshot pool handles + offsets from m_mesh at Build, so building
+    // them after the swap means they see the compacted state. The upload drain
+    // guarantees the pools' initial data is on the GPU before the copy.
+    CommandManager.FlushUploadsAndWait();
+    VK::WorldGPU::CompactPools();
+
     // ----- Trees ------------------------------------------------------------
     // GPU-driven indirect path: walks Visuals[] for MT_TREE_ST/PM, builds
-    // metadata + transforms SSBOs. Session A only — Session B adds compute
-    // cull + draw. Must run AFTER LoadVisuals (Visuals[] populated).
+    // metadata + transforms SSBOs. Must run AFTER LoadVisuals (Visuals[]
+    // populated) and AFTER CompactPools (snapshots pool handles/offsets +
+    // reads back meshlet/hull geometry from the pools).
     if (!Trees) Trees = xr_new<VK::CTreeManager>();
     Trees->Build();
 
@@ -158,17 +186,17 @@ void CRender::level_Load(IReader* fs)
     // CPU FlushDepth path. See vk_pass_shadow / vk_shadow_gpu.
     VK::ShadowGPU::Build();
 
-    // ----- GPU-driven world forward pass -----------------------------------
-    // Extract opaque/AT static world meshes grouped by material for compute-cull
-    // + indirect draw (moves per-object CPU submission off the CPU so detail-rich
-    // levels stop hitting the draw-call wall). See vk_pass_world / vk_world_gpu.
-    VK::WorldGPU::Build();
-
     // ----- LOD imposters ----------------------------------------------------
     // FLOD billboard facets (MT_LOD) for distant foliage density. Must run after
     // LoadVisuals so the vkFLOD objects exist.
     if (!LODs) LODs = xr_new<VK::CLODManager>();
     LODs->Build();
+
+    // ----- Terrain splat-mask bake (mask-less maps) -------------------------
+    // Community maps regionalize terrain by LEVEL SHADER and ship no `_mask` —
+    // bake the mask from their own region geometry (soft seams). No-op on maps
+    // with an authored mask. Must run AFTER LoadVisuals + material creation.
+    VK::TerrainMask::BakeIfNeeded();
 
     pApp->LoadEnd();
 
@@ -245,6 +273,11 @@ void CRender::level_Unload()
     // the first frame re-renders the atlas from the new casters.
     VK::VSM::InvalidateCache();
 
+    // Terrain composite cache captured THIS level's terrain material/mesh/affine —
+    // forget them (the next level's first terrain draw re-captures + re-bakes).
+    VK::TerrainCache::OnLevelUnload();
+    VK::TerrainMask::OnLevelUnload();
+
     if (LODs) {
         LODs->Destroy();
         xr_delete(LODs);
@@ -264,6 +297,7 @@ void CRender::level_Unload()
 // ============================================================================
 void CRender::LoadBuffers(CStreamReader* base_fs, BOOL _alternative)
 {
+    VK::Vram::Scope _vram_scope("Geom/Pools");
     R_ASSERT2(base_fs, "Could not load geometry - file not found");
 
     xr_vector<VK::CVulkanBuffer*>& _VB = _alternative ? xVB : nVB;
@@ -313,7 +347,7 @@ void CRender::LoadBuffers(CStreamReader* base_fs, BOOL _alternative)
                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // CTreeManager meshlet readback (positions)
             _VB[i] = xr_new<VK::CVulkanBuffer>();
-            _VB[i]->Create(vCount * vSize, vbUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+            _VB[i]->Create(vCount * vSize, vbUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
             _VB[i]->Upload(pData, vCount * vSize);
 
             // Only the normal pool publishes to g_BufferPool — extended (geomx)
@@ -346,7 +380,7 @@ void CRender::LoadBuffers(CStreamReader* base_fs, BOOL _alternative)
                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT;   // CTreeManager meshlet readback (indices)
             _IB[i] = xr_new<VK::CVulkanBuffer>();
-            _IB[i]->Create(iSize, ibUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+            _IB[i]->Create(iSize, ibUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
             _IB[i]->Upload(pData, iSize);
 
             if (VK::g_BufferPool && !_alternative)

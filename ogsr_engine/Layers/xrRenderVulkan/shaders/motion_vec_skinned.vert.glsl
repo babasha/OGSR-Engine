@@ -26,12 +26,13 @@ layout(location = 1) out vec4 vPrevClip;
 layout(location = 2) out vec2 vUV;       // for the fragment alpha-test (cutout holes)
 
 layout(push_constant) uniform PC {
-    mat4 curVP;     // 0   this frame's view-proj
-    mat4 prevVP;    // 64  previous frame's view-proj
+    mat4 curVP;     // 0   this frame's view-proj, UNJITTERED (jitter-free MV)
+    mat4 prevVP;    // 64  previous frame's view-proj, UNJITTERED
     uint skinMode;  // 128 1=1W,2=2W,3=3W,4=4W
     uint curBase;   // 132 this frame's first bone slot
     uint prevBase;  // 136 previous frame's first bone slot (== curBase if the skeleton is new)
     uint boneCount; // 140 bone count (index clamp)
+    vec2 jitter;    // 144 this frame's sub-pixel jitter (D3D-NDC) re-applied to gl_Position
 } pc;
 
 layout(std430, set = 0, binding = 0) readonly buffer Bones { mat4 bones[]; };
@@ -69,8 +70,12 @@ void main()
     vec3 pos = a_Position.xyz;
     vec4 wpCur  = skinMat(pc.curBase)  * vec4(pos, 1.0);   // world pos, this frame's pose
     vec4 wpPrev = skinMat(pc.prevBase) * vec4(pos, 1.0);   // world pos, previous pose
-    vCurClip  = pc.curVP  * wpCur;
+    vCurClip  = pc.curVP  * wpCur;    // unjittered → clean MV in the fragment
     vPrevClip = pc.prevVP * wpPrev;
     vUV         = a_TexCoordExt.xy;
-    gl_Position = vCurClip;   // rasterize at the current position (matches the forward/prepass depth)
+    // Rasterize at the JITTERED position so depth bit-matches the forward/prepass
+    // (which jittered the combined matrix). Re-applying the clip translation here
+    // (clip.xy += jitter*w) reproduces that exactly while keeping MV jitter-free.
+    gl_Position = vCurClip;
+    gl_Position.xy += pc.jitter * gl_Position.w;
 }

@@ -604,6 +604,11 @@ public:
 
     Fvector flashlight_attach_offset{}, flashlight_pos{};
     Fvector flashlight_omni_attach_offset{}, flashlight_world_attach_offset{}, flashlight_omni_world_attach_offset{};
+    // NPC weapon-mounted flashlight low-pass: the weapon XFORM()/aim bob every frame
+    // with the animation, so the projected (grass) shadow "skips rope". Smoothed for
+    // NPCs only (the player's HUD light stays crisp). Seeded on first active frame.
+    Fvector m_npc_fl_pos{}, m_npc_fl_dir{};
+    bool    m_npc_fl_valid{ false };
 
 protected:
     bool has_flashlight{};

@@ -26,10 +26,14 @@ VkPipelineColorBlendAttachmentState AdditiveAttachment();
 
 // Build a fullscreen-triangle graphics pipeline. `tag` is only used in the
 // failure log. Returns VK_NULL_HANDLE on failure (logged).
+// `shadingRate` bakes a STATIC per-pipeline fragment shading rate (coarse shading)
+// when > 1x1 AND the device supports pipelineFragmentShadingRate — for low-frequency
+// fullscreen effects (light cones) that tolerate 2x2 shading. Default 1x1 = per-pixel.
 VkPipeline CreatePipeline(VkShaderModule vs, VkShaderModule fs, VkFormat colorFmt,
                           VkPipelineLayout layout,
                           const VkPipelineColorBlendAttachmentState& blend,
-                          const char* tag);
+                          const char* tag,
+                          VkExtent2D shadingRate = { 1, 1 });
 
 // MRT variant: `count` color attachments (formats + per-attachment blend states,
 // each `count` long). Same fullscreen skeleton otherwise. Used by GTAO+IL, which

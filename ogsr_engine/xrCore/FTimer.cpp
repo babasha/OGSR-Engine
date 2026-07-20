@@ -1,6 +1,7 @@
 #include "stdafx.h"
 
 XRCORE_API BOOL g_bEnableStatGather = FALSE;
+XRCORE_API BOOL g_bForceStatGather = FALSE;   // see FTimer.h — VK profiler stat gathering
 
 void CStatTimer::FrameStart()
 {

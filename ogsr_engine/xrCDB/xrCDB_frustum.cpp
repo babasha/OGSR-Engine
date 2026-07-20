@@ -1,6 +1,7 @@
 #include "stdafx.h"
 
 #include "xrCDB.h"
+#include "xrCDB_tiled.h"
 #include "frustum.h"
 
 using namespace CDB;
@@ -85,11 +86,59 @@ public:
     }
 };
 
+// Tiled routing: cull whole tiles against the frustum by their exact geometry
+// bounds (the grid is at most a few thousand cells), stab the survivors.
+template <bool bClass3, bool bFirst>
+static void frustum_query_tiled(COLLIDER* CL, TILE_GRID& G, Fvector* verts, TRI* tris, const CFrustum& F)
+{
+    frustum_collider<bClass3, bFirst> BC;
+    BC._init(CL, verts, tris, &F);
+
+    u32 stabbed = 0;
+    for (u32 iz = 0; iz < G.nz; ++iz)
+        for (u32 ix = 0; ix < G.nx; ++ix)
+        {
+            TILE& t = G.cell(ix, iz);
+            if (!t.file_nodes)
+                continue;
+            u32 mask = F.getMask();
+            Fvector mM[2] = {t.bb_min, t.bb_max};
+            if (fcvNone == F.testAABB(&mM[0].x, mask))
+                continue;
+            with_tile(G, t, [&](const AABBNoLeafNode* nodes) { BC._stab(nodes, mask); });
+            ++stabbed;
+            if (bFirst && CL->r_count())
+                return;
+        }
+    if (!bFirst && stabbed > 1)
+        CL->r_dedup_by_id(); // boundary tris live in 2+ tiles
+}
+
 void COLLIDER::frustum_query(u32 frustum_mode, const MODEL* m_def, const CFrustum& F)
 {
     ZoneScoped;
 
     m_def->syncronize();
+
+    if (TILE_GRID* G = m_def->tiled())
+    {
+        r_clear();
+        if (frustum_mode & OPT_FULL_TEST)
+        {
+            if (frustum_mode & OPT_ONLYFIRST)
+                frustum_query_tiled<true, true>(this, *G, m_def->verts, m_def->tris, F);
+            else
+                frustum_query_tiled<true, false>(this, *G, m_def->verts, m_def->tris, F);
+        }
+        else
+        {
+            if (frustum_mode & OPT_ONLYFIRST)
+                frustum_query_tiled<false, true>(this, *G, m_def->verts, m_def->tris, F);
+            else
+                frustum_query_tiled<false, false>(this, *G, m_def->verts, m_def->tris, F);
+        }
+        return;
+    }
 
     // Get nodes
     const AABBNoLeafTree* T = (const AABBNoLeafTree*)m_def->tree->GetTree();

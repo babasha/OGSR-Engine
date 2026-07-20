@@ -35,6 +35,10 @@ public:
 
     void Load();
 
+    // Tiled-CDB residency tick (no-op when cdb_tiles is off): prefetch the
+    // bubble around `focus`, evict LRU tiles beyond the budget.
+    void UpdateStreaming(const Fvector& focus);
+
     // Occluded/No
     BOOL RayTest(const Fvector& start, const Fvector& dir, float range, collide::rq_target tgt, collide::ray_cache* cache, const CObject* ignore_object);
 

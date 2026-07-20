@@ -13,6 +13,19 @@ ENGINE_API Flags32 psMouseInvert = {FALSE};
 #define MOUSEBUFFERSIZE 64
 #define KEYBOARDBUFFERSIZE 64
 
+// A2.3 (editor-embedded): DirectInput requires the cooperative-level window to be
+// TOP-LEVEL. When the engine renders into a host-owned panel, Device.m_hWnd is a
+// WS_CHILD — SetCooperativeLevel then fails with DIERR_INVALIDPARAM and the CHK_DX in
+// CInput's ctor aborts the process. Use the child's top-level ancestor (the host's
+// window) instead; input still belongs to the same window from the OS's point of view.
+static HWND input_coop_hwnd()
+{
+    extern bool g_ed_embedded;
+    if (g_ed_embedded && Device.m_hWnd)
+        return GetAncestor(Device.m_hWnd, GA_ROOT);
+    return Device.m_hWnd;
+}
+
 CInput::CInput(bool bExclusive, int deviceForInit)
 {
     is_exclusive_mode = bExclusive;
@@ -82,7 +95,7 @@ HRESULT CInput::CreateInputDevice(LPDIRECTINPUTDEVICE8* device, GUID guidDevice,
 
     // Set the cooperativity level to let DirectInput know how this device
     // should interact with the system and with other DirectInput applications.
-    HRESULT _hr = (*device)->SetCooperativeLevel(Device.m_hWnd, dwFlags);
+    HRESULT _hr = (*device)->SetCooperativeLevel(input_coop_hwnd(), dwFlags);
     if (FAILED(_hr) && (_hr == E_NOTIMPL))
         Msg("! INPUT: Can't set coop level. Emulation???");
     else
@@ -116,11 +129,11 @@ void CInput::exclusive_mode(const bool exclusive)
     is_exclusive_mode = exclusive;
 
     pKeyboard->Unacquire();
-    R_CHK(pKeyboard->SetCooperativeLevel(Device.m_hWnd, (exclusive ? DISCL_EXCLUSIVE : DISCL_NONEXCLUSIVE) | DISCL_FOREGROUND));
+    R_CHK(pKeyboard->SetCooperativeLevel(input_coop_hwnd(), (exclusive ? DISCL_EXCLUSIVE : DISCL_NONEXCLUSIVE) | DISCL_FOREGROUND));
     pKeyboard->Acquire();
 
     pMouse->Unacquire();
-    R_CHK(pMouse->SetCooperativeLevel(Device.m_hWnd, (exclusive ? DISCL_EXCLUSIVE : DISCL_NONEXCLUSIVE) | DISCL_FOREGROUND | DISCL_NOWINKEY));
+    R_CHK(pMouse->SetCooperativeLevel(input_coop_hwnd(), (exclusive ? DISCL_EXCLUSIVE : DISCL_NONEXCLUSIVE) | DISCL_FOREGROUND | DISCL_NOWINKEY));
     pMouse->Acquire();
 }
 
@@ -540,6 +553,14 @@ u16 CInput::DikToChar(const int dik, const bool utf) const
 // https://stackoverflow.com/a/36827574
 void CInput::clip_cursor(bool clip)
 {
+    // Embedded in a host UI: never hide or trap the cursor — it belongs to the SDK,
+    // which needs it for its menus, panels and the viewport gizmos.
+    {
+        extern bool g_ed_embedded;
+        if (g_ed_embedded)
+            clip = false;
+    }
+
     if (clip)
     {
         while (ShowCursor(FALSE) >= 0)

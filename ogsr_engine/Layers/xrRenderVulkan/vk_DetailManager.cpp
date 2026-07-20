@@ -11,8 +11,11 @@
 #include "stdafx.h"
 #include "vk_DetailManager.h"
 #include "HW_Vulkan.h"
+#include "vk_image.h"      // VK::CreateImage / CreateImage2D / CreateImageView
+#include "vk_compute_util.h" // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_swapchain.h"               // for color/depth formats in CreateGfxPipeline
 #include "vk_scene_color.h"             // HDR scene target format
+#include "vk_motionvec.h"               // VK::MotionVec::Format — RG16F MV target (grass MV overlay)
 #include "vk_pipeline_cache.h"          // VK::PipelineCache::GetCacheObject() — shared disk-backed cache
 #include "vk_env_light.h"               // VK::EnvLight — set 1 (sun_vp + sun shadow map)
 #include "vk_shaders.h"                 // g_ShaderManager
@@ -93,6 +96,7 @@ DetailSlot& CDetailManager::QueryDB(int sx, int sz)
 // ============================================================================
 void CDetailManager::Load()
 {
+    VK::Vram::Scope _vram_scope("Grass");
     if (m_bCreated) return;
 
     if (!FS.exist("$level$", "level.details")) {
@@ -212,7 +216,7 @@ void CDetailManager::Unload()
         if (m_HeightmapSampler) { vkDestroySampler   (VulkanHW.m_Device, m_HeightmapSampler, nullptr); m_HeightmapSampler = VK_NULL_HANDLE; }
         if (m_HeightmapView)    { vkDestroyImageView (VulkanHW.m_Device, m_HeightmapView,    nullptr); m_HeightmapView    = VK_NULL_HANDLE; }
         if (m_HeightmapImage)   {
-            vmaDestroyImage(VulkanHW.m_Allocator, m_HeightmapImage, m_HeightmapAlloc);
+            VK::Vram::DestroyImage(VulkanHW.m_Allocator, m_HeightmapImage, m_HeightmapAlloc);
             m_HeightmapImage = VK_NULL_HANDLE;
             m_HeightmapAlloc = VK_NULL_HANDLE;
         }
@@ -304,6 +308,26 @@ void CDetailManager::BakeHeightmap()
                 if (u < -0.01f || v < -0.01f || (u + v) > 1.01f) continue;
                 const float y = v0.y + u * (v1.y - v0.y) + v * (v2.y - v0.y);
                 const u32 idx = u32(pz) * m_HeightmapW + u32(px);
+
+                // Authored-range filter: UNDERGROUND floors (tunnels, bunkers)
+                // face up too, so the plain MIN picked the basement floor for
+                // every surface texel above one — the gen's interior guard
+                // (terrainY < y_base-1) then rejected ALL surface grass there
+                // = the "field 300×300 without grass" holes. Accept a candidate
+                // only inside the slot's authored detail Y range (±2 m). Slots
+                // with no details keep the raw MIN (their texels only feed
+                // border gathers; empty slots never spawn grass anyway).
+                const float wx = m_HMOriginX + (float(px) + 0.5f) * texelSizeX;
+                const float wz = m_HMOriginZ + (float(pz) + 0.5f) * texelSizeZ;
+                DetailSlot& ds = QueryDB(int(floorf(wx / dm_slot_size)), int(floorf(wz / dm_slot_size)));
+                const bool slotHasDetails =
+                    ds.r_id(0) != DetailSlot::ID_Empty || ds.r_id(1) != DetailSlot::ID_Empty ||
+                    ds.r_id(2) != DetailSlot::ID_Empty || ds.r_id(3) != DetailSlot::ID_Empty;
+                if (slotHasDetails) {
+                    const float yb = ds.r_ybase();
+                    if (y < yb - 2.0f || y > yb + ds.r_yheight() + 2.0f) continue;
+                }
+
                 if (y < heightData[idx]) heightData[idx] = y;
             }
         }
@@ -332,34 +356,12 @@ void CDetailManager::BakeHeightmap()
     Msg("[VK Grass] Rasterized %u tris, uploading R32F image…", rasterized);
 
     // Allocate device-local R32F image via VMA.
-    VkImageCreateInfo ici{};
-    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType     = VK_IMAGE_TYPE_2D;
-    ici.format        = VK_FORMAT_R32_SFLOAT;
-    ici.extent        = { m_HeightmapW, m_HeightmapH, 1 };
-    ici.mipLevels     = 1;
-    ici.arrayLayers   = 1;
-    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &m_HeightmapImage, &m_HeightmapAlloc, nullptr) != VK_SUCCESS) {
-        Msg("![VK Grass] vmaCreateImage failed for heightmap");
-        m_HeightmapImage = VK_NULL_HANDLE;
+    if (!VK::CreateImage2D(VK_FORMAT_R32_SFLOAT, { m_HeightmapW, m_HeightmapH },
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            m_HeightmapImage, m_HeightmapAlloc, "Grass.Heightmap")) {
         return;
     }
-
-    VkImageViewCreateInfo vci{};
-    vci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vci.image    = m_HeightmapImage;
-    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format   = VK_FORMAT_R32_SFLOAT;
-    vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &m_HeightmapView);
+    m_HeightmapView = VK::CreateImageView(m_HeightmapImage, VK_FORMAT_R32_SFLOAT);
 
     VkSamplerCreateInfo sci{};
     sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -431,6 +433,36 @@ void CDetailManager::UploadSlotData()
     m_TotalSlots = dtH.size_x * dtH.size_z;
     const u32 dataSize = m_TotalSlots * u32(sizeof(GpuSlotPacked));
 
+    // Anomaly/GAMMA level.details bakes carry BUGGED full-black slots: c_hemi==0
+    // blobs under tree crowns (SSFX's own deffer_grass.vs clamps with the comment
+    // "Some spots are bugged (Full black)"). Heal instead of just clamping: rebuild
+    // each zero slot from the healthy 7x7 neighbourhood mean. Small crown blobs
+    // fill in with plausible shade; large legitimately dark areas (building
+    // interiors) keep zero neighbours and stay dark. The SSFX 0.05 floor is
+    // applied on top at pack time below.
+    xr_vector<u8> hemiHealed(m_TotalSlots);
+    for (u32 i = 0; i < m_TotalSlots; ++i) hemiHealed[i] = u8(dtSlots[i].c_hemi);
+    u32 healedCnt = 0;
+    {
+        const int W = int(dtH.size_x), H = int(dtH.size_z);
+        for (int z = 0; z < H; ++z)
+            for (int x = 0; x < W; ++x) {
+                const u32 i = u32(z) * u32(W) + u32(x);
+                if (dtSlots[i].c_hemi != 0) continue;
+                u32 sum = 0, cnt = 0;
+                for (int dz = -3; dz <= 3; ++dz)
+                    for (int dx = -3; dx <= 3; ++dx) {
+                        const int nx = x + dx, nz = z + dz;
+                        if (nx < 0 || nx >= W || nz < 0 || nz >= H) continue;
+                        const u32 v = dtSlots[u32(nz) * u32(W) + u32(nx)].c_hemi;
+                        if (v > 0) { sum += v; ++cnt; }
+                    }
+                if (cnt >= 3) { hemiHealed[i] = u8((sum + cnt / 2) / cnt); ++healedCnt; }
+            }
+    }
+    if (healedCnt)
+        Msg("[VK Grass] healed %u bugged hemi==0 slots (of %u) from neighbours", healedCnt, m_TotalSlots);
+
     xr_vector<GpuSlotPacked> packed(m_TotalSlots);
     for (u32 i = 0; i < m_TotalSlots; ++i) {
         DetailSlot& ds = dtSlots[i];
@@ -441,8 +473,10 @@ void CDetailManager::UploadSlotData()
                   | (u32(ds.id1) << 8)
                   | (u32(ds.id2) << 16)
                   | (u32(ds.id3) << 24);
+        // hemi: healed value + the SSFX 0.05 floor (their deffer_grass.vs clamp).
+        const float hemiF = std::max(float(hemiHealed[i]) / 15.0f, 0.05f);
         p.lighting = u32(ds.r_qclr(ds.c_dir,  15) * 65535.0f)
-                  | (u32(ds.r_qclr(ds.c_hemi, 15) * 65535.0f) << 16);
+                  | (u32(hemiF * 65535.0f) << 16);
 
         auto packPal = [](const DetailPalette& pal) -> u32 {
             const u32 a0 = u32(float(pal.a0) / 15.0f * 255.0f);
@@ -460,7 +494,7 @@ void CDetailManager::UploadSlotData()
     m_SlotDataSSBO = xr_new<VK::CVulkanBuffer>();
     m_SlotDataSSBO->Create(dataSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     m_SlotDataSSBO->Upload(packed.data(), dataSize);
 
     Msg("[VK Grass] Slot SSBO uploaded: %u slots (%.1f KB)", m_TotalSlots, dataSize / 1024.0f);
@@ -492,7 +526,7 @@ void CDetailManager::UploadObjInfo()
     m_ObjInfoSSBO = xr_new<VK::CVulkanBuffer>();
     m_ObjInfoSSBO->Create(dataSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     m_ObjInfoSSBO->Upload(infos.data(), dataSize);
 
     Msg("[VK Grass] ObjInfo SSBO uploaded: %u types (%.1f KB)", count, dataSize / 1024.0f);
@@ -504,13 +538,15 @@ void CDetailManager::UploadObjInfo()
 // ============================================================================
 void CDetailManager::CreateGpuBuffers()
 {
+    m_OutputCapacity  = GPU_OUTPUT_CAPACITY;   // per-level manager: start small, grow to demand
+    m_PendingCapacity = 0;
     m_VisibleSSBO = xr_new<VK::CVulkanBuffer>();
     m_VisibleSSBO->Create(
-        u64(GPU_OUTPUT_CAPACITY) * sizeof(DetailInstance),
+        u64(m_OutputCapacity) * sizeof(DetailInstance),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT  |
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     m_IndirectCmdBuf = xr_new<VK::CVulkanBuffer>();
     m_IndirectCmdBuf->Create(
@@ -518,7 +554,7 @@ void CDetailManager::CreateGpuBuffers()
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT  |
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     m_AtomicCounters = xr_new<VK::CVulkanBuffer>();
     m_AtomicCounters->Create(
@@ -526,7 +562,17 @@ void CDetailManager::CreateGpuBuffers()
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_TRANSFER_DST_BIT   |
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+
+    // Host mirror of counters[0..127] (used [0..63] + dropped [64..127] per
+    // type) — read a few frames stale, logged throttled from Render, and
+    // drives the auto-grow. Overflow used to be SILENT and showed up as whole
+    // fields without grass (per-type section exhausted).
+    m_OverflowRB = xr_new<VK::CVulkanBuffer>();
+    m_OverflowRB->Create(2u * GPU_MAX_OBJ_TYPES * sizeof(u32),
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    m_OverflowPtr = (u32*)m_OverflowRB->Map();
+    if (m_OverflowPtr) memset(m_OverflowPtr, 0, 2u * GPU_MAX_OBJ_TYPES * sizeof(u32));
 
     // GenUBO: host-visible so PrepareFrame can rewrite without a staging copy.
     m_GenUBO = xr_new<VK::CVulkanBuffer>();
@@ -535,11 +581,39 @@ void CDetailManager::CreateGpuBuffers()
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
 
-    Msg("[VK Grass] GPU buffers: visible=%.1fMB indirect=%.1fKB atomic=%.1fKB ubo=64B sectionSize=%u",
-        u64(GPU_OUTPUT_CAPACITY) * sizeof(DetailInstance) / (1024.0f * 1024.0f),
+    // Shadow-CASTER set: second (smaller) instance stream from the caster gen
+    // dispatch — distance-only cull, so blades outside the camera frustum still
+    // cast into the spot/cascade/cube/VSM shadow maps.
+    m_CasterSSBO = xr_new<VK::CVulkanBuffer>();
+    m_CasterSSBO->Create(
+        u64(GPU_CASTER_CAPACITY) * sizeof(DetailInstance),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT  |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+
+    m_CasterIndirectBuf = xr_new<VK::CVulkanBuffer>();
+    m_CasterIndirectBuf->Create(
+        GPU_MAX_OBJ_TYPES * sizeof(VkDrawIndexedIndirectCommand),
+        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT  |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+
+    m_CasterAtomic = xr_new<VK::CVulkanBuffer>();
+    m_CasterAtomic->Create(
+        (GPU_MAX_OBJ_TYPES * 2 + 4) * sizeof(u32),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT   |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+
+    Msg("[VK Grass] GPU buffers: visible=%.1fMB (auto-grow, cap %.0fMB) indirect=%.1fKB atomic=%.1fKB ubo=64B sectionSize=%u",
+        u64(m_OutputCapacity) * sizeof(DetailInstance) / (1024.0f * 1024.0f),
+        u64(GPU_OUTPUT_CAP_MAX) * sizeof(DetailInstance) / (1024.0f * 1024.0f),
         GPU_MAX_OBJ_TYPES * sizeof(VkDrawIndexedIndirectCommand) / 1024.0f,
         (GPU_MAX_OBJ_TYPES * 2 + 4) * sizeof(u32) / 1024.0f,
-        GPU_OUTPUT_CAPACITY / _max(u32(objects.size()), 1u));
+        m_OutputCapacity / _max(u32(objects.size()), 1u));
 
     // One-shot fill of IndirectCmdBuf: indexCount/firstIndex/vertexOffset/
     // firstInstance never change during the level. instanceCount is patched
@@ -567,6 +641,8 @@ void CDetailManager::CreateGpuBuffers()
         if (cmd != VK_NULL_HANDLE) {
             VkBufferCopy r{ 0, 0, sz };
             vkCmdCopyBuffer(cmd, staging.GetHandle(), m_IndirectCmdBuf->GetHandle(), 1, &r);
+            if (m_CasterIndirectBuf)   // same static fields; instanceCount patched per frame
+                vkCmdCopyBuffer(cmd, staging.GetHandle(), m_CasterIndirectBuf->GetHandle(), 1, &r);
             VulkanHW.EndSingleTimeCommands(cmd);
         }
         staging.Destroy();
@@ -578,7 +654,11 @@ void CDetailManager::DestroyGpuBuffers()
     if (m_VisibleSSBO)    { m_VisibleSSBO->Destroy();    xr_delete(m_VisibleSSBO); }
     if (m_IndirectCmdBuf) { m_IndirectCmdBuf->Destroy(); xr_delete(m_IndirectCmdBuf); }
     if (m_AtomicCounters) { m_AtomicCounters->Destroy(); xr_delete(m_AtomicCounters); }
+    if (m_OverflowRB)     { m_OverflowRB->Destroy();     xr_delete(m_OverflowRB); m_OverflowPtr = nullptr; }
     if (m_GenUBO)         { m_GenUBO->Destroy();         xr_delete(m_GenUBO); }
+    if (m_CasterSSBO)        { m_CasterSSBO->Destroy();        xr_delete(m_CasterSSBO); }
+    if (m_CasterIndirectBuf) { m_CasterIndirectBuf->Destroy(); xr_delete(m_CasterIndirectBuf); }
+    if (m_CasterAtomic)      { m_CasterAtomic->Destroy();      xr_delete(m_CasterAtomic); }
 }
 
 // ============================================================================
@@ -588,31 +668,12 @@ namespace {
 bool Create1x1Image(VkFormat fmt, const void* pixel, u32 pixelSize,
                     VkImage& outImage, VmaAllocation& outAlloc, VkImageView& outView)
 {
-    VkImageCreateInfo ici{};
-    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType     = VK_IMAGE_TYPE_2D;
-    ici.format        = fmt;
-    ici.extent        = { 1, 1, 1 };
-    ici.mipLevels     = 1;
-    ici.arrayLayers   = 1;
-    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &outImage, &outAlloc, nullptr) != VK_SUCCESS)
+    if (!VK::CreateImage2D(fmt, { 1, 1 },
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            outImage, outAlloc))
         return false;
 
-    VkImageViewCreateInfo vci{};
-    vci.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vci.image            = outImage;
-    vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format           = fmt;
-    vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &outView);
+    outView = VK::CreateImageView(outImage, fmt);
 
     VK::CVulkanBuffer staging;
     staging.Create(pixelSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
@@ -671,9 +732,9 @@ void CDetailManager::DestroyDummyTextures()
 {
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     if (m_DummyHZBView)   { vkDestroyImageView(VulkanHW.m_Device, m_DummyHZBView,   nullptr); m_DummyHZBView   = VK_NULL_HANDLE; }
-    if (m_DummyHZBImage)  { vmaDestroyImage(VulkanHW.m_Allocator, m_DummyHZBImage,  m_DummyHZBAlloc); m_DummyHZBImage = VK_NULL_HANDLE; }
+    if (m_DummyHZBImage)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, m_DummyHZBImage,  m_DummyHZBAlloc); m_DummyHZBImage = VK_NULL_HANDLE; }
     if (m_DummyTrailView) { vkDestroyImageView(VulkanHW.m_Device, m_DummyTrailView, nullptr); m_DummyTrailView = VK_NULL_HANDLE; }
-    if (m_DummyTrailImage){ vmaDestroyImage(VulkanHW.m_Allocator, m_DummyTrailImage,m_DummyTrailAlloc); m_DummyTrailImage = VK_NULL_HANDLE; }
+    if (m_DummyTrailImage){ VK::Vram::DestroyImage(VulkanHW.m_Allocator, m_DummyTrailImage,m_DummyTrailAlloc); m_DummyTrailImage = VK_NULL_HANDLE; }
 }
 
 // ============================================================================
@@ -712,51 +773,28 @@ void CDetailManager::CreateHZB(u32 depthW, u32 depthH)
     m_HZBDepthExtent = { depthW, depthH };
 
     // ----- HZB image (R32F, mip chain, STORAGE+SAMPLED) --------------------
-    VkImageCreateInfo ici{};
-    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType     = VK_IMAGE_TYPE_2D;
-    ici.format        = VK_FORMAT_R32_SFLOAT;
-    ici.extent        = { m_HZBWidth, m_HZBHeight, 1 };
-    ici.mipLevels     = m_HZBMipCount;
-    ici.arrayLayers   = 1;
-    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &m_HZBImage, &m_HZBAlloc, nullptr) != VK_SUCCESS) {
-        Msg("![VK Grass] HZB image create failed"); m_HZBImage = VK_NULL_HANDLE; return;
-    }
+    VK::ImageDesc hzb;
+    hzb.format = VK_FORMAT_R32_SFLOAT;
+    hzb.extent = { m_HZBWidth, m_HZBHeight, 1 };
+    hzb.mips   = m_HZBMipCount;
+    hzb.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    hzb.name   = "Grass.HZB";
+    if (!VK::CreateImage(hzb, m_HZBImage, m_HZBAlloc)) return;
 
     // Full-mip sampled view (gen binding 6 + build source for HZB passes).
-    VkImageViewCreateInfo fvci{};
-    fvci.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    fvci.image            = m_HZBImage;
-    fvci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-    fvci.format           = VK_FORMAT_R32_SFLOAT;
-    fvci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, m_HZBMipCount, 0, 1 };
-    vkCreateImageView(VulkanHW.m_Device, &fvci, nullptr, &m_HZBView);
+    m_HZBView = VK::CreateImageView(m_HZBImage, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D,
+                                    VK_IMAGE_ASPECT_COLOR_BIT, 0, m_HZBMipCount);
 
     // Per-mip single-level storage views (build destination).
     m_HZBMipViews.resize(m_HZBMipCount, VK_NULL_HANDLE);
-    for (u32 m = 0; m < m_HZBMipCount; ++m) {
-        VkImageViewCreateInfo mvci = fvci;
-        mvci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, m, 1, 0, 1 };
-        vkCreateImageView(VulkanHW.m_Device, &mvci, nullptr, &m_HZBMipViews[m]);
-    }
+    for (u32 m = 0; m < m_HZBMipCount; ++m)
+        m_HZBMipViews[m] = VK::CreateImageView(m_HZBImage, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D,
+                                               VK_IMAGE_ASPECT_COLOR_BIT, m, 1);
 
     // DEPTH-aspect view of the swapchain depth (first build pass source).
     // Explicit DEPTH-only aspect so combined D32_S8 formats stay samplable.
-    VkImageViewCreateInfo dvci{};
-    dvci.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    dvci.image            = Swapchain.m_DepthImage;
-    dvci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-    dvci.format           = Swapchain.m_DepthFormat;
-    dvci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-    vkCreateImageView(VulkanHW.m_Device, &dvci, nullptr, &m_DepthSampleView);
+    m_DepthSampleView = VK::CreateImageView(Swapchain.m_DepthImage, Swapchain.m_DepthFormat,
+                                            VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1);
 
     // Sampler — nearest + clamp; the build shader picks exact texels itself,
     // the gen shader reads explicit mips. CLAMP avoids wrap at screen edges.
@@ -821,26 +859,13 @@ void CDetailManager::CreateHZB(u32 depthW, u32 depthH)
     dai.pSetLayouts = layouts.data();
     vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, m_HZBDescSets.data());
 
-    VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; pcr.offset = 0; pcr.size = sizeof(HZBBuildPush);
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1; plci.pSetLayouts = &m_HZBDescLayout;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &m_HZBPipelineLayout);
+    m_HZBPipelineLayout = VK::MakePipelineLayout({ m_HZBDescLayout }, sizeof(HZBBuildPush));
 
     VkShaderModule cs = g_ShaderManager->Load("hzb_build.comp.spv");
     if (cs == VK_NULL_HANDLE) { Msg("![VK Grass] hzb_build.comp.spv load failed"); return; }
 
-    VkComputePipelineCreateInfo cpi{};
-    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = cs; cpi.stage.pName = "main";
-    cpi.layout = m_HZBPipelineLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &m_HZBPipeline) != VK_SUCCESS) {
-        Msg("![VK Grass] HZB compute pipeline create failed"); return;
-    }
+    m_HZBPipeline = VK::CreateComputePipeline(cs, m_HZBPipelineLayout, "Grass.HZBBuild");
+    if (m_HZBPipeline == VK_NULL_HANDLE) return;
 
     // Write the descriptor sets once — all views are stable for the HZB's life.
     // set[0]: src = depth (SHADER_READ_ONLY at sample time), dst = mip0.
@@ -888,7 +913,7 @@ void CDetailManager::DestroyHZB()
     for (VkImageView v : m_HZBMipViews) if (v) vkDestroyImageView(VulkanHW.m_Device, v, nullptr);
     m_HZBMipViews.clear();
     if (m_HZBView)           { vkDestroyImageView(VulkanHW.m_Device, m_HZBView, nullptr); m_HZBView = VK_NULL_HANDLE; }
-    if (m_HZBImage)          { vmaDestroyImage(VulkanHW.m_Allocator, m_HZBImage, m_HZBAlloc); m_HZBImage = VK_NULL_HANDLE; }
+    if (m_HZBImage)          { VK::Vram::DestroyImage(VulkanHW.m_Allocator, m_HZBImage, m_HZBAlloc); m_HZBImage = VK_NULL_HANDLE; }
 
     m_HZBWidth = m_HZBHeight = m_HZBMipCount = 0;
     m_HZBDepthExtent = { 0, 0 };
@@ -935,7 +960,12 @@ void CDetailManager::LoadDetailTextures()
         }
 
         auto* tex = xr_new<VK::CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false)) {
+        // Grass blade albedo — Colour. The stream class is passed explicitly only
+        // because the colourspace argument follows it; it keeps the historical
+        // TexStreamClass::UI default (preserved as-is, not endorsed — changing grass
+        // residency is a separate question from colourspace).
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, VK::TexStreamClass::UI,
+                          VK::TexColorSpace::Color)) {
             Msg("![VK Grass] LoadDDS failed for %s", full);
             xr_delete(tex);
             continue;
@@ -1025,13 +1055,15 @@ void CDetailManager::CreateGpuGenPipeline()
         Msg("![VK Grass] gen DSL create failed"); return;
     }
 
+    // ×2: the VISIBLE set + the shadow-CASTER set (same layout, caster
+    // SSBO/atomics/indirect swapped in at bindings 3/4/5).
     VkDescriptorPoolSize ps[3]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 3;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         ps[1].descriptorCount = 5;
-    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         ps[2].descriptorCount = 1;
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 6;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         ps[1].descriptorCount = 10;
+    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         ps[2].descriptorCount = 2;
     VkDescriptorPoolCreateInfo pci{};
     pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets       = 1;
+    pci.maxSets       = 2;
     pci.poolSizeCount = 3;
     pci.pPoolSizes    = ps;
     vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &m_GenDescPool);
@@ -1042,36 +1074,19 @@ void CDetailManager::CreateGpuGenPipeline()
     dai.descriptorSetCount = 1;
     dai.pSetLayouts        = &m_GenDescLayout;
     vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_GenDescSet);
+    vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_CasterDescSet);
 
     // Pipeline layout: 1 set + 208 B push.
-    VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.offset     = 0;
-    pcr.size       = sizeof(DetailGenPushConstants);
-    DM_CheckPushSize("gen", pcr.size);
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &m_GenDescLayout;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pcr;
-    vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &m_GenPipelineLayout);
+    DM_CheckPushSize("gen", sizeof(DetailGenPushConstants));
+    m_GenPipelineLayout = VK::MakePipelineLayout({ m_GenDescLayout }, sizeof(DetailGenPushConstants));
 
     VkShaderModule cs = g_ShaderManager->Load("detail_generate.comp.spv");
     if (cs == VK_NULL_HANDLE) {
         Msg("![VK Grass] detail_generate.comp.spv load failed"); return;
     }
 
-    VkComputePipelineCreateInfo cpi{};
-    cpi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = cs;
-    cpi.stage.pName  = "main";
-    cpi.layout       = m_GenPipelineLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &m_GenPipeline) != VK_SUCCESS) {
-        Msg("![VK Grass] gen compute pipeline create failed"); return;
-    }
+    m_GenPipeline = VK::CreateComputePipeline(cs, m_GenPipelineLayout, "Grass.DetailGen");
+    if (m_GenPipeline == VK_NULL_HANDLE) return;
 
     UpdateGenDescriptors();
     Msg("[VK Grass] Gen pipeline OK (1 set, 9 bindings, 208 B push)");
@@ -1082,7 +1097,7 @@ void CDetailManager::DestroyGpuGenPipeline()
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
     if (m_GenPipeline)       { vkDestroyPipeline(VulkanHW.m_Device, m_GenPipeline, nullptr); m_GenPipeline = VK_NULL_HANDLE; }
     if (m_GenPipelineLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, m_GenPipelineLayout, nullptr); m_GenPipelineLayout = VK_NULL_HANDLE; }
-    if (m_GenDescPool)       { vkDestroyDescriptorPool(VulkanHW.m_Device, m_GenDescPool, nullptr); m_GenDescPool = VK_NULL_HANDLE; m_GenDescSet = VK_NULL_HANDLE; }
+    if (m_GenDescPool)       { vkDestroyDescriptorPool(VulkanHW.m_Device, m_GenDescPool, nullptr); m_GenDescPool = VK_NULL_HANDLE; m_GenDescSet = VK_NULL_HANDLE; m_CasterDescSet = VK_NULL_HANDLE; }
     if (m_GenDescLayout)     { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, m_GenDescLayout, nullptr); m_GenDescLayout = VK_NULL_HANDLE; }
 }
 
@@ -1111,29 +1126,45 @@ void CDetailManager::UpdateGenDescriptors()
     bi[3] = { m_AtomicCounters->GetHandle(),0, VK_WHOLE_SIZE };
     bi[4] = { m_IndirectCmdBuf->GetHandle(),0, VK_WHOLE_SIZE };
     bi[5] = { m_GenUBO->GetHandle(),        0, VK_WHOLE_SIZE };
+    // Caster set variant: output/atomics/indirect swapped for the caster buffers.
+    VkDescriptorBufferInfo ci[3]{};
+    const bool haveCaster = m_CasterDescSet != VK_NULL_HANDLE
+        && m_CasterSSBO && m_CasterAtomic && m_CasterIndirectBuf;
+    if (haveCaster) {
+        ci[0] = { m_CasterSSBO->GetHandle(),        0, VK_WHOLE_SIZE };
+        ci[1] = { m_CasterAtomic->GetHandle(),      0, VK_WHOLE_SIZE };
+        ci[2] = { m_CasterIndirectBuf->GetHandle(), 0, VK_WHOLE_SIZE };
+    }
 
-    VkWriteDescriptorSet w[9]{};
-    auto setBuf = [&](u32 i, u32 binding, VkDescriptorType t, const VkDescriptorBufferInfo* info) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = m_GenDescSet; w[i].dstBinding = binding; w[i].descriptorCount = 1;
-        w[i].descriptorType = t; w[i].pBufferInfo = info;
+    VkWriteDescriptorSet w[18]{};
+    u32 nW = 0;
+    auto setBuf = [&](VkDescriptorSet ds, u32 binding, VkDescriptorType t, const VkDescriptorBufferInfo* info) {
+        auto& x = w[nW++];
+        x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        x.dstSet = ds; x.dstBinding = binding; x.descriptorCount = 1;
+        x.descriptorType = t; x.pBufferInfo = info;
     };
-    auto setImg = [&](u32 i, u32 binding, const VkDescriptorImageInfo* info) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = m_GenDescSet; w[i].dstBinding = binding; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = info;
+    auto setImg = [&](VkDescriptorSet ds, u32 binding, const VkDescriptorImageInfo* info) {
+        auto& x = w[nW++];
+        x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        x.dstSet = ds; x.dstBinding = binding; x.descriptorCount = 1;
+        x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; x.pImageInfo = info;
     };
-    setImg(0, 0, &hm);
-    setBuf(1, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[0]);
-    setBuf(2, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[1]);
-    setBuf(3, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[2]);
-    setBuf(4, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[3]);
-    setBuf(5, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[4]);
-    setImg(6, 6, &hzb);
-    setBuf(7, 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &bi[5]);
-    setImg(8, 8, &trl);
+    auto writeSet = [&](VkDescriptorSet ds, bool caster) {
+        setImg(ds, 0, &hm);
+        setBuf(ds, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[0]);
+        setBuf(ds, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[1]);
+        setBuf(ds, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, caster ? &ci[0] : &bi[2]);
+        setBuf(ds, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, caster ? &ci[1] : &bi[3]);
+        setBuf(ds, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, caster ? &ci[2] : &bi[4]);
+        setImg(ds, 6, &hzb);
+        setBuf(ds, 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &bi[5]);
+        setImg(ds, 8, &trl);
+    };
+    writeSet(m_GenDescSet, false);
+    if (haveCaster) writeSet(m_CasterDescSet, true);
 
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 9, w, 0, nullptr);
+    vkUpdateDescriptorSets(VulkanHW.m_Device, nW, w, 0, nullptr);
 }
 
 // ============================================================================
@@ -1323,10 +1354,138 @@ void CDetailManager::CreateGfxPipeline()
 void CDetailManager::DestroyGfxPipeline()
 {
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+    DestroyMotionPipeline();   // built on top of m_GfxDescLayout — free it first
     if (m_GfxPipeline)       { vkDestroyPipeline(VulkanHW.m_Device, m_GfxPipeline, nullptr); m_GfxPipeline = VK_NULL_HANDLE; }
     if (m_GfxPipelineLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, m_GfxPipelineLayout, nullptr); m_GfxPipelineLayout = VK_NULL_HANDLE; }
     if (m_GfxDescPool)       { vkDestroyDescriptorPool(VulkanHW.m_Device, m_GfxDescPool, nullptr); m_GfxDescPool = VK_NULL_HANDLE; m_GfxDescSets.clear(); }
     if (m_GfxDescLayout)     { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, m_GfxDescLayout, nullptr); m_GfxDescLayout = VK_NULL_HANDLE; }
+}
+
+// Grass wind-sway MV overlay pipeline. Reuses the gfx descriptor layout (set0 =
+// diffuse @0 + s_waves @1) and vertex input, but outputs RG16F motion, tests depth
+// LEQUAL WITHOUT writing, and carries the SAME depth bias as the forward grass draw
+// so its clip depth bit-matches what that pass already stored (LEQUAL passes on
+// equal). Push = cur/prev VP + cur/prev wind (detail_motion.vert reprojects both).
+void CDetailManager::CreateMotionPipeline()
+{
+    if (m_MotionPipeline != VK_NULL_HANDLE) return;               // already built
+    if (!g_ShaderManager || m_GfxDescLayout == VK_NULL_HANDLE) return;
+
+    VkShaderModule vs = g_ShaderManager->Load("detail_motion.vert.spv");
+    VkShaderModule fs = g_ShaderManager->Load("detail_motion.frag.spv");
+    if (vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE) {
+        Msg("![VK Grass] detail_motion.{vert,frag}.spv load failed — grass MV disabled");
+        return;
+    }
+
+    // Layout: set0 = gfx descriptor layout (diffuse + s_waves), push = MV (VS only).
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr.size       = sizeof(DetailMotionPushConstants);
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &m_GfxDescLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcr;
+    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &m_MotionPipelineLayout) != VK_SUCCESS) {
+        Msg("![VK Grass] MV pipeline layout create failed"); return;
+    }
+
+    // Same vertex input as the forward gfx pipeline.
+    VkVertexInputBindingDescription vibd[2]{};
+    vibd[0] = { 0, sizeof(VK::CDetail::Vertex), VK_VERTEX_INPUT_RATE_VERTEX   };
+    vibd[1] = { 1, sizeof(DetailInstance),       VK_VERTEX_INPUT_RATE_INSTANCE };
+    VkVertexInputAttributeDescription via[7]{};
+    via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT,    0  };
+    via[1] = { 1, 0, VK_FORMAT_R32G32_SFLOAT,       12 };
+    via[2] = { 2, 0, VK_FORMAT_R32_SFLOAT,          20 };
+    via[3] = { 3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0  };
+    via[4] = { 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 16 };
+    via[5] = { 5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32 };
+    via[6] = { 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 48 };
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 2; vi.pVertexBindingDescriptions   = vibd;
+    vi.vertexAttributeDescriptionCount = 7; vi.pVertexAttributeDescriptions = via;
+
+    VkPipelineShaderStageCreateInfo ss[2]{};
+    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
+    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    // Cull NONE + the SAME depth bias as the forward grass draw so depth bit-matches.
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode             = VK_POLYGON_MODE_FILL;
+    rs.cullMode                = VK_CULL_MODE_NONE;
+    rs.frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth               = 1.0f;
+    rs.depthBiasEnable         = VK_TRUE;
+    rs.depthBiasConstantFactor = -2.0f;
+    rs.depthBiasSlopeFactor    = -1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_FALSE;                  // scene depth already owns the surface
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;   // RG16F motion
+    ba.blendEnable    = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1; cb.pAttachments = &ba;
+
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynState{};
+    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
+
+    VkFormat mvFmt = VK::MotionVec::Format();
+    VkPipelineRenderingCreateInfo prci{};
+    prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    prci.colorAttachmentCount    = 1;
+    prci.pColorAttachmentFormats = &mvFmt;
+    prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
+
+    VkGraphicsPipelineCreateInfo pi{};
+    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pi.pNext               = &prci;
+    pi.stageCount          = 2;     pi.pStages             = ss;
+    pi.pVertexInputState   = &vi;   pi.pInputAssemblyState = &ia;
+    pi.pViewportState      = &vp;   pi.pRasterizationState = &rs;
+    pi.pMultisampleState   = &ms;   pi.pDepthStencilState  = &ds;
+    pi.pColorBlendState    = &cb;   pi.pDynamicState       = &dynState;
+    pi.layout              = m_MotionPipelineLayout;
+    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &m_MotionPipeline) != VK_SUCCESS) {
+        Msg("![VK Grass] MV pipeline create failed");
+        vkDestroyPipelineLayout(VulkanHW.m_Device, m_MotionPipelineLayout, nullptr);
+        m_MotionPipelineLayout = VK_NULL_HANDLE;
+        return;
+    }
+    Msg("[VK Grass] MV overlay pipeline OK (wind-sway motion vectors)");
+}
+
+void CDetailManager::DestroyMotionPipeline()
+{
+    if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+    if (m_MotionPipeline)       { vkDestroyPipeline(VulkanHW.m_Device, m_MotionPipeline, nullptr); m_MotionPipeline = VK_NULL_HANDLE; }
+    if (m_MotionPipelineLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, m_MotionPipelineLayout, nullptr); m_MotionPipelineLayout = VK_NULL_HANDLE; }
 }
 
 }  // namespace VK

@@ -12,14 +12,19 @@
 
 #include "stdafx.h"
 #include "vk_volumetrics.h"
+#include "vk_color_space.h"   // ColorSpace::LinearizeRGB — env colours are authored sRGB
 #include "vk_buffer.h"            // CVulkanBuffer
 #include "vk_command_buffer.h"    // CVulkanCommandManager::FRAMES_IN_FLIGHT
 #include "vk_shaders.h"           // g_ShaderManager (SPIR-V loader)
+#include "vk_image.h"             // VK::CreateImage / CreateImageView
+#include "vk_compute_util.h"      // VK::CreateComputePipeline
 #include "vk_shadow.h"            // ShadowMap — sun cascade maps + matrices (occlusion source)
+#include "vk_pass_shadow.h"       // SpotShadow_TileOfLight — spot-pool tile per fog light
 #include "vk_vsm.h"               // VSM atlas + page table + clipmap UBO (smooth occlusion, no cache tick)
 #include "vk_clustered.h"         // Clustered::DeriveGridZ — ONE source of truth for the exp-Z grid
 #include "vk_light.h"             // Lights::CollectFrame / GpuLight — P2 local lights in fog
 #include "vk_profiler.h"          // VK::Prof zones + NameImage
+#include "vk_gpu_particles.h"     // GPUParticles::SplatMedia — #6 GPU smoke → froxel media
 #include "../../xr_3da/IGame_Persistent.h"   // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"        // CEnvDescriptorMixer (sun_dir/sun_color/ambient)
 #include "../../xr_3da/device.h"             // Device.vCameraPosition
@@ -33,8 +38,11 @@ extern int   ps_r_vol_debug;      // debug view — also self-activates the path
 extern float ps_r_vol_density;    // base extinction / scatter density
 extern float ps_r_vol_height;     // height-fog falloff rate (0 = uniform fog)
 extern float ps_r_vol_g;          // Henyey-Greenstein anisotropy (~0.6 forward)
+extern float ps_r_vol_lights_g;   // local-light forward scatter (torch glare; sep. from sun r_vol_g)
+extern float ps_r_torch_vol;      // fog shaft strength for handheld torches only (fixtures keep ×3)
 extern float ps_r_vol_intensity;  // in-scatter brightness multiplier
 extern float ps_r_vol_amb;        // indoor ambient floor (fraction of sky ambient kept under a roof)
+extern float ps_r_vol_ambient;    // fog sky-fill tint scale (decoupled from surface r_ambient_floor)
 extern float ps_r_vol_indoor;     // indoor density boost (thicken fog under a roof so small rooms show it)
 extern float ps_r_vol_sun;        // sun-beam in-scatter boost (directional shaft pops through the ambient haze)
 extern float ps_r_vol_lights;     // P2: local light in-scatter strength in fog
@@ -53,7 +61,14 @@ extern int   ps_r_vol_smoke_debug;    // Stage-1 VMS debug: 1 = isolate injected
 extern float ps_r_vol_smoke_footprint; // Stage-1.1 VMS: max splat footprint (froxel cells; 0 = point)
 extern float ps_r_vol_smoke_shadow;       // Stage-2 VMS: smoke self-shadow strength (0 = off)
 extern float ps_r_vol_smoke_shadow_step;  // Stage-2 VMS: self-shadow sun-march step (world m)
+extern float ps_r_vol_smoke_dist;         // media cutoff (m) — same LOD zone CollectSmokeParticles uses
+extern float ps_r_vol_smoke_dist_full;    // full-quality inner radius (m)
+extern int   ps_r__detail_radius;         // caps the media cutoff (terrain detail bubble)
 extern int   ps_r_light_occ;              // dynamic-light terrain/static occlusion (stops indoor lamps leaking into fog/smoke)
+extern int   ps_r_atmo;                   // atmospheric scattering (Rayleigh+Mie aerial perspective) master
+extern float ps_r_atmo_rayleigh;          // Rayleigh (blue distance) strength
+extern float ps_r_atmo_mie;               // Mie (warm sun halo) strength
+extern float ps_r_atmo_mie_g;             // Mie forward anisotropy g
 
 namespace VK { namespace Vol {
 
@@ -103,9 +118,16 @@ namespace {
         float lightParams[4];  // x = count, y = boost, z = spot-shadowed light idx (-1), w = point-shadowed idx (-1)
         struct { float pos[4]; float color[4]; float dir[4]; } lights[8];
         float noiseParams[4];  // P3: x = amount, y = scale, z = speed, w = time clock
-        float spot_vp[16];     // spot (flashlight) shadow VP — occlude the cone in fog
+        // Spot shadow POOL: per-tile view·proj (occlude each pooled light's fog
+        // cone by ITS OWN tile — headlights and the flashlight all cut at once).
+        // The per-light tile rides in lights[i].color[3] bits 2+ (tile+1, <<2).
+        float spot_pool_vp[Lights::kMaxShadowSpots][16];
         float smokeParams[4];  // Stage-1 VMS: x = smoke-inject strength (0 = no injected smoke)
         float light_occ[4];    // r_light_occ: x = enable, y = bury bias, z = frag-below band, w = strength
+        // Atmospheric scattering (r_atmo): Rayleigh (blue) + Mie (forward halo) →
+        // aerial perspective. Appended last (integrate UBO stays a valid prefix).
+        float atmo[4];         // x = enable, y = Rayleigh strength, z = Mie strength, w = Mie g
+        float atmoR[4];        // rgb = Rayleigh scattering tint (blue-heavy), w unused
     };
     constexpr u32 kVolMaxLights = 8;
     constexpr VkDeviceSize kUboStride = (sizeof(VolUBO) + 255) & ~VkDeviceSize(255);
@@ -207,48 +229,27 @@ namespace {
     bool CreateVolume(VkImage& img, VmaAllocation& alloc, VkImageView& view,
                       u32 ex, u32 ey, u32 ez, const char* name)
     {
-        VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ici.imageType   = VK_IMAGE_TYPE_3D;
-        ici.format      = kVolFormat;
-        ici.extent      = { ex, ey, ez };
-        ici.mipLevels   = 1;
-        ici.arrayLayers = 1;
-        ici.samples     = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling      = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage       = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-        VmaAllocationCreateInfo aci{};
-        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-        if (vmaCreateImage(VulkanHW.m_Allocator, &ici, &aci, &img, &alloc, nullptr) != VK_SUCCESS) {
-            Msg("![VK Vol] %s image create failed", name); return false;
-        }
-        VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vci.image    = img;
-        vci.viewType = VK_IMAGE_VIEW_TYPE_3D;
-        vci.format   = kVolFormat;
-        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (vkCreateImageView(VulkanHW.m_Device, &vci, nullptr, &view) != VK_SUCCESS) {
-            Msg("![VK Vol] %s view create failed", name); return false;
-        }
-        Prof::NameImage(img, name);
-        return true;
+        VK::ImageDesc d;
+        d.type   = VK_IMAGE_TYPE_3D;
+        d.format = kVolFormat;
+        d.extent = { ex, ey, ez };
+        // TRANSFER_SRC/DST: the temporal path vkCmdCopyImage's scatter -> history
+        // (Execute), which requires both the usage flags and the TRANSFER layouts.
+        // Without these the copy + its layout barriers are invalid (VUID-01212/01213/
+        // 06662/06663). integ never copies but the extra flags are harmless.
+        d.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        d.name   = name;
+        if (!VK::CreateImage(d, img, alloc)) return false;
+        view = VK::CreateImageView(img, kVolFormat, VK_IMAGE_VIEW_TYPE_3D);
+        return view != VK_NULL_HANDLE;
     }
 
     VkPipeline BuildComputePipe(const char* spv, VkPipelineLayout layout)
     {
         VkShaderModule cs = g_ShaderManager->Load(spv);
         if (!cs) { Msg("![VK Vol] %s load failed", spv); return VK_NULL_HANDLE; }
-        VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cp.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cp.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        cp.stage.module = cs; cp.stage.pName = "main";
-        cp.layout = layout;
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &pipe) != VK_SUCCESS) {
-            Msg("![VK Vol] %s pipeline create failed", spv); return VK_NULL_HANDLE;
-        }
-        return pipe;
+        return VK::CreateComputePipeline(cs, layout, spv);
     }
 }
 
@@ -287,14 +288,14 @@ bool Init()
     if (!s_uboMapped) { Msg("![VK Vol] UBO map failed"); s_failed = true; return false; }
 
     // Dummy SSBO — keeps the VSM page-table binding valid before VSM is ready.
-    s_dummySSBO.Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_dummySSBO.Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     // Stage-1 smoke: device-local atomic accumulation SSBO (uint[cells*4], cleared +
     // splatted + resolved each frame on the GPU) + a host-visible per-particle upload
     // ring (one buffer per in-flight slot, CPU writes off the GPU timeline).
     s_smokeAccum.Create(VkDeviceSize(kSmokeCells) * 4 * sizeof(u32),
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     for (u32 i = 0; i < kFramesInFlight; ++i) {
         s_smokeParts[i].Create(VkDeviceSize(kMaxSmokeParticles) * sizeof(SmokeParticle),
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
@@ -507,7 +508,12 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // the knob (or the debug view, which also drives the path). smokeActive false →
     // no splat/resolve, smokeParams 0 → inject skips it.
     const u32  smokeN      = (smoke && smokeCount) ? ((smokeCount < kMaxSmokeParticles) ? smokeCount : kMaxSmokeParticles) : 0u;
-    const bool smokeActive = (ps_r_vol_smoke_inject > 0.0f || ps_r_vol_smoke_debug != 0) && (smokeN > 0u);
+    // #6: GPU-routed smoke has no CPU particles — its media comes from a GPU-side
+    // splat of the particle pool (recorded below, same accum SSBO). The GPU alive
+    // count is unknown on the CPU, so when the GP pool is live the splat+resolve
+    // run every frame (bounded: one early-out dispatch + the coarse-grid resolve).
+    const bool gpSplat     = GPUParticles::WantsMediaSplat();
+    const bool smokeActive = (ps_r_vol_smoke_inject > 0.0f || ps_r_vol_smoke_debug != 0) && (smokeN > 0u || gpSplat);
 
     // exp-Z grid — ONE source of truth shared with the clustered cull, so the
     // froxel Z mapping is identical to the inverse the composite uses.
@@ -525,18 +531,33 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // Sun + ambient from the SAME env source the receivers use (so the fog colour
     // tracks the lit surfaces). Neutral fallback before a level loads.
     ub.sun_dir[0] = 0.f; ub.sun_dir[1] = -1.f; ub.sun_dir[2] = 0.f;
-    ub.sun_color[0] = ub.sun_color[1] = ub.sun_color[2] = 0.6f * ps_r_sun_boost;
-    ub.sky_ambient[0] = ub.sky_ambient[1] = ub.sky_ambient[2] = 0.05f + ps_r_ambient_floor;
+    ub.sun_color[0] = ub.sun_color[1] = ub.sun_color[2] = 0.6f;
+    // Fog ambient tracks the ENV ambient (dark/blue at night) × r_vol_ambient — NOT
+    // the surface receiver floor (r_ambient_floor). That flat white floor lifts lit
+    // geometry off black, but in the fog it integrates along the sightline into a
+    // whitish haze that self-brightens the whole night scene. Scaling the real env
+    // ambient instead keeps night air genuinely dark.
+    ub.sky_ambient[0] = ub.sky_ambient[1] = ub.sky_ambient[2] = 0.05f;
     if (g_pGamePersistent) {
         if (auto* E = g_pGamePersistent->Environment().CurrentEnv) {
             ub.sun_dir[0] = E->sun_dir.x; ub.sun_dir[1] = E->sun_dir.y; ub.sun_dir[2] = E->sun_dir.z;
-            ub.sun_color[0] = E->sun_color.x * ps_r_sun_boost;
-            ub.sun_color[1] = E->sun_color.y * ps_r_sun_boost;
-            ub.sun_color[2] = E->sun_color.z * ps_r_sun_boost;
-            ub.sky_ambient[0] = E->ambient.x + ps_r_ambient_floor;
-            ub.sky_ambient[1] = E->ambient.y + ps_r_ambient_floor;
-            ub.sky_ambient[2] = E->ambient.z + ps_r_ambient_floor;
+            ub.sun_color[0] = E->sun_color.x;
+            ub.sun_color[1] = E->sun_color.y;
+            ub.sun_color[2] = E->sun_color.z;
+            ub.sky_ambient[0] = E->ambient.x;
+            ub.sky_ambient[1] = E->ambient.y;
+            ub.sky_ambient[2] = E->ambient.z;
         }
+    }
+    // Decode, THEN scale — the r_sun_boost / r_vol_ambient multiplies used to be fused
+    // into the assignments above, which would have applied them on the wrong side of
+    // the sRGB curve. Split so the fallback and the real env values share one
+    // conversion and the knobs keep meaning "scale the radiance".
+    ColorSpace::LinearizeRGB(ub.sun_color);
+    ColorSpace::LinearizeRGB(ub.sky_ambient);
+    for (int c = 0; c < 3; ++c) {
+        ub.sun_color[c]   *= ps_r_sun_boost;
+        ub.sky_ambient[c] *= ps_r_vol_ambient;
     }
 
     memcpy(ub.sun_vp,      &ShadowMap::GetLightVP(),    sizeof(ub.sun_vp));
@@ -571,21 +592,45 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
         const u32 nL = (FL.count < kVolMaxLights) ? FL.count : kVolMaxLights;
         ub.lightParams[0] = float(nL);
         ub.lightParams[1] = ps_r_vol_lights;
-        // Shadow-budget picks (1 spot + 1 point) → occlude their fog in-scatter so the
-        // flashlight cone stops at walls. Only valid if the pick landed in our 8.
-        ub.lightParams[2] = (FL.spotIdx  >= 0 && (u32)FL.spotIdx  < nL) ? float(FL.spotIdx)  : -1.f;
+        // z: local-light forward-scatter anisotropy (separate from the sun's
+        // r_vol_g) — a gentler peak so a torch shone at the camera doesn't spike
+        // into a cold-white searchlight glare. Was unused (-1); harmless if an
+        // old shader ignores it (localLights clamps g into hgPhase's valid range).
+        ub.lightParams[2] = ps_r_vol_lights_g;
         ub.lightParams[3] = (FL.pointIdx >= 0 && (u32)FL.pointIdx < nL) ? float(FL.pointIdx) : -1.f;
         for (u32 i = 0; i < nL; ++i) {
             memcpy(ub.lights[i].pos,   FL.gpu[i].pos,   sizeof(float) * 4);
             memcpy(ub.lights[i].color, FL.gpu[i].color, sizeof(float) * 4);
             memcpy(ub.lights[i].dir,   FL.gpu[i].dir,   sizeof(float) * 4);
-            // Volumetric-flagged lamps (R4 renders a visible BEAM for these —
-            // pole lamps, car headlights): +2 on the spot flag, the inject
-            // boosts their fog in-scatter so the shaft actually reads.
-            if (FL.volFlag[i]) ub.lights[i].color[3] += 2.0f;
+            // Handheld/worn torches (CTorch head-lamp, weapon light) vs fixtures
+            // (hanging lamps, searchlights). A torch is a SMALL worn light, not a
+            // searchlight — so it does NOT get the ×3 lamp beam boost; instead its
+            // fog shaft is scaled by r_torch_vol (premultiplied into the inject's
+            // OWN colour copy — surface lighting is a separate UBO, untouched).
+            // This is what stops an NPC head-lamp shone at the camera reading as a
+            // projector while overhead lamps keep their punchy beam.
+            if (FL.flashFlag[i]) {
+                ub.lights[i].color[0] *= ps_r_torch_vol;
+                ub.lights[i].color[1] *= ps_r_torch_vol;
+                ub.lights[i].color[2] *= ps_r_torch_vol;
+            }
+            // Volumetric-flagged FIXTURES (R4 renders a visible BEAM for these —
+            // pole lamps, car headlights): +2 on the spot flag, the inject boosts
+            // their fog in-scatter so the shaft actually reads. Torches excluded.
+            else if (FL.volFlag[i]) ub.lights[i].color[3] += 2.0f;
+            // Pool index (+1, <<2): a light is spot OR point, so the same bits
+            // carry the spot tile or the point cube — every pooled light's fog
+            // is cut by its own map, not just the single budget winner.
+            const int tile = SpotShadow_TileOfLight(FL.src[i]);
+            if (tile >= 0) ub.lights[i].color[3] += float((tile + 1) << 2);
+            else {
+                const int cube = PointShadow_CubeOfLight(FL.src[i]);
+                if (cube >= 0) ub.lights[i].color[3] += float((cube + 1) << 2);
+            }
         }
     }
-    memcpy(ub.spot_vp, &ShadowMap::GetSpotVP(), sizeof(ub.spot_vp));
+    for (u32 t = 0; t < Lights::kMaxShadowSpots; ++t)
+        memcpy(ub.spot_pool_vp[t], &ShadowMap::GetSpotTileVP(t), sizeof(ub.spot_pool_vp[t]));
 
     // P3 — animated dust/mist: amount/scale/speed + a wall-clock for the drift.
     ub.noiseParams[0] = ps_r_vol_noise;
@@ -604,6 +649,14 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     ub.light_occ[1] = 0.001f;   // bury bias (NDC-z)
     ub.light_occ[2] = 0.006f;   // frag-below band
     ub.light_occ[3] = 1.0f;     // strength
+
+    // Atmospheric scattering (r_atmo) — Rayleigh + Mie aerial perspective in the fog.
+    ub.atmo[0] = ps_r_atmo ? 1.0f : 0.0f;
+    ub.atmo[1] = ps_r_atmo_rayleigh;
+    ub.atmo[2] = ps_r_atmo_mie;
+    ub.atmo[3] = ps_r_atmo_mie_g;
+    // Physically-based Rayleigh tint (β ratio 5.8/13.5/33.1e-6 normalized → blue-heavy).
+    ub.atmoR[0] = 0.18f; ub.atmoR[1] = 0.41f; ub.atmoR[2] = 1.0f; ub.atmoR[3] = 0.0f;
 
     // ---- Temporal accumulation (r_vol_ta): sub-froxel Halton jitter + the prev
     // frame's reprojection inputs. alpha 0 until we have a valid history frame.
@@ -688,7 +741,8 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
         const int z = Prof::ZoneBegin(cmd, "VolSmoke");
         if (ps_r_vol_smoke_debug && (s_frame % 120u) == 0u)
             Msg("[VK Vol] smoke inject: %u particles (debug %d, density %.2f)", smokeN, ps_r_vol_smoke_debug, ps_r_vol_smoke_density);
-        memcpy(s_smokePartsMapped[slot], smoke, size_t(smokeN) * sizeof(SmokeParticle));
+        if (smokeN)
+            memcpy(s_smokePartsMapped[slot], smoke, size_t(smokeN) * sizeof(SmokeParticle));
 
         // accum + media are SHARED (not per-slot); with frames in flight, order the
         // PREVIOUS frame's reads (resolve's accum read, inject's media sample) before
@@ -724,10 +778,26 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
         sp.zParams[0]   = gz.nearZ; sp.zParams[1] = gz.farZ; sp.zParams[2] = gz.logFarNear;
         sp.dims[0] = float(kSmokeX); sp.dims[1] = float(kSmokeY); sp.dims[2] = float(kSmokeZ); sp.dims[3] = kSmokeFixed;
         sp.params[0] = float(smokeN); sp.params[1] = ps_r_vol_smoke_density; sp.params[2] = ps_r_vol_smoke_footprint;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_splatPipe);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_splatLayout, 0, 1, &s_splatSet[slot], 0, nullptr);
-        vkCmdPushConstants(cmd, s_splatLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sp), &sp);
-        vkCmdDispatch(cmd, (smokeN + 63u) / 64u, 1, 1);
+        if (smokeN) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_splatPipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_splatLayout, 0, 1, &s_splatSet[slot], 0, nullptr);
+            vkCmdPushConstants(cmd, s_splatLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sp), &sp);
+            vkCmdDispatch(cmd, (smokeN + 63u) / 64u, 1, 1);
+        }
+
+        // #6: GPU-routed smoke splats itself from the particle pool into the same
+        // accum SSBO (no CPU particles behind it any more). Same camera basis /
+        // grid push; the spare .w lanes carry the CollectSmokeParticles LOD zone.
+        if (gpSplat) {
+            const float maxD     = _min(ps_r_vol_smoke_dist, float(_max(ps_r__detail_radius, 1)));
+            const float distFull = _min(ps_r_vol_smoke_dist_full, maxD);
+            GPUParticles::MediaSplatPush mp{};
+            static_assert(sizeof(mp) == sizeof(sp), "media splat push mirrors SplatPush");
+            memcpy(&mp, &sp, sizeof(mp));
+            mp.camPos[3] = distFull;
+            mp.camDir[3] = maxD;
+            GPUParticles::SplatMedia(cmd, s_smokeAccum.GetHandle(), mp);
+        }
 
         // accum splat-write → resolve read.
         {
@@ -856,10 +926,10 @@ void Destroy()
     if (s_integView)   { vkDestroyImageView(VulkanHW.m_Device, s_integView, nullptr); s_integView = VK_NULL_HANDLE; }
     if (s_histView)    { vkDestroyImageView(VulkanHW.m_Device, s_histView, nullptr); s_histView = VK_NULL_HANDLE; }
     if (s_smokeView)   { vkDestroyImageView(VulkanHW.m_Device, s_smokeView, nullptr); s_smokeView = VK_NULL_HANDLE; }
-    if (s_scatterImg)  { vmaDestroyImage(VulkanHW.m_Allocator, s_scatterImg, s_scatterAlloc); s_scatterImg = VK_NULL_HANDLE; s_scatterAlloc = VK_NULL_HANDLE; }
-    if (s_integImg)    { vmaDestroyImage(VulkanHW.m_Allocator, s_integImg, s_integAlloc); s_integImg = VK_NULL_HANDLE; s_integAlloc = VK_NULL_HANDLE; }
-    if (s_histImg)     { vmaDestroyImage(VulkanHW.m_Allocator, s_histImg, s_histAlloc); s_histImg = VK_NULL_HANDLE; s_histAlloc = VK_NULL_HANDLE; }
-    if (s_smokeImg)    { vmaDestroyImage(VulkanHW.m_Allocator, s_smokeImg, s_smokeAlloc); s_smokeImg = VK_NULL_HANDLE; s_smokeAlloc = VK_NULL_HANDLE; }
+    if (s_scatterImg)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_scatterImg, s_scatterAlloc); s_scatterImg = VK_NULL_HANDLE; s_scatterAlloc = VK_NULL_HANDLE; }
+    if (s_integImg)    { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_integImg, s_integAlloc); s_integImg = VK_NULL_HANDLE; s_integAlloc = VK_NULL_HANDLE; }
+    if (s_histImg)     { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_histImg, s_histAlloc); s_histImg = VK_NULL_HANDLE; s_histAlloc = VK_NULL_HANDLE; }
+    if (s_smokeImg)    { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_smokeImg, s_smokeAlloc); s_smokeImg = VK_NULL_HANDLE; s_smokeAlloc = VK_NULL_HANDLE; }
     s_ubo.Destroy(); s_uboMapped = nullptr;
     s_dummySSBO.Destroy();
     s_smokeAccum.Destroy();

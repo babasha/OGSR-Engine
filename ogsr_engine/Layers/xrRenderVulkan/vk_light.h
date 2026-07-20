@@ -31,6 +31,10 @@ public:
     bool    volumetric = false;   // game asked for a visible beam (R4 lamp shafts) — stored for diagnostics/future
     bool    synthBeam  = false;   // OUR lightplanes-derived beam light (SynthCones): the fog
                                   // boost applies, but the FL cone path must NOT double-draw it
+    bool    flashlight = false;   // handheld/worn torch (CTorch head-lamp / weapon light) vs a
+                                  // fixture (hanging lamp / searchlight / campfire). Torches get
+                                  // the restrained R4 fog treatment (no lamp beam boost) so a
+                                  // head-lamp shone at the camera isn't a searchlight glare.
     Fvector pos{ 0.f, 0.f, 0.f };
     Fvector dir{ 0.f, 0.f, 1.f };
     float   range  = 8.f;
@@ -50,6 +54,7 @@ public:
     bool  get_volumetric()                  override { return volumetric; }
     void  set_volumetric_intensity(float)   override {}
     void  set_volumetric_distance(float)    override {}
+    void  set_flashlight(bool b)            override { flashlight = b; }
     void  set_flare(bool)                   override {}
     bool  get_flare()                       override { return false; }
     void  set_position(const Fvector& P)    override { pos = P; }
@@ -72,6 +77,12 @@ namespace Lights {
 
 constexpr u32 kMaxLights = 16;          // UBO array size — foliage + the non-clustered fallback path
 constexpr u32 kMaxClusterLights = 256;  // SSBO array size — the clustered forward path (vk_clustered)
+constexpr u32 kMaxShadowSpots  = 8;     // spot shadow POOL: tiles in the spot atlas (4×2 of 1024²).
+                                        // Every pooled spot gets its own shadow map, so several
+                                        // headlights/searchlights + the flashlight all shadow at once.
+constexpr u32 kMaxShadowPoints = 4;     // point shadow POOL: cubes in the point cube ARRAY (512²×6 each).
+                                        // Every pooled point (campfire/lamp) gets its own shadow cube,
+                                        // so several fires with NPCs sitting around all shadow at once.
 
 // GPU-side light record — must match the Lighting UBO `lights[]` entry layout.
 struct GpuLight {
@@ -80,10 +91,10 @@ struct GpuLight {
     float dir[4];     // xyz = spot direction, w = cos(cone/2)
 };
 
-// Per-frame light set + the two shadow-casting picks (budget: 1 spot + 1 point).
-// `gpu` holds up to kMaxClusterLights (clustered path uploads them all to the
-// SSBO); the UBO + foliage read only the first kMaxLights. spotIdx/pointIdx are
-// indices into this same array, so they're valid for both paths.
+// Per-frame light set + the shadow-casting picks (budget: a POOL of up to
+// kMaxShadowSpots spots + 1 point cube). `gpu` holds up to kMaxClusterLights
+// (clustered path uploads them all to the SSBO); the UBO + foliage read only
+// the first kMaxLights. All indices index this same array.
 struct FrameLights {
     GpuLight gpu[kMaxClusterLights];
     // CPU-side parallel flags (NOT uploaded — GpuLight layout is shared with the
@@ -93,13 +104,28 @@ struct FrameLights {
     // 1 = SynthCones beam-backing light: fog boost YES, FL-path analytic cone NO
     // (SynthCones draws its own geometry-derived cone for these).
     u8       synthFlag[kMaxClusterLights] = {};
+    // 1 = handheld/worn torch (CTorch / weapon light): the fog inject skips the
+    // lamp beam boost so a head-lamp shone at the camera stays the soft R4 shaft.
+    u8       flashFlag[kMaxClusterLights] = {};
+    // Source light per gpu[] entry — identity for the spot-pool tile cache
+    // (compare only, never dereference outside this frame).
+    vkLight* src[kMaxClusterLights] = {};
     u32      count    = 0;
-    int      spotIdx  = -1;   // gpu[] index of the spot-shadowed light (flashlight), -1 = none
-    int      pointIdx = -1;   // gpu[] index of the point-shadowed light (campfire),  -1 = none
-    // Source params of the shadowed picks (for the shadow-pass cameras):
+    // Spot shadow POOL: gpu[] indices of the shadow-flagged spots that get a
+    // tile this frame, nearest-first (narrow beams keep their 4× advantage).
+    u32      poolCount = 0;
+    int      poolGi[kMaxShadowSpots] = {};
+    int      spotIdx  = -1;   // gpu[] index of the COOKIE spot (flashlight beam texture);
+                              // falls back to poolGi[0] when no pooled spot has a texture
+    // Point shadow POOL: gpu[] indices of the shadow-flagged points that get a
+    // cube this frame, nearest-first.
+    u32      poolCountP = 0;
+    int      poolGiP[kMaxShadowPoints] = {};
+    int      pointIdx = -1;   // gpu[] index of the nearest pooled point (legacy single-pick alias), -1 = none
+    // Source params of the cookie pick / nearest point pick:
     Fvector  spotPos{};  Fvector spotDir{ 0.f, 0.f, 1.f }; float spotRange = 0.f; float spotCone = 0.f;
     Fvector  pointPos{}; float pointRange = 0.f;
-    shared_str spotTexture;   // the picked spot's cookie (flashlight beam pattern)
+    shared_str spotTexture;   // the cookie spot's texture (flashlight beam pattern)
 };
 
 // Collect the nearest active lights around `eye` and pick the shadowed ones.

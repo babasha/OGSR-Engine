@@ -8,11 +8,16 @@
 // xrRenderVulkan — dynamic light registry. See vk_light.h.
 #include "stdafx.h"
 #include "vk_light.h"
+#include "vk_color_space.h"        // ColorSpace::LinearizeRGB — authored light colours are sRGB
 #include "../../xr_3da/device.h"   // Device.dwFrame (per-frame idempotence)
 
 #include <algorithm>
 
-extern int ps_r_light_debug;   // r_light_debug — log the collected light set every ~2 s
+extern int   ps_r_light_debug; // r_light_debug — log the collected light set every ~2 s
+extern int   ps_r_spot_pool;   // r_spot_pool — active spot-shadow tiles (1..kMaxShadowSpots)
+extern int   ps_r_point_pool;  // r_point_pool — active point-shadow cubes (1..kMaxShadowPoints)
+extern float ps_r_point_boost; // r_point_boost — campfire glow intensity × (volumetric points)
+extern float ps_r_point_range; // r_point_range — campfire light reach × (volumetric points)
 
 namespace VK {
 
@@ -78,22 +83,72 @@ const FrameLights& CollectFrame(const Fvector& eye)
         std::sort(cands.begin(), cands.end(), byDist);
     }
 
-    // Fill the GPU array + pick the shadow-casting budget (1 spot + 1 point):
-    // prefer lights the game flagged shadow=true (flashlight), then nearest.
-    int   spotBest = -1, pointBest = -1;
-    bool  pointBestFlag = false;
-    float spotBestD2 = 1e30f, pointBestD2 = 1e30f;
+    // Fill the GPU array + pick the shadow budget: a POOL of up to
+    // kMaxShadowSpots spots (each gets its own atlas tile) + 1 point cube.
+    // Spots compete only when the game flagged them shadow=true (flashlight,
+    // synth beams) — a random lamp shouldn't cost a map.
+    struct SpotCand { int gi; float eff; };
+    SpotCand spotCands[kMaxClusterLights];
+    u32      nSpotCands = 0;
+    SpotCand pointCands[kMaxClusterLights];   // {gi, d2} — shadow-flagged points
+    u32      nPointCands = 0;
+
+    // POINT range deadband (hysteresis). Campfires animate l->range by ±~0.5 m
+    // every frame (flicker). But gpu[].pos[3] is the ONE range shared by shading,
+    // fog AND the shadow cube — the cube's far plane + the receiver's depth
+    // linearization both key off it. That per-frame jitter forced the cube's
+    // cached STATIC faces to re-raster EVERY frame (the static/dynamic split never
+    // cached — [VK PointPool] static=1 every frame). Freeze the range inside a 1 m
+    // band per light: the visible flicker is colour/intensity (l->color, untouched),
+    // not the exact reach, so a frozen radius is imperceptible and the static cube
+    // now caches. Keyed by light identity across frames; slot reclaimed by age.
+    struct RangeHold { const void* owner = nullptr; float range = 0.f; u32 seen = 0; };
+    static RangeHold s_pointRangeHold[kMaxClusterLights];
+    const u32 rhFrame = Device.dwFrame;
+    auto stablePointRange = [&](const void* owner, float raw) -> float {
+        RangeHold* free_ = nullptr; RangeHold* oldest = &s_pointRangeHold[0];
+        for (auto& h : s_pointRangeHold) {
+            if (h.owner == owner) {
+                if (_abs(raw - h.range) > 1.0f) h.range = raw;   // snap only on a real reach change
+                h.seen = rhFrame; return h.range;
+            }
+            if (!h.owner && !free_) free_ = &h;
+            if (h.seen < oldest->seen) oldest = &h;
+        }
+        RangeHold* slot = free_ ? free_ : oldest;               // claim free, else evict LRU
+        slot->owner = owner; slot->range = raw; slot->seen = rhFrame;
+        return raw;
+    };
 
     for (const Cand& c : cands)
     {
-        const vkLight* l = c.l;
+        vkLight* l = c.l;
         const u32 i = s_frame.count++;
         s_frame.volFlag[i]   = l->volumetric ? 1 : 0;
         s_frame.synthFlag[i] = l->synthBeam  ? 1 : 0;
+        s_frame.flashFlag[i] = l->flashlight ? 1 : 0;
+        s_frame.src[i]       = l;
         GpuLight& g = s_frame.gpu[i];
-        g.pos[0] = l->pos.x; g.pos[1] = l->pos.y; g.pos[2] = l->pos.z; g.pos[3] = l->range;
+        // Campfire/brazier tuning: volumetric-flagged POINT lights get the glow +
+        // reach multipliers (r_point_boost / r_point_range). Stored into gpu[]
+        // so shading, fog AND the shadow cube (which reads gpu[].pos[3]) agree.
+        const bool  fire     = (l->type == IRender_Light::POINT) && l->volumetric;
+        const float rangeMul = fire ? ps_r_point_range : 1.f;
+        const float boost    = fire ? ps_r_point_boost : 1.f;
+        // Deadband the POINT reach so a flickering campfire's shadow cube can cache
+        // its statics (see s_pointRangeHold). Spots keep their exact range.
+        float range3 = l->range * rangeMul;
+        if (l->type == IRender_Light::POINT) range3 = stablePointRange(l, range3);
+        g.pos[0] = l->pos.x; g.pos[1] = l->pos.y; g.pos[2] = l->pos.z; g.pos[3] = range3;
+        // Light colours are authored by eye in item configs / ALife spawn data
+        // (torch color_r2, lamp colour, headlights…), i.e. sRGB. Decode here — this is
+        // the single collection point feeding BOTH the ≤16-light UBO copy and the
+        // clustered SSBO, so one conversion covers every dynamic light in the frame.
+        // boost is applied AFTER the decode: like r_sun_boost it is a radiance scale.
         g.color[0] = l->color.r; g.color[1] = l->color.g; g.color[2] = l->color.b;
-        g.color[3] = (l->type == IRender_Light::SPOT) ? 1.f : 0.f;
+        ColorSpace::LinearizeRGB(g.color);
+        g.color[0] *= boost; g.color[1] *= boost; g.color[2] *= boost;
+        g.color[3] = (l->type == IRender_Light::SPOT) ? 1.f : 0.f;   // flag, never colour
         Fvector d = l->dir;
         if (d.magnitude() < 1e-5f) d.set(0.f, -1.f, 0.f);
         d.normalize();
@@ -102,31 +157,60 @@ const FrameLights& CollectFrame(const Fvector& eye)
 
         if (l->type == IRender_Light::SPOT)
         {
-            // Spots get the budget ONLY when the game flagged them shadow=true
-            // (flashlight). No fallback — a random lamp shouldn't cost a map.
             if (!l->shadow) continue;
             // Narrow beams (headlights/searchlights/synth cones, <60°) are the
             // shadows the player actually SEES — 4× distance advantage over
-            // wide 120° utility lamps, so walking away from a car doesn't flip
-            // the map to a downward pole lamp whose shadow barely reads.
+            // wide 120° utility lamps for the pool ordering.
             const float eff = c.d2 * (l->cone < deg2rad(60.f) ? 0.25f : 1.f);
-            if (eff < spotBestD2) { spotBest = int(i); spotBestD2 = eff;
-                          s_frame.spotPos = l->pos; s_frame.spotDir = d;
-                          s_frame.spotRange = l->range; s_frame.spotCone = l->cone;
-                          s_frame.spotTexture = l->texture; }
+            spotCands[nSpotCands++] = { int(i), eff };
         }
         else
         {
+            // Points compete for a pool cube only when the game flagged them
+            // shadow=true (campfires) — like spots, no fallback for random lamps.
+            if (!l->shadow) continue;
             if (l->range < kPointShadowMinRange) continue;
             if (c.d2 > kPointShadowMaxDist * kPointShadowMaxDist) continue;
-            const bool better = (l->shadow && !pointBestFlag)
-                             || (l->shadow == pointBestFlag && c.d2 < pointBestD2);
-            if (better) { pointBest = int(i); pointBestFlag = l->shadow; pointBestD2 = c.d2;
-                          s_frame.pointPos = l->pos; s_frame.pointRange = l->range; }
+            pointCands[nPointCands++] = { int(i), c.d2 };
         }
     }
-    s_frame.spotIdx  = spotBest;
-    s_frame.pointIdx = pointBest;
+    // Pool = the best kMaxShadowSpots candidates (r_spot_pool can shrink it).
+    std::sort(spotCands, spotCands + nSpotCands,
+              [](const SpotCand& a, const SpotCand& b) { return a.eff < b.eff; });
+    const u32 poolCap = u32(std::clamp(ps_r_spot_pool, 1, int(kMaxShadowSpots)));
+    s_frame.poolCount = (nSpotCands < poolCap) ? nSpotCands : poolCap;
+    for (u32 k = 0; k < s_frame.poolCount; ++k)
+        s_frame.poolGi[k] = spotCands[k].gi;
+    // Cookie pick: the pooled spot with a projection texture (flashlight beam
+    // pattern); plain poolGi[0] otherwise. Receivers gate the cookie on this.
+    s_frame.spotIdx = (s_frame.poolCount > 0) ? s_frame.poolGi[0] : -1;
+    for (u32 k = 0; k < s_frame.poolCount; ++k) {
+        const vkLight* l = s_frame.src[s_frame.poolGi[k]];
+        if (l->texture.size()) { s_frame.spotIdx = s_frame.poolGi[k]; break; }
+    }
+    if (s_frame.spotIdx >= 0) {
+        const vkLight* l = s_frame.src[s_frame.spotIdx];
+        s_frame.spotPos = l->pos; s_frame.spotDir = l->dir;
+        if (s_frame.spotDir.magnitude() < 1e-5f) s_frame.spotDir.set(0.f, -1.f, 0.f);
+        s_frame.spotDir.normalize();
+        s_frame.spotRange = l->range; s_frame.spotCone = l->cone;
+        s_frame.spotTexture = l->texture;
+    }
+    // Point pool = nearest kMaxShadowPoints shadow-flagged points.
+    std::sort(pointCands, pointCands + nPointCands,
+              [](const SpotCand& a, const SpotCand& b) { return a.eff < b.eff; });
+    const u32 poolCapP = u32(std::clamp(ps_r_point_pool, 1, int(kMaxShadowPoints)));
+    s_frame.poolCountP = (nPointCands < poolCapP) ? nPointCands : poolCapP;
+    for (u32 k = 0; k < s_frame.poolCountP; ++k)
+        s_frame.poolGiP[k] = pointCands[k].gi;
+    // Legacy single-pick alias = the nearest pooled point (fog/receiver fallbacks).
+    if (s_frame.poolCountP > 0) {
+        s_frame.pointIdx = s_frame.poolGiP[0];
+        const vkLight* l = s_frame.src[s_frame.pointIdx];
+        s_frame.pointPos = l->pos; s_frame.pointRange = l->range;
+    } else {
+        s_frame.pointIdx = -1;
+    }
 
     // r_light_debug 1: dump the whole registry + the collected set every ~2 s.
     // Diagnoses "a lamp in R4 doesn't light here" — if the light is absent from
@@ -136,10 +220,10 @@ const FrameLights& CollectFrame(const Fvector& eye)
         static u32 s_lastLog = 0;
         if (Device.dwTimeGlobal - s_lastLog > 2000) {
             s_lastLog = Device.dwTimeGlobal;
-            Msg("[VK Light] registry=%zu collected=%u (eye %.0f,%.0f,%.0f) spotShadow=%d pointShadow=%d",
-                s_registry.size(), s_frame.count, eye.x, eye.y, eye.z, spotBest, pointBest);
-            if (spotBest >= 0)
-                Msg("[VK Light] spot pick: pos=(%.0f,%.0f,%.0f) dir=(%.2f,%.2f,%.2f) range=%.1f cone=%.0f tex=%s",
+            Msg("[VK Light] registry=%zu collected=%u (eye %.0f,%.0f,%.0f) spotPool=%u cookie=%d pointPool=%u",
+                s_registry.size(), s_frame.count, eye.x, eye.y, eye.z, s_frame.poolCount, s_frame.spotIdx, s_frame.poolCountP);
+            if (s_frame.spotIdx >= 0)
+                Msg("[VK Light] cookie pick: pos=(%.0f,%.0f,%.0f) dir=(%.2f,%.2f,%.2f) range=%.1f cone=%.0f tex=%s",
                     s_frame.spotPos.x, s_frame.spotPos.y, s_frame.spotPos.z,
                     s_frame.spotDir.x, s_frame.spotDir.y, s_frame.spotDir.z,
                     s_frame.spotRange, rad2deg(s_frame.spotCone),

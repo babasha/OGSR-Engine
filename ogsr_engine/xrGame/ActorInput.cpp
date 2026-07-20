@@ -229,6 +229,20 @@ void CActor::IR_OnKeyboardRelease(int cmd)
 
 void CActor::IR_OnKeyboardHold(int cmd)
 {
+    // [mod-compat diag] "мышь крутит, WASD мёртв" on foreign maps: name the gate that
+    // swallows movement keys. First few movement keys only — then silence.
+    if (cmd == kFWD || cmd == kBACK || cmd == kL_STRAFE || cmd == kR_STRAFE)
+    {
+        static u32 s_diagLeft = 12, s_skip = 0;
+        if (s_diagLeft && (s_skip++ % 15) == 0) // every ~0.25s of held key — enough to see position (not) changing
+        {
+            --s_diagLeft;
+            Msg("[ActorInput] move cmd=%d | alive=%d health=%.3f remote=%d ext_handler=%d talking=%d holder=%d hud_adjust=%d | pos=(%.2f, %.2f, %.2f) mstate_real=%x | chr=%d env=%d",
+                cmd, (int)!!g_Alive(), GetfHealth(), (int)!!Remote(), (int)!!m_input_external_handler, (int)!!IsTalking(), (int)!!m_holder, (int)g_bHudAdjustMode, Position().x,
+                Position().y, Position().z, mstate_real, (int)character_physics_support()->movement()->CharacterExist(), (int)character_physics_support()->movement()->Environment());
+        }
+    }
+
     if (g_bHudAdjustMode && pInput->iGetAsyncKeyState(DIK_LSHIFT))
     {
         if (pInput->iGetAsyncKeyState(DIK_UP))

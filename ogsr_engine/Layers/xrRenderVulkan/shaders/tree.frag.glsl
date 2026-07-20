@@ -4,6 +4,7 @@
 #define ENV_SET 2                  // EnvLight UBO + samplers live at set 2
 #include "vsm_sample.glsl"         // vsmSunShadow (set 2 b14)
 #include "light_ubo.glsl"          // DynLight + Lighting UBO (set 2 b0) + samplers (set 2 b1..13)
+#include "foliage_shadow.glsl"     // foliageLightShadow — foliage receives spot/point pool shadows
 #include "surface_class.glsl"      // SC_* classification + snow (foliage)
 
 // xrRenderVulkan - tree forward fragment shader. set 1/binding 0 = per-group
@@ -61,13 +62,37 @@ float cascSample1(sampler2D smap, mat4 vp, vec3 wp, float bias_)
     return cascTap(smap, uv, n.z - bias_);
 }
 
-// Hemisphere sky ambient - tree crowns sample straight up (no per-leaf normal).
-vec3 skyAmbientUp()
+// Sky ambient (crowns sample straight up — no per-leaf normal) now comes from the
+// shared header, so the canopy gets the SH9 irradiance the world does instead of a
+// private point-sampled copy.
+#include "sky_ambient.glsl"
+
+// Sky specular sheen for the canopy (r_ibl). Leaves have no normal, so a real
+// reflection is meaningless — instead give the crown a soft view-dependent sky
+// sheen (up-reflected, high roughness = blurry), gated by per-tree sky openness
+// (vLight.x) and boosted when wet. Karis EnvBRDFApprox (local copy of env_common).
+vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
 {
-    float lod = L.sky_params.z;
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
+    const vec4 c1 = vec4( 1.0,  0.0425,  1.040, -0.040);
+    vec4  r    = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * ab.x + ab.y;
+}
+vec3 canopySkySheen(vec3 wp, float openness)
+{
+    if (L.ibl_params.x < 0.004) return vec3(0.0);
     const vec3 up = vec3(0.0, 1.0, 0.0);
-    return mix(textureLod(uSky0, up, lod).rgb, textureLod(uSky1, up, lod).rgb,
-               clamp(L.sky_params.x, 0.0, 1.0));
+    vec3  V   = normalize(L.eye_pos.xyz - wp);
+    float NoV = clamp(dot(up, V), 0.0, 1.0);
+    vec3  R   = reflect(-V, up);
+    float wetF  = clamp(L.rain_params.y, 0.0, 1.0);
+    float rough = mix(0.7, 0.5, wetF);
+    vec3  pref  = textureLod(uSkySpec, R, rough * L.ibl_params.z).rgb;
+    // Subtle when dry, glistens when wet; × canopy openness so inner/shaded leaves stay matte.
+    return pref * EnvBRDFApprox(vec3(0.04), rough, NoV)
+         * (L.ibl_params.x * L.ibl_params.y * openness * (0.12 + 0.88 * wetF));
 }
 
 // Foliage variant: leaves have no per-pixel normal -> attenuation-only.
@@ -101,6 +126,8 @@ vec3 dynLightsFoliage(vec3 wp)
             } else
                 att *= clamp((ca - ci) / max(1.0 - ci, 1e-3), 0.0, 1.0);
         }
+        // Dynamic shadow (spot tile / point cube) — see detail.frag.
+        att *= foliageLightShadow(i, wp);
         acc += L.lights[i].color.rgb * (att * 0.7);
     }
     return acc;
@@ -110,13 +137,21 @@ layout(push_constant) uniform PC {
     mat4  mViewProj;
     float uvScale;
     float alphaRef;
+    float statsOn;    // 1 = mark the visible-tree bitset (r_profiler diagnostics)
 } pc;
 
 layout(location = 0) in vec2 vUV;
 layout(location = 1) in vec3 vLight;
 layout(location = 2) in vec3 vSunLit;
 layout(location = 3) in vec3 vWPos;
+layout(location = 4) flat in uint vTreeIdx;
 layout(location = 0) out vec4 outColor;
+
+// Visible-tree bitset (set 0 shares the tree gfx layout with the VS transforms).
+// A fragment that survives the alpha test marks its tree — with early-Z on the
+// prepass depth that's ≈ "this tree has visible pixels". Guard-read first so the
+// atomic fires ~once per tree, not per fragment.
+layout(set = 0, binding = 2, std430) buffer SeenBits { uint seenBits[]; };
 
 // 1-tap sun shadow (cascades first, then the far map) - see world_lmap.frag.
 float sunShadow1(vec3 worldPos)
@@ -137,9 +172,18 @@ float sunShadow1(vec3 worldPos)
 
 void main()
 {
-    vec4 diff = texture(uDiffuse, vUV);
+    vec4 diff = texture(uDiffuse, vUV, L.spot_flash.z);   // DLSS mip bias (0 native)
+    // Alpha stays UNBIASED: the sharper (biased) alpha mip shrinks the cutout
+    // coverage at the alphaRef threshold → black holes onto the dark crown
+    // interior at distance («чёрные пятна на листве» under DLSS upscaling).
+    if (L.spot_flash.z != 0.0) diff.a = texture(uDiffuse, vUV).a;
     if (diff.a < pc.alphaRef)
         discard;
+
+    if (pc.statsOn > 0.5) {
+        uint w = vTreeIdx >> 5u, m = 1u << (vTreeIdx & 31u);
+        if ((seenBits[w] & m) == 0u) atomicOr(seenBits[w], m);
+    }
 
     // r_ssao_debug 1: trees show the raw AO map too.
     if (L.ao_params.w > 0.5) {
@@ -170,11 +214,15 @@ void main()
     vec3 ambient = (skyAmbientUp() * (vLight.x * L.sky_params.y * 0.75) + L.ambient.rgb)
                  * coloredAO(gtaoVis(), diff.rgb) * ssilBoost();   // + SSIL bounce (ambient only)
 
-    vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos));
+    vec3 sheen = canopySkySheen(vWPos, vLight.x);   // sky specular sheen (r_ibl)
+    vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos)) + sheen;
 
     // Distance fog (R4).
     float fog = clamp(length(vWPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 
+    if (L.ibl_params.w > 0.5) { outColor = vec4(sheen, 1.0); return; }   // r_ibl_debug
+    vec4 ptdbg = foliagePointDebug(vWPos);
+    if (ptdbg.a > 0.5) { outColor = vec4(ptdbg.rgb, 1.0); return; }
     outColor = vec4(col, 1.0);
 }

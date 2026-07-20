@@ -123,11 +123,25 @@ void CLevel::g_sv_Spawn(CSE_Abstract* E)
 
     // Client spawn
     //	T.Start		();
-    CObject* O = Objects.Create(*E->s_name);
+    // Чужой контент: для неизвестной секции сервер уже подставил inert-рестриктор
+    // (см. F_entity_Create), но s_name остаётся оригинальным — клиентский Create
+    // упал бы фаталом на pSettings->r_string(секция, "class"). Зеркалим placeholder.
+    const char* client_section = *E->s_name;
+    if (!pSettings->section_exist(client_section))
+    {
+        Msg("! [%s] unknown section '%s' -> client space_restrictor placeholder", __FUNCTION__, client_section);
+        client_section = "space_restrictor";
+    }
+    CObject* O = Objects.Create(client_section);
     // Msg				("--spawn--CREATE: %f ms",1000.f*T.GetAsync());
 
     //	T.Start		();
-    if (0 == O || (!O->net_Spawn(E)))
+    if (0 == O)
+    {
+        Msg("! Failed to create entity '%s'", *E->s_name);
+        return;
+    }
+    if (!O->net_Spawn(E))
     {
         O->setDestroy(TRUE);
         O->net_Destroy();

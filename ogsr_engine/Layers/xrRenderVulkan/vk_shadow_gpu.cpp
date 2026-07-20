@@ -14,7 +14,9 @@
 #include "vk_world_material.h"  // WorldMaterial (alphaRef, isWmark)
 #include "vk_buffer.h"          // CVulkanBuffer
 #include "vk_pipeline_cache.h"  // GetDepthPipeline / GetDepthLayout
+#include "vk_compute_util.h"    // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_shaders.h"         // g_ShaderManager
+#include "vk_world_gpu.h"       // WorldGPU::InSet (cluster-shadow coverage diag)
 #include "vk_profiler.h"        // Prof::CmdBeginLabel
 #include <algorithm>
 
@@ -65,7 +67,7 @@ void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
 // aren't missed — a top-level-only walk drops their shadows vs the CPU FlushDepth
 // path. Trees (MT_TREE_*) and skeletons are handled elsewhere / not opaque static
 // casters; alpha-tested + wmark leaves stay on the CPU AT path.
-void ExtractCasters(vkRender_Visual* rv, xr_vector<vkFVisual*>& out)
+void ExtractCasters(vkRender_Visual* rv, xr_vector<vkFVisual*>& out, xr_vector<vkFVisual*>* atOut)
 {
     if (!rv) return;
     const u32 t = rv->Type;
@@ -74,7 +76,10 @@ void ExtractCasters(vkRender_Visual* rv, xr_vector<vkFVisual*>& out)
         if (!fv->m_mesh.IsValid() || !fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) return;
         WorldMaterial* mat = fv->m_pWorldMaterial;
         if (mat && mat->isWmark) return;
-        if (mat && mat->alphaRef >= 0.f) return;   // alpha-tested → CPU AT path
+        if (mat && mat->alphaRef >= 0.f) {   // alpha-tested → CPU AT path / GPU cluster AT (coverage diag)
+            if (atOut) atOut->push_back(fv);
+            return;
+        }
         out.push_back(fv);
         return;
     }
@@ -82,7 +87,7 @@ void ExtractCasters(vkRender_Visual* rv, xr_vector<vkFVisual*>& out)
         auto* hv = dynamic_cast<vkFHierrarhyVisual*>(rv);
         if (!hv) return;
         for (auto* child : hv->children)
-            ExtractCasters(child, out);
+            ExtractCasters(child, out, atOut);
     }
 }
 
@@ -121,16 +126,11 @@ bool CreateCullPipeline()
     }
     vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_cullLayout) != VK_SUCCESS) return false;
+    s_cullLayout = VK::MakePipelineLayout({ s_setL }, sizeof(CullPush));
+    if (s_cullLayout == VK_NULL_HANDLE) return false;
 
-    VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module = cs; cp.stage.pName = "main";
-    cp.layout = s_cullLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &s_cullPipe) != VK_SUCCESS) return false;
+    s_cullPipe = VK::CreateComputePipeline(cs, s_cullLayout, "ShadowGPU.Cull");
+    if (s_cullPipe == VK_NULL_HANDLE) return false;
     return true;
 }
 
@@ -138,17 +138,21 @@ bool CreateCullPipeline()
 
 void Build()
 {
+    VK::Vram::Scope _vram_scope("ShadowGPU");
     if (s_built) return;
     s_built = true;   // one attempt; stays "built" (possibly empty) so we don't retry every frame
 
     // Collect OPAQUE static casters, recursing into hierarchy/LOD containers
     // (alpha-tested stay on the CPU AT path; wmarks never cast).
     xr_vector<vkFVisual*> casters; casters.reserve(8192);
+    xr_vector<vkFVisual*> atCasters; atCasters.reserve(8192);   // coverage diag only (GPU AT draws via WorldGPU)
     for (IRenderVisual* iv : RImplementation.Visuals)
-        ExtractCasters(static_cast<vkRender_Visual*>(iv), casters);
+        ExtractCasters(static_cast<vkRender_Visual*>(iv), casters, &atCasters);
     const u32 nPreDedup = (u32)casters.size();   // diag: hierarchy double-collection vs nesting recovered
     std::sort(casters.begin(), casters.end());
     casters.erase(std::unique(casters.begin(), casters.end()), casters.end());
+    std::sort(atCasters.begin(), atCasters.end());
+    atCasters.erase(std::unique(atCasters.begin(), atCasters.end()), atCasters.end());
 
     if (casters.empty()) { Msg("[VK ShadowGPU] no opaque static casters"); return; }
 
@@ -226,16 +230,16 @@ void Build()
     // meta SSBO (device-local)
     s_meta = xr_new<CVulkanBuffer>();
     s_meta->Create(sizeof(GpuCasterMeta) * s_total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     s_meta->Upload(meta.data(), sizeof(GpuCasterMeta) * s_total);
 
     // indirect + count (device-local, GPU-written) — per (target, group) region.
     const VkBufferUsageFlags iu = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     s_indirect = xr_new<CVulkanBuffer>();
     s_indirect->Create((VkDeviceSize)TGT_COUNT * nGroups * s_maxGroupMesh * sizeof(VkDrawIndexedIndirectCommand), iu,
-                       VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+                       VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     s_count = xr_new<CVulkanBuffer>();
-    s_count->Create((VkDeviceSize)TGT_COUNT * nGroups * sizeof(u32), iu, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_count->Create((VkDeviceSize)TGT_COUNT * nGroups * sizeof(u32), iu, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     if (!CreateCullPipeline()) { Msg("![VK ShadowGPU] cull pipeline failed — disabled"); s_groups.clear(); return; }
 
@@ -270,6 +274,29 @@ void Build()
 
     Msg("[VK ShadowGPU] built: %u opaque casters (%u pre-dedup), %u groups, maxGroup=%u",
         s_total, nPreDedup, nGroups, s_maxGroupMesh);
+
+    // Phase 3 coverage diag: casters NOT in the WorldGPU cluster set lose their
+    // shadow when the cluster shadow paths replace this per-mesh set (they are
+    // usually null-material / no-diffuse leaves; tessellated ones only appear
+    // with r_tess on). A big number here = fall back (r_shadow_cluster 0).
+    {
+        u32 uncovered = 0;
+        for (vkFVisual* fv : casters)
+            if (!WorldGPU::InSet(fv)) ++uncovered;
+        if (uncovered)
+            Msg("![VK ShadowGPU] cluster-shadow coverage: %u/%u casters outside the WorldGPU set (their shadows drop under r_shadow_cluster/r_vsm_cluster)",
+                uncovered, s_total);
+        // Same coverage question for the ALPHA-TESTED casters now that
+        // r_gpu_shadows_at routes them through the cluster shadow slices: an AT
+        // leaf outside the WorldGPU set loses its shadow (the CPU cutout queues
+        // are idle under gpuAT). A big number = flip r_gpu_shadows_at 0.
+        u32 uncoveredAT = 0;
+        for (vkFVisual* fv : atCasters)
+            if (!WorldGPU::InSet(fv)) ++uncoveredAT;
+        Msg("%s[VK ShadowGPU] cluster-shadow AT coverage: %u/%u AT casters outside the WorldGPU set%s",
+            uncoveredAT ? "!" : "", uncoveredAT, (u32)atCasters.size(),
+            uncoveredAT ? " (their shadows drop under r_gpu_shadows_at)" : "");
+    }
 }
 
 bool Built() { return s_built && !s_groups.empty() && s_cullPipe != VK_NULL_HANDLE; }

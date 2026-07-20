@@ -40,4 +40,18 @@ REM Reflex SDK — also deferred until requested by OGSR team.
 REM RD /s /q 3rd_party\Src\NVIDIA_Reflex\Reflex
 REM git clone --branch main --depth 1 https://github.com/NVIDIAGameWorks/Reflex.git 3rd_party\Src\NVIDIA_Reflex\Reflex
 
+REM NVIDIA Streamline (SL 2.12.0) + meshoptimizer (v1.2) — needed by the Vulkan renderer
+REM (vk_sl.cpp / vk_dlss.cpp / vk_meshopt.cpp), referenced from vulkan_renderer.props.
+REM Both are gitignored (see the root .gitignore): unlike every dep above, they unpack
+REM into the dependency folder ITSELF rather than a nested clone dir, and meshoptimizer
+REM ships its own .gitignore that must not be replaced.
+REM
+REM Deliberately NOT executable yet: the delete-then-clone pattern used above removes the
+REM folder FIRST, so a wrong URL or a moved tag would destroy a working SDK and fail to
+REM replace it. Verify upstream before enabling (NVIDIA has renamed the Streamline org).
+REM   meshoptimizer: clone https://github.com/zeux/meshoptimizer.git (tag v1.2) directly
+REM                  into 3rd_party\Src\meshoptimizer
+REM   Streamline:    shipped as a RELEASE asset (prebuilt bin/include/lib), not a source
+REM                  clone — unpack the v2.12.0 release into 3rd_party\Src\NVIDIA_Streamline
+
 pause

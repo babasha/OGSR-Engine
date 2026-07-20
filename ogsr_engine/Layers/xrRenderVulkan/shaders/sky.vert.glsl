@@ -14,11 +14,17 @@
 
 // Manual vec4 packing — push_constant default layout is implementation-
 // defined for vec3+scalar mixes; vec4s eliminate that ambiguity.
+// Full push block must match sky.frag.glsl exactly (shared range across stages).
+// The VS only reads the first three vec4s; the rest are consumed by the FS.
 layout(push_constant) uniform PushConstants {
     vec4 camRightTan_rot;   // .xyz = vCameraRight * tan(fov/2) * aspect, .w = skyRotation
     vec4 camUpTan_weight;   // .xyz = vCameraTop   * tan(fov/2),          .w = blendWeight
     vec4 camForward_pad;    // .xyz = vCameraDirection (unit)
     vec4 skyColor_pad;      // .xyz = sky_color tint
+    vec4 sunDir_pad;        // FS only
+    vec4 sunColor_pad;      // FS only
+    vec4 cloudsColor;       // FS only
+    vec4 cloudParams;       // FS only
 } pc;
 
 layout(location = 0) out vec3 vWorldDir;

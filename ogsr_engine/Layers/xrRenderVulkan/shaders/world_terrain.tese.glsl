@@ -71,7 +71,7 @@ void main() {
             // Mud: the SOIL itself is pressed in — depth scales with the splat
             // softness (earth/grass deep, gravel shallow, asphalt none) and rain
             // loosens it. Berm boosted: displaced soil piles visibly at the rim.
-            vec4  m  = textureLod(uMask, vUV, 0.0);
+            vec4  m  = textureLod(uMask, terrainMaskUV(vUV, wp), 0.0);
             float ws = dot(m, vec4(1.0));
             m = (ws > 1e-4) ? (m / ws) : vec4(1.0, 0.0, 0.0, 0.0);
             float wet  = clamp(L.rain_params.y, 0.0, 1.0);

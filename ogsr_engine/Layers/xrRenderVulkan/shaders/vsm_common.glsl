@@ -41,6 +41,23 @@ int vsmToroidalSlot(int level, ivec2 absPage) {
     return level * VSM_PAGES_PER_LVL + sy * VSM_PAGES_AXIS + sx;
 }
 
+// RECEIVER MASK (r_vsm_rmask, the UE5 VSM idea): per virtual page an 8×8 bitmask of
+// which 16×16-texel cells visible receivers actually sample (written by vsm_mark,
+// 2 u32 per page: .x = rows 0..3, .y = rows 4..7, bit = row*8+col). Dynamic-pass bins
+// drop a (caster, page) pair whose footprint misses every sampled cell — sub-page
+// culling of both instances and alpha-test fill. STATIC cached pages must NOT use it
+// (a partially-rendered page goes stale when the camera samples other cells later).
+// Build the 64-bit rect mask for inclusive cell rect [c0..c1], both in [0,7].
+uvec2 vsmRectMask8(ivec2 c0, ivec2 c1) {
+    uint row = (0xFFu >> uint(7 - (c1.x - c0.x))) << uint(c0.x);
+    uvec2 m = uvec2(0u);
+    for (int y = c0.y; y <= c1.y; ++y) {
+        if (y < 4) m.x |= row << uint(y * 8);
+        else       m.y |= row << uint((y - 4) * 8);
+    }
+    return m;
+}
+
 // Pick the FINEST clipmap level whose ortho square contains light-space XY `lxy`.
 // level[L] = (origin.xy = light-space XY of texel (0,0), z = full extent in metres).
 // Returns level (0..VSM_LEVELS-1) or -1 if outside every level. On a hit, `uv` is

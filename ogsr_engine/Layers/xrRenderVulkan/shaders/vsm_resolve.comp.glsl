@@ -33,6 +33,7 @@ layout(set = 0, binding = 6) uniform Resolve {
     vec4 curCamPos;      // xyz = this frame camera (stored as G for next frame); w = history weight on dyn-shadowed pixels (r_vsm_ta_blend_dyn)
     vec4 screen;         // xy = pixel dims, zw = 1/dims
     vec4 params;         // x = history weight (alpha), y = reject tolerance, z = historyValid, w = dyn-gate (1 = skip dyn pages with no casters, r_vsm_dyn_gate)
+    vec4 params2;        // x = clamp tol (neighbourhood clamp, r_vsm_ta_clamp), y = motion ref px (r_vsm_ta_motion), z = motion-floor weight (r_vsm_ta_motion_floor), w = unused
 } R;
 
 // VSM atlas sample (3x3 PCF) — mirrors the page mapping vsm_page.vert rasterized with.
@@ -43,17 +44,38 @@ layout(set = 0, binding = 6) uniform Resolve {
 // dynHit (out) = fraction of taps the DYNAMIC atlas shadows (always computed): these
 // casters MOVE every frame (wind-swaying crowns, NPCs), so main() cuts the EMA history
 // weight there — the full weight drags a many-frame smear ("jelly") behind them.
-float sampleVSM(vec3 wp, out float dynOcc, out float dynHit)
+// statLit (out) = visibility against the STATIC atlas ALONE (trees/buildings, no
+// grass/NPC/wind-tree dyn casters) — written to mask B. HISTORY: this was the
+// mask-based grass receiver path (grass read B to avoid dyn blade-frequency stripes
+// projecting onto the canopy); grass now samples the atlases DIRECTLY at its own
+// world pos (vsm_sample VSM_GRASS_DIRECT), so B survives only as a diagnostic
+// (r_grass_debug 3 comparison view) — nearly free: same taps, one extra compare.
+float sampleVSM(vec3 wp, out float dynOcc, out float dynHit, out float statLit)
 {
     dynOcc = 0.0;
     dynHit = 0.0;
+    statLit = 1.0;
     vec3 lp = (vsmC.view * vec4(wp, 1.0)).xyz;
     vec2 luv; ivec2 page;
     int  L = vsmSelect(lp.xy, vsmC.level, luv, page);
     if (L < 0) return 1.0;
 
+    // Walk COARSER until the STATIC page is mapped. The static table is fully resident
+    // for every marked page, so a miss at the finest containing level means the page
+    // was marked coarser (throttle LOD bias, r_vsm_throttle) or its scroll-in redraw
+    // was deferred (r_vsm_dirty_budget) — sample the next coarser level instead of
+    // falling out "lit". One 4-byte read per extra step; the un-throttled steady state
+    // exits on the first iteration (identical to the old single lookup).
+    uint slotS = VSM_UNMAPPED;
+    for (; L < VSM_LEVELS; ++L) {
+        vec2 t = (lp.xy - vsmC.level[L].xy) / vsmC.level[L].z;
+        page   = clamp(ivec2(floor(t * float(VSM_PAGES_AXIS))), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));
+        slotS  = vsmPageTable[vsmPageIndex(L, page)];
+        if (slotS < uint(VSM_MAX_PHYS_S)) { luv = t; break; }
+    }
+    if (L >= VSM_LEVELS) return 1.0;   // mapped nowhere → lit (old policy)
+
     int  idx   = vsmPageIndex(L, page);
-    uint slotS = vsmPageTable[idx];      // STATIC atlas slot (toroidal-cached; 6144 grid)
     uint slotD = vsmPageTableDyn[idx];   // DYNAMIC atlas slot (demand-allocated; 2048 grid)
     bool hasS  = slotS < uint(VSM_MAX_PHYS_S);
     bool resD  = slotD < uint(VSM_MAX_PHYS);
@@ -68,35 +90,54 @@ float sampleVSM(vec3 wp, out float dynOcc, out float dynHit)
     vec2  baseS = vec2(float(slotS % uint(VSM_ATLAS_W_S)), float(slotS / uint(VSM_ATLAS_W_S)));
     vec2  baseD = vec2(float(slotD % uint(VSM_ATLAS_W)),   float(slotD / uint(VSM_ATLAS_W)));
     float zHere = (lp.z - vsmC.zparams.x) * vsmC.zparams.y;
-    float bias  = vsmC.zparams.z;
+    float bias  = vsmC.zparams.z;   // STATIC-atlas receiver bias (terrain self-shadow acne)
+    float biasD = vsmC.zparams.w;   // DYNAMIC-atlas receiver bias (tiny: no ground in that atlas)
     const vec2 dimS = vec2(float(VSM_ATLAS_W_S), float(VSM_ATLAS_H_S));   // static atlas (6144)
     const vec2 dimD = vec2(float(VSM_ATLAS_W),   float(VSM_ATLAS_H));     // dynamic atlas (2048)
 
     const float tp    = 1.0 / float(VSM_PAGE_SIZE);   // one page texel, page-local units
     const float inset = 0.5 * tp;
-    float lit = 0.0;
+    float lit = 0.0, litS = 0.0;
     for (int dy = -1; dy <= 1; ++dy)
     for (int dx = -1; dx <= 1; ++dx) {
         vec2 pl = clamp(pageLocal + vec2(float(dx), float(dy)) * tp, vec2(inset), vec2(1.0 - inset));
-        // Nearer occluder across both atlases (each looked up via its own slot + grid). An
-        // empty page in either reads its CLEAR / clamp-to-white = 1.0 = no occluder.
+        // Each atlas gets its OWN receiver bias. The static atlas holds the ground
+        // itself, so its bias (zparams.z) must absorb terrain self-shadow acne — but at
+        // a 2000 m clipmap z-range 0.0003 normalized = 0.6 m along the sun ray, which
+        // also REJECTED every dyn occluder closer than 0.6 m: grass blade parts below
+        // ~half a metre cast nothing (high sun shrinks the gap = H/sin(elev) further) —
+        // tuft shadows went missing/cut while tall trees were unaffected. The DYNAMIC
+        // atlas holds ONLY casters (grass/NPC/near-crowns), NEVER the receiving ground,
+        // so it cannot acne against it → a tiny epsilon (zparams.w, r_vsm_bias_dyn:
+        // D16 quantization + the write-side raster bias) keeps low blades shadowing.
         float occS = 1.0;
         if (hasS) occS = min(occS, texture(uAtlas, (baseS + pl) / dimS).r);
-        float occ = occS;
+        bool sh = (zHere - bias > occS);
         if (hasD || dbgD) {
             float d = texture(uAtlasDyn, (baseD + pl) / dimD).r;
-            if (hasD) {
-                occ = min(occ, d);
-                if (zHere - bias > d) dynHit += 1.0 / 9.0;
+            if (hasD && (zHere - biasD > d)) {
+                sh = true;
+                dynHit += 1.0 / 9.0;
             }
-            // Debug: count only the VISIBLE darkening the dyn atlas causes — taps the
-            // static atlas leaves lit but the dyn depth shadows. (Raw dyn occlusion
+            // Debug: mode 1 counts only the VISIBLE darkening the dyn atlas causes — taps
+            // the static atlas leaves lit but the dyn depth shadows. (Raw dyn occlusion
             // painted whole shadow COLUMNS through houses/crowns — technically correct
             // atlas content, but already dark in the real image = pure confusion.)
-            if (dbgD && (zHere - bias <= occS) && (zHere - bias > d)) dynOcc += 1.0 / 9.0;
+            // Mode 2 (r_vsm_debug_dyn 2) = RAW: any dyn occlusion, ungated — for auditing
+            // whether a caster made it into the atlas at all (grass pair coverage).
+            // Mode 3 (r_vsm_debug_dyn 3) = PRESENCE: any caster DEPTH at this receiver's
+            // texel, ignoring the depth comparison — splits "fragments never rasterized
+            // into the page" (no red in 3) from "depth written but the test rejects it"
+            // (red in 3, none in 2).
+            if (dbgD) {
+                if (R.prevCamPos.w > 2.5) { if (d < 0.999) dynOcc += 1.0 / 9.0; }
+                else if ((R.prevCamPos.w > 1.5 || zHere - bias <= occS) && (zHere - biasD > d)) dynOcc += 1.0 / 9.0;
+            }
         }
-        lit += (zHere - bias > occ) ? 0.0 : 1.0;
+        lit  += sh ? 0.0 : 1.0;
+        litS += (zHere - bias > occS) ? 0.0 : 1.0;   // static atlas alone (grass receivers)
     }
+    statLit = litS * (1.0 / 9.0);
     return lit * (1.0 / 9.0);
 }
 
@@ -116,20 +157,20 @@ void main()
 
     vec2  uv   = (vec2(px) + 0.5) * R.screen.zw;
     float zndc = texture(uDepth, uv).r;
-    if (zndc >= 0.99999) { imageStore(uOut, px, vec4(1.0, 1e6, 0.0, 0.0)); return; }   // sky → lit
+    if (zndc >= 0.99999) { imageStore(uOut, px, vec4(1.0, 1e6, 1.0, 0.0)); return; }   // sky → lit (B too)
 
     vec4 clip  = vec4(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, zndc, 1.0);
     vec4 world = R.invViewProj * clip;
     vec3 wp    = world.xyz / world.w;
 
-    float dynOcc, dynHit;
-    float cur  = sampleVSM(wp, dynOcc, dynHit);
+    float dynOcc, dynHit, statLit;
+    float cur  = sampleVSM(wp, dynOcc, dynHit, statLit);
 
     // Debug refinement: a surface FACING AWAY from the sun gets no direct light — a dyn
     // shadow there changes nothing on screen (e.g. a ceiling under a roof hole crossed by
     // a distant NPC's shadow column). Reconstruct the geometric normal from depth and
     // drop the red on backfacing/grazing pixels.
-    if (dynOcc > 0.0) {
+    if (dynOcc > 0.0 && R.prevCamPos.w < 1.5) {   // mode 2 = raw: keep backfacing/grazing red too
         vec3 wpX = reconWorld(uv + vec2(R.screen.z, 0.0));
         vec3 wpY = reconWorld(uv + vec2(0.0, R.screen.w));
         vec3 n   = cross(wpX - wp, wpY - wp);
@@ -157,13 +198,35 @@ void main()
                     // shadows this pixel now — or did last frame (hist.a covers the
                     // trailing edge) — drop to the dyn history weight (r_vsm_ta_blend_dyn).
                     float a = (dynHit > 0.0 || hist.a > 0.0) ? min(R.params.x, R.curCamPos.w) : R.params.x;
-                    outShadow = mix(cur, hist.r, a);
+
+                    // (2) MOTION-ADAPTIVE weight. The distance reject above only catches
+                    // DISocclusion (surface changed) — but high-frequency foliage shadows on
+                    // the SAME ground (same depth) pass it, and under camera motion the
+                    // bilinear history fetch at `puv` blurs a bit more each frame → the full
+                    // EMA accumulates that blur into "каша" (only while moving). Fade the
+                    // weight toward a floor by the reprojected screen motion (px): still
+                    // camera keeps the full EMA (clean coarse shadow + sub-texel detail),
+                    // moving camera stops compounding the blur.
+                    float motionPx = length((puv - uv) * R.screen.xy);
+                    float mfade = clamp(motionPx / max(R.params2.y, 1e-3), 0.0, 1.0);
+                    a = mix(a, min(a, R.params2.z), mfade);
+
+                    // (1) NEIGHBOURHOOD CLAMP (value space). Bound the history sample to the
+                    // current shadow ±tol before the blend so a stale value can't drag a
+                    // many-frame trail (the classic TAA anti-ghost, done per-pixel without
+                    // the extra sampleVSM taps a spatial min/max would cost): sub-texel
+                    // jitter within tol still averages (keeps the AA), a big deviation
+                    // (moved foliage edge) is clamped out (kills the smear).
+                    float hClamped = clamp(hist.r, cur - R.params2.x, cur + R.params2.x);
+                    outShadow = mix(cur, hClamped, a);
                 }
             }
         }
     }
-    // B = raw (untemporal) dyn-atlas occlusion for the tonemap's red debug overlay
-    // (r_vsm_debug_dyn); A = this frame's dynHit (next frame's trailing-edge EMA cut);
-    // receivers read only R.
-    imageStore(uOut, px, vec4(outShadow, dist, dynOcc, dynHit));
+    // B = STATIC-only visibility — diagnostic channel (r_grass_debug 3; grass shading
+    // now samples the atlases directly, see sampleVSM's statLit note). Raw, no EMA.
+    // Under r_vsm_debug_dyn the debug dynOcc takes the channel over (the red overlay).
+    // A = this frame's dynHit (next frame's trailing-edge EMA cut).
+    float bOut = (R.prevCamPos.w > 0.5) ? dynOcc : statLit;
+    imageStore(uOut, px, vec4(outShadow, dist, bOut, dynHit));
 }

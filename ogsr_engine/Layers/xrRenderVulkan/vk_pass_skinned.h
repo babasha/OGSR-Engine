@@ -15,6 +15,8 @@
 #include "vk_core.h"
 #include "vk_pass_context.h"
 
+class CFrustum;   // per-face cull for the point-cube skinned overlay
+
 namespace VK
 {
     void Pass_Skinned(FrameContext& ctx);
@@ -45,13 +47,22 @@ namespace VK
     // Depth-only render of the world (non-HUD) skinned casters into the currently
     // bound shadow attachment. Caller owns render begin/end, viewport and bias.
     // Default cull = the sun ortho box; pass cullPos+cullRange to cull against a
-    // light sphere instead (spot/point shadow maps).
+    // light sphere instead (spot/point shadow maps). `frustum` (optional) adds a
+    // per-view frustum test — a POINT cube passes each face's frustum so an NPC
+    // renders only into the 1-2 faces it actually occupies, not all 6.
     void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
-                              const Fvector* cullPos = nullptr, float cullRange = 0.f);
+                              const Fvector* cullPos = nullptr, float cullRange = 0.f,
+                              const CFrustum* frustum = nullptr);
 
     // Any world skinned caster inside the sphere this frame? (cheap pre-check —
     // lets the point-cube shadow skip re-rendering when no one is near the light)
     bool Skinned_AnyCasterInSphere(const Fvector& pos, float range);
+
+    // True when this visual is a skeleton that the skinned path draws. The rigid
+    // sun-caster pass asks before drawing so the two never draw the same object — and it
+    // asks here rather than repeating the test, so they cannot drift apart.
+    // Takes IRenderVisual so this header stays free of the visual hierarchy.
+    bool Skinned_HandlesVisual(IRenderVisual* v);
 
     // NPCs into the scene depth PREPASS (camera VP) — GTAO occluders + early-Z.
     // Alpha-tested with skinned.frag's threshold so cutout coverage matches the
@@ -69,7 +80,17 @@ namespace VK
     // true screen motion. Depth-tested (LEQUAL, no write) against the complete
     // scene depth. Caller owns render begin/end + the negative-height viewport
     // (VK::MotionVec::ExecuteDynamic). prevVP = previous frame's view-proj.
-    void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP);
+    // curVP/prevVP are UNJITTERED (jitter-free MV); jitterNdcX/Y (D3D-NDC, 0 when DLSS
+    // off) is re-applied to gl_Position so depth still bit-matches the jittered forward geometry.
+    void Skinned_RenderMotion(VkCommandBuffer cmd, const Fmatrix& curVP, const Fmatrix& prevVP,
+                              float jitterNdcX, float jitterNdcY);
+
+    // First-person HUD weapon MV overlay: same as above for the HUD list, using the
+    // HUD-FOV projection (cur/prev) at the near-depth viewport [0,0.02] the forward
+    // HUD pass used. Fixes the viewmodel ghosting under DLSS/TAA. Caller owns begin/end.
+    void Skinned_RenderMotionHud(VkCommandBuffer cmd, const VkExtent2D& ext,
+                                 const Fmatrix& curHudVP, const Fmatrix& prevHudVP,
+                                 float jitterNdcX, float jitterNdcY);
 
     // Glass refraction, kinematics half (r_glass_refr): re-draw this frame's glass
     // leaves into the heat-haze distortion pass (called by Pass_Particles phase 3).

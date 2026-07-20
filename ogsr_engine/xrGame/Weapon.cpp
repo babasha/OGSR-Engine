@@ -576,6 +576,7 @@ void CWeapon::Load(LPCSTR section)
         flashlight_render->set_type(IRender_Light::SPOT);
         flashlight_render->set_shadow(ParentIsActor());
         flashlight_render->set_moveable(true);
+        flashlight_render->set_flashlight(true);   // handheld weapon light — restrained R4 fog
 
         const Fcolor clr = READ_IF_EXISTS(pSettings, r_fcolor, m_light_section, b_r2 ? "color_r2" : "color", (Fcolor{0.6f, 0.55f, 0.55f, 1.0f}));
 
@@ -1060,6 +1061,7 @@ void CWeapon::UpdateFlashlight()
         {
             flashlight_render->set_active(false);
             flashlight_omni->set_active(false);
+            m_npc_fl_valid = false;   // re-seed the NPC low-pass on next activation
             UpdateAddonsVisibility();
         }
 
@@ -1082,6 +1084,29 @@ void CWeapon::UpdateFlashlight()
 
                 flashlight_dir_omni = get_LastFD();
                 XFORM().transform_tiny(flashlight_pos_omni, flashlight_omni_world_attach_offset);
+
+                // NPC weapon-mounted flashlight: XFORM()/aim bob every frame with the
+                // weapon animation → the projected (grass) shadow "skips rope". Low-pass
+                // the SPOT pos/dir for NPCs (the player uses the HUD path above, so its
+                // light stays crisp). τ ≈ 120 ms kills the bob, still follows real aim.
+                if (!smart_cast<CActor*>(H_Parent()))
+                {
+                    if (!m_npc_fl_valid)
+                    {
+                        m_npc_fl_pos = flashlight_pos;
+                        m_npc_fl_dir = flashlight_dir;
+                        m_npc_fl_valid = true;
+                    }
+                    else
+                    {
+                        const float a = 1.f - expf(-Device.fTimeDelta / 0.12f);
+                        m_npc_fl_pos.lerp(m_npc_fl_pos, flashlight_pos, a);
+                        m_npc_fl_dir.lerp(m_npc_fl_dir, flashlight_dir, a);
+                        if (m_npc_fl_dir.magnitude() > 1e-4f) m_npc_fl_dir.normalize();
+                    }
+                    flashlight_pos = m_npc_fl_pos;
+                    flashlight_dir = m_npc_fl_dir;
+                }
             }
 
             Fmatrix flashlightXForm;

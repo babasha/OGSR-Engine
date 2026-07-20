@@ -10,6 +10,8 @@
 // resident pool + free-list. See gpu_particles_roadmap.md.
 #include "stdafx.h"
 #include "vk_gpu_particles.h"
+#include <atomic>
+#include <mutex>
 #include "vk_buffer.h"
 #include "vk_shaders.h"
 #include "vk_profiler.h"
@@ -19,12 +21,16 @@
 #include "vk_swapchain.h"
 #include "vk_scene_color.h"
 #include "vk_pass_particles.h"   // ParticlePass::GetTextureView — bindless sprite views
+#include "vk_volumetrics.h"      // Vol:: froxel scatter probe (Stage-0 smoke lighting)
 #include "HW_Vulkan.h"
 #include "vk_core.h"
 #include "../../xr_3da/device.h"
 
 extern int ps_r_gpu_particles;
 extern int ps_r_gpu_particles_max;
+extern int ps_r_gpu_particles_sort;   // Phase 4: depth-sort alpha smoke (back-to-front)
+extern float ps_r_vol_smoke;        // Stage-0 smoke light-probe strength
+extern float ps_r_vol_smoke_clamp;  // radiance clamp (smoke doesn't blow to white)
 
 // World-emitter feed: walks the live .pe particle visuals and appends one
 // EmitterSample per playing smoke effect. Defined in vk_gpu_particles_feed.cpp
@@ -37,7 +43,9 @@ namespace VK { namespace GPUParticles {
 namespace {
     constexpr u32 kFramesInFlight     = CVulkanCommandManager::FRAMES_IN_FLIGHT;
     constexpr u32 kDefaultMaxParticles = 1u << 16;   // 64K — plenty for the Phase-1 test
-    constexpr u32 kNumBindings         = 8u;
+    constexpr u32 kNumBindings         = 11u;  // 8 = progAlive (#5), 9 = sort scratch (Phase 4), 10 = kill requests
+    constexpr u32 kSortBuckets         = 512u; // must match gp_common.glsl GP_SORT_BUCKETS
+    constexpr u32 kMaxKills            = 64u;  // emitter kill requests per frame (excess stays queued)
     constexpr u32 kMaxEmitPerFrame     = 1024u;      // safety cap on a frame's total spawn burst
     constexpr u32 kMaxEmitPerEmitter   = 256u;       // per-emitter burst cap
     constexpr u32 kMaxPrograms         = 64u;        // per-defId program registry capacity
@@ -58,6 +66,21 @@ namespace {
     CVulkanBuffer* s_program   = nullptr;   // Program[kMaxPrograms]
     CVulkanBuffer* s_spawnReq[kFramesInFlight] = {};  // SpawnRequest[kMaxEmitters], per-frame
     CVulkanBuffer* s_texInfo   = nullptr;   // TexInfo[kMaxPrograms] (per-program atlas meta)
+    CVulkanBuffer* s_progAlive = nullptr;   // uint[kMaxPrograms] — GPU-side alive count per program (#5)
+    CVulkanBuffer* s_sort      = nullptr;   // uint[kSortBuckets + maxP] — Phase 4 histogram + unsorted copy
+    CVulkanBuffer* s_killReq[kFramesInFlight] = {};  // KillRequest[kMaxKills], per-frame host-visible
+
+    // Must match gp_common.glsl KillRequest (32 B std430).
+    struct KillRequest {
+        float posRadius[4];    // xyz = emitter position, w = radius SQUARED
+        u32   program;
+        u32   _kp[3];
+    };
+    static_assert(sizeof(KillRequest) == 32, "KillRequest 32 B std430");
+
+    // Pending emitter kills (queued from game/render threads, drained per frame).
+    std::mutex              s_killMx;
+    xr_vector<KillRequest>  s_pendingKills;
 
     // ---- Bindless sprite textures (Phase 3 #5) -----------------------------
     // One COMBINED_IMAGE_SAMPLER array (slot = program index), written
@@ -70,14 +93,31 @@ namespace {
     VkDescriptorSet       s_texSet       = VK_NULL_HANDLE;
     VkSampler             s_texSampler   = VK_NULL_HANDLE;
 
+    // ---- Froxel volumetric light-probe (Stage-0 smoke lighting) ------------
+    // set 2 = the Vol scatter volume (sampler3D). Only on the bindless path;
+    // re-pointed at Vol's view when the volumes regenerate (Generation bumps).
+    VkDescriptorSetLayout s_volSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet       s_volSet       = VK_NULL_HANDLE;
+    u32                   s_volBoundGen  = 0xFFFFFFFFu;   // != any real Generation()
+
     // ---- Per-defId program registry (Phase 3 step 1) -----------------------
     // s_program holds Program[kMaxPrograms]. Slot 0 = authored campfire;
     // gp_mirror/gp_spawn register real .pe effects into later slots. Each
     // particle stores its slot in defId so gp_simulate runs the right program.
     shared_str s_progName[kMaxPrograms];    // [0] = "<campfire>"
     float      s_progRate[kMaxPrograms] = {};
-    float      s_progLife[kMaxPrograms] = {};   // particle lifetime (for pool-budget gating)
+    float      s_progLife[kMaxPrograms] = {};   // particle lifetime (fallback budget gating)
+    u32        s_progMaxP[kMaxPrograms] = {};   // authored per-INSTANCE budget (CPEDef::m_MaxParticles) — #5
+    std::atomic<s32> s_progInstances[kMaxPrograms] = {};  // LIVE claimed effect objects per program (#5 cap basis)
     u32        s_progCount     = 0;
+
+    // Deferred instance releases: a destroyed object's budget stays claimed
+    // until its ghost particles could have died (the life cap), otherwise the
+    // freed units are snapped up by other instances' spawn requests and the
+    // effect starves briefly when its object is recreated.
+    struct PendingRelease { int slot; float when; };
+    std::mutex                 s_releaseMx;      // destructor (game thread) vs drain (render thread)
+    xr_vector<PendingRelease>  s_pendingRelease;
 
     // Auto-routing (Phase 3 #3) won't move an effect onto the shared GPU pool if
     // its steady-state budget (rate × life) exceeds this — area fog / persistent
@@ -103,8 +143,12 @@ namespace {
     VkPipeline s_pipeReset = VK_NULL_HANDLE;
     VkPipeline s_pipeEmit  = VK_NULL_HANDLE;
     VkPipeline s_pipeSim   = VK_NULL_HANDLE;
-    VkPipeline s_pipeBuild = VK_NULL_HANDLE;
-    VkPipeline s_pipeDraw  = VK_NULL_HANDLE;
+    VkPipeline s_pipeBuild   = VK_NULL_HANDLE;
+    VkPipeline s_pipeDraw    = VK_NULL_HANDLE;   // alpha-blend billboards
+    VkPipeline s_pipeDrawAdd = VK_NULL_HANDLE;   // additive billboards (fire/sparks)
+    VkPipeline s_pipeSortHist    = VK_NULL_HANDLE;   // Phase 4: depth-bucket histogram
+    VkPipeline s_pipeSortScan    = VK_NULL_HANDLE;   // Phase 4: exclusive prefix sum
+    VkPipeline s_pipeSortScatter = VK_NULL_HANDLE;   // Phase 4: back-to-front scatter
 
     // Layouts.
     VkPipelineLayout s_compLayout = VK_NULL_HANDLE;
@@ -114,6 +158,19 @@ namespace {
     VkDescriptorSetLayout s_setLayout = VK_NULL_HANDLE;
     VkDescriptorPool      s_poolDesc  = VK_NULL_HANDLE;
     VkDescriptorSet       s_set[kFramesInFlight] = {};
+
+    // ---- #6 media splat (GPU smoke → Vol froxel accum) ----------------------
+    // Lazily built on the first SplatMedia call (Vol::Execute records it in the
+    // World pass). One set: pool/counters/aliveList + Vol's accum SSBO; the set
+    // is rewritten only when the accum buffer changes (Vol re-init — idle).
+    VkDescriptorSetLayout s_mediaSetL   = VK_NULL_HANDLE;
+    VkPipelineLayout      s_mediaLayout = VK_NULL_HANDLE;
+    VkPipeline            s_mediaPipe   = VK_NULL_HANDLE;
+    VkDescriptorPool      s_mediaPool   = VK_NULL_HANDLE;
+    VkDescriptorSet       s_mediaSet    = VK_NULL_HANDLE;
+    VkBuffer              s_mediaAccum  = VK_NULL_HANDLE;   // currently bound accum buffer
+    bool                  s_mediaFailed = false;            // sticky until Destroy
+    bool                  s_mediaRecorded = false;          // splat read pool this frame → WAR barrier before sim
 
     // ---- Helpers -----------------------------------------------------------
     VkShaderModule LoadShader(const char* name)
@@ -158,6 +215,10 @@ namespace {
         destroy(s_pipeSim);
         destroy(s_pipeBuild);
         destroy(s_pipeDraw);
+        destroy(s_pipeDrawAdd);
+        destroy(s_pipeSortHist);
+        destroy(s_pipeSortScan);
+        destroy(s_pipeSortScatter);
         if (s_compLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_compLayout, nullptr); s_compLayout = VK_NULL_HANDLE; }
         if (s_drawLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_drawLayout, nullptr); s_drawLayout = VK_NULL_HANDLE; }
         if (s_poolDesc)   { vkDestroyDescriptorPool(VulkanHW.m_Device, s_poolDesc, nullptr);   s_poolDesc   = VK_NULL_HANDLE; }
@@ -165,8 +226,14 @@ namespace {
         for (u32 i = 0; i < kFramesInFlight; ++i) s_set[i] = VK_NULL_HANDLE;
         if (s_texPool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_texPool, nullptr);      s_texPool      = VK_NULL_HANDLE; }
         if (s_texSetLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_texSetLayout, nullptr); s_texSetLayout = VK_NULL_HANDLE; }
+        if (s_volSetLayout) { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_volSetLayout, nullptr); s_volSetLayout = VK_NULL_HANDLE; }
         if (s_texSampler)   { vkDestroySampler(VulkanHW.m_Device, s_texSampler, nullptr);          s_texSampler   = VK_NULL_HANDLE; }
-        s_texSet = VK_NULL_HANDLE;
+        s_texSet = VK_NULL_HANDLE; s_volSet = VK_NULL_HANDLE; s_volBoundGen = 0xFFFFFFFFu;
+        destroy(s_mediaPipe);
+        if (s_mediaLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_mediaLayout, nullptr); s_mediaLayout = VK_NULL_HANDLE; }
+        if (s_mediaPool)   { vkDestroyDescriptorPool(VulkanHW.m_Device, s_mediaPool, nullptr);   s_mediaPool   = VK_NULL_HANDLE; }
+        if (s_mediaSetL)   { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_mediaSetL, nullptr); s_mediaSetL = VK_NULL_HANDLE; }
+        s_mediaSet = VK_NULL_HANDLE; s_mediaAccum = VK_NULL_HANDLE; s_mediaFailed = false; s_mediaRecorded = false;
     }
 
     void DestroyBuffers()
@@ -179,7 +246,10 @@ namespace {
         del(s_freeList);
         del(s_program);
         del(s_texInfo);
+        del(s_progAlive);
+        del(s_sort);
         for (u32 i = 0; i < kFramesInFlight; ++i) del(s_spawnReq[i]);
+        for (u32 i = 0; i < kFramesInFlight; ++i) del(s_killReq[i]);
     }
 
     // ---- Authored test effect (campfire smoke) -----------------------------
@@ -269,6 +339,9 @@ namespace {
         ti.frameDimX    = td.frameDimX  ? td.frameDimX  : 1u;
         ti.frameCount   = td.frameCount ? td.frameCount : 1u;
         ti.frameSpeed   = td.frameSpeed;
+        ti.alignDir[0]  = td.alignDir[0];                   // bit3: zero-velocity billboard axis
+        ti.alignDir[1]  = td.alignDir[1];
+        ti.alignDir[2]  = td.alignDir[2];
 
         if (s_useTextures && td.name[0]) {
             VkImageView view = VK::ParticlePass::GetTextureView(td.name);
@@ -298,6 +371,7 @@ namespace {
 // ==========================================================================
 bool Init()
 {
+    VK::Vram::Scope _vram_scope("GPUParticles");
     if (s_inited) return !s_failed;
     s_inited = true;
 
@@ -309,29 +383,32 @@ bool Init()
 
     // ---- Buffers -----------------------------------------------------------
     s_pool = xr_new<CVulkanBuffer>();
-    s_pool->Create(poolSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_pool->Create(poolSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     if (!s_pool->IsValid()) { Msg("![VK GP] pool alloc failed"); s_failed = true; return false; }
     Prof::NameBuffer(s_pool->GetHandle(), "GP_Pool");
 
     s_counters = xr_new<CVulkanBuffer>();
-    s_counters->Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_counters->Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     if (!s_counters->IsValid()) { Msg("![VK GP] counters alloc failed"); s_failed = true; return false; }
     Prof::NameBuffer(s_counters->GetHandle(), "GP_Counters");
 
+    // aliveList holds 2*maxP: the world region [0,maxP) and the HUD region
+    // [maxP,2maxP). Within each, alpha grows from the front, additive from the
+    // back (4 draw groups total: world/HUD × alpha/additive — see gp_simulate).
     s_aliveList = xr_new<CVulkanBuffer>();
-    s_aliveList->Create(idxSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_aliveList->Create(idxSize * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     if (!s_aliveList->IsValid()) { Msg("![VK GP] aliveList alloc failed"); s_failed = true; return false; }
     Prof::NameBuffer(s_aliveList->GetHandle(), "GP_AliveList");
 
     s_indirect = xr_new<CVulkanBuffer>();
     s_indirect->Create(64,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     if (!s_indirect->IsValid()) { Msg("![VK GP] indirect alloc failed"); s_failed = true; return false; }
     Prof::NameBuffer(s_indirect->GetHandle(), "GP_Indirect");
 
     s_freeList = xr_new<CVulkanBuffer>();
-    s_freeList->Create(idxSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    s_freeList->Create(idxSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     if (!s_freeList->IsValid()) { Msg("![VK GP] freeList alloc failed"); s_failed = true; return false; }
     Prof::NameBuffer(s_freeList->GetHandle(), "GP_FreeList");
 
@@ -348,6 +425,7 @@ bool Init()
         s_program->Upload(&prog, sizeof(prog), 0);   // slot 0
         s_progName[0]   = "<campfire>";
         s_progRate[0]   = prog.emitRate;
+        s_progMaxP[0]   = 512;   // authored test effect: rate 80/s × life 4.5s ≈ 360 steady-state
         s_progCount     = 1;
         Msg("[VK GPUParticles] program #0 (campfire): %u actions, emitRate %.0f/s, life %.1fs (registry cap %u)",
             prog.actionCount, prog.emitRate, prog.emit.sc[3], kMaxPrograms);
@@ -369,12 +447,41 @@ bool Init()
         Prof::NameBuffer(s_spawnReq[i]->GetHandle(), "GP_SpawnReq");
     }
 
+    // Per-frame emitter kill requests (hard stops / destroyed objects).
+    for (u32 i = 0; i < kFramesInFlight; ++i) {
+        s_killReq[i] = xr_new<CVulkanBuffer>();
+        s_killReq[i]->Create(VkDeviceSize(kMaxKills) * sizeof(KillRequest),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+        if (!s_killReq[i]->IsValid()) { Msg("![VK GP] killReq alloc failed"); s_failed = true; return false; }
+        Prof::NameBuffer(s_killReq[i]->GetHandle(), "GP_KillReq");
+    }
+
     // Per-program TexInfo (atlas frame metadata, read by the billboard VS).
     s_texInfo = xr_new<CVulkanBuffer>();
     s_texInfo->Create(VkDeviceSize(kMaxPrograms) * sizeof(TexInfo),
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
     if (!s_texInfo->IsValid()) { Msg("![VK GP] texInfo alloc failed"); s_failed = true; return false; }
     Prof::NameBuffer(s_texInfo->GetHandle(), "GP_TexInfo");
+
+    // #5: per-program alive counts — GPU-written (emit claims, sim releases),
+    // zeroed by gp_init. Enforces cap = m_MaxParticles × live instances so a
+    // greedy effect (area fog) can't starve the shared pool.
+    // Host-visible so `gp_stats` can peek at the live counters (256 B, GPU
+    // atomics are memory-type-agnostic on desktop; the CPU read is diagnostic
+    // — a frame or two stale is fine).
+    s_progAlive = xr_new<CVulkanBuffer>();
+    s_progAlive->Create(VkDeviceSize(kMaxPrograms) * sizeof(u32),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    if (!s_progAlive->IsValid()) { Msg("![VK GP] progAlive alloc failed"); s_failed = true; return false; }
+    Prof::NameBuffer(s_progAlive->GetHandle(), "GP_ProgAlive");
+
+    // Phase 4 alpha-sort scratch: histogram (gp_reset zeroes it) + an unsorted
+    // copy of the world-alpha aliveList region for the scatter pass.
+    s_sort = xr_new<CVulkanBuffer>();
+    s_sort->Create(VkDeviceSize(kSortBuckets + s_maxP) * sizeof(u32),
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+    if (!s_sort->IsValid()) { Msg("![VK GP] sort scratch alloc failed"); s_failed = true; return false; }
+    Prof::NameBuffer(s_sort->GetHandle(), "GP_Sort");
 
     // ---- Bindless sprite texture array (only if descriptor indexing exists) -
     s_useTextures = VulkanHW.m_bBindlessSupported;
@@ -407,9 +514,10 @@ bool Init()
         { Msg("![VK GP] tex set layout failed"); s_useTextures = false; }
 
         if (s_useTextures) {
-            VkDescriptorPoolSize tps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxPrograms };
+            // Room for the bindless sprite array (set 1) + the froxel probe set (set 2).
+            VkDescriptorPoolSize tps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxPrograms + 1 };
             VkDescriptorPoolCreateInfo tpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            tpci.maxSets       = 1;
+            tpci.maxSets       = 2;
             tpci.poolSizeCount = 1;
             tpci.pPoolSizes    = &tps;
             if (vkCreateDescriptorPool(VulkanHW.m_Device, &tpci, nullptr, &s_texPool) != VK_SUCCESS)
@@ -422,6 +530,22 @@ bool Init()
             dai.pSetLayouts        = &s_texSetLayout;
             if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_texSet) != VK_SUCCESS)
             { Msg("![VK GP] tex set alloc failed"); s_useTextures = false; }
+        }
+        // Froxel probe set (set 2 = one sampler3D, fragment stage).
+        if (s_useTextures) {
+            VkDescriptorSetLayoutBinding vb{};
+            vb.binding = 0; vb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            vb.descriptorCount = 1; vb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo vlci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            vlci.bindingCount = 1; vlci.pBindings = &vb;
+            if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &vlci, nullptr, &s_volSetLayout) != VK_SUCCESS)
+            { Msg("![VK GP] vol set layout failed"); s_useTextures = false; }
+        }
+        if (s_useTextures) {
+            VkDescriptorSetAllocateInfo vai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            vai.descriptorPool = s_texPool; vai.descriptorSetCount = 1; vai.pSetLayouts = &s_volSetLayout;
+            if (vkAllocateDescriptorSets(VulkanHW.m_Device, &vai, &s_volSet) != VK_SUCCESS)
+            { Msg("![VK GP] vol set alloc failed"); s_useTextures = false; }
         }
     }
     Msg("[VK GPUParticles] sprite textures: %s", s_useTextures ? "BINDLESS" : "procedural (no descriptor indexing)");
@@ -479,10 +603,14 @@ bool Init()
         { Msg("![VK GP] comp layout failed"); s_failed = true; return false; }
     }
     {
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DrawPush) };
-        VkDescriptorSetLayout sets[2] = { s_setLayout, s_texSetLayout };
+        // Push is VERTEX-only on the procedural path; on the bindless path the
+        // fragment also reads it (froxel probe strength/clamp). set2 = froxel probe.
+        VkPushConstantRange pcr{
+            s_useTextures ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                          : VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DrawPush) };
+        VkDescriptorSetLayout sets[3] = { s_setLayout, s_texSetLayout, s_volSetLayout };
         VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount         = s_useTextures ? 2u : 1u;  // set1 = bindless sprites
+        plci.setLayoutCount         = s_useTextures ? 3u : 1u;  // set1 = sprites, set2 = froxel probe
         plci.pSetLayouts            = sets;
         plci.pushConstantRangeCount = 1;
         plci.pPushConstantRanges    = &pcr;
@@ -496,9 +624,12 @@ bool Init()
     VkShaderModule modEmit  = LoadShader("gp_emit.comp.spv");
     VkShaderModule modSim   = LoadShader("gp_simulate.comp.spv");
     VkShaderModule modBuild = LoadShader("gp_build.comp.spv");
+    VkShaderModule modSortH = LoadShader("gp_sort_hist.comp.spv");
+    VkShaderModule modSortS = LoadShader("gp_sort_scan.comp.spv");
+    VkShaderModule modSortC = LoadShader("gp_sort_scatter.comp.spv");
     VkShaderModule modVS    = LoadShader("gp_particle.vert.spv");
     VkShaderModule modFS    = LoadShader(s_useTextures ? "gp_particle_tex.frag.spv" : "gp_particle.frag.spv");
-    if (!modInit || !modReset || !modEmit || !modSim || !modBuild || !modVS || !modFS)
+    if (!modInit || !modReset || !modEmit || !modSim || !modBuild || !modSortH || !modSortS || !modSortC || !modVS || !modFS)
     { s_failed = true; return false; }
 
     s_pipeInit  = CreateComputePipeline(modInit,  s_compLayout);
@@ -506,7 +637,11 @@ bool Init()
     s_pipeEmit  = CreateComputePipeline(modEmit,  s_compLayout);
     s_pipeSim   = CreateComputePipeline(modSim,   s_compLayout);
     s_pipeBuild = CreateComputePipeline(modBuild, s_compLayout);
-    if (!s_pipeInit || !s_pipeReset || !s_pipeEmit || !s_pipeSim || !s_pipeBuild)
+    s_pipeSortHist    = CreateComputePipeline(modSortH, s_compLayout);
+    s_pipeSortScan    = CreateComputePipeline(modSortS, s_compLayout);
+    s_pipeSortScatter = CreateComputePipeline(modSortC, s_compLayout);
+    if (!s_pipeInit || !s_pipeReset || !s_pipeEmit || !s_pipeSim || !s_pipeBuild ||
+        !s_pipeSortHist || !s_pipeSortScan || !s_pipeSortScatter)
     { Msg("![VK GP] compute pipeline creation failed"); s_failed = true; return false; }
 
     // ---- Graphics pipeline (additive-free alpha billboards) ----------------
@@ -582,6 +717,14 @@ bool Init()
         if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
                                       1, &pi, nullptr, &s_pipeDraw) != VK_SUCCESS)
         { Msg("![VK GP] draw pipeline failed"); s_failed = true; return false; }
+
+        // Additive variant (fire/sparks/muzzle): SRC_ALPHA, ONE. Same shaders +
+        // state, only the destination colour factor differs. Additive is order-
+        // independent, so no sort needed for these.
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
+                                      1, &pi, nullptr, &s_pipeDrawAdd) != VK_SUCCESS)
+        { Msg("![VK GP] additive draw pipeline failed"); s_failed = true; return false; }
     }
 
     // ---- Descriptor writes -------------------------------------------------
@@ -597,6 +740,9 @@ bool Init()
                 { s_program->GetHandle(),    0, VK_WHOLE_SIZE },
                 { s_spawnReq[i]->GetHandle(),0, VK_WHOLE_SIZE },
                 { s_texInfo->GetHandle(),    0, VK_WHOLE_SIZE },
+                { s_progAlive->GetHandle(),  0, VK_WHOLE_SIZE },
+                { s_sort->GetHandle(),       0, VK_WHOLE_SIZE },
+                { s_killReq[i]->GetHandle(), 0, VK_WHOLE_SIZE },
             };
             VkWriteDescriptorSet w[kNumBindings]{};
             for (u32 b = 0; b < kNumBindings; ++b) {
@@ -640,28 +786,84 @@ int ResolveProgram(const char* name)
     Program prog;
     float   rate = 0.0f;
     TexDesc tex{};
-    if (!TranslateEffect(name, prog, rate, tex))  // logs its own failure reason
+    u32     maxP = 0;
+    if (!TranslateEffect(name, prog, rate, tex, maxP))  // logs its own failure reason
         return -1;
 
     const u32 idx = s_progCount++;
     s_progName[idx] = name;
     s_progRate[idx] = rate;
-    s_progLife[idx] = prog.emit.sc[3];            // lifetime (sc.w) for budget gating
+    s_progLife[idx] = prog.emit.sc[3];            // lifetime (sc.w) for fallback budget gating
+    s_progMaxP[idx] = maxP;                       // per-instance cap (#5) — 0 = def had none
     s_program->Upload(&prog, sizeof(prog), VkDeviceSize(idx) * sizeof(Program));
     FillProgramTexture(idx, tex);                 // bindless slot + atlas TexInfo
-    Msg("[VK GPUParticles] registered '%s' as program #%u (emitRate %.0f/s, life %.1fs, tex '%s')",
-        name, idx, rate, s_progLife[idx], tex.name[0] ? tex.name : "<none>");
+    Msg("[VK GPUParticles] registered '%s' as program #%u (emitRate %.0f/s, life %.1fs, maxP %u, tex '%s')",
+        name, idx, rate, s_progLife[idx], maxP, tex.name[0] ? tex.name : "<none>");
     return (int)idx;
 }
 
 bool  Enabled()              { return s_inited && !s_failed && ps_r_gpu_particles != 0; }
 float ProgramRate(int slot)  { return (slot >= 0 && (u32)slot < s_progCount) ? s_progRate[slot] : 0.0f; }
+float ProgramLife(int slot)  { return (slot >= 0 && (u32)slot < s_progCount) ? s_progLife[slot] : 0.0f; }
+u32   ProgramMaxP(int slot)  { return (slot >= 0 && (u32)slot < s_progCount) ? s_progMaxP[slot] : 0u; }
 
-// Safe to auto-route onto the shared GPU pool? (rate × life within budget.)
+// Safe to auto-route onto the shared GPU pool? With per-program alive caps
+// (#5: cap = m_MaxParticles × live instances, enforced in gp_emit) any effect
+// whose PER-INSTANCE budget fits a pool share routes — including area fog /
+// persistent fields the old rate×life gate refused. The rate×life budget
+// remains only as a fallback for defs without an authored m_MaxParticles.
 bool ProgramRoutable(int slot)
 {
     if (slot < 0 || (u32)slot >= s_progCount) return false;
+    if (s_progMaxP[slot]) return s_progMaxP[slot] <= s_maxP / 4;
     return s_progRate[slot] * s_progLife[slot] <= kRouteBudget;
+}
+
+// #5 live-instance registry — the cap basis. Counting only frustum-visible
+// emitters made the flame budget wander between campfires (one immortal
+// billboard shared by the whole camp); live OBJECTS mirror the CPU's
+// per-instance pool lifetime exactly.
+void AddProgramInstance(int slot)
+{
+    if (slot >= 0 && (u32)slot < kMaxPrograms) ++s_progInstances[slot];
+}
+void ReleaseProgramInstance(int slot)
+{
+    if (slot < 0 || (u32)slot >= kMaxPrograms) return;
+    // Deferred: the instance's ghost particles keep using its budget for up to
+    // one particle lifetime — release the cap share only once they're gone.
+    const float life = ((u32)slot < s_progCount) ? _max(s_progLife[slot], 1.0f) : 1.0f;
+    std::lock_guard<std::mutex> g(s_releaseMx);
+    s_pendingRelease.push_back({ slot, Device.fTimeGlobal + life });
+}
+
+// CPU parity for hard stops / destruction — see the header comment.
+void QueueKill(int slot, const Fvector& pos, float radius)
+{
+    if (slot < 0 || (u32)slot >= kMaxPrograms || !s_inited || s_failed) return;
+    KillRequest k{};
+    k.posRadius[0] = pos.x; k.posRadius[1] = pos.y; k.posRadius[2] = pos.z;
+    k.posRadius[3] = radius * radius;
+    k.program      = (u32)slot;
+    std::lock_guard<std::mutex> g(s_killMx);
+    s_pendingKills.push_back(k);
+}
+
+// `gp_stats` — per-program budget diagnostics: authored per-instance maxP,
+// live claimed objects (cap basis) and the GPU's alive counter (host-visible
+// peek, a frame stale). Nails "why doesn't X spawn" straight from the console.
+void DumpStats()
+{
+    if (!s_inited || s_failed) { Msg("![VK GP] gp_stats: module not initialised"); return; }
+    const u32* alive = s_progAlive ? (const u32*)s_progAlive->Map() : nullptr;
+    Msg("[VK GP] gp_stats: %u program(s), pool %u", s_progCount, s_maxP);
+    for (u32 i = 0; i < s_progCount; ++i) {
+        const s32 inst = s_progInstances[i].load(std::memory_order_relaxed);
+        Msg("  #%u '%s': maxP %u x inst %d = cap %u | alive(GPU) %u | rate %.0f/s life %.1fs",
+            i, s_progName[i].c_str(), s_progMaxP[i], inst,
+            s_progMaxP[i] * u32(_max(inst, s32(0))),
+            alive ? alive[i] : 0u, s_progRate[i], s_progLife[i]);
+    }
 }
 
 // ==========================================================================
@@ -732,6 +934,91 @@ void ClearSpawns()
 }
 
 // ==========================================================================
+// #6 media splat — GPU smoke feeds the froxel fog without CPU particles.
+// Vol::Execute records this between its accum clear and resolve (World pass,
+// before this frame's gp_reset/sim → reads LAST frame's alive list).
+// ==========================================================================
+bool WantsMediaSplat()
+{
+    return s_inited && !s_failed && !s_mediaFailed && ps_r_gpu_particles != 0 && s_poolInited;
+}
+
+bool SplatMedia(VkCommandBuffer cmd, VkBuffer accumBuf, const MediaSplatPush& push)
+{
+    if (!WantsMediaSplat() || cmd == VK_NULL_HANDLE || accumBuf == VK_NULL_HANDLE) return false;
+
+    // Lazy pipeline / set (first Vol frame with the GP pool live).
+    if (s_mediaPipe == VK_NULL_HANDLE) {
+        auto fail = [&](const char* what) { Msg("![VK GP] media splat %s failed", what); s_mediaFailed = true; return false; };
+
+        VkDescriptorSetLayoutBinding b[4]{};
+        for (u32 i = 0; i < 4; ++i) {
+            b[i].binding         = i;
+            b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        lci.bindingCount = 4; lci.pBindings = b;
+        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_mediaSetL) != VK_SUCCESS)
+            return fail("set layout");
+
+        VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MediaSplatPush) };
+        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        plci.setLayoutCount = 1; plci.pSetLayouts = &s_mediaSetL;
+        plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_mediaLayout) != VK_SUCCESS)
+            return fail("pipeline layout");
+
+        VkShaderModule mod = LoadShader("gp_media_splat.comp.spv");
+        if (mod == VK_NULL_HANDLE) return fail("shader load");
+        s_mediaPipe = CreateComputePipeline(mod, s_mediaLayout);
+        if (s_mediaPipe == VK_NULL_HANDLE) return fail("pipeline");
+
+        VkDescriptorPoolSize psz{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
+        VkDescriptorPoolCreateInfo dpi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
+        if (vkCreateDescriptorPool(VulkanHW.m_Device, &dpi, nullptr, &s_mediaPool) != VK_SUCCESS)
+            return fail("descriptor pool");
+        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dai.descriptorPool = s_mediaPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_mediaSetL;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_mediaSet) != VK_SUCCESS)
+            return fail("set alloc");
+
+        Msg("[VK GP] media splat ready — GPU smoke feeds the froxel fog directly");
+    }
+
+    if (accumBuf != s_mediaAccum) {
+        VkDescriptorBufferInfo bi[4] = {
+            { s_pool->GetHandle(),      0, VK_WHOLE_SIZE },
+            { s_counters->GetHandle(),  0, VK_WHOLE_SIZE },
+            { s_aliveList->GetHandle(), 0, VK_WHOLE_SIZE },
+            { accumBuf,                 0, VK_WHOLE_SIZE },
+        };
+        VkWriteDescriptorSet w[4]{};
+        for (u32 i = 0; i < 4; ++i) {
+            w[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            w[i].dstSet = s_mediaSet; w[i].dstBinding = i; w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
+        }
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+        s_mediaAccum = accumBuf;
+    }
+
+    const int z = Prof::ZoneBegin(cmd, "GP::MediaSplat");
+    MediaSplatPush mp = push;
+    mp.params[0] = float(s_maxP);   // aliveList bounds guard (count read on-GPU from counters[1])
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mediaPipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mediaLayout, 0, 1, &s_mediaSet, 0, nullptr);
+    vkCmdPushConstants(cmd, s_mediaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mp), &mp);
+    vkCmdDispatch(cmd, (s_maxP + 63u) / 64u, 1, 1);
+    Prof::ZoneEnd(cmd, z);
+
+    s_mediaRecorded = true;
+    return true;
+}
+
+// ==========================================================================
 // DispatchComputeAndDraw — init(once) → reset → emit → sim → build → draw
 // ==========================================================================
 void DispatchComputeAndDraw(FrameContext& ctx)
@@ -743,10 +1030,29 @@ void DispatchComputeAndDraw(FrameContext& ctx)
     VkCommandBuffer cmd = ctx.cmd;
     const u32 maxP = s_maxP;
 
+    // #6: the World pass's media splat READ pool/aliveList/counters earlier in
+    // this command buffer; order those reads before this pass's writes (WAR —
+    // the compute→compute execution dependency is what matters).
+    if (s_mediaRecorded) { MemBarrier(cmd); s_mediaRecorded = false; }
+
     auto bindCompute = [&](VkPipeline pipe) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_compLayout, 0, 1, &s_set[slot], 0, nullptr);
     };
+
+    // ---- Drain matured deferred instance releases (#5 budget hygiene) -----
+    {
+        std::lock_guard<std::mutex> g(s_releaseMx);
+        for (size_t i = 0; i < s_pendingRelease.size();) {
+            if (Device.fTimeGlobal >= s_pendingRelease[i].when) {
+                const int sl = s_pendingRelease[i].slot;
+                if (sl >= 0 && (u32)sl < kMaxPrograms && --s_progInstances[sl] < 0)
+                    s_progInstances[sl] = 0;   // defensive
+                s_pendingRelease[i] = s_pendingRelease.back();
+                s_pendingRelease.pop_back();
+            } else ++i;
+        }
+    }
 
     // ---- Gather emitter samples (camera + gp_spawn + real world .pe) ------
     const float dt = Device.fTimeDelta;
@@ -760,7 +1066,8 @@ void DispatchComputeAndDraw(FrameContext& ctx)
         em.accum += s_progRate[em.program] * dt;
         u32 cnt = (u32)em.accum;
         em.accum -= (float)cnt;                  // keep the fraction
-        if (cnt == 0) continue;
+        // Zero-count samples are kept: they contribute to the per-program
+        // instance count (#5 alive cap) but never become spawn requests.
         EmitterSample es;
         es.program = em.program;
         es.count   = cnt;
@@ -776,6 +1083,15 @@ void DispatchComputeAndDraw(FrameContext& ctx)
     // ---- Convert samples → dense spawn-request gid ranges -----------------
     // Each request claims [firstSlot, firstSlot+count); the emit shader walks
     // them to spawn the right program at the right world position.
+    //
+    // #5 per-program alive cap = m_MaxParticles × instances emitting THIS frame
+    // (mirrors the CPU path, where each instance owned its own m_MaxParticles
+    // pool), clamped so no program family owns more than half the shared pool.
+    // Carried in sr.pos.w (uint bits); gp_emit claims progAlive[] against it.
+    u32 instCount[kMaxPrograms] = {};
+    for (const EmitterSample& es : samples)
+        if (es.program < kMaxPrograms) ++instCount[es.program];
+
     SpawnRequest reqs[kMaxEmitters];
     u32 numReq = 0, emitCount = 0;
     for (const EmitterSample& es : samples) {
@@ -785,10 +1101,25 @@ void DispatchComputeAndDraw(FrameContext& ctx)
         if (emitCount + cnt > kMaxEmitPerFrame) cnt = kMaxEmitPerFrame - emitCount;
         if (cnt == 0) continue;
 
+        u32 cap = 0;   // 0 = uncapped (def had no m_MaxParticles)
+        if (es.program < kMaxPrograms && s_progMaxP[es.program]) {
+            // Cap basis = live claimed OBJECTS (CPU per-instance pool parity);
+            // this frame's visible-emitter count is the lower bound (covers
+            // camera/gp_spawn test emitters that aren't registry-tracked).
+            const s32 liveS = s_progInstances[es.program].load(std::memory_order_relaxed);
+            const u32 inst  = _max(u32(_max(liveS, s32(0))), instCount[es.program]);
+            const u64 c = u64(s_progMaxP[es.program]) * inst;
+            const u32 capMax = maxP / 2;
+            cap = (c > capMax) ? capMax : (u32)c;
+        }
+
         SpawnRequest& sr = reqs[numReq];
-        sr.pos[0] = es.pos.x; sr.pos[1] = es.pos.y; sr.pos[2] = es.pos.z; sr.pos[3] = 0.0f;
+        sr.pos[0] = es.pos.x; sr.pos[1] = es.pos.y; sr.pos[2] = es.pos.z;
+        memcpy(&sr.pos[3], &cap, sizeof(cap));
         sr.vel[0] = es.vel.x; sr.vel[1] = es.vel.y; sr.vel[2] = es.vel.z; sr.vel[3] = 0.0f;
-        sr.program   = es.program;
+        // bit31 of program = HUD emitter → gp_simulate routes it to the HUD
+        // aliveList region, drawn with the HUD-FOV projection + near depth.
+        sr.program   = es.program | (es.hud ? 0x80000000u : 0u);
         sr.count     = cnt;
         sr.firstSlot = emitCount;
         sr.seed      = Device.dwFrame * 2654435761u + (numReq + 1u) * 2246822519u;
@@ -798,6 +1129,17 @@ void DispatchComputeAndDraw(FrameContext& ctx)
     if (numReq > 0)
         s_spawnReq[slot]->Upload(reqs, VkDeviceSize(numReq) * sizeof(SpawnRequest), 0);
 
+    // ---- Drain queued emitter kills into this frame's buffer ---------------
+    u32 numKills = 0;
+    {
+        std::lock_guard<std::mutex> g(s_killMx);
+        if (!s_pendingKills.empty()) {
+            numKills = (u32)_min((size_t)kMaxKills, s_pendingKills.size());
+            s_killReq[slot]->Upload(s_pendingKills.data(), VkDeviceSize(numKills) * sizeof(KillRequest), 0);
+            s_pendingKills.erase(s_pendingKills.begin(), s_pendingKills.begin() + numKills);
+        }
+    }
+
     // Shared compute push.
     ComputePush push{};
     push.spawnPos[0] = camBelow.x;               // reserved (emit reads request pos)
@@ -806,10 +1148,19 @@ void DispatchComputeAndDraw(FrameContext& ctx)
     memcpy(&push.spawnPos[3], &emitCount, 4);
     push.dt_gravity[0] = dt;
     push.dt_gravity[1] = 9.8f;
+    push.dt_gravity[2] = Device.fTimeGlobal;     // scroll time for Turbulence noise field
+    // Camera basis for the Phase 4 depth sort (view-Z bucketing).
+    push.camPos[0]     = Device.vCameraPosition.x;
+    push.camPos[1]     = Device.vCameraPosition.y;
+    push.camPos[2]     = Device.vCameraPosition.z;
+    push.camForward[0] = Device.vCameraDirection.x;
+    push.camForward[1] = Device.vCameraDirection.y;
+    push.camForward[2] = Device.vCameraDirection.z;
     push.maxParticles  = maxP;
     push.frameSeed     = Device.dwFrame;
     push.activeProgram = 0;                       // reserved
     push.numRequests   = numReq;
+    push.numKills      = numKills;
 
     // ---- One-time pool init ------------------------------------------------
     if (!s_poolInited) {
@@ -851,7 +1202,28 @@ void DispatchComputeAndDraw(FrameContext& ctx)
         Prof::ZoneEnd(cmd, z);
     }
 
-    MemBarrier(cmd);   // sim writes aliveCount → build reads
+    MemBarrier(cmd);   // sim writes aliveCount/aliveList → sort/build read
+
+    // ---- Phase 4: depth-sort the world-alpha region (back-to-front) --------
+    // Counting sort over 512 log-Z buckets: histogram → exclusive scan →
+    // scatter (rewrites aliveList[0..worldAlpha) in place; additive and HUD
+    // regions untouched — additive is order-independent, HUD counts are tiny).
+    if (ps_r_gpu_particles_sort) {
+        const int z = Prof::ZoneBegin(cmd, "GP::Sort");
+        bindCompute(s_pipeSortHist);
+        vkCmdPushConstants(cmd, s_compLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (maxP + 63) / 64, 1, 1);
+        MemBarrier(cmd);   // histogram + unsorted copy → scan reads
+        bindCompute(s_pipeSortScan);
+        vkCmdPushConstants(cmd, s_compLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        MemBarrier(cmd);   // scan offsets → scatter claims
+        bindCompute(s_pipeSortScatter);
+        vkCmdPushConstants(cmd, s_compLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (maxP + 63) / 64, 1, 1);
+        MemBarrier(cmd);   // sorted aliveList → build/draw read
+        Prof::ZoneEnd(cmd, z);
+    }
 
     // ---- Build indirect ----------------------------------------------------
     {
@@ -898,6 +1270,34 @@ void DispatchComputeAndDraw(FrameContext& ctx)
         ri.pColorAttachments    = &cAtt;
         ri.pDepthAttachment     = &dAtt;
 
+        // ---- Froxel volumetric light-probe params (Stage-0 smoke lighting) --
+        // Re-point set 2 at Vol's scatter volume when it (re)generates, then
+        // gather the probe params. strength 0 disables the probe (r_vol off, or
+        // the additive / HUD draws). Bindless path only.
+        float probeStrength = 0.0f, probeNear = 1.0f, probeLogFN = 1.0f;
+        const float probeClamp = ps_r_vol_smoke_clamp;
+        if (s_useTextures && s_volSet && VK::Vol::Ready()) {
+            const u32 gen = VK::Vol::Generation();
+            if (gen != s_volBoundGen) {
+                VkImageView sv = VK::Vol::GetScatterView();
+                VkSampler   ss = VK::Vol::GetSampler();
+                if (sv && ss) {
+                    VkDescriptorImageInfo ii{ ss, sv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                    VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    w.dstSet = s_volSet; w.dstBinding = 0; w.descriptorCount = 1;
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+                    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+                    s_volBoundGen = gen;
+                }
+            }
+            if (s_volBoundGen == gen && VK::Vol::Wanted()) {
+                const VK::Vol::GridZParams gz = VK::Vol::GetGridZ();
+                probeNear     = gz.nearZ;
+                probeLogFN    = gz.logFarNear;
+                probeStrength = ps_r_vol_smoke;
+            }
+        }
+
         vkCmdBeginRendering(cmd, &ri);
 
         DrawPush dpush{};
@@ -906,16 +1306,56 @@ void DispatchComputeAndDraw(FrameContext& ctx)
         dpush.camRight[0] = Device.vCameraRight.x;
         dpush.camRight[1] = Device.vCameraRight.y;
         dpush.camRight[2] = Device.vCameraRight.z;
+        dpush.camRight[3] = probeNear;
         dpush.camUp[0]    = Device.vCameraTop.x;
         dpush.camUp[1]    = Device.vCameraTop.y;
         dpush.camUp[2]    = Device.vCameraTop.z;
+        dpush.camUp[3]    = probeLogFN;
+        dpush.camPosStr[0] = Device.vCameraPosition.x;
+        dpush.camPosStr[1] = Device.vCameraPosition.y;
+        dpush.camPosStr[2] = Device.vCameraPosition.z;
+        dpush.camPosStr[3] = probeStrength;
+        dpush.camDirClamp[0] = Device.vCameraDirection.x;
+        dpush.camDirClamp[1] = Device.vCameraDirection.y;
+        dpush.camDirClamp[2] = Device.vCameraDirection.z;
+        dpush.camDirClamp[3] = probeClamp;
 
-        vkCmdPushConstants(cmd, s_drawLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(dpush), &dpush);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeDraw);
+        const VkShaderStageFlags pcStages = s_useTextures
+            ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT) : VK_SHADER_STAGE_VERTEX_BIT;
+
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_drawLayout, 0, 1, &s_set[slot], 0, nullptr);
         if (s_useTextures && s_texSet)
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_drawLayout, 1, 1, &s_texSet, 0, nullptr);
-        vkCmdDrawIndirect(cmd, s_indirect->GetHandle(), 0, 1, sizeof(VkDrawIndirectCommand));
+        if (s_useTextures && s_volSet)
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_drawLayout, 2, 1, &s_volSet, 0, nullptr);
+
+        const VkDeviceSize kCmd = sizeof(VkDrawIndirectCommand);   // 16 B
+
+        // ---- World billboards: scene projection, full depth range ----------
+        // cmds: 0=world-alpha 1=world-add 2=hud-alpha 3=hud-add. Only world
+        // alpha smoke gets the froxel probe; additive is self-emissive (strength
+        // 0) and HUD uses a different projection (probe would misproject).
+        vkCmdPushConstants(cmd, s_drawLayout, pcStages, 0, sizeof(dpush), &dpush);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeDraw);
+        vkCmdDrawIndirect(cmd, s_indirect->GetHandle(), 0 * kCmd, 1, kCmd);
+
+        dpush.camPosStr[3] = 0.0f;   // additive: probe off
+        vkCmdPushConstants(cmd, s_drawLayout, pcStages, 0, sizeof(dpush), &dpush);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeDrawAdd);
+        vkCmdDrawIndirect(cmd, s_indirect->GetHandle(), 1 * kCmd, 1, kCmd);
+
+        // ---- HUD billboards (muzzle flashes): HUD-FOV projection + near depth
+        //      range [0, 0.02] so they sit on the weapon and never clip walls
+        //      (mirrors the CPU HUD phase in vk_pass_particles). Probe off.
+        DrawPush hpush = dpush;      // strength already 0
+        memcpy(hpush.viewProj, &Device.mFullTransform_hud2, 64);
+        vkCmdPushConstants(cmd, s_drawLayout, pcStages, 0, sizeof(hpush), &hpush);
+        VkViewport hvp = vp; hvp.minDepth = 0.0f; hvp.maxDepth = 0.02f;
+        vkCmdSetViewport(cmd, 0, 1, &hvp);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeDraw);
+        vkCmdDrawIndirect(cmd, s_indirect->GetHandle(), 2 * kCmd, 1, kCmd);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeDrawAdd);
+        vkCmdDrawIndirect(cmd, s_indirect->GetHandle(), 3 * kCmd, 1, kCmd);
 
         vkCmdEndRendering(cmd);
         Prof::ZoneEnd(cmd, z);
@@ -933,9 +1373,14 @@ void Destroy()
     s_inited     = false;
     s_failed     = false;
     s_poolInited = false;
-    for (u32 i = 0; i < kMaxPrograms; ++i) { s_progName[i] = shared_str(); s_progRate[i] = 0.0f; }
+    for (u32 i = 0; i < kMaxPrograms; ++i) {
+        s_progName[i] = shared_str(); s_progRate[i] = 0.0f; s_progLife[i] = 0.0f;
+        s_progMaxP[i] = 0; s_progInstances[i] = 0;
+    }
     s_progCount = 0;
     s_emitters.clear();
+    { std::lock_guard<std::mutex> g(s_releaseMx); s_pendingRelease.clear(); }
+    { std::lock_guard<std::mutex> g(s_killMx);    s_pendingKills.clear(); }
     Msg("[VK GPUParticles] destroyed");
 }
 

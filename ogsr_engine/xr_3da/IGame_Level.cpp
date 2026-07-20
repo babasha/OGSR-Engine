@@ -107,14 +107,26 @@ void IGame_Level::OnRender()
 {
 }
 
+// Section meter for the seqFrame profiler hook (pure.h) — see the twin in
+// CLevel::OnFrame. Splits the growing seq:CLevel time across the big calls here.
+struct LvlSectionProbe
+{
+    const char* n; CTimer t; bool on;
+    explicit LvlSectionProbe(const char* name) : n(name), on(g_seq_profile_cb != nullptr) { if (on) t.Start(); }
+    ~LvlSectionProbe() { if (on && g_seq_profile_cb) g_seq_profile_cb(n, t.GetElapsed_sec() * 1000.f); }
+};
+
 void IGame_Level::OnFrame()
 {
     ZoneScoped;
 
     // Update all objects
     VERIFY(bReady);
-    Objects.Update(false);
-    g_hud->OnFrame();
+    { LvlSectionProbe _p("Lvl/objects");   Objects.Update(false); }
+    { LvlSectionProbe _p("Lvl/hud");       g_hud->OnFrame(); }
+
+    // Tiled-CDB collision streaming (no-op unless cdb_tiles)
+    { LvlSectionProbe _p("Lvl/cdbStream"); ObjectSpace.UpdateStreaming(Device.vCameraPosition); }
 
     // Ambience
     if (Sounds_Random.size() && (Device.dwTimeGlobal > Sounds_Random_dwNextTime))

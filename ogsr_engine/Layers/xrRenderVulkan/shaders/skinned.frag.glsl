@@ -71,9 +71,26 @@ layout(set = 2, binding = 0) uniform Lighting {
     vec4 _pad_pom_params7;
     vec4 cluster_params;   // x=sliceScale, y=sliceBias, z=near, w=enable (0/1/2 debug)
     vec4 cluster_params2;  // x=gridX, y=gridY, z=gridZ, w=maxLightsPerCluster
+    // Tail pads up to the spot-pool block (see light_ubo.glsl for the layout).
+    vec4 _pad_light_occ;
+    vec4 _pad_sf_params;
+    vec4 _pad_deform_count;
+    vec4 _pad_deform_stamps[256];
+    mat4 _pad_deform_vp;
+    vec4 _pad_deform_tex;
+    vec4 spot_params;      // x = grass shadow strength on surfaces (r_spot_grass_shadow)
+    // Spot shadow POOL: per-light tile (+1, packed 4/vec4) + per-tile view·proj.
+    vec4 spot_assign[4];
+    mat4 spot_pool_vp[8];
+    vec4 point_assign[4];  // Point POOL: per-light cube-array index (+1, packed 4/vec4)
+    vec4 ibl_params;       // Sky specular IBL: x=enable×fade, y=strength, z=maxMip, w=debug
+    vec4 _pad_beam_params;
+    vec4 _pad_beam2;
+    vec4 spot_flash;       // z = DLSS texture mip-LOD bias (log2(render/display), 0 native)
 } L;
 layout(set = 2, binding = 2) uniform sampler2D uSpotShadow;
-layout(set = 2, binding = 3) uniform samplerCube uPointShadow;
+layout(set = 2, binding = 22) uniform sampler2D uSpotShadowGrass;   // spot+grass beam atlas
+layout(set = 2, binding = 3) uniform samplerCubeArray uPointShadow;
 layout(set = 2, binding = 4) uniform sampler2D uShadowNear;    // sun cascade 0 (~0.61 cm texels)
 layout(set = 2, binding = 5) uniform sampler2D uShadowC1;      // sun cascade 1 (~1.46 cm texels)
 layout(set = 2, binding = 6) uniform samplerCube uSky0;        // sky ambient cube 0 (weather A)
@@ -81,6 +98,7 @@ layout(set = 2, binding = 7) uniform samplerCube uSky1;        // sky ambient cu
 layout(set = 2, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
 layout(set = 2, binding = 8) uniform sampler2D uAO;            // GTAO (half-res)
 layout(set = 2, binding = 21) uniform sampler2D uIL;          // SSIL one-bounce indirect light (half-res, r_ssil)
+layout(set = 2, binding = 26) uniform samplerCube uSkySpec;   // prefiltered sky specular IBL cube (r_ibl)
 
 // SSIL ambient boost - see light_ubo.glsl (SSFX hdiffuse *= IL). Multiplies the
 // ambient where AO does; 0/no-op where there's no bounce or r_ssil is off.
@@ -88,6 +106,38 @@ vec3 ssilBoost()
 {
     vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
     return vec3(1.0) + il / (1.0 + il);
+}
+
+// Sky specular IBL (r_ibl) — local copies of env_common (skinned has its own UBO).
+// NPC gear/skin/helmet reflect the sky + catch a sun glint. Karis EnvBRDFApprox.
+vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
+{
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
+    const vec4 c1 = vec4( 1.0,  0.0425,  1.040, -0.040);
+    vec4  r    = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * ab.x + ab.y;
+}
+vec3 iblSpecular(vec3 N, vec3 V, float roughness, vec3 F0)
+{
+    if (L.ibl_params.x < 0.004) return vec3(0.0);
+    float NoV  = clamp(dot(N, V), 0.0, 1.0);
+    vec3  R    = reflect(-V, N);
+    vec3  pref = textureLod(uSkySpec, R, clamp(roughness, 0.0, 1.0) * L.ibl_params.z).rgb;
+    return pref * EnvBRDFApprox(F0, roughness, NoV) * L.ibl_params.y * L.ibl_params.x;
+}
+vec3 sunSpec(vec3 N, vec3 V, vec3 Ld, float roughness, vec3 F0)
+{
+    if (L.ibl_params.x < 0.004) return vec3(0.0);
+    vec3  H   = normalize(V + Ld);
+    float NoH = clamp(dot(N, H), 0.0, 1.0);
+    float VoH = clamp(dot(V, H), 0.0, 1.0);
+    float a   = max(roughness * roughness, 0.002);
+    float d   = (NoH * NoH * (a * a - 1.0) + 1.0);
+    float D   = (a * a) / (3.14159265 * d * d);
+    vec3  F   = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
+    return vec3(D * 0.25) * F * L.ibl_params.x;
 }
 
 // GTAO visibility - see world_lmap.frag (occludes hemi+ambient only). NPCs are
@@ -112,25 +162,25 @@ vec3 coloredAO(float ao, vec3 albedo)
     return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
 }
 
-// Hemisphere sky ambient (R4 hmodel.h) - see world_lmap.frag.
-vec3 skyAmbient(vec3 N)
-{
-    float lod = L.sky_params.z;
-    return mix(textureLod(uSky0, N, lod).rgb, textureLod(uSky1, N, lod).rgb,
-               clamp(L.sky_params.x, 0.0, 1.0));
-}
+// Sky ambient — shared header (SH9 irradiance + fallbacks), see sky_ambient.glsl.
+#include "sky_ambient.glsl"
 
-// Spot/point shadow + dynamic lights - same model as world_lmap.frag.
-// LINEAR-depth compare with a world epsilon (see shadow_common.glsl — a
-// constant NDC bias leaked light through fences near the spot's far plane).
+// Spot/point shadow + dynamic lights - same model as world_lmap.frag
+// (shadow_common.glsl): the spot POOL atlas, per-light tile, LINEAR-depth
+// compare with a world epsilon.
+int spotTileOf(int gi)
+{
+    if (gi < 0 || gi >= 16) return -1;
+    return int(L.spot_assign[gi >> 2][gi & 3] + 0.5) - 1;
+}
 float spotLinZ(float zndc, float f)
 {
-    const float n = 0.5;   // ComputeSpotVP near plane
+    const float n = 0.5;   // ComputeSpotVPFor near plane
     return n * f / max(f - zndc * (f - n), 1e-4);
 }
-float spotShadowF(vec3 wp, float range)
+float spotShadowF(vec3 wp, float range, int tile)
 {
-    vec4 c = L.spot_vp * vec4(wp, 1.0);
+    vec4 c = L.spot_pool_vp[tile] * vec4(wp, 1.0);
     if (c.w <= 0.0) return 1.0;
     vec3 ndc = c.xyz / c.w;
     vec2 uv = ndc.xy * 0.5 + 0.5;
@@ -138,21 +188,48 @@ float spotShadowF(vec3 wp, float range)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
     float f    = max(range, 1.0);
     float zRef = spotLinZ(ndc.z, f) - 0.08;
+    const vec2 kTileScale = vec2(0.25, 0.5);
     vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
+    vec2  tBase = vec2(float(tile & 3), float(tile >> 2)) * kTileScale;
+    vec2  tMin  = tBase + texel * 1.5;
+    vec2  tMax  = tBase + kTileScale - texel * 1.5;
+    vec2  auv   = tBase + uv * kTileScale;
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += (zRef <= spotLinZ(texture(uSpotShadow, uv + vec2(x, y) * texel).r, f)) ? 1.0 : 0.0;
+            sum += (zRef <= spotLinZ(texture(uSpotShadow, clamp(auv + vec2(x, y) * texel, tMin, tMax)).r, f)) ? 1.0 : 0.0;
     return sum * (1.0 / 9.0);
 }
 
-float pointShadowF(vec3 wp, vec3 lp, float range)
+int pointCubeOf(int gi)
 {
+    if (gi < 0 || gi >= 16) return -1;
+    return int(L.point_assign[gi >> 2][gi & 3] + 0.5) - 1;
+}
+float pointShadowF(vec3 wp, vec3 lp, float range, int cube)
+{
+    // LINEAR-depth compare, world epsilon (same fix as the spot pool) — the old
+    // 0.01 NDC bias grew to metres at the range edge and ate far NPC shadows.
+    // 3x3 PCF perpendicular to the lookup ray — magnified near-caster (grass)
+    // shadows read as hard 512-cube texel squares with 1 tap (see shadow_common).
     vec3 d = wp - lp;
     float z = max(max(abs(d.x), abs(d.y)), abs(d.z));
-    const float n = 0.1;
-    float refD = range * (z - n) / (max(z, n) * max(range - n, 1e-3));
-    return (refD - 0.01 <= texture(uPointShadow, d).r) ? 1.0 : 0.0;
+    const float n = 0.1;                 // kPointNear
+    float f    = max(range, 1.0);
+    float zRef = z - 0.08;
+    vec3 up = (abs(d.y) > abs(d.x) && abs(d.y) > abs(d.z)) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t1 = normalize(cross(up, d));
+    vec3 t2 = normalize(cross(d, t1));
+    float texel = 2.0 * z / float(textureSize(uPointShadow, 0).x);
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            vec3 dd = d + (t1 * float(x) + t2 * float(y)) * texel;
+            float zMap = texture(uPointShadow, vec4(dd, float(cube))).r;
+            zMap = n * f / max(f - zMap * (f - n), 1e-4);
+            sum += (zRef <= zMap) ? 1.0 : 0.0;
+        }
+    return sum * (1.0 / 9.0);
 }
 
 // Shade ONE dynamic light — same model as world_lmap.frag (passed-in fields so
@@ -186,9 +263,11 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
             att *= clamp((ca - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
     }
     vec3 tint = lcol.rgb;
-    if (gi == sIdx) {
-        att *= spotShadowF(wp, r);
-        if (L.shadow_params.z > 0.5) {
+    if (lcol.w > 0.5) {
+        // Spot POOL: every pooled spot samples its own atlas tile.
+        int tile = spotTileOf(gi);
+        if (tile >= 0) att *= spotShadowF(wp, r, tile);
+        if (gi == sIdx && L.shadow_params.z > 0.5) {
             vec4 cc = L.spot_vp * vec4(wp, 1.0);
             if (cc.w > 0.0) {
                 vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
@@ -197,7 +276,10 @@ vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int
             }
         }
     }
-    else if (gi == pIdx) att *= pointShadowF(wp, lpos.xyz, r);
+    else {
+        int cube = pointCubeOf(gi);
+        if (cube >= 0) att *= pointShadowF(wp, lpos.xyz, r, cube);
+    }
     float ndl = dot(N, ld);
     // Narrow-beam wrap diffuse — same as light_shade.glsl (grazing headlight
     // beams painted no light pool at plain Lambert).
@@ -282,7 +364,10 @@ float sunShadow(vec3 worldPos)
 
 void main()
 {
-    vec4 base = texture(uTexDiffuse, v_uv);
+    vec4 base = texture(uTexDiffuse, v_uv, L.spot_flash.z);   // DLSS mip bias (0 native)
+    // Alpha UNBIASED — biased alpha mips shrink the cutout coverage (straps/hair
+    // edges pixelate under DLSS upscaling; same physics as the tree-crown holes).
+    if (L.spot_flash.z != 0.0) base.a = texture(uTexDiffuse, v_uv).a;
 
     // Collimator/red-dot sight marks (R4 hud_reddotsight: additive, unlit):
     // output the texture as-is — the additive pipeline ADDS it over the sight
@@ -395,6 +480,23 @@ void main()
     vec3 col = base.rgb * light;
     float outA = 1.0;
 
+    // Sky specular IBL (r_ibl) — NPC gear/skin reflects the sky + a sun glint.
+    // Reflection needs only directions; the BODY's N/Vv are world-space (correct),
+    // gated by ray-traced sky visibility (pc.hemi). HUD bones are view-relative, so
+    // a directional reflection would swing with the camera → HUD gets a flat sky-tint
+    // Fresnel rim instead (weapon/hands catch the sky colour at grazing angles).
+    // BODY NPCs only. HUD hands/weapon are SKIPPED: their bones are view-relative,
+    // so a sky reflection is meaningless there — the earlier flat Fresnel rim just
+    // painted a pale "waxy" edge on grazing hand/bolt surfaces. Body N/Vview are
+    // world-space (correct), gated by ray-traced sky visibility (pc.hemi).
+    vec3 specIBL = vec3(0.0);
+    if (pc.hudMode < 0.5) {
+        vec3 Vview = normalize(L.eye_pos.xyz - v_wpos);
+        specIBL  = iblSpecular(N, Vview, 0.6, vec3(0.04)) * pc.hemi;
+        specIBL += sun * sunSpec(N, Vview, normalize(-L.sun_dir.xyz), 0.6, vec3(0.04)) * max(ndl, 0.0);
+    }
+    col += specIBL;
+
     // GLASS pane (kinematics furniture/doors/vehicle windows, NPC glasses) —
     // R4 model_env_lq.ps: colour = light × lerp(ENV REFLECTION, texture, a),
     // blend alpha = the texture's own alpha. Clean glass ≈ invisible + sheen.
@@ -428,5 +530,6 @@ void main()
         if (isGlass) outA *= (1.0 - fog) * (1.0 - fog);   // R4: alpha fades with fog²
     }
 
+    if (L.ibl_params.w > 0.5) { o_color = vec4(specIBL, 1.0); return; }   // r_ibl_debug
     o_color = vec4(col, outA);
 }

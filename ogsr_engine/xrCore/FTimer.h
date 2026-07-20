@@ -164,6 +164,9 @@ public:
 };
 
 extern XRCORE_API BOOL g_bEnableStatGather;
+// Renderer-side request to gather CStatTimer stats WITHOUT the rs_stats overlay
+// (the VK profiler logs them; the overlay needs fonts the VK build doesn't create).
+extern XRCORE_API BOOL g_bForceStatGather;
 
 class XRCORE_API CStatTimer
 {
