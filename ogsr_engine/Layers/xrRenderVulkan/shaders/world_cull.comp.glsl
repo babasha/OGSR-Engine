@@ -47,7 +47,7 @@ layout(push_constant) uniform PC {
     vec4 viewDir;        // .xyz normalized camera forward (view-Z LOD projection)
     vec4 lodParams;      // x = pxScale/thresholdPx, y = min distance clamp
     uint numGroups;
-    uint unused0;        // was maxGroupMesh (uniform regions) — kept for layout stability
+    float ssaCull;       // SSA cull: 2·pxScale/r_ssa_px, 0 = off (was unused0)
     uint total;          // number of cullable entries
     uint _pad;
 } pc;
@@ -75,6 +75,17 @@ void main()
     float r = m.sphere.w;
     for (int i = 0; i < 6; ++i)
         if (dot(pc.planes[i].xyz, c) + pc.planes[i].w < -r) return;   // outside this plane
+
+    // SSA cull (r_ssa_px): plain WHOLE meshes (flags bit1) never cluster/LOD —
+    // they rendered full geometry to the horizon, and that sub-pixel triangle
+    // soup cost 8x in quad helpers (r_fsinv_split, 23-07-2026). Skip the mesh
+    // once its sphere's projected DIAMETER drops under the threshold:
+    // 2·r·pxScale/viewZ < ssaPx  ⟺  r·ssaCull < viewZ. Clusters are exempt —
+    // a large surface's small clusters must not evaporate piecewise.
+    if (pc.ssaCull > 0.0 && (m.flags & 2u) != 0u) {
+        float dz = max(pc.lodParams.y, dot(pc.viewDir.xyz, c - pc.cameraPos.xyz) - r);
+        if (r * pc.ssaCull < dz) return;
+    }
 
     // ---- Stage B residency ----
     uint sb = (streamBits[l >> 4u] >> ((l & 15u) * 2u)) & 3u;

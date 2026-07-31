@@ -51,7 +51,18 @@ inline float SrgbToLinear(float c)
 // True when the renderer is running the linear pipeline. Every conversion below is
 // a no-op otherwise, so call sites can be written unconditionally and stay honest:
 // the gamma path keeps its historical numbers to the bit.
-inline bool Active() { return ps_r_linear_color != 0; }
+//
+// LATCHED once per process (first call happens no earlier than device init, well
+// after user.ltx applied): texture formats bake the choice per texture at load,
+// so a mid-session cvar flip half-applies — decoded-dark textures without the
+// OETF, or streamed-in textures in the other space than the resident ones. That
+// exact confusion was field-reported 23-07-2026 («выключил r_linear_color и
+// стало вообще супер темно»). The cvar now takes effect on the NEXT game start.
+inline bool Active()
+{
+    static const bool s_latched = ps_r_linear_color != 0;
+    return s_latched;
+}
 
 // Convert an authored (sRGB) colour in place. No-op in the gamma pipeline.
 inline void Linearize(float& r, float& g, float& b)

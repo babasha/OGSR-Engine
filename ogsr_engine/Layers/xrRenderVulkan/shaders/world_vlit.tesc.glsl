@@ -12,6 +12,7 @@ layout(location = 2) in vec3  vBakedColor[];
 layout(location = 3) in float vSunMask[];
 layout(location = 4) in vec3  vWorldPos[];
 layout(location = 5) in vec3  vNormal[];
+layout(location = 7) in float vBakedHemi[];   // baked sky access (NORMAL.a)
 
 layout(location = 0) out vec2  tUV[];
 layout(location = 1) out vec2  tDetailUV[];
@@ -19,6 +20,7 @@ layout(location = 2) out vec3  tBakedColor[];
 layout(location = 3) out float tSunMask[];
 layout(location = 4) out vec3  tWorldPos[];
 layout(location = 5) out vec3  tNormal[];
+layout(location = 7) out float tBakedHemi[];
 
 layout(location = 8)  patch out vec3 pnB210;
 layout(location = 9)  patch out vec3 pnB120;
@@ -59,6 +61,7 @@ void main()
     tSunMask[gl_InvocationID]    = vSunMask[gl_InvocationID];
     tWorldPos[gl_InvocationID]   = vWorldPos[gl_InvocationID];
     tNormal[gl_InvocationID]     = vNormal[gl_InvocationID];
+    tBakedHemi[gl_InvocationID]  = vBakedHemi[gl_InvocationID];
     gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
 
     if (gl_InvocationID == 0) {

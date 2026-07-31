@@ -76,6 +76,7 @@ layout(push_constant) uniform PC {
     vec4 p4;   // x=vol mode (0 off / 1 composite / 2 debug), y=near, z=far, w=log2(far/near)
     vec4 p5;   // SSIL: x=strength, y=debug (show only bounce), z=enable (0 = skip); w = VSM dyn-shadow debug (r_vsm_debug_dyn: red overlay)
     vec4 p6;   // sun-beam ground splash: x=strength (0=off, r_sun_beam_splash), y=in-scatter luminance threshold (r_sun_beam_splash_thr); z=DLSS CAS sharpen (r_dlss_sharp, 0=off); w=DLSS debug mode ±1..3 (r_dlss_debug; sign: + = DLSS output resolved this frame, − = plain scene)
+    vec4 p7;   // x=r_vol_upsample (volume reconstruction filter, 0=old single tap), y=frame counter for the per-frame pattern rotation (0 = frozen: no temporal upscaler this frame), zw reserved
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -319,8 +320,36 @@ void main()
             fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238,  vec2(0.06711056, 0.00583715))))) - 0.5;
         ign *= 0.5;   // ±0.25 froxel
         vec3 vtex = vec3(textureSize(uVolume, 0));
-        vec3 vuvw = vec3(uv + ign * (1.0 / vtex.xy), vw + (ign.x + ign.y) * 0.5 / vtex.z);
-        vec4 vol  = textureLod(uVolume, vuvw, 0.0);
+        vec4 vol;
+        if (pc.p7.x > 0.5) {
+            // RECONSTRUCTION (r_vol_upsample). The volume is ~7-8 screen pixels per
+            // froxel, so a single tap resolves it at its own coarse resolution — that
+            // is the "PS1 pixels" visible with r_vol_ta 0, and what the temporal pass
+            // was really covering up. Four taps on a rotated grid inside ±0.5 froxel
+            // form a tent over ~2 froxels: the blockiness (information the volume can
+            // never carry anyway) turns into a smooth gradient. The Z offset keeps the
+            // old per-pixel dither so slice banding stays broken up.
+            //
+            // The grid ROTATES per frame, but only while a temporal upscaler resolves
+            // (p7.y, else 0). That inverts a trap: a screen-STATIC pattern is the worst
+            // possible input to DLSS — it looks like stable detail, so DLSS preserves
+            // the grain instead of averaging it. Rotating turns the same taps into free
+            // supersampling of the volume. With no upscaler the pattern stays frozen,
+            // since an animated one would just crawl.
+            float ang = 2.39996323 * pc.p7.y + 6.2831853 * ign.x;   // golden angle/frame + per-pixel decorrelation
+            vec2  cs  = vec2(cos(ang), sin(ang));
+            mat2  rot = mat2(cs.x, -cs.y, cs.y, cs.x);
+            const vec2 kTap[4] = vec2[4](vec2( 0.35,  0.35), vec2(-0.35,  0.35),
+                                         vec2( 0.35, -0.35), vec2(-0.35, -0.35));
+            float zoff = (ign.x + ign.y) * 0.5 / vtex.z;
+            vol = vec4(0.0);
+            for (int i = 0; i < 4; ++i)
+                vol += textureLod(uVolume, vec3(uv + (rot * kTap[i]) / vtex.xy, vw + zoff), 0.0);
+            vol *= 0.25;
+        } else {
+            vec3 vuvw = vec3(uv + ign * (1.0 / vtex.xy), vw + (ign.x + ign.y) * 0.5 / vtex.z);
+            vol = textureLod(uVolume, vuvw, 0.0);
+        }
         if (pc.p4.x > 1.5)
             c = vol.rgb * exposure * 8.0;             // r_vol_debug: raw in-scatter pattern
         else {

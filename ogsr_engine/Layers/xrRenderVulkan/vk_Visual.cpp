@@ -54,6 +54,7 @@ void VK_Render_Mesh::Destroy()
     p_rm_Indices = nullptr;
     m_fast = nullptr;
     vBase = vCount = vStride = 0;
+    vAddr = 0;
     tcOffset = 24;
     iBase = iCount = 0;
     dwPrimitives = 0;
@@ -233,10 +234,17 @@ void vkRender_Visual::LoadTexture(IReader* data)
                 else if (tn_lower.find("green")  != xr_string::npos) bc.set(0.50f, 1.00f, 0.55f);
                 else                                                 bc.set(0.88f, 0.94f, 1.00f);   // cool white (flashlight-like)
             }
+            // `selflight_det*` is NOT one of these: despite the name its main pass is
+            // a plain `deffer_model_flat` with bump+detail (see the stock .s script), so
+            // it is an ordinary opaque material -- the first-person body uses it, and
+            // shading it additively turned the player's legs into a ghost. Only the bare
+            // `selflight`/`selflightl` lamp shaders want the additive treatment.
+            const bool selflight_add = sn_lower.find("selflight") != xr_string::npos && sn_lower.find("_det") == xr_string::npos;
+
             if (sn_lower.find("reddot")      != xr_string::npos ||
                 sn_lower.find("collimator")  != xr_string::npos ||
                 sn_lower.find("holo")        != xr_string::npos ||
-                sn_lower.find("selflight")   != xr_string::npos)   // lamp/projector self-lit faces
+                selflight_add)                                     // lamp/projector self-lit faces
             {
                 m_bEmissiveAdd = true;
                 static int s_diag = 0;
@@ -406,6 +414,7 @@ void vkFVisual::Copy(vkRender_Visual* from)
     m_mesh.vCount = src->m_mesh.vCount;
     m_mesh.vStride = src->m_mesh.vStride;
     m_mesh.tcOffset = src->m_mesh.tcOffset;
+    m_mesh.vAddr = src->m_mesh.vAddr;   // same VkBuffer -> same device address
 
     m_mesh.p_rm_Indices = src->m_mesh.p_rm_Indices;
     m_mesh.iBase = src->m_mesh.iBase;
@@ -1355,11 +1364,16 @@ static void vk_ComputeSynthBeamsBoned(u32 dwVertType, const void* _verts_, u32 c
 static void vkUploadConvertedVertices(VK_Render_Mesh& mesh, void* dst, u32 vStride, u32 vertCount)
 {
     mesh.p_rm_Vertices = xr_new<VK::CVulkanBuffer>();
+    // SHADER_DEVICE_ADDRESS: the compute pre-skinning pass (preskin.comp, see
+    // Skinned_PreSkin) reads these vertices through a buffer reference instead
+    // of a per-leaf descriptor.
     mesh.p_rm_Vertices->Create(vertCount * vStride,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
     mesh.p_rm_Vertices->Upload(dst, vertCount * vStride);
     mesh.vStride = vStride;
+    mesh.vAddr   = mesh.p_rm_Vertices->GetDeviceAddress();
 }
 
 // Convert vertBoned* -> vertHW_* and upload. renderMode uses the vkSkeletonX_ST enum
@@ -1600,11 +1614,25 @@ void vkSkeletonX_PM::Load(const char* name, IReader* data, u32 flags)
     data->seek(0);
     vkFProgressive::Load(name, data, flags | VLOAD_NOVERTICES);   // indices + sliding window only
 
+    // SWI: pin the DRAW range to window 0 (max quality — R4 select_lod_id(1.0)).
+    // The full index chunk also contains the coarser windows' replacement
+    // triangles; the skinned pass draws m_mesh directly (no per-frame window
+    // pick like vkFProgressive::Submit), so the full range stacked a coarse
+    // copy of the mesh INSIDE the fine one — visible double-model on NPCs,
+    // stretched "webbing" at extended joints, and wasted fragment work. Same
+    // rule as vkFTreeVisual_PM (its stray "floating branch" fix). Trimming
+    // here propagates to every consumer: color, prepass, shadows, VSM, MV.
+    if (sw_count > 0)
+    {
+        m_mesh.iBase += sw_offsets[0];
+        m_mesh.iCount = sw_counts[0];
+    }
+
     m_mesh.vBase = 0;
     m_mesh.vCount = dwVertCount;
     _Load_hw_VK(_verts_, dwVertType, dwVertCount);
-    // NOTE: progressive leaves keep the FULL index chunk (all LOD windows) —
-    // wallmark faces may overlap across LODs; visually negligible (alpha decal).
+    // NOTE: wmCPU keeps the FULL index chunk (all LOD windows) — wallmark faces
+    // may overlap across LODs; visually negligible (alpha decal).
     wmCPU = vk_skinned_retain_cpu(dwVertType, _verts_, dwVertCount, data);
     if (m_bLitBlend && !m_SynthBeams.count)
         vk_ComputeSynthBeamsBoned(dwVertType, _verts_, dwVertCount,

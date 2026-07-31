@@ -31,8 +31,15 @@ enum WorldSpec : u8
     WS_WET   = 1u << 2,   // rain/wetness active this frame (frame-global)
     WS_IBL   = 1u << 3,   // sky specular IBL active this frame (frame-global, r_ibl)
     WS_DEBUG = 1u << 4,   // any r_*_debug view active (frame-global, 0 in normal play)
-    WS_ALL   = WS_POM | WS_SNOW | WS_WET | WS_IBL | WS_DEBUG,   // full uber path (safe default)
-    WS_FRAME = WS_SNOW | WS_WET | WS_IBL | WS_DEBUG,            // the frame-global subset
+    // Texture-streaming GPU feedback (txfbReport atomicMin) master gate — on
+    // whenever r_txstream is (off DCEs the atomic). The atomic is an FS SIDE
+    // EFFECT, which forbids automatic early-Z (measured 6-8x FS invocations vs
+    // visible samples, Кордон 23-07-2026); that cost is solved structurally by
+    // the EARLY_ZTEST FS twin on no-z-write statics pipelines (EarlyTwin), so
+    // feedback stays per-frame.
+    WS_FEEDBACK = 1u << 5,
+    WS_ALL   = WS_POM | WS_SNOW | WS_WET | WS_IBL | WS_DEBUG | WS_FEEDBACK,   // full uber path (safe default)
+    WS_FRAME = WS_SNOW | WS_WET | WS_IBL | WS_DEBUG | WS_FEEDBACK,            // the frame-global subset
 };
 
 // Per-frame value of the frame-global variant bits (WS_FRAME subset). Get() ORs
@@ -85,6 +92,22 @@ struct Key
     // instead of duplicating that state. Kept an explicit key field rather than
     // inferred from `vs`: the vertex input layout must stay a stated property.
     bool            instanced    = false;
+    // Alpha-tested statics variant (r_at_equal): depth EQUAL + NO write. The
+    // prepass already resolved the frontmost OPAQUE texel's depth, so EQUAL
+    // early-Z rejects every other AT fragment — occluded layers AND the
+    // transparent texels of the front layer — before the (heavy) uber-FS runs.
+    // Callers set it only for aref>=0 statics that ARE in the prepass (never
+    // dynamics/wmark/emis/tess — their color depth differs from the prepass).
+    bool            atEqual      = false;
+    // Prepass-covered statics (r_z_prepass): depth write OFF, LEQUAL kept. The
+    // prepass already wrote these items' final depth, so the color-pass write is
+    // redundant — and CRITICALLY, the world uber-FS statically contains `discard`
+    // (runtime aref gate), which with z-write ON forces the HW to LATE-Z: every
+    // occluded fragment still runs the FS. Attributed 23-07-2026 on Кордон:
+    // gpuStatics = 10.8M FS invocations vs ~3.5M visible (r_fsinv_split) — the
+    // whole frustum's depth complexity was being shaded. No write → early-Z is
+    // legal again even with discard present → occluded fragments never launch.
+    bool            noZWrite     = false;
 
     bool operator==(const Key& o) const noexcept
     {
@@ -92,7 +115,8 @@ struct Key
             && vs == o.vs && fs == o.fs && depthTest == o.depthTest
             && wmark == o.wmark && tess == o.tess && emis == o.emis
             && vrsStatic == o.vrsStatic && specMask == o.specMask
-            && instanced == o.instanced;
+            && instanced == o.instanced && atEqual == o.atEqual
+            && noZWrite == o.noZWrite;
     }
 };
 
@@ -200,6 +224,8 @@ struct hash<VK::PipelineCache::Key>
         h ^= std::hash<bool>{}(k.vrsStatic)           + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<u32>{}(k.specMask)             + 0x85ebca6b + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(k.instanced)           + 0x27d4eb2f + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.atEqual)             + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.noZWrite)            + 0x517cc1b7 + (h << 6) + (h >> 2);
         return h;
     }
 };

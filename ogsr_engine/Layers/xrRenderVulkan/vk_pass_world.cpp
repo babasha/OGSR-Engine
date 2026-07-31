@@ -47,6 +47,9 @@ extern int ps_r_ssao_npc_normals;   // NPC normal G-buffer for GTAO (global scop
 extern int ps_r_compose;     // Stage D world composition: total chunk count (home + clones), 0/1 = off
 extern int ps_r_vrs;         // VRS level (0/1/2) — here only to gate the FS-invocation stats query
 extern int ps_r_vrs_force;   // diag: force pipeline-rate NxN on the world color pass, ignoring the SRI
+extern int ps_r_at_equal;    // AT statics: depth-EQUAL color path (needs the prepass) — live A/B
+extern int ps_r_fsinv_split; // diag: 4-way FS-invocation attribution in World/Color (replaces the single counter)
+extern int ps_r_z_prepass;   // statics color: no z-write → early-Z with discard (live A/B)
 
 namespace VK {
 
@@ -301,7 +304,8 @@ void Pass_World(FrameContext& ctx)
         if (ps_r_vol_smoke_inject > 0.0f)
             VK::CollectSmokeParticles(s_smoke);
         VK::Vol::Execute(cmd, vpt, CommandManager.GetCurrentFrame(),
-                         s_smoke.empty() ? nullptr : s_smoke.data(), (u32)s_smoke.size());
+                         s_smoke.empty() ? nullptr : s_smoke.data(), (u32)s_smoke.size(),
+                         ctx.depthView);   // prev-frame depth (prepass hasn't run yet) → froxel depth rejection
     }
 
     // Throttled average: static-collect CPU vs the whole-frame cpu — confirms the
@@ -635,7 +639,12 @@ void Pass_World(FrameContext& ctx)
     const int zColor = VK::Prof::ZoneBegin(cmd, "World/Color");
     // VRS diag: FS-invocation count for THIS pass ([VK VRS] world-color FS
     // invocations). r_vrs_force 1 = stats only (rate stays 1x1) for a baseline.
-    if (VulkanHW.m_bVRSSupported && (ps_r_vrs > 0 || ps_r_vrs_force > 0))
+    // r_fsinv_split REPLACES the single bracket with 4 sequential sub-queries
+    // (only one pipeline-stats query may be active at a time).
+    const bool fsSplit = ps_r_fsinv_split > 0;
+    if (fsSplit)
+        VK::VRS::SubStatsReset(cmd, CommandManager.GetCurrentFrame());   // reset must stay outside the rendering scope
+    else if (VulkanHW.m_bVRSSupported && (ps_r_vrs > 0 || ps_r_vrs_force > 0))
         VK::VRS::StatsBegin(cmd, CommandManager.GetCurrentFrame());
     vkCmdBeginRendering(cmd, &ri);
     // VRS: no vkCmdSetFragmentShadingRateKHR here — world pipelines carry a STATIC
@@ -718,11 +727,29 @@ void Pass_World(FrameContext& ctx)
     // prepass. With the prepass depth already in place, early-Z rejects every
     // occluded fragment before the forward shader runs.
     const int zStatics = VK::Prof::ZoneBegin(cmd, "World/Statics");
+    // r_at_equal: AT statics ride the depth-EQUAL/no-write variant — valid only
+    // because the prepass above (FlushDepth + DrawDepth) wrote their final depth.
+    const bool atEq = prepass && ps_r_at_equal > 0;
+    const bool zPre = prepass && ps_r_z_prepass > 0;
+    const u32  fsFrame = CommandManager.GetCurrentFrame();
+    g_RenderQueue.SetATEqual(atEq);
+    g_RenderQueue.SetPrepassZ(zPre);
+    if (fsSplit) VK::VRS::SubStatsBegin(cmd, fsFrame, 0);
     g_RenderQueue.Flush(ctx);
+    if (fsSplit) VK::VRS::SubStatsEnd(cmd, fsFrame, 0);
+    g_RenderQueue.SetATEqual(false);   // dynamics flush below is NOT in the prepass
+    g_RenderQueue.SetPrepassZ(false);
     // GPU static set (drawn after the CPU flush so DrawColor's self-contained
     // pushes don't disturb Flush's push state). EnvLight set = set 1. worldOccluded
     // → draw the Hi-Z-culled set (CullColor ran above); else the frustum set.
-    if (gpuWorld) WorldGPU::DrawColor(cmd, *ctx.viewProj, EnvLight::GetCurrentSet(), worldOccluded);
+    if (fsSplit) VK::VRS::SubOccBegin(cmd, fsFrame);   // samples-passed over the GPU statics draw
+    if (gpuWorld) WorldGPU::DrawColor(cmd, *ctx.viewProj, EnvLight::GetCurrentSet(), worldOccluded, atEq, zPre,
+                                      fsSplit ? (int)fsFrame : -1);
+    else if (fsSplit) {   // keep all split queries begun+ended so the batch stays readable
+        VK::VRS::SubStatsBegin(cmd, fsFrame, 1); VK::VRS::SubStatsEnd(cmd, fsFrame, 1);
+        VK::VRS::SubStatsBegin(cmd, fsFrame, 2); VK::VRS::SubStatsEnd(cmd, fsFrame, 2);
+    }
+    if (fsSplit) VK::VRS::SubOccEnd(cmd, fsFrame);
     // Cluster-LOD debug overlay (r_cluster_debug): the DAG cut made visible —
     // clusters as flat colors (1) or wireframe (2), same indirect set as above.
     if (gpuWorld && ps_r_cluster_debug) WorldGPU::DrawDebug(cmd, *ctx.viewProj, ps_r_cluster_debug, worldOccluded);
@@ -733,6 +760,7 @@ void Pass_World(FrameContext& ctx)
     // so Flush pushes a per-item MVP (= xform * viewProj). vkFHierrarhyVisual /
     // CKinematics recurse into children inside Submit. Skinned leaves with no VB
     // (index-only stopgap) self-skip in Submit until the skinned path is ported.
+    if (fsSplit) VK::VRS::SubStatsBegin(cmd, fsFrame, 3);
     if (!g_DynamicVisuals.empty()) {
         g_RenderQueue.Clear();
         for (const DynVisual& d : g_DynamicVisuals) {
@@ -750,11 +778,14 @@ void Pass_World(FrameContext& ctx)
         g_RenderQueue.Flush(ctx);
         g_RenderQueue.SetAllowTess(true);
     }
+    if (fsSplit) VK::VRS::SubStatsEnd(cmd, fsFrame, 3);
 
     // Skinned dynamic leaves (NPCs / weapons / hands): GPU skinning, own pipeline +
     // bone SSBO. Same render pass (color + depth) as the statics above.
     const int zSkin = VK::Prof::ZoneBegin(cmd, "World/Skinned");
+    if (fsSplit) VK::VRS::SubStatsBegin(cmd, fsFrame, 4);
     Pass_Skinned(ctx);
+    if (fsSplit) VK::VRS::SubStatsEnd(cmd, fsFrame, 4);
     VK::Prof::ZoneEnd(cmd, zSkin);
 
     vkCmdEndRendering(cmd);

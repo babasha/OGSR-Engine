@@ -59,6 +59,14 @@ struct StreamTexture
     u32             lastSwapFrame= 0;           // residency change frame (skip stale feedback)
     u8              demoteTicks  = 0;           // consecutive stream ticks feedback wanted coarser
     bool            ioPending    = false;       // async .dds read in flight — don't re-plan
+
+    // Textures that live on the SAME surface as this one and therefore want the same
+    // texel density, but get no feedback of their own: the material's normal+gloss
+    // map. Only the base diffuse carries a feedback slot (one streamID fits in the
+    // push block), so a companion's wanted mip is DERIVED from its base each tick —
+    // see the propagation pass in StreamStep. Companions are shared by name across
+    // materials, so one may be listed by several bases; the sharpest wins.
+    std::vector<CVulkanTexture*> companions;
 };
 
 class TextureStreamer
@@ -73,6 +81,14 @@ public:
                   u32 fullMips, VkFormat fmt, u32 residentBase,
                   VkDeviceSize residentBytes, TexStreamClass klass);
     void Unregister(CVulkanTexture* tex);
+
+    // Tie a normal+gloss map to the base diffuse it shares a surface with, making it
+    // eligible for dynamic streaming: it has no feedback slot, so its wanted mip is
+    // derived from the base's every tick (matched by RESOLUTION, not mip index — the
+    // two textures are often different sizes). Without this the whole Bump class can
+    // only be capped at LOAD and never recovers, which on a tight budget means
+    // permanently mushy normals. Idempotent; opting the base out cascades here.
+    void LinkCompanion(CVulkanTexture* base, CVulkanTexture* companion);
 
     // Opt a texture out of (or back into) dynamic streaming after registration.
     // Used for terrain-material bases: their 15-binding splat set is captured by

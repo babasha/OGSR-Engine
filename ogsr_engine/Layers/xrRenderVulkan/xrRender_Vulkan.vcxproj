@@ -117,7 +117,6 @@
     <ClInclude Include="vk_light.h" />
     <ClInclude Include="vk_shadow.h" />
     <ClInclude Include="vk_pass_shadow.h" />
-    <ClInclude Include="vk_pass_sunshafts.h" />
     <ClInclude Include="vk_pass_lightcones.h" />
     <ClInclude Include="vk_pass_sky.h" />
     <ClInclude Include="vk_scene_color.h" />
@@ -143,6 +142,7 @@
     <ClInclude Include="vk_clustered.h" />
     <ClInclude Include="vk_color_space.h" />
     <ClInclude Include="vk_ibl.h" />
+    <ClInclude Include="vk_clouds.h" />
     <ClInclude Include="vk_volumetrics.h" />
     <ClInclude Include="vk_framegraph.h" />
     <ClInclude Include="vk_async.h" />
@@ -159,6 +159,7 @@
     <ClCompile Include="vk_world_gpu.cpp" />
     <ClCompile Include="vk_clustered.cpp" />
     <ClCompile Include="vk_ibl.cpp" />          <!-- sky specular IBL prefilter (compute) -->
+    <ClCompile Include="vk_clouds.cpp" />       <!-- volumetric cloud noise bake (compute) -->
     <ClCompile Include="vk_volumetrics.cpp" />
     <ClCompile Include="vk_framegraph.cpp" />   <!-- render graph: frame-wide resource-state tracker -->
     <ClCompile Include="vk_async.cpp" />        <!-- async compute foundation (cross-queue timeline) -->
@@ -217,7 +218,6 @@
     <ClCompile Include="vk_light.cpp" />
     <ClCompile Include="vk_shadow.cpp" />
     <ClCompile Include="vk_pass_shadow.cpp" />
-    <ClCompile Include="vk_pass_sunshafts.cpp" />
     <ClCompile Include="vk_pass_lightcones.cpp" />
     <ClCompile Include="vk_pipeline_cache.cpp" />
     <ClCompile Include="vk_render_queue.cpp" />

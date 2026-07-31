@@ -106,6 +106,11 @@ private:
     float next_lightning_time;
     BOOL bEnabled;
 
+    // The colour this bolt is currently ADDING to the env (the animated flash, 0
+    // when idle). Published so the renderer can light the sky with it instead of
+    // following the fake sun the bolt installs in sun_dir -- see Flash().
+    Fvector current_flash{};
+
     // params
     //	Fvector2					p_var_alt;
     //	float						p_var_long;
@@ -130,6 +135,15 @@ public:
     // CurrentEnv->sun_dir with the bolt direction, so shadow code must hold its
     // last real sun direction instead of following it (see vk_pass_shadow).
     bool IsActive() const { return state == stWorking; }
+
+    // Flash colour being added this frame (0,0,0 when no bolt). A real lightning
+    // strike is a huge, very distant area light: it lifts the whole sky, it does
+    // not put a second sun in it. The engine's own trick does the opposite --
+    // sun_dir is swung at the strike, so everything that draws AT the sun (sky
+    // disc, volumetric sun beam) sprouts a duplicate sun with god rays fanning out
+    // of it, one per bolt in the clap. The renderer holds the real sun direction
+    // and spends THIS instead, as sky/ambient light.
+    const Fvector& Flash() const { return current_flash; }
 
     shared_str AppendDef(CEnvironment& environment, CInifile* pIni, CInifile* thunderbolts, LPCSTR sect);
     shared_str AppendDef_shoc(CEnvironment& environment, CInifile* pIni, LPCSTR sect);

@@ -10,8 +10,8 @@
 // Replaces the R4 `models\lightplanes` texture-sheet fakes: every spot light
 // the game flags volumetric (headlights, searchlights, pole lamps) gets an
 // analytic raymarched cone of in-scatter added over the HDR scene, built from
-// the light's real position/direction/cone/range/colour. Runs right after
-// Pass_SunShafts (same depth-sampled additive-fullscreen shape).
+// the light's real position/direction/cone/range/colour. Depth-sampled additive
+// fullscreen pass, right after Sky.
 //
 // cvars: r_light_cones (master, 2 = marched-cone debug), r_light_cone_density,
 // r_light_cone_len (beam length = range × this), r_light_cone_soft (penumbra),

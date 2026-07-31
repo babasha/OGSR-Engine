@@ -62,8 +62,14 @@ bool Wanted();      // r_vol != 0
 // r_vol is off (the volume keeps its SHADER_READ layout, the composite is gated).
 // `smoke`/`smokeCount` = this frame's smoke particles to inject as media (Stage 1);
 // pass nullptr/0 for none. Internally clamped to the splat capacity.
+// `sceneDepthPrev` (optional): the scene depth ATTACHMENT view — Execute runs before
+// this frame's prepass, so it still holds LAST frame's depth in SHADER_READ layout.
+// Enables froxel depth rejection (r_vol_depth_reject): fog behind the geometry of its
+// own view column gets no in-scatter (kills the through-wall glow the trilinear volume
+// fetch smears onto walls). Pass VK_NULL_HANDLE to disable (editor path).
 void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
-             const SmokeParticle* smoke, u32 smokeCount);
+             const SmokeParticle* smoke, u32 smokeCount,
+             VkImageView sceneDepthPrev = VK_NULL_HANDLE);
 
 // Composite inputs for the tonemap fold: the integrated volume (rgb = in-scatter,
 // a = transmittance) + a linear/clamp sampler. The view exists from Init on (the

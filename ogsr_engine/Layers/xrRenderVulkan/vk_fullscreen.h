@@ -9,7 +9,7 @@
 #include "vk_core.h"
 
 // Shared fullscreen-triangle pass helpers. The post-processing passes (bloom,
-// ssao, sunshafts, tonemap) all built the SAME graphics-pipeline skeleton — no
+// ssao, light cones, tonemap) all built the SAME graphics-pipeline skeleton — no
 // vertex input, triangle list, cull none, no depth attachment, 1 color
 // attachment, dynamic viewport+scissor — differing only in shaders, color
 // format, blend attachment and pipeline layout. CreatePipeline captures that.
@@ -21,7 +21,7 @@ VkPipelineColorBlendAttachmentState OpaqueAttachment(
     VkColorComponentFlags writeMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
 
-// Additive (ONE, ONE / ADD) RGBA attachment — e.g. sun-shafts over the scene.
+// Additive (ONE, ONE / ADD) RGBA attachment — in-scatter layered over the scene.
 VkPipelineColorBlendAttachmentState AdditiveAttachment();
 
 // Build a fullscreen-triangle graphics pipeline. `tag` is only used in the

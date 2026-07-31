@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // Fullscreen triangle for the sky pass — no VBO, vertices generated from
 // gl_VertexIndex. Three verts at clip-space (-1,-1) / (3,-1) / (-1,3) cover
@@ -16,16 +17,9 @@
 // defined for vec3+scalar mixes; vec4s eliminate that ambiguity.
 // Full push block must match sky.frag.glsl exactly (shared range across stages).
 // The VS only reads the first three vec4s; the rest are consumed by the FS.
-layout(push_constant) uniform PushConstants {
-    vec4 camRightTan_rot;   // .xyz = vCameraRight * tan(fov/2) * aspect, .w = skyRotation
-    vec4 camUpTan_weight;   // .xyz = vCameraTop   * tan(fov/2),          .w = blendWeight
-    vec4 camForward_pad;    // .xyz = vCameraDirection (unit)
-    vec4 skyColor_pad;      // .xyz = sky_color tint
-    vec4 sunDir_pad;        // FS only
-    vec4 sunColor_pad;      // FS only
-    vec4 cloudsColor;       // FS only
-    vec4 cloudParams;       // FS only
-} pc;
+// Was a push block; moved to a UBO when it outgrew the 128-byte guaranteed push
+// limit (see sky_ubo.glsl). The VS reads only the camera basis.
+#include "sky_ubo.glsl"
 
 layout(location = 0) out vec3 vWorldDir;
 
@@ -40,7 +34,7 @@ void main()
     // pos.x ∈ [-1, 1] across the screen width, pos.y ∈ [-1, 1] across height.
     // Viewport is flipped (vp.height < 0) so pos.y = +1 corresponds to top of
     // screen — matches X-Ray's vCameraTop pointing world-up.
-    vWorldDir = pc.camForward_pad.xyz
-              + pos.x * pc.camRightTan_rot.xyz
-              + pos.y * pc.camUpTan_weight.xyz;
+    vWorldDir = S.camForward_alt.xyz
+              + pos.x * S.camRightTan_rot.xyz
+              + pos.y * S.camUpTan_weight.xyz;
 }

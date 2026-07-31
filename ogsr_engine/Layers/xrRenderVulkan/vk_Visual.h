@@ -189,6 +189,15 @@ struct VK_Render_Mesh
     u32                 vStride = 0;    // Bytes per vertex
     u32                 tcOffset = 24;  // TEXCOORD0 byte offset (24=lmap, 28=vert-lit)
 
+    // Device address of p_rm_Vertices, resolved ONCE at upload. Only skinned
+    // leaves set it (vkUploadConvertedVertices) — the compute pre-skinning pass
+    // reads the source vertices through it, which keeps that pass down to a
+    // single descriptor set no matter how many leaves are on screen. Cached
+    // here rather than in a VkBuffer->address map because VkBuffer handles are
+    // recycled after a level unload and a stale map would hand out a dead
+    // address. 0 = not addressable (level geometry, pooled buffers).
+    VkDeviceAddress     vAddr = 0;
+
     // Index buffer
     VK::CVulkanBuffer*  p_rm_Indices = nullptr;
     u32                 iBase = 0;      // First index offset

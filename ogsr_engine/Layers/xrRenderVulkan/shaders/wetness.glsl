@@ -12,16 +12,43 @@
 #ifndef WETNESS_GLSL
 #define WETNESS_GLSL
 
-// lmap/vlit puddle coverage: procedural blobs on near-flat up-facing surfaces.
-// SSS placement (puddlesMaskProc) is the default; flow sim is the parked alt.
+// SF_Concavity for the real-dip placement below. Included HERE, not by the callers:
+// world_lmap/world_vlit pull surface_field.glsl in AFTER this file, so relying on
+// their include would leave the symbol undeclared. env_common.glsl (rainVis) comes
+// before wetness.glsl in all three, which is what surface_field actually needs.
+#include "surface_field.glsl"
+
+// lmap/vlit puddle coverage: STATIC geometry (concrete slabs, asphalt platforms,
+// floors) — everything that is not splat terrain. This path had none of what the
+// terrain path grew: no height fill, no real dips, no border hardness, just a soft
+// noise blob times a slope mask. Soft blobs of partial coverage read as nothing once
+// the shading requires a real `pud`, which is why asphalt could look permanently
+// puddle-free while the terrain beside it pooled. SSFX's own static shader
+// (deffer_impl_flat.ps) is NOT soft either: it drives the mask through
+// smoothstep(0, 0.09, x) — border hardness 0.7 — so a pool has a defined edge.
 // `wet` is rain_params.y AFTER the rainVis multiply; `upness` = clamp(N.y,0,1).
 float puddleCoverage(vec3 wp, vec3 N, float wet, float upness)
 {
     float slope = clamp((1.0 - max(abs(N.x), abs(N.z)) - 0.9) * 13.0, 0.0, 1.0);
     float cov   = clamp(wet * L.pom_params7.y * 1.5, 0.0, 1.0);   // grows/recedes; x1.5 = distinct, not fields
-    float pud   = (L.pom_params7.x > 0.5) ? puddlesMaskProc(wp.xz, cov, L.pom_params7.w) * slope
-                : (L.pom_params6.x > 0.5) ? smoothstep(0.04, 0.12, simWaterSoft(wp)) * upness
-                : 0.0;
+    float pud;
+    if (L.pom_params7.x > 0.5) {
+        pud = puddlesMaskProc(wp.xz, cov, L.pom_params7.w);
+        // Real ground dips (r_puddle_geo), same signal the terrain uses: water goes
+        // where the ground is actually concave, not where the noise happens to peak.
+        float geo = L.puddle_geo.x;
+        if (geo > 0.001)
+            pud = mix(pud, max(pud * 0.25, SF_Concavity(wp)), geo);
+        // SSFX G_PUDDLES_BORDER_HARDNESS 0.7 -> smoothstep(0, 0.09, pud): a pool with
+        // an edge instead of a smear. Strict mode only — this is their number.
+        if (L.pom_params7.x > 1.5)
+            pud = smoothstep(0.0, 0.09, pud);
+        pud *= slope;
+    } else if (L.pom_params6.x > 0.5) {
+        pud = smoothstep(0.04, 0.12, simWaterSoft(wp)) * upness;
+    } else {
+        pud = 0.0;
+    }
     return clamp(pud, 0.0, 1.0);
 }
 
@@ -50,7 +77,14 @@ vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud,
 
     vec3  toEye    = L.eye_pos.xyz - wp;
     float dist     = length(toEye);
-    float reflFade = smoothstep(70.0, 35.0, dist);
+    // RANGE (r_wet_dist). This was 70->35 m, which is why our ground read wet under
+    // the player's feet and bone dry thirty steps out — on open terrain that reads as
+    // "only the bit around me got rained on". SSFX fades its wet gloss over 250->200 m
+    // (rain_patch_normal.ps), i.e. the whole visible field stays wet. The ripple math
+    // keeps its own tight fade (18->8 m), so the extra range costs one cube tap on
+    // wet pixels, not the expensive part.
+    float wetFar   = max(L.puddle_geo.y, 20.0);
+    float reflFade = smoothstep(wetFar, wetFar * 0.5, dist);
     if (wetK * reflFade < 0.004) return vec3(0.0);
 
     float t = L.sky_params.w;
@@ -60,8 +94,19 @@ vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud,
     vec2  vel   = (L.pom_params6.x > 0.5) ? simFlow(wp) : vec2(0.0);
     float velMS = length(vel) * 150.0;
     vec2  scrl  = (velMS > 0.01) ? normalize(vel) * (t * velMS * 0.25) : vec2(0.0);
+    // SSFX-STRICT (r_puddle_sss 2). Our look was tuned as a WATER BODY: a dark cool
+    // tint that fills at pud^2 behind a fresnel-dominated mirror. SSFX draws a GLOSS
+    // PATCH instead (deffer_terrain_high_flat_d.ps / deffer_impl_flat.ps): neutral
+    // tint applied LINEARLY, the normal snapped up twice as fast, reflection a flat
+    // 0.4 cap that the deferred SSR mirrors, plus a global gloss lift on all wet
+    // ground. The difference only shows at PARTIAL coverage — and partial is what
+    // real ground mostly has: at pud 0.3 our tint enters at 0.09 and fresnel kills
+    // the head-on view, so it reads "wet, no puddles", while SSFX already shows a
+    // distinct pool. Strict = their constants verbatim, so the two can be A/B'd.
+    bool  strict = L.pom_params7.x > 1.5;
     // Puddle = flat water mirror (flatten normal toward up).
-    vec3  Nbase = mix(N, vec3(0.0, 1.0, 0.0), clamp(pud * pud, 0.0, 1.0));
+    float flat_w = strict ? clamp(pud * pud * 2.0, 0.0, 1.0) : clamp(pud * pud, 0.0, 1.0);
+    vec3  Nbase = mix(N, vec3(0.0, 1.0, 0.0), flat_w);
     vec3  Nr = Nbase;
     float crest = 0.0;
     if (ripFade > 0.01) {
@@ -80,9 +125,33 @@ vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud,
     float reflLod = mix(5.0, 0.0, pud);
     vec3 sky = textureLod(uSky0, R, reflLod).rgb;
     if (xf > 0.01) sky = mix(sky, textureLod(uSky1, R, reflLod).rgb, xf);
-    // Water BODY fills later (pud^2) than the SHINE (reflection ~ pud) - "shine first".
-    albedo = mix(albedo, albedo * vec3(0.34, 0.40, 0.46) * (1.0 - 0.25 * pud), pud * pud);
-    float puddleK = wetK * pud * (0.45 + 0.55 * fres) * reflFade * clamp(L.rain_params.w, 0.0, 2.0);
+    // TINT. Strict = SSFX G_PUDDLES_TINT (0.66,0.63,0.6), lerped LINEARLY by coverage
+    // — a neutral darkening that shows from the first hint of a pool. Ours is a cool
+    // water body that fills at pud^2 ("shine first, then the body").
+    albedo = strict ? mix(albedo, albedo * vec3(0.66, 0.63, 0.60), clamp(pud, 0.0, 1.0))
+                    : mix(albedo, albedo * vec3(0.34, 0.40, 0.46) * (1.0 - 0.25 * pud), pud * pud);
+    // REFLECTION. Strict follows SSFX's gbuffer gloss: G = max(G, pud*0.4) plus the
+    // global G_PUDDLES_TERRAIN_EXTRA_WETNESS (saturate(wet*2)*0.15) that makes ALL
+    // rained-on ground faintly glossy, not just the pools. In a DEFERRED renderer
+    // that gloss is a hard specular lobe; ours was scaled down TWICE on the way out
+    // (a 0.35 fresnel floor AND r_wet_refl 0.6), so at coverage 0.5 the puddle showed
+    // about 7% of the sky and read as a transparent film. Strict reflects at SSFX
+    // scale: floor 0.55, and r_wet_refl re-centred on 1.0 so the knob still tunes
+    // taste without halving the effect by default.
+    // ⚠ POOL and SHEEN are DIFFERENT TERMS - merging them turned the whole ground
+    // into a mirror. SSFX's 0.4 / 0.15 are GLOSS values feeding a specular BRDF: a
+    // 0.15 lobe is a sheen that shows at grazing angles and around highlights. We
+    // multiply by a full sky cube, where 0.15 means "15% mirror, head-on included",
+    // so giving the SUM a 0.55 floor lit every wet texel on the level. Standing water
+    // does mirror when you look straight down, so the POOL keeps the floor; wet
+    // ground that is merely damp gets fresnel-ONLY, which is how wet asphalt actually
+    // behaves - dark underfoot, shining as it turns away from you.
+    float pudRefl   = min(pud, 1.0) * 0.4 * (0.55 + 0.45 * fres);
+    float sheenRefl = clamp(wetK * 2.0, 0.0, 1.0) * 0.10 * fres;
+    float reflScale = reflFade * clamp(L.rain_params.w * 1.6, 0.0, 2.0);
+    float puddleK = strict
+        ? (pudRefl + sheenRefl) * reflScale
+        : wetK * pud * (0.45 + 0.55 * fres) * reflFade * clamp(L.rain_params.w, 0.0, 2.0);
     // SUN GLINT (SSFX specular_phong) - ripples shatter it to sparkles.
     vec3  Ld    = normalize(-L.sun_dir.xyz);
     vec3  Hh    = normalize(Ld + V);
@@ -94,6 +163,12 @@ vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud,
     // ONLY to the ENV sky reflection — sun glint / foam / ripple crests have their
     // own visibility (sun shadow), so leave them untouched.
     float specOcc = (L.pom_params6.w > 0.0) ? mix(1.0, specOcclusion(bentN, R, ao), L.pom_params6.w) : 1.0;
+    // ENERGY (strict): what the WATER mirrors away is not also seen through it, so
+    // the reflection replaces the bottom instead of being laid over it — that is what
+    // stops a puddle reading as clean glass on dirt. Driven by the POOL term only:
+    // damp ground has no body to hide, and attenuating it by the sheen was part of
+    // what made the whole terrain look flooded.
+    if (strict) albedo *= 1.0 - clamp(pudRefl * reflScale * specOcc, 0.0, 0.85);
     return sky * (puddleK * specOcc) + L.sun_color.rgb * (glint * 3.0) + vec3(foam) + crestCol;
 }
 

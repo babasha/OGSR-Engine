@@ -29,6 +29,16 @@ namespace VK
     // fallback by Pass_Skinned.
     void Skinned_UploadBones();
 
+    // COMPUTE PRE-SKINNING (r_preskin) — registered as the "PreSkin" pass, which
+    // runs before every consumer. Uploads this frame's bones, then skins each
+    // visible leaf ONCE into a shared world-space pool laid out as vertHW_1W.
+    // The consumers are unchanged: they bind the pool and push skinMode=1 against
+    // an identity bone, so their existing pipelines pass the pre-skinned position
+    // and normal straight through. A leaf that doesn't fit the pool keeps the old
+    // per-pass skinning, so the two paths mix safely within a frame.
+    // MUST be recorded OUTSIDE a dynamic-rendering scope (it dispatches compute).
+    void Skinned_PreSkin(VkCommandBuffer cmd);
+
     // World-space foot-bone positions of this frame's skinned bodies (player + NPCs),
     // for snow footprint deformation. Valid after Skinned_UploadBones().
     void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet = 24);

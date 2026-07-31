@@ -163,9 +163,16 @@ void TextureStreamer::Register(CVulkanTexture* tex, const char* file, u32 fullW,
     st.residentBytes = residentBytes;
     st.lastUsedFrame = Device.dwFrame;
     st.klass         = klass;
-    // Only base diffuse of world/model geometry is eligible for dynamic mip streaming:
-    // detail/lmap/terrain/bump are tiled/low-res and their descriptor bindings live in
-    // multi-texture sets the rebind hook doesn't cover; UI must stay crisp.
+    // Streamable BY DEFAULT is base diffuse only, because the decision loop is driven
+    // by GPU feedback and only the world FS reports a slot (txfbReport, for the
+    // diffuse): a texture nothing reports reads as `fbSeenFrame == 0` = "not sampled
+    // in a long time" and sinks to the coarsest mip with no way back.
+    // `<bump>` normal maps escape that through LinkCompanion (they inherit their
+    // diffuse's decoded LOD instead of spending a second feedback slot per material),
+    // so they are enabled THERE, not here — a bump nobody linked stays non-streamable,
+    // which is the safe default.
+    // Either way Bump takes the LOAD-TIME budget fit below, which is what keeps a big
+    // level inside VRAM (Pripyat: 1591 bump maps, pinned full-res, pushed it past it).
     st.streamable    = (klass == TexStreamClass::WorldDiffuse) && (fullMips > 1) && (file && file[0]);
 
     // Streamables get a compact GPU-feedback slot (the shaders atomicMin the
@@ -200,19 +207,52 @@ void TextureStreamer::Unregister(CVulkanTexture* tex)
     m_Tex.erase(it);
 }
 
+void TextureStreamer::LinkCompanion(CVulkanTexture* base, CVulkanTexture* companion)
+{
+    if (!base || !companion || base == companion) return;
+    std::lock_guard<std::mutex> lk(s_Mutex);
+    auto bit = m_Tex.find(base);
+    auto cit = m_Tex.find(companion);
+    if (bit == m_Tex.end() || cit == m_Tex.end()) return;
+    StreamTexture& b = bit->second;
+    StreamTexture& c = cit->second;
+
+    // A companion only makes sense behind a base that actually gets feedback — its
+    // wanted mip is derived from the base's. Opting the base out (tree/prop path)
+    // cascades below, so this stays true for the texture's lifetime.
+    if (!b.streamable) return;
+
+    if (std::find(b.companions.begin(), b.companions.end(), companion) == b.companions.end())
+        b.companions.push_back(companion);
+
+    // Enable the companion here rather than in Register: an UNLINKED bump must stay
+    // pinned (nothing would ever ask for it back).
+    if (!c.streamable && c.fullMips > 1 && c.file.size())
+        c.streamable = true;
+}
+
 void TextureStreamer::SetStreamable(CVulkanTexture* tex, bool enable)
 {
     if (!tex) return;
-    std::lock_guard<std::mutex> lk(s_Mutex);
-    auto it = m_Tex.find(tex);
-    if (it == m_Tex.end()) return;
-    StreamTexture& s = it->second;
-    if (!enable && s.fbSlot != 0xFFFFFFFFu) {
-        m_FreeSlots.push_back(s.fbSlot);
-        if (s.fbSlot < m_SlotOwner.size()) m_SlotOwner[s.fbSlot] = nullptr;
-        s.fbSlot = 0xFFFFFFFFu;
+    std::vector<CVulkanTexture*> cascade;
+    {
+        std::lock_guard<std::mutex> lk(s_Mutex);
+        auto it = m_Tex.find(tex);
+        if (it == m_Tex.end()) return;
+        StreamTexture& s = it->second;
+        if (!enable && s.fbSlot != 0xFFFFFFFFu) {
+            m_FreeSlots.push_back(s.fbSlot);
+            if (s.fbSlot < m_SlotOwner.size()) m_SlotOwner[s.fbSlot] = nullptr;
+            s.fbSlot = 0xFFFFFFFFu;
+        }
+        s.streamable = enable && (s.fullMips > 1) && s.file.size();
+        // Opting a base OUT must take its companions with it: their wanted mip comes
+        // from this base's feedback, so leaving them streamable would strand them —
+        // no reports, aged out, evicted to the floor, never promoted back (exactly
+        // the failure the tree path hit in the 22:19 regression, one level down).
+        if (!enable) cascade = s.companions;
     }
-    s.streamable = enable && (s.fullMips > 1) && s.file.size();
+    for (CVulkanTexture* c : cascade) SetStreamable(c, false);
 }
 
 u32 TextureStreamer::GetFeedbackSlot(CVulkanTexture* tex) const
@@ -436,17 +476,22 @@ u32 TextureStreamer::PlanLoadMipSkip(u32 fullW, u32 fullH, u32 fullMips, VkForma
     }
     if (maxSkip == 0) return 0;
 
-    // 1) Manual quality lever — WorldDiffuse only (keep UI/detail/lmap/terrain crisp).
+    // Classes that may be shrunk to fit. Diffuse can also heal later (feedback-driven);
+    // Bump cannot yet (see `st.streamable`) — it is included deliberately, as a size-vs-
+    // crash trade: 1591 pinned full-res bump maps are what pushed Pripyat past the VRAM
+    // budget until a tree upload failed and the process died (25-07). A softer normal map
+    // under memory pressure is a better outcome than no level, and this only bites when
+    // the budget is actually tight. Terrain/lmap/detail stay out: they are a handful of
+    // tiled maps, and crushing the splat mask at load left the ground permanently in mush.
+    const bool budgetFit = (klass == TexStreamClass::WorldDiffuse || klass == TexStreamClass::Bump);
+
+    // 1) Manual quality lever (keep UI/detail/lmap/terrain crisp).
     u32 skip = 0;
-    if (klass == TexStreamClass::WorldDiffuse && psTextureLOD > 0)
+    if (budgetFit && psTextureLOD > 0)
         skip = std::min<u32>((u32)psTextureLOD, maxSkip);
 
-    // 2) Automatic budget-fit — WorldDiffuse ONLY. It is the one class the dynamic
-    // streamer can PROMOTE BACK later; every other class (Lmap/Terrain/Detail/Bump/
-    // UI) has no recovery path, so a load-time crush would freeze it blurry for the
-    // whole session (Pripyat: the terrain splat mask budget-capped at load = ground
-    // permanently in mush). Never permanently crush what cannot heal.
-    if (klass == TexStreamClass::WorldDiffuse) {
+    // 2) Automatic budget-fit.
+    if (budgetFit) {
         VkDeviceSize usage = 0, devBudget = 0;
         VulkanHW.GetVramBudget(usage, devBudget);
         // Credit VMA's cached-but-free block space (level transitions: the previous
@@ -510,7 +555,85 @@ void TextureStreamer::EndLevelLoad()
                     Msg("[VK-TexStream]   class %-12s: %4u tex, %5llu MB", KlassName((TexStreamClass)k),
                         nClass[k], (unsigned long long)(byClass[k] >> 20));
         }
+        {   // How much of the pool the budget can actually MOVE. The class totals say
+            // where the bytes are; this says how many of them a small card can trade
+            // for quality instead of being stuck with. Everything outside it is a
+            // fixed tax that only a content or load-time decision can change.
+            VkDeviceSize sBytes = 0; u32 sCount = 0;
+            for (auto& kv : m_Tex)
+                if (kv.second.streamable) { sBytes += kv.second.residentBytes; ++sCount; }
+            Msg("[VK-TexStream]   MANAGEABLE: %u tex, %llu MB of %llu MB tracked (fixed tax %llu MB)",
+                sCount, (unsigned long long)(sBytes >> 20),
+                (unsigned long long)(m_TrackedBytes >> 20),
+                (unsigned long long)((m_TrackedBytes - sBytes) >> 20));
+        }
+        {   // ...and WHICH files those are. A class total says how much is out of the
+            // streamer's reach; only the names say whether that's a texture the level
+            // needs at full res or (seen before) a forgotten uncompressed backup. The
+            // list is deliberately NON-streamable-only: streamable ones the budget
+            // already manages, so they'd just crowd out the actionable rows.
+            std::vector<const StreamTexture*> fixed;
+            fixed.reserve(m_Tex.size());
+            for (auto& kv : m_Tex)
+                if (!kv.second.streamable) fixed.push_back(&kv.second);
+            std::sort(fixed.begin(), fixed.end(),
+                      [](const StreamTexture* a, const StreamTexture* b) {
+                          return a->residentBytes > b->residentBytes; });
+            const u32 topN = std::min<u32>(12, (u32)fixed.size());
+            if (topN) Msg("[VK-TexStream]   top non-streamable (the bytes no budget can reach):");
+            for (u32 i = 0; i < topN; ++i) {
+                const StreamTexture* s = fixed[i];
+                Msg("[VK-TexStream]     %5llu MB  %ux%u m%u  %-12s %s",
+                    (unsigned long long)(s->residentBytes >> 20),
+                    s->fullW >> s->residentBase, s->fullH >> s->residentBase,
+                    s->fullMips - s->residentBase, KlassName(s->klass), s->file.c_str());
+            }
+        }
+        {   // The SAME .dds resident more than once. Texture objects are created per
+            // consumer (per material key in WorldMaterialCache, per role cache for
+            // bump/height/terrain), so one file used by several materials/roles pays
+            // for several GPU images. Costs nothing to look at and is invisible in
+            // every other metric — the class totals count the copies as legitimate.
+            struct Dup { u32 n; VkDeviceSize total, largest; };
+            std::unordered_map<std::string, Dup> byFile;
+            byFile.reserve(m_Tex.size());
+            for (auto& kv : m_Tex) {
+                if (!kv.second.file || !kv.second.file.c_str()[0]) continue;
+                Dup& d = byFile[kv.second.file.c_str()];
+                ++d.n;
+                d.total   += kv.second.residentBytes;
+                d.largest  = std::max(d.largest, kv.second.residentBytes);
+            }
+            std::vector<std::pair<const std::string*, Dup>> dups;
+            VkDeviceSize wastedAll = 0;
+            u32 copiesAll = 0;
+            for (auto& kv : byFile) {
+                if (kv.second.n < 2) continue;
+                wastedAll += kv.second.total - kv.second.largest;   // keep one copy
+                copiesAll += kv.second.n - 1;
+                dups.emplace_back(&kv.first, kv.second);
+            }
+            if (!dups.empty()) {
+                std::sort(dups.begin(), dups.end(), [](const auto& a, const auto& b) {
+                    return (a.second.total - a.second.largest) > (b.second.total - b.second.largest); });
+                Msg("[VK-TexStream]   DUPLICATE files: %zu names, %u redundant copies, %llu MB wasted",
+                    dups.size(), copiesAll, (unsigned long long)(wastedAll >> 20));
+                const u32 topD = std::min<u32>(10, (u32)dups.size());
+                for (u32 i = 0; i < topD; ++i)
+                    Msg("[VK-TexStream]     x%u  %5llu MB wasted  %s", dups[i].second.n,
+                        (unsigned long long)((dups[i].second.total - dups[i].second.largest) >> 20),
+                        dups[i].first->c_str());
+            }
+        }
     }
+    // The other side of the ledger. Textures are the half we can steer; the rest —
+    // geometry, VSM atlases, render targets, frame-gen buffers — is the half that
+    // decides whether a level fits a small card at all (Pripyat: ~2.7 GB of it
+    // against 2.8 GB of textures). The attribution registry already buckets it by
+    // subsystem, but only ever printed behind r_profiler>=3, so nobody looked. At
+    // load end it costs one line and lands right next to the texture picture.
+    VK::Vram::LogFull();
+
     // Lock released — now trim the resident set to leave the reserve free (its own
     // locking + GPU work). Runs here, at the load-end idle point, NOT per frame.
     EnforceLoadReserve();
@@ -672,7 +795,16 @@ void TextureStreamer::StreamStep()
 
         const VkDeviceSize budget = BudgetBytes();
         if (budget == 0) return;
-        const VkDeviceSize slack = budget - budget / 8;   // free-promote ceiling (~87%)
+        // Pool hysteresis. Promotes fill the pool up to the BUDGET; once tracked
+        // passes it, off-screen residencies are evicted back down to `evictTarget`.
+        // ⚠ These two thresholds used to be ONE-DIRECTIONAL — promotes gated at 87%
+        // of budget, eviction only starting at 100% — so a pool landing between them
+        // froze SOLID: no promote fits, nothing triggers a demote, so `freed` stays 0
+        // and every promote is "starved" forever (23:47 log: 976 ticks of
+        // `0 promote / starved 8..21` at tracked 3440 / budget 3671, not one byte
+        // moved). A full pool must REPLACE, not freeze — eviction below is therefore
+        // driven by promote DEMAND, not by pressure alone.
+        const VkDeviceSize evictTarget = budget - budget / 8;
 
         const u32 bias = (u32)m_OverBias;
 
@@ -683,10 +815,41 @@ void TextureStreamer::StreamStep()
 
         VkDeviceSize tracked = m_TrackedBytes;
 
-        struct Cand { StreamTexture* s; u32 target; s32 severity; };
+        // --- Companion propagation: a wish for the feedback-less normal maps ------
+        // A `<bump>` sits on the SAME SURFACE as its diffuse, so it wants the same
+        // TEXEL DENSITY — matched by RESOLUTION, not by mip index (a 2048² diffuse
+        // with a 1024² normal must not be handed "base mip 3" and end up half as
+        // sharp as the surface asked for). One normal is shared by many materials, so
+        // the SHARPEST base wins; `fbSeenFrame == now` marks "already visited this
+        // tick" for that min. Everything downstream then treats a bump exactly like a
+        // diffuse — rescue, promote, demote and eviction need no special case at all.
+        for (auto& kv : m_Tex) {
+            StreamTexture& b = kv.second;
+            if (b.companions.empty() || !b.streamable) continue;
+            if (b.fbSeenFrame == 0 || (now - b.fbSeenFrame) >= 60) continue;   // base off-screen
+            if (b.fbWantedBase == 0xFFFFFFFFu) continue;
+            const u32 baseDim = std::max(1u, std::max(b.fullW, b.fullH) >> b.fbWantedBase);
+            for (CVulkanTexture* ct : b.companions) {
+                auto cit = m_Tex.find(ct);
+                if (cit == m_Tex.end()) continue;
+                StreamTexture& c = cit->second;
+                if (!c.streamable) continue;
+                const u32 cMax = MaxBaseForDims(c.fullW, c.fullH, c.fullMips, kMinResidentDim);
+                u32 want = 0;
+                while (want < cMax && (std::max(c.fullW, c.fullH) >> want) > baseDim) ++want;
+                const bool fresh = (c.fbSeenFrame != now);
+                c.fbSeenFrame  = now;
+                c.fbWantedBase = fresh ? want : std::min(c.fbWantedBase, want);
+            }
+        }
+
+        // `deep` is the rescue-only second target: the mip the GPU actually asked
+        // for, tried in the same step when the budget can seat it (see below).
+        struct Cand { StreamTexture* s; u32 target; s32 severity; u32 deep = 0xFFFFFFFFu; };
         std::vector<Cand> rescues;    // visible & below the 256px floor — unconditional
         std::vector<Cand> promotes;   // visible quality promotes — budget-gated
-        std::vector<Cand> demotes;
+        std::vector<Cand> demotes;    // visible but over-resident (feedback says coarser)
+        std::vector<Cand> evictable;  // off-screen — the fuel that funds the promotes
 
         for (auto& kv : m_Tex) {
             StreamTexture& s = kv.second;
@@ -706,24 +869,42 @@ void TextureStreamer::StreamStep()
                 if (want < s.residentBase) {
                     s.demoteTicks = 0;
                     if (s.residentBase > floorB)   // below 256px on screen → rescue to the floor now;
-                        rescues.push_back({ &s, floorB, (s32)(s.residentBase - floorB) });
+                        rescues.push_back({ &s, floorB, (s32)(s.residentBase - floorB), want });
                     else                           // above it, further sharpening queues on the budget
                         promotes.push_back({ &s, want, (s32)(s.residentBase - want) });
                 } else if (want > s.residentBase) {
                     // Sustained-coarser only, and only when memory matters — an
                     // over-sharp resident texture is harmless with a roomy budget.
-                    if (++s.demoteTicks >= 3 && tracked > slack)
+                    if (++s.demoteTicks >= 3 && tracked > evictTarget)
                         demotes.push_back({ &s, want, (s32)(want - s.residentBase) });
                 } else {
                     s.demoteTicks = 0;
                 }
-            } else if (tracked > budget) {
-                // Invisible for a while + over budget → give its VRAM back. Straight
-                // to the 64px floor: feedback rescues it within ticks if the player
-                // turns around.
+            } else {
+                // Off-screen for a while → eviction fuel. Collected EVERY tick (not
+                // only over budget): at equilibrium the pool is full, so the only way
+                // an approaching surface gets sharper is by taking the bytes from
+                // something behind the camera. How deep we cut depends on pressure:
+                //  - equilibrium → the 256px perceptual floor. Most of a chain lives
+                //    in mip 0, so this yields ~94% of the relief of a 64px cut while
+                //    keeping a texture that is merely off-screen (or VISIBLE through a
+                //    path that doesn't write feedback — the tree/prop class of the
+                //    22:19 regression) one tick away from presentable.
+                //  - actually over budget → the hard 64px floor, as before.
                 const bool longUnseen = s.fbSeenFrame == 0 || (now - s.fbSeenFrame) > 300;
-                if (longUnseen && s.residentBase < maxB)
-                    demotes.push_back({ &s, maxB, (s32)(maxB - s.residentBase) });
+                if (longUnseen) {
+                    const u32 target = (tracked > budget)
+                                     ? maxB
+                                     : MaxBaseForDims(s.fullW, s.fullH, s.fullMips, kVisibleFloorDim);
+                    if (s.residentBase < target) {
+                        const VkDeviceSize after =
+                            MipChainBytes(s.fullW, s.fullH, s.fullMips, target, s.format);
+                        const VkDeviceSize relief =
+                            (s.residentBytes > after) ? (s.residentBytes - after) : 0;
+                        if (relief > 0)
+                            evictable.push_back({ &s, target, (s32)(relief >> 10) });   // KB, for the sort
+                    }
+                }
             }
         }
 
@@ -732,48 +913,102 @@ void TextureStreamer::StreamStep()
         // is a few dozen MB of overdraft the driver can absorb).
         std::sort(rescues.begin(), rescues.end(),
                   [](const Cand& a, const Cand& b) { return a.severity > b.severity; });
-        u32 nRes = 0;
+        u32 nRes = 0, nDeep = 0;
         for (const Cand& c : rescues) {
             if (nRes >= kMaxRescuesPerTick) break;
-            const VkDeviceSize after =
-                MipChainBytes(c.s->fullW, c.s->fullH, c.s->fullMips, c.target, c.s->format);
+            // ONE STEP when the budget allows. Healing to the floor and sharpening on
+            // a later tick re-reads the WHOLE .dds and rebuilds the image a second
+            // time for the same surface — the 00:31 log was a solid ladder of
+            // `1 rescue -> 1 promote` pairs. The floor stays the unconditional
+            // fallback (a 256px chain is ~90 KB, affordable even over budget); the
+            // mip the GPU actually asked for is taken instead whenever it fits, which
+            // also lands the sharp texture a tick earlier.
+            u32          target = c.target;
+            VkDeviceSize after  =
+                MipChainBytes(c.s->fullW, c.s->fullH, c.s->fullMips, target, c.s->format);
+            if (c.deep < c.target) {
+                const VkDeviceSize deepBytes =
+                    MipChainBytes(c.s->fullW, c.s->fullH, c.s->fullMips, c.deep, c.s->format);
+                const VkDeviceSize delta =
+                    (deepBytes > c.s->residentBytes) ? (deepBytes - c.s->residentBytes) : 0;
+                if (tracked + delta <= budget) { target = c.deep; after = deepBytes; ++nDeep; }
+            }
             tracked += (after > c.s->residentBytes) ? (after - c.s->residentBytes) : 0;
-            c.s->wantedBase = c.target;
-            plan.emplace_back(c.s, c.target);
+            c.s->wantedBase = target;
+            plan.emplace_back(c.s, target);
             ++nRes;
         }
 
-        // Demotes (they fund the quality promotes), biggest relief first. Own cap —
-        // a big invisible backlog must never starve the promote side (seen in the
-        // 21:19 log: 700 pending demotes ate all 8 slots, 0 promotes for minutes).
-        std::sort(demotes.begin(), demotes.end(),
-                  [](const Cand& a, const Cand& b) { return a.s->residentBytes > b.s->residentBytes; });
+        // Promotes are ordered (blurriest on screen first) BEFORE any demote is
+        // planned, because their total is what the eviction below has to fund.
+        std::sort(promotes.begin(), promotes.end(),
+                  [](const Cand& a, const Cand& b) { return a.severity > b.severity; });
+
+        VkDeviceSize demand = 0;   // bytes the promotes we'll attempt this tick need
+        {
+            u32 n = 0;
+            for (const Cand& c : promotes) {
+                if (n >= kMaxPromotesPerTick) break;
+                const VkDeviceSize after =
+                    MipChainBytes(c.s->fullW, c.s->fullH, c.s->fullMips, c.target, c.s->format);
+                if (after > c.s->residentBytes) demand += after - c.s->residentBytes;
+                ++n;
+            }
+        }
+        // How much must come back this tick: enough to seat that demand under the
+        // budget, plus (when we're actually over it) the overshoot down to the
+        // eviction target.
+        VkDeviceSize need = (tracked > budget) ? (tracked - evictTarget) : 0;
+        if (tracked + demand > budget)
+            need = std::max(need, tracked + demand - budget);
+
         VkDeviceSize freed = 0;   // bytes this tick's demotes give back
-        u32 nDem = 0;
-        for (const Cand& c : demotes) {
-            if (nDem >= kMaxDemotesPerTick) break;
+        u32 nDem = 0, nEvict = 0;
+        auto applyDemote = [&](const Cand& c) {
             const VkDeviceSize after =
                 MipChainBytes(c.s->fullW, c.s->fullH, c.s->fullMips, c.target, c.s->format);
+            if (after >= c.s->residentBytes) return;
             freed   += (c.s->residentBytes - after);
             tracked -= (c.s->residentBytes - after);
             c.s->wantedBase = c.target;
             plan.emplace_back(c.s, c.target);
+        };
+
+        // Over-resident VISIBLE textures first — the GPU itself said they're coarser
+        // than they need to be, so this is free relief. Shared cap with eviction: a
+        // big backlog must never starve the promote side (the 21:19 log: 700 pending
+        // demotes ate all 8 slots, 0 promotes for minutes).
+        std::sort(demotes.begin(), demotes.end(),
+                  [](const Cand& a, const Cand& b) { return a.s->residentBytes > b.s->residentBytes; });
+        for (const Cand& c : demotes) {
+            if (nDem >= kMaxDemotesPerTick) break;
+            applyDemote(c);
             ++nDem;
         }
 
-        // Quality promotes: most-starved first (biggest mip gap = blurriest on
-        // screen). Allowed under the slack ceiling OR as a net-zero pair (funded by
-        // this tick's demotes) — over budget the pool composition still shifts
-        // toward what's actually on screen instead of freezing.
-        std::sort(promotes.begin(), promotes.end(),
+        // Then evict off-screen residencies — biggest relief first, and only as many
+        // as `need` actually calls for (paying one image rebuild per promote, not a
+        // mass eviction every tick).
+        std::sort(evictable.begin(), evictable.end(),
                   [](const Cand& a, const Cand& b) { return a.severity > b.severity; });
+        for (const Cand& c : evictable) {
+            if (freed >= need) break;
+            if (nDem + nEvict >= kMaxDemotesPerTick) break;
+            applyDemote(c);
+            ++nEvict;
+        }
+        const size_t evictFuel = evictable.size() - nEvict;   // still available next tick
+
+        // Quality promotes: under the budget ceiling OR funded net-zero by what this
+        // tick just freed. `starved` now means something honest — the pool is full AND
+        // there was nothing off-screen left to take the bytes from.
         u32 nPro = 0, nStarved = 0;
         for (const Cand& c : promotes) {
             if (nPro >= kMaxPromotesPerTick) break;
             const VkDeviceSize after =
                 MipChainBytes(c.s->fullW, c.s->fullH, c.s->fullMips, c.target, c.s->format);
             const VkDeviceSize delta = (after > c.s->residentBytes) ? (after - c.s->residentBytes) : 0;
-            const bool fits   = tracked + delta <= slack;
+            const bool fits   = tracked + delta <= budget;
             const bool funded = delta <= freed;
             if (delta > 0 && !fits && !funded) { ++nStarved; continue; }
             if (!fits) freed -= delta;
@@ -793,21 +1028,21 @@ void TextureStreamer::StreamStep()
         // trickle-promotes ran, pinning the world at quarter-res with 3 GB of budget
         // free — the 21:54 log). Fast decay when the budget has real room.
         // Cap +3: past that the 256px floor dominates anyway.
-        // ...but only when tracked actually exceeds the BUDGET. Starving at the
-        // 87% slack ceiling with room below budget is equilibrium, not
-        // oversubscription — ratcheting bias there pinned the world at +3.0 with
-        // 400 MB of budget unused (23:30 log: want 1 pro / starved 1 forever).
-        if (nStarved > 0 && tracked > budget)
+        // ...and only when the starvation is REAL: the pool is full and there is no
+        // eviction fuel left. Starving with fuel in hand is just this tick's demote
+        // cap — next tick funds it. (Ratcheting on the plain tracked>budget test
+        // pinned the world at +3.0 with 400 MB unused — the 23:30 log.)
+        if (nStarved > 0 && evictFuel == 0)
             m_OverBias = std::min(m_OverBias + 0.25f, 3.0f);
         else {
-            const float decay = (tracked + (VkDeviceSize(512) << 20) < slack) ? 0.5f : 0.125f;
+            const float decay = (tracked + (VkDeviceSize(512) << 20) < evictTarget) ? 0.5f : 0.125f;
             m_OverBias = std::max(m_OverBias - decay, 0.0f);
         }
 
         // Tick telemetry — only when something happened (or wanted to and couldn't).
         if (!plan.empty() || nStarved > 0) {
-            Msg("[VK-TexStream] tick: %u rescue / %u promote / %u demote (want %zu pro %zu dem, starved %u), tracked %llu MB, budget %llu MB, bias +%.1f",
-                nRes, nPro, nDem, promotes.size(), demotes.size(), nStarved,
+            Msg("[VK-TexStream] tick: %u rescue (%u deep) / %u promote / %u demote / %u evict (want %zu pro %zu dem, starved %u, fuel %zu), tracked %llu MB, budget %llu MB, bias +%.1f",
+                nRes, nDeep, nPro, nDem, nEvict, promotes.size(), demotes.size(), nStarved, evictFuel,
                 (unsigned long long)(tracked >> 20), (unsigned long long)(budget >> 20), m_OverBias);
         }
     }

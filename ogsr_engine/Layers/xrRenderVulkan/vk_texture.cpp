@@ -17,7 +17,7 @@
 // r_linear_color — 1 = load TexColorSpace::Color textures as _SRGB so the sampler
 // decodes to linear. Declared at GLOBAL scope on purpose: a namespace-scope extern
 // mangles differently and silently fails to bind (see the SSAO lesson).
-extern int ps_r_linear_color;
+#include "vk_color_space.h"   // ColorSpace::Active() — latched: format choice must not flip mid-session
 
 // DDS definitions
 const u32 DDS_MAGIC = 0x20534444; // "DDS "
@@ -363,6 +363,22 @@ void CVulkanTexture::CreateImageView()
         viewInfo.components.g = VK_COMPONENT_SWIZZLE_ONE;
         viewInfo.components.b = VK_COMPONENT_SWIZZLE_ONE;
         viewInfo.components.a = VK_COMPONENT_SWIZZLE_R;
+    } else if (m_ChanFix == ChanFix::AlphaFromRed) {
+        // Height map repacked to BC4: shaders sample `.a`, the scalar now lives in R.
+        viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;
+        viewInfo.components.g = VK_COMPONENT_SWIZZLE_R;
+        viewInfo.components.b = VK_COMPONENT_SWIZZLE_R;
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_R;
+    } else if (m_ChanFix != ChanFix::None) {
+        // CS/CoP hemi lightmap: broadcast the single meaningful channel into RGB
+        // so the SHoC-convention shaders (`dot(lm.rgb, 1/3)`) read the real hemi.
+        // Red once repacked to BC4, alpha if the repack was skipped.
+        const VkComponentSwizzle hs = (m_ChanFix == ChanFix::HemiFromRed) ? VK_COMPONENT_SWIZZLE_R
+                                                                          : VK_COMPONENT_SWIZZLE_A;
+        viewInfo.components.r = hs;
+        viewInfo.components.g = hs;
+        viewInfo.components.b = hs;
+        viewInfo.components.a = hs;
     } else if (m_bBCSwizzle) {
         // BC/DXT textures: swap R<->B channels
         // DirectX DXT textures use BGRA order, Vulkan BC uses RGBA
@@ -507,11 +523,89 @@ static VkFormat ToSrgbFormat(VkFormat f)
     }
 }
 
-// Priority (VK_EXT_memory_priority) by streaming class: streamable world diffuse is
-// cheapest to evict; everything else keeps the VMA mid default.
+// Priority (VK_EXT_memory_priority) by streaming class: the classes the budget can
+// shrink are cheapest to evict; everything else keeps the VMA mid default. Bump joined
+// them on 25-07 — one map per material makes them bulk, not fixtures.
 static float PriorityForClass(VK::TexStreamClass k)
 {
-    return (k == VK::TexStreamClass::WorldDiffuse) ? 0.25f : 0.5f;
+    return (k == VK::TexStreamClass::WorldDiffuse || k == VK::TexStreamClass::Bump) ? 0.25f : 0.5f;
+}
+
+// Which channel of a hemi lightmap actually holds the bake?
+//
+// X-Ray has TWO lightmap conventions and the shaders pick one at COMPILE time
+// (common_functions.h): SHoC does `get_hemi = dot(lmh.rgb, 1/3)` with sun in .a,
+// CS/CoP does `get_hemi = lmh.a` with sun in .g. A level built by the later
+// compiler therefore ships lmap#N_2 with RGB left EMPTY — and read the SHoC way
+// it yields hemi == 0, i.e. every lightmapped static on the map loses its sky
+// light and renders as if it stood in the dark (measured: Pripyat's hemi maps are
+// rgb 0.000 / alpha 0.250, Cordon's are rgb 0.177 / alpha 0.128).
+//
+// Rather than branch per level, detect it per texture from the data itself and let
+// the image VIEW normalise the convention (RGB←A), so the shaders stay single-form.
+// BC3 endpoints are enough: means over a sample of blocks, no decode needed.
+static bool DetectLmapHemiChannel(const void* data, VkDeviceSize dataSize,
+                                  u32 width, u32 height, VkFormat format,
+                                  double& outRgbMean, double& outAlphaMean)
+{
+    if (format != VK_FORMAT_BC3_UNORM_BLOCK && format != VK_FORMAT_BC3_SRGB_BLOCK) return false;
+
+    const u64 blocks = (u64)((width + 3) / 4) * ((height + 3) / 4);
+    if (blocks == 0 || dataSize < blocks * 16) return false;
+
+    const u8* p = (const u8*)data;
+    const u64 step = (blocks > 4096) ? (blocks / 4096) : 1;   // ~4k samples is plenty
+    double sumRGB = 0.0, sumA = 0.0;
+    u64 n = 0;
+    for (u64 b = 0; b < blocks; b += step, ++n) {
+        const u8* blk = p + b * 16;
+        sumA += (blk[0] + blk[1]) * (0.5 / 255.0);                  // BC3 alpha endpoints
+        const u16 c0 = (u16)(blk[8]  | (blk[9]  << 8));             // BC1 colour endpoints (RGB565)
+        const u16 c1 = (u16)(blk[10] | (blk[11] << 8));
+        const double r = (((c0 >> 11) & 31) + ((c1 >> 11) & 31)) * (0.5 / 31.0);
+        const double g = (((c0 >>  5) & 63) + ((c1 >>  5) & 63)) * (0.5 / 63.0);
+        const double bl = ((c0 & 31) + (c1 & 31)) * (0.5 / 31.0);
+        sumRGB += (r + g + bl) * (1.0 / 3.0);
+    }
+    if (n == 0) return false;
+
+    outRgbMean = sumRGB / n;
+    outAlphaMean = sumA / n;
+    // Deliberately lopsided thresholds: the two conventions are an order of
+    // magnitude apart, so only a genuinely EMPTY rgb (with data in alpha) flips.
+    return (outRgbMean < 0.02) && (outAlphaMean > 0.02);
+}
+
+// Repack such a lightmap BC3 -> BC4, dropping the empty colour blocks.
+//
+// This is NOT a re-encode: BC4 *is* BC3's alpha block — the same 8 bytes, same
+// two endpoints, same 3-bit indices. So the repack is a pure gather (keep 8 of
+// every 16 bytes) with no decoder, no encoder, no generation loss; the sampler
+// reads bit-identical values afterwards. What we drop is measured to be exactly
+// zero. Pripyat's 27 x 4096^2 hemi maps: 432 MB -> 216 MB.
+static void* TranscodeBC3AlphaToBC4(const void* src, u32 width, u32 height, u32 mipLevels,
+                                    VkDeviceSize& outSize)
+{
+    VkDeviceSize total = 0;
+    for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
+        total += (VkDeviceSize)((w + 3) / 4) * ((h + 3) / 4) * 8;
+        if (w > 1) w >>= 1;
+        if (h > 1) h >>= 1;
+    }
+    u8* dst = (u8*)xr_malloc((size_t)total);
+    if (!dst) return nullptr;
+
+    const u8* s = (const u8*)src;
+    u8*       d = dst;
+    for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
+        const u64 blocks = (u64)((w + 3) / 4) * ((h + 3) / 4);
+        for (u64 b = 0; b < blocks; ++b, s += 16, d += 8)
+            memcpy(d, s, 8);   // BC3 alpha block == BC4 block, verbatim
+        if (w > 1) w >>= 1;
+        if (h > 1) h >>= 1;
+    }
+    outSize = total;
+    return dst;
 }
 
 // Pure DDS worker: parse header, create the image covering mips [mipSkip..end], and
@@ -660,11 +754,11 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
     // vk_pass_tonemap.cpp). Flipping the format here is enough: no shader that samples a
     // Colour texture needs to change, because the hardware does the decode on fetch.
     //
-    // Gated so the old all-gamma pipeline stays reachable for A/B. The gate is read at
-    // LOAD time, so toggling the cvar only takes effect for textures loaded afterwards —
-    // it needs a level reload, unlike a live per-frame knob. That is inherent: the
-    // colourspace is baked into the image format, not a shader uniform.
-    if (colorSpace == TexColorSpace::Color && ps_r_linear_color)
+    // Gated so the old all-gamma pipeline stays reachable for A/B. The colourspace is
+    // baked into the image format at LOAD time, so the selector is the process-latched
+    // ColorSpace::Active() — a mid-session cvar flip would otherwise leave resident and
+    // streamed-in textures in different spaces (and the OETF out of step with both).
+    if (colorSpace == TexColorSpace::Color && VK::ColorSpace::Active())
         format = ToSrgbFormat(format);
 
     u32 width = header.dwWidth;
@@ -737,6 +831,41 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
                 filename, (unsigned long long)expected, fullW, fullH, fullMips, (unsigned long long)dataSize);
             if (ownsData) { void* p = const_cast<void*>(data); xr_free(p); }
             return {};
+        }
+    }
+
+    // Hemi lightmaps only: which channel carries the bake (see DetectLmapHemiChannel),
+    // and repack to single-channel BC4 while we hold the blob. Done here — after the
+    // truncation guard (so the source is known complete), before the residency plan
+    // and CreateView, both of which must see the FINAL format.
+    {
+        // A hemi lightmap qualifies only if the bake actually sits in alpha (measured);
+        // a height map qualifies by construction — every sampler of it reads .a.
+        double rgbMean = 0.0, aMean = 0.0;
+        const bool lmapInAlpha = (m_StreamClass == VK::TexStreamClass::Lmap)
+                              && DetectLmapHemiChannel(data, dataSize, width, height, format, rgbMean, aMean);
+        const bool heightOnly  = m_AlphaOnly
+                              && (format == VK_FORMAT_BC3_UNORM_BLOCK || format == VK_FORMAT_BC3_SRGB_BLOCK);
+
+        if (lmapInAlpha || heightOnly) {
+            m_ChanFix = lmapInAlpha ? ChanFix::HemiFromAlpha : ChanFix::None;   // pre-repack fallbacks
+            VkDeviceSize packedSize = 0;
+            if (void* packed = TranscodeBC3AlphaToBC4(data, width, height, mipLevels, packedSize)) {
+                if (ownsData) { void* old = const_cast<void*>(data); xr_free(old); }
+                Msg("[VK %s] '%s': %s -> repacked BC3->BC4, %.1f -> %.1f MB",
+                    lmapInAlpha ? "Lmap" : "Height", filename,
+                    lmapInAlpha ? "hemi in ALPHA, rgb empty" : "alpha-only sampled, rgb unused",
+                    dataSize / 1048576.0, packedSize / 1048576.0);
+                data      = packed;
+                dataSize  = packedSize;
+                ownsData  = true;
+                format    = VK_FORMAT_BC4_UNORM_BLOCK;
+                // BC4 delivers the scalar in R; route it to wherever shaders look.
+                m_ChanFix = lmapInAlpha ? ChanFix::HemiFromRed : ChanFix::AlphaFromRed;
+            } else if (lmapInAlpha) {
+                Msg("[VK Lmap] '%s': hemi in ALPHA (rgb %.3f empty) — repack allocation failed, sampling alpha in place",
+                    filename, rgbMean);
+            }
         }
     }
 
@@ -832,6 +961,7 @@ bool CVulkanTexture::BuildStreamImage(CVulkanTexture& out, u32 mipSkip) const
     if (m_SourceFile.size() == 0) return false;
     out.m_StreamClass       = m_StreamClass;
     out.m_LoadSwizzleIntent = m_LoadSwizzleIntent;
+    out.m_AlphaOnly         = m_AlphaOnly;   // else a rebuilt mip would skip the BC4 repack
     // Carry the colourspace across a promote/demote. Without this the rebuilt image
     // would re-derive its format from the default (Data → UNORM) and a texture would
     // silently change colourspace mid-session the first time it streamed a mip.
@@ -849,6 +979,7 @@ bool CVulkanTexture::BuildStreamImageFromBlob(CVulkanTexture& out, u32 mipSkip,
     if (m_SourceFile.size() == 0 || !blob || blobSize == 0) return false;
     out.m_StreamClass       = m_StreamClass;
     out.m_LoadSwizzleIntent = m_LoadSwizzleIntent;
+    out.m_AlphaOnly         = m_AlphaOnly;   // else a rebuilt mip would skip the BC4 repack
     out.m_LoadColorSpace    = m_LoadColorSpace;   // see BuildStreamImage
     out.m_MemPriority       = m_MemPriority;
     DDSLoadResult r = out.loadDDSFromMemory(m_SourceFile.c_str(), blob, blobSize,
@@ -873,6 +1004,7 @@ void CVulkanTexture::SwapContents(CVulkanTexture& other)
     std::swap(m_CurrentLayout,other.m_CurrentLayout);
     std::swap(m_bAlphaSwizzle,other.m_bAlphaSwizzle);
     std::swap(m_bBCSwizzle,   other.m_bBCSwizzle);
+    std::swap(m_ChanFix,      other.m_ChanFix);        // view-visible: must migrate with the handles
     std::swap(m_bCubemap,     other.m_bCubemap);
     std::swap(m_ArrayLayers,  other.m_ArrayLayers);
     std::swap(m_MemPriority,  other.m_MemPriority);
@@ -949,7 +1081,7 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle,
         return false;
     }
 
-    if (colorSpace == TexColorSpace::Color && ps_r_linear_color)
+    if (colorSpace == TexColorSpace::Color && VK::ColorSpace::Active())
         format = ToSrgbFormat(format);
 
     u32 width = header.dwWidth;

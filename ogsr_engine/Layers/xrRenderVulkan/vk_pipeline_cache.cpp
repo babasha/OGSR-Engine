@@ -42,6 +42,11 @@ namespace {
     VkShaderModule                         s_WorldLmapFadeFS = VK_NULL_HANDLE;
     VkShaderModule                         s_WorldVlitFadeVS = VK_NULL_HANDLE;
     VkShaderModule                         s_WorldVlitFadeFS = VK_NULL_HANDLE;
+    // EARLY_ZTEST twins of the world FS modules (see Init + EarlyTwin).
+    VkShaderModule                         s_WorldLmapEarlyFS     = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldVlitEarlyFS     = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldLmapFadeEarlyFS = VK_NULL_HANDLE;
+    VkShaderModule                         s_WorldVlitFadeEarlyFS = VK_NULL_HANDLE;
     std::unordered_map<Key, VkPipeline>    s_Pipelines;
     // Frame-global world variant bits (WS_FRAME subset), stamped once per frame by
     // Pass_World via SetFrameSpecMask(). Default = full path until first stamp.
@@ -177,19 +182,20 @@ static void BuildVertexInputForStride(u32 stride, u32 tcOffset,
 // Fill a VkSpecializationInfo (+ its backing storage) for the 5 world uber-FS variant
 // bits. The caller owns vals/entries/info so they outlive vkCreateGraphicsPipelines.
 // Order MUST match the SpecId decorations in shaders/world_variants.glsl (POM=0 ..
-// DEBUG=4). Passed to the FRAGMENT stage only (VS/TCS/TES declare no spec constants).
-static void BuildWorldSpecInfo(u8 mask, VkBool32 vals[5],
-                               VkSpecializationMapEntry entries[5], VkSpecializationInfo& info)
+// DEBUG=4, FEEDBACK=5). Passed to the FRAGMENT stage only (VS/TCS/TES declare no
+// spec constants).
+static void BuildWorldSpecInfo(u8 mask, VkBool32 vals[6],
+                               VkSpecializationMapEntry entries[6], VkSpecializationInfo& info)
 {
-    const u8 bits[5] = { WS_POM, WS_SNOW, WS_WET, WS_IBL, WS_DEBUG };
-    for (u32 i = 0; i < 5; ++i) {
+    const u8 bits[6] = { WS_POM, WS_SNOW, WS_WET, WS_IBL, WS_DEBUG, WS_FEEDBACK };
+    for (u32 i = 0; i < 6; ++i) {
         vals[i]    = (mask & bits[i]) ? VK_TRUE : VK_FALSE;
         entries[i] = { i, i * (u32)sizeof(VkBool32), sizeof(VkBool32) };
     }
     info = {};
-    info.mapEntryCount = 5;
+    info.mapEntryCount = 6;
     info.pMapEntries   = entries;
-    info.dataSize      = 5 * sizeof(VkBool32);
+    info.dataSize      = 6 * sizeof(VkBool32);
     info.pData         = vals;
 }
 
@@ -247,6 +253,18 @@ bool Init()
     s_WorldVlitFadeFS = g_ShaderManager->Load("world_vlit_fade.frag.spv");
     if (!s_WorldLmapFadeVS || !s_WorldLmapFadeFS || !s_WorldVlitFadeVS || !s_WorldVlitFadeFS)
         Msg("![VK PipelineCache] world *_fade shaders missing — cluster crossfade (r_cluster_fade) disabled");
+    // EARLY_ZTEST twins (same sources, glslc -DEARLY_ZTEST): forced early depth
+    // test so the streaming-feedback atomic (an FS side effect that forbids
+    // automatic early-Z) never executes for occluded fragments. Bound ONLY to
+    // no-z-write statics pipelines — see EarlyTwin() in CreatePipeline.
+    // Optional: missing modules fall back to the normal FS (correct, just slow).
+    s_WorldLmapEarlyFS     = g_ShaderManager->Load("world_lmap_earlyz.frag.spv");
+    s_WorldVlitEarlyFS     = g_ShaderManager->Load("world_vlit_earlyz.frag.spv");
+    s_WorldLmapFadeEarlyFS = g_ShaderManager->Load("world_lmap_fade_earlyz.frag.spv");
+    s_WorldVlitFadeEarlyFS = g_ShaderManager->Load("world_vlit_fade_earlyz.frag.spv");
+    if (!s_WorldLmapEarlyFS || !s_WorldVlitEarlyFS)
+        Msg("![VK PipelineCache] world *_earlyz shaders missing — statics keep the late-Z uber-FS (slow)");
+
     // Instanced world VS variants (vk_instance_gpu, host/editor scenes). Optional:
     // missing modules just keep the host scene on the CPU RenderQueue.
     s_WorldLmapInstVS = g_ShaderManager->Load("world_lmap_inst.vert.spv");
@@ -663,8 +681,8 @@ VkPipeline GetTerrainPipeline()
     const u32 fsIdx = nStage;
     stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT;   stages[nStage++].module = zoff ? s_TerrainFSZoff : s_TerrainFS;
     // Bake the world-variant spec constants into the terrain FS (storage lives to the create).
-    VkBool32                 specVals[5];
-    VkSpecializationMapEntry specEntries[5];
+    VkBool32                 specVals[6];
+    VkSpecializationMapEntry specEntries[6];
     VkSpecializationInfo     specInfo;
     BuildWorldSpecInfo(mask, specVals, specEntries, specInfo);
     stages[fsIdx].pSpecializationInfo = &specInfo;
@@ -970,6 +988,21 @@ static void BuildVertexInputForStride(u32 stride, u32 tcOffset,
     attrs[5] = { 5, 0, VK_FORMAT_R8G8B8A8_UNORM, 12 };   // packed vertex normal
 }
 
+// EARLY_ZTEST twin of a world FS module, or the module itself when no twin is
+// loaded. The twin forces the depth test BEFORE the shader, so the streaming-
+// feedback atomic (an FS side effect — automatic early-Z is illegal with it)
+// only ever runs for visible fragments. ONLY legal without depth writes (early
+// tests write depth before the AT discard) — the callers below bind it exactly
+// for the atEqual/noZWrite statics variants, which force depthWrite off.
+static VkShaderModule EarlyTwin(VkShaderModule fs)
+{
+    if (fs == s_WorldLmapFS     && s_WorldLmapEarlyFS)     return s_WorldLmapEarlyFS;
+    if (fs == s_WorldVlitFS     && s_WorldVlitEarlyFS)     return s_WorldVlitEarlyFS;
+    if (fs == s_WorldLmapFadeFS && s_WorldLmapFadeEarlyFS) return s_WorldLmapFadeEarlyFS;
+    if (fs == s_WorldVlitFadeFS && s_WorldVlitFadeEarlyFS) return s_WorldVlitFadeEarlyFS;
+    return fs;
+}
+
 static VkPipeline CreatePipeline(const Key& k)
 {
     VkVertexInputBindingDescription   binding{};
@@ -1013,11 +1046,16 @@ static VkPipeline CreatePipeline(const Key& k)
     stages[0].module = k.vs; stages[0].pName = "main";
     stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = k.fs; stages[1].pName = "main";
-    // World uber-FS variants (Inc 1): bake POM/SNOW/WET/IBL/DEBUG spec constants so the
-    // driver DCEs the unused features (and their VGPRs). Storage lives to the create call.
-    VkBool32                 specVals[5];
-    VkSpecializationMapEntry specEntries[5];
+    // No-z-write statics (atEqual/noZWrite): swap in the EARLY_ZTEST twin —
+    // matches the depth-state block below, which forces depthWrite off for
+    // exactly this condition (early tests + z-write would break AT discard).
+    const bool earlyZ = (k.atEqual || k.noZWrite) && !tess && !k.wmark && !k.emis;
+    stages[1].module = earlyZ ? EarlyTwin(k.fs) : k.fs;
+    stages[1].pName  = "main";
+    // World uber-FS variants (Inc 1): bake POM/SNOW/WET/IBL/DEBUG/FEEDBACK spec constants
+    // so the driver DCEs the unused features (and their VGPRs). Storage lives to the create call.
+    VkBool32                 specVals[6];
+    VkSpecializationMapEntry specEntries[6];
     VkSpecializationInfo     specInfo;
     BuildWorldSpecInfo(k.specMask, specVals, specEntries, specInfo);
     stages[1].pSpecializationInfo = &specInfo;
@@ -1078,6 +1116,21 @@ static VkPipeline CreatePipeline(const Key& k)
     ds.depthTestEnable  = k.depthTest ? VK_TRUE : VK_FALSE;
     ds.depthWriteEnable = (k.depthTest && !k.wmark) ? VK_TRUE : VK_FALSE;   // decals never write depth
     ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+    // AT statics (r_at_equal): the prepass depth IS this geometry's final depth,
+    // so EQUAL + no-write lets early-Z kill occluded AT layers and the front
+    // layer's transparent texels without invoking the FS. Depth equality holds
+    // because both VS paths compute gl_Position = mvp * vec4(pos, 1) from the
+    // same pushed matrix. Never combined with tess (re-rasterized with bias).
+    // Prepass-covered statics (earlyZ = same condition that bound the
+    // EARLY_ZTEST FS twin above — the twin is only legal WITHOUT depth writes):
+    // the prepass already wrote these items' final depth, so drop the redundant
+    // write. AT items additionally test EQUAL (r_at_equal) — the prepass depth
+    // IS the front opaque texel, so early-Z also kills the transparent texels
+    // and every occluded AT layer. Opaque keep LEQUAL (safe on prepass gaps).
+    if (earlyZ) {
+        ds.depthWriteEnable = VK_FALSE;
+        if (k.atEqual) ds.depthCompareOp = VK_COMPARE_OP_EQUAL;
+    }
     // Phase 4 wires up an actual depth attachment; right now no depth target
     // is bound at draw time so these flags only affect future passes.
 

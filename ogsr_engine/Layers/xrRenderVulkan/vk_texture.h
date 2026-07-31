@@ -112,6 +112,13 @@ public:
                  TexColorSpace colorSpace = TexColorSpace::Data);
 
     /**
+     * Declare that only this texture's ALPHA is ever sampled (height maps).
+     * Call BEFORE LoadDDS: it lets the loader drop the colour blocks and repack
+     * a BC3 source into half-size BC4, re-routing A<-R in the view. See m_AlphaOnly.
+     */
+    void SetAlphaOnly(bool v) { m_AlphaOnly = v; }
+
+    /**
      * Загрузить cubemap текстуру из DDS файла (6 faces)
      * @param filename Путь к файлу
      * @param applyBCSwizzle  R↔B swap on BC formats — see LoadDDS notes.
@@ -261,6 +268,20 @@ private:
     VkImageLayout   m_CurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool            m_bAlphaSwizzle = false; // For alpha-only textures (fonts): swizzle R→A, RGB→ONE
     bool            m_bBCSwizzle = false;    // For BC/DXT textures: swizzle R<->B for DirectX compatibility
+    // Channel fix-ups for textures we sample through ONE channel while the file
+    // stores four. Two cases, both repacked to single-channel BC4 on load (see
+    // TranscodeBC3AlphaToBC4) and re-routed here so no shader has to change:
+    //   HemiFromAlpha — CS/CoP hemi lightmap, repack skipped: broadcast A into RGB
+    //   HemiFromRed   — same lightmap after repack: broadcast R into RGB
+    //   AlphaFromRed  — height map (`<bump>#`, sampled as .a) after repack: A <- R
+    enum class ChanFix : u8 { None = 0, HemiFromAlpha, HemiFromRed, AlphaFromRed };
+    ChanFix         m_ChanFix = ChanFix::None;
+
+    // "Only this texture's ALPHA is ever sampled" — set by the caller before
+    // LoadDDS (height maps). Licenses the BC4 repack: the colour blocks are dead
+    // weight by construction, not by measurement. Kept as state so a streaming
+    // rebuild of the same source repacks identically.
+    bool            m_AlphaOnly = false;
 
     // Streaming metadata — populated by LoadDDS, consumed by the streamer.
     shared_str      m_SourceFile;            // resolved .dds path (for re-reading mips)

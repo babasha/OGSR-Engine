@@ -128,8 +128,18 @@ void DrawDepth(VkCommandBuffer cmd, const Fmatrix& viewProj, bool displaceTerrai
 // + per-material tail. INSIDE the color BeginRendering. `envSet` = EnvLight set.
 // useOcclusion=true draws the Hi-Z-culled set (CullColor's cmds2/counts2) instead
 // of the frustum set — the caller passes true only when CullColor ran this frame.
+// atEqual: AT groups draw with the depth-EQUAL/no-write pipeline variant
+// (r_at_equal) — pass true only when THIS view's depth prepass drew the AT set
+// (home pass); compose clones and other callers without a matching AT prepass
+// must pass false or their AT geometry early-Z's away entirely.
+// prepassZ: opaque groups drop the redundant depth write (r_z_prepass) so the
+// discard-bearing uber-FS keeps early-Z; same caller contract as atEqual.
+// fsFrame >= 0 arms the r_fsinv_split terrain/mesh attribution: query 1 brackets
+// the terrain groups (they sort first), query 2 the mesh groups; both always
+// begin+end so the frame's result batch stays readable.
 void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet,
-               bool useOcclusion = false);
+               bool useOcclusion = false, bool atEqual = false, bool prepassZ = false,
+               int fsFrame = -1);
 
 // Cluster-LOD debug overlay (r_cluster_debug): redraw the culled set colored by
 // cluster id — mode 1 = flat fill (UE-style cluster view), 2 = wireframe over

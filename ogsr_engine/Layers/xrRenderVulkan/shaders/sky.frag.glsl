@@ -31,16 +31,22 @@ layout(set = 0, binding = 1) uniform samplerCube uSky1;
 layout(set = 0, binding = 2) uniform sampler2D   uClouds0;  // scrolling cloud layer 0
 layout(set = 0, binding = 3) uniform sampler2D   uClouds1;  // scrolling cloud layer 1
 
-layout(push_constant) uniform PushConstants {
-    vec4 camRightTan_rot;   // .w = skyRotation
-    vec4 camUpTan_weight;   // .w = blendWeight
-    vec4 camForward_pad;    // .w = unused
-    vec4 skyColor_pad;      // .w = unused
-    vec4 sunDir_pad;        // xyz = sun TRAVEL dir (to-sun = -sunDir)
-    vec4 sunColor_pad;      // xyz = sun colour (env, time-of-day)
-    vec4 cloudsColor;       // rgb = clouds_color tint, w = clouds_color.w (intensity / weight)
-    vec4 cloudParams;       // x = scroll time (fTimeGlobal/10 * speed), y = enable 0/1, z = intensity, w = unused
-} pc;
+// Volumetric cloud noise volumes, baked once at init by vk_clouds.
+layout(set = 0, binding = 5) uniform sampler3D uCloudShape;    // 128^3: base form + Worley FBM
+layout(set = 0, binding = 6) uniform sampler3D uCloudDetail;   // 32^3: edge erosion
+layout(set = 0, binding = 7) uniform sampler2D uCloudWeather;  // 512^2: coverage / type / band
+
+// Cloud coverage counters (r_clouds_debug). Written only when debug is on; the CPU
+// reads them back and LOGS the result, because "look at the screen and describe it"
+// is a diagnostic the log cannot carry — and the log is how this project is debugged.
+layout(std430, set = 0, binding = 8) buffer CloudDebug {
+    uint skyPixels;     // pixels where the sky pass ran with the deck enabled
+    uint cloudPixels;   // ...of those, how many got any cloud at all
+    uint maxAlphaM;     // max coverage x1000
+    uint sumAlphaM;     // sum of coverage x1000 (mean over skyPixels)
+} dbg;
+
+#include "sky_ubo.glsl"
 
 layout(location = 0) in  vec3 vWorldDir;
 layout(location = 0) out vec4 outColor;
@@ -58,6 +64,9 @@ const vec2  WIND1 = vec2(0.92387953, 0.38268343);  // (sin67.5, cos67.5)
 // with ibl_prefilter.comp, which must reproduce this exact mapping to build a
 // world-space light probe (see the header for why).
 #include "sky_halfcube.glsl"
+#include "atmosphere.glsl"     // procedural Rayleigh+Mie sky (r_sky_proc)
+#include "noise_common.glsl"   // nc_remap for the cloud model
+#include "clouds.glsl"         // volumetric cloud deck + cirrus (r_clouds_vol)
 
 void main()
 {
@@ -65,44 +74,68 @@ void main()
 
     // R4 rotates the skybox geometry by sky_rotation; sampling at R(-θ)*d
     // lands on the same texel that geometry would expose to the view ray.
-    float skyRot = pc.camRightTan_rot.w;
+    float skyRot = S.camRightTan_rot.w;
     vec3 dirRot = SkyUnrotate(dir, skyRot);
 
     vec3 sampleDir = SampleDirHalfCube(dirRot);
 
-    vec4 c0 = texture(uSky0, sampleDir);
-    vec4 c1 = texture(uSky1, sampleDir);
-    vec3 col = mix(c0.rgb, c1.rgb, clamp(pc.camUpTan_weight.w, 0.0, 1.0));
-
-    // skybox.vs in R4 pre-scales the per-vertex tint by 1.7 ("pre-scale by
-    // tonemap"). We do the same here so brightness matches R4 output.
-    vec3 tint = pc.skyColor_pad.xyz * 1.7;
-
-    // Sun disk + aureole — additive over the sky, gated above the horizon. The
-    // bright HDR core blooms (bloom pass) into a glow; the wide power terms give
-    // the soft atmospheric halo around it. sunColor is the time-of-day env colour
-    // (warm at dawn/dusk). Compared in UNROTATED world space (skyRot is cube-only).
-    vec3  toSun = normalize(-pc.sunDir_pad.xyz);
+    // Compared in UNROTATED world space (skyRot is a cube-authoring thing).
+    vec3  toSun = normalize(-S.sunDir_pad.xyz);
     float cosA  = dot(dir, toSun);
-    float above = smoothstep(-0.08, 0.02, toSun.y);              // fade out below horizon
-    float disk  = smoothstep(0.9993, 0.9997, cosA);             // sharp core (~1° radius)
-    float halo  = pow(max(cosA, 0.0), 350.0) * 0.35
-                + pow(max(cosA, 0.0),  40.0) * 0.05;            // aureole
-    vec3  sun   = pc.sunColor_pad.xyz * ((disk * 12.0 + halo) * above);
 
-    vec3 outc = col * tint + sun;
+    vec3 outc;
+    if (S.atmoParams.x > 0.5) {
+        // ── PROCEDURAL SKY (r_sky_proc) ──────────────────────────────────────
+        // Radiance from geometry + physics, NOT from the weather config's colours.
+        // That is the whole point: at dusk the config hands us neutral grey and a
+        // zeroed sun, so anything derived from it is grey. This is derived from the
+        // sun's ELEVATION, which the config does get right.
+        outc = AtmosphereRadiance(dir, toSun, S.atmoParams.y, S.atmoParams.w,
+                                  S.atmoParams.z, 0.0);
+
+        // The sun's own disk, coloured by how much atmosphere its light crossed —
+        // this is what turns it red as it sets, with no authored colour involved.
+        vec3  sunCol = SunTransmittance(toSun, S.atmoParams.z, 0.0);
+        float disk   = smoothstep(0.9993, 0.9997, cosA);
+        outc += sunCol * (disk * 12.0 * S.atmoParams.y);
+        // No separate halo term here: the Mie lobe in AtmosphereRadiance already
+        // produces the aureole, physically, and adding the old ad-hoc one on top
+        // would double it.
+    } else {
+        // ── LEGACY CUBEMAP SKY (A/B path) ────────────────────────────────────
+        vec4 c0 = texture(uSky0, sampleDir);
+        vec4 c1 = texture(uSky1, sampleDir);
+        vec3 col = mix(c0.rgb, c1.rgb, clamp(S.camUpTan_weight.w, 0.0, 1.0));
+
+        // skybox.vs in R4 pre-scales the per-vertex tint by 1.7 ("pre-scale by
+        // tonemap"). We do the same here so brightness matches R4 output.
+        vec3 tint = S.skyColor_pad.xyz * 1.7;
+
+        // Sun disk + aureole — additive, gated above the horizon. sunColor is the
+        // time-of-day env colour (which measures ~0 at dusk, hence this whole arc).
+        float above = smoothstep(-0.08, 0.02, toSun.y);
+        float disk  = smoothstep(0.9993, 0.9997, cosA);          // sharp core (~1° radius)
+        float halo  = pow(max(cosA, 0.0), 350.0) * 0.35
+                    + pow(max(cosA, 0.0),  40.0) * 0.05;         // aureole
+        outc = col * tint + S.sunColor_pad.xyz * ((disk * 12.0 + halo) * above);
+    }
 
     // --- Animated clouds (R4 RenderClouds port) -----------------------------
     // Gate: r_clouds cvar (cloudParams.y) AND clouds_color.w > 0 (R4 skips the
     // pass when the weather's cloud weight is ~0 — e.g. clear night).
-    if (pc.cloudParams.y > 0.5 && pc.cloudsColor.w > 0.001 && dirRot.y > 0.0) {
+    // Skipped entirely when the volumetric deck is on — ONE kind of cloud, never two
+    // (the decision that was settled when this was first planned). The painted clouds
+    // in the weather cube need no suppression here: the procedural sky never samples
+    // that cube at all.
+    if (S.shape.x <= 0.001
+        && S.cloudParams.y > 0.5 && S.cloudsColor.w > 0.001 && dirRot.y > 0.0) {
         // Project the view ray onto R4's flattened cloud dome. The dome is a
         // unit hemisphere scaled (10, 0.4, 10); clouds.vs tiles by the OBJECT-
         // space position p.xz and fades by pow(p.y, 25). Undo the scale to get
         // p from the world ray: p = normalize(S^-1 * dirRot), S^-1 = (0.1,2.5,0.1).
         vec3 p = normalize(vec3(dirRot.x * 0.1, dirRot.y * 2.5, dirRot.z * 0.1));
 
-        float t = pc.cloudParams.x;                              // fTimeGlobal/10 * speed
+        float t = S.cloudParams.x;                              // fTimeGlobal/10 * speed
         vec2 tc0 = p.xz * CLOUD_TILE0 + WIND0 * t * CLOUD_SPEED0;
         vec2 tc1 = p.xz * CLOUD_TILE1 + WIND1 * t * CLOUD_SPEED1;
 
@@ -116,10 +149,48 @@ void main()
         // alpha composite over the sky (additive-of-rgb was wrong → invisible
         // clouds; the visible ones were baked into the day cubemap).
         float fade   = pow(clamp(p.y, 0.0, 1.0), 25.0);
-        vec3  cloudRGB = pc.cloudsColor.rgb * (s0.rgb + s1.rgb);
-        float cloudA   = clamp(pc.cloudsColor.w * fade * (s0.a + s1.a)
-                             * pc.cloudParams.z, 0.0, 1.0);
+        vec3  cloudRGB = S.cloudsColor.rgb * (s0.rgb + s1.rgb);
+        float cloudA   = clamp(S.cloudsColor.w * fade * (s0.a + s1.a)
+                             * S.cloudParams.z, 0.0, 1.0);
         outc = mix(outc, cloudRGB, cloudA);
+    }
+
+    // --- Volumetric clouds (r_clouds_vol) -----------------------------------
+    // Composited far-to-near: cirrus sits above the deck, so the deck goes over the
+    // sky first and the cirrus over both.
+    if (S.shape.x > 0.001) {
+        // Per-pixel march offset. A fixed start plane prints concentric rings across
+        // the whole sky (the classic raymarch banding); an interleaved-gradient
+        // dither turns those rings into noise the eye reads as cloud grain.
+        float dith = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+
+        vec4 cir = CloudsCirrus(dir, toSun, dith);
+        vec4 dek = CloudsRaymarch(dir, toSun, S.camForward_alt.w, dith);
+
+        // r_clouds_debug: show the marched COVERAGE directly, unlit. This answers the
+        // only question that matters when the sky looks unchanged — is there any
+        // density at all, or is the model producing nothing? 1 = raw alpha,
+        // 2 = alpha x20 (catches a deck that exists but is far too thin to see).
+        if (S.shape.w > 0.5) {
+            // Sample SPARSELY (1 pixel in 64). Four atomics per pixel from ~4M
+            // invocations all target the same four addresses — that is total
+            // serialisation on one cache line and was itself a large part of the
+            // slowdown. An 8x8 stride keeps the statistics just as meaningful.
+            ivec2 px = ivec2(gl_FragCoord.xy);
+            if (((px.x | px.y) & 7) == 0) {
+                float a = clamp(dek.a, 0.0, 1.0);
+                atomicAdd(dbg.skyPixels, 1u);
+                if (a > 0.01) atomicAdd(dbg.cloudPixels, 1u);
+                atomicMax(dbg.maxAlphaM, uint(a * 1000.0));
+                atomicAdd(dbg.sumAlphaM, uint(a * 1000.0));
+            }
+            float a = (S.shape.w > 1.5) ? min(dek.a * 20.0, 1.0) : dek.a;
+            outColor = vec4(vec3(a), 1.0);
+            return;
+        }
+
+        outc = mix(outc, dek.rgb / max(dek.a, 1e-4), dek.a);
+        outc = mix(outc, cir.rgb, cir.a * (1.0 - dek.a * 0.85));
     }
 
     outColor = vec4(outc, 1.0);

@@ -33,7 +33,9 @@ layout(set = 0, binding = 6) uniform Resolve {
     vec4 curCamPos;      // xyz = this frame camera (stored as G for next frame); w = history weight on dyn-shadowed pixels (r_vsm_ta_blend_dyn)
     vec4 screen;         // xy = pixel dims, zw = 1/dims
     vec4 params;         // x = history weight (alpha), y = reject tolerance, z = historyValid, w = dyn-gate (1 = skip dyn pages with no casters, r_vsm_dyn_gate)
-    vec4 params2;        // x = clamp tol (neighbourhood clamp, r_vsm_ta_clamp), y = motion ref px (r_vsm_ta_motion), z = motion-floor weight (r_vsm_ta_motion_floor), w = unused
+    vec4 params2;        // x = clamp tol (neighbourhood clamp, r_vsm_ta_clamp), y = motion ref px (r_vsm_ta_motion), z = motion-floor weight (r_vsm_ta_motion_floor), w = slope-bias min (r_vsm_bias_min, normalized; 0 = legacy constant bias)
+    vec4 params3;        // SOFT SHADOWS: x = filter taps (0 = legacy 3x3 PCF), y = blocker-search taps, z = tan(sun cone half-angle), w = max blocker search distance (m)
+    vec4 params4;        // x = per-frame noise phase (decorrelates the stochastic discs so the EMA averages them), yzw = reserved
 } R;
 
 // VSM atlas sample (3x3 PCF) — mirrors the page mapping vsm_page.vert rasterized with.
@@ -50,11 +52,26 @@ layout(set = 0, binding = 6) uniform Resolve {
 // projecting onto the canopy); grass now samples the atlases DIRECTLY at its own
 // world pos (vsm_sample VSM_GRASS_DIRECT), so B survives only as a diagnostic
 // (r_grass_debug 3 comparison view) — nearly free: same taps, one extra compare.
-float sampleVSM(vec3 wp, out float dynOcc, out float dynHit, out float statLit)
+// nrm/tanT = the receiver plane's depth-reconstructed normal and its slope vs the
+// sun ray, from main(). r_vsm_bias_min > 0 enables the modern bias scheme:
+//   NORMAL OFFSET — shift the sample point off the surface by ~2 texels along the
+//   normal: the acne band (PCF footprint + bilinear + sub-texel jitter) is cleared
+//   POSITIONALLY, so the depth bias can stay a small constant (write-side raster
+//   bias + D16 quantization) instead of a slope-ballooned slack. The legacy flat
+//   0.6 m — and even the round-1 slope-scaled bias with its 0.6 m cap — let sun
+//   punch through everything thinner than the slack (plank walls, roofs, corners).
+//   The remaining slope term is capped LOW (0.15 m): grazing acne rides the offset.
+float sampleVSM(vec3 wp, vec3 nrm, float tanT, out float dynOcc, out float dynHit, out float statLit)
 {
     dynOcc = 0.0;
     dynHit = 0.0;
     statLit = 1.0;
+    if (R.params2.w > 0.0 && dot(nrm, nrm) > 0.5) {
+        vec3 lp0 = (vsmC.view * vec4(wp, 1.0)).xyz;
+        vec2 uv0; ivec2 pg0;
+        int L0 = vsmSelect(lp0.xy, vsmC.level, uv0, pg0);
+        if (L0 >= 0) wp += nrm * (2.0 * vsmC.level[L0].z * (1.0 / 4096.0));
+    }
     vec3 lp = (vsmC.view * vec4(wp, 1.0)).xyz;
     vec2 luv; ivec2 page;
     int  L = vsmSelect(lp.xy, vsmC.level, luv, page);
@@ -90,7 +107,16 @@ float sampleVSM(vec3 wp, out float dynOcc, out float dynHit, out float statLit)
     vec2  baseS = vec2(float(slotS % uint(VSM_ATLAS_W_S)), float(slotS / uint(VSM_ATLAS_W_S)));
     vec2  baseD = vec2(float(slotD % uint(VSM_ATLAS_W)),   float(slotD / uint(VSM_ATLAS_W)));
     float zHere = (lp.z - vsmC.zparams.x) * vsmC.zparams.y;
-    float bias  = vsmC.zparams.z;   // STATIC-atlas receiver bias (terrain self-shadow acne)
+    float bias  = vsmC.zparams.z;   // legacy flat receiver bias (r_vsm_bias_min 0 path)
+    if (R.params2.w > 0.0) {
+        // Small constant (r_vsm_bias_min ≈ raster write bias + D16 quantization) +
+        // a slope term for the PCF footprint, capped at 0.15 m — the normal offset
+        // above carries the grazing-angle acne, a big depth slack only re-opens
+        // the thin-wall light leaks this scheme exists to close.
+        float texelW = vsmC.level[L].z * (1.0 / 4096.0);          // VSM_VIRTUAL_RES
+        float slopeN = 2.2 * texelW * tanT * vsmC.zparams.y;      // metres -> normalized z
+        bias = R.params2.w + min(slopeN, 0.15 * vsmC.zparams.y);
+    }
     float biasD = vsmC.zparams.w;   // DYNAMIC-atlas receiver bias (tiny: no ground in that atlas)
     const vec2 dimS = vec2(float(VSM_ATLAS_W_S), float(VSM_ATLAS_H_S));   // static atlas (6144)
     const vec2 dimD = vec2(float(VSM_ATLAS_W),   float(VSM_ATLAS_H));     // dynamic atlas (2048)
@@ -141,6 +167,207 @@ float sampleVSM(vec3 wp, out float dynOcc, out float dynHit, out float statLit)
     return lit * (1.0 / 9.0);
 }
 
+// ===========================================================================
+// SOFT SHADOWS — stochastic PCSS over the VSM atlases (r_vsm_soft > 0).
+//
+// The 3x3 PCF above blurs by a FIXED texel radius: a post's shadow at its own
+// base is exactly as soft as a crown's from 15 m up. This path gives the real
+// thing — contact-hard, distance-soft — in two stochastic passes:
+//   (1) BLOCKER SEARCH: taps in a disc of radius tan(theta)*range around the
+//       receiver; every tap nearer the light than the receiver is a blocker.
+//       Their average depth gives the blocker distance D.
+//   (2) FILTER: taps in a disc of radius w = tan(theta)*D — the geometric
+//       penumbra cast by a source of angular radius theta. D small (contact)
+//       collapses w to one texel = hard edge; D large (canopy) = wide and soft.
+// Both discs are VOGEL spirals rotated by a per-pixel + per-frame hash, so the
+// sampling error is NOISE, not banding — and noise is precisely what the
+// temporal resolve below already exists to eat (clipmap jitter + EMA +
+// neighbourhood clamp). Owning that denoiser is why stochastic beats a regular
+// grid here; a fixed kernel would have to pay every tap every frame.
+//
+// Deliberately NOT a depth-march (UE5's SMRT): "first sample behind the depth
+// surface" can never un-occlude a ray that started inside the shadow volume, so
+// the umbra GROWS outward instead of the edge softening about the geometric
+// boundary. That is invisible at the sun's true 0.53 deg, but this engine
+// exposes an exaggerated cinematic angle, where one-sided penumbra reads as
+// fat, bloated shadows. PCSS is symmetric at any angle.
+// ===========================================================================
+const vec2  kDimS  = vec2(float(VSM_ATLAS_W_S), float(VSM_ATLAS_H_S));   // static atlas, pages
+const vec2  kDimD  = vec2(float(VSM_ATLAS_W),   float(VSM_ATLAS_H));     // dynamic atlas, pages
+const float kInset = 0.5 / float(VSM_PAGE_SIZE);                         // half a texel, page-local
+const float kMaxNormalOffset = 0.25;                                     // m — cap on the filter-scaled normal lift (peter-panning)
+
+// Vogel disc: i-th of n points on a golden-angle spiral, rotated by phi. Even
+// coverage at ANY n (no power-of-two requirement) for one sin/cos per tap.
+vec2 vsmVogel(int i, int n, float phi)
+{
+    float r = sqrt((float(i) + 0.5) / float(n));
+    float a = float(i) * 2.39996323 + phi;
+    return r * vec2(cos(a), sin(a));
+}
+
+// Interleaved gradient noise (Jimenez) — the cheap blue-ish per-pixel hash that
+// temporal filters resolve well. The frame phase rotates it over time so the
+// EMA averages DIFFERENT taps each frame instead of baking one pattern in.
+float vsmIGN(vec2 px, float phase)
+{
+    return fract(52.9829189 * fract(dot(px + 5.588238 * phase, vec2(0.06711056, 0.00583715))));
+}
+
+// Page-table lookup at a FIXED clipmap level for arbitrary light-space XY (the
+// filter disc walks across page boundaries). The level stays the receiver's:
+// changing it mid-filter would mix texel scales inside one estimate. A tap on
+// an unmapped page is DROPPED by the caller rather than counted lit — dropping
+// keeps the ratio unbiased, counting would punch holes in the shadow.
+bool vsmPageAt(vec2 lxy, int L, out vec2 pl, out uint slotS, out uint slotD)
+{
+    pl = vec2(0.0); slotS = VSM_UNMAPPED; slotD = VSM_UNMAPPED;
+    vec2 t = (lxy - vsmC.level[L].xy) / vsmC.level[L].z;
+    if (any(lessThan(t, vec2(0.0))) || any(greaterThanEqual(t, vec2(1.0)))) return false;
+    ivec2 pg  = ivec2(floor(t * float(VSM_PAGES_AXIS)));
+    int   idx = vsmPageIndex(L, pg);
+    slotS = vsmPageTable[idx];
+    slotD = vsmPageTableDyn[idx];
+    pl    = clamp(t * float(VSM_PAGES_AXIS) - vec2(pg), vec2(kInset), vec2(1.0 - kInset));
+    return slotS < uint(VSM_MAX_PHYS_S);
+}
+
+float vsmDepthS(uint slot, vec2 pl)
+{
+    vec2 base = vec2(float(slot % uint(VSM_ATLAS_W_S)), float(slot / uint(VSM_ATLAS_W_S)));
+    return texture(uAtlas, (base + pl) / kDimS).r;
+}
+float vsmDepthD(uint slot, vec2 pl)
+{
+    vec2 base = vec2(float(slot % uint(VSM_ATLAS_W)), float(slot / uint(VSM_ATLAS_W)));
+    return texture(uAtlasDyn, (base + pl) / kDimD).r;
+}
+
+// Stochastic PCSS. Same contract as sampleVSM (1 = lit .. 0 = shadowed) so main()
+// treats the two paths identically. `rnd` = (disc rotation, unused) from the
+// per-pixel/per-frame hash.
+float sampleVSMSoft(vec3 wp, vec3 nrm, float tanT, float rot,
+                    out float dynOcc, out float dynHit, out float statLit)
+{
+    dynOcc = 0.0; dynHit = 0.0; statLit = 1.0;
+    bool haveN = dot(nrm, nrm) > 0.5;
+
+    vec3 lp = (vsmC.view * vec4(wp, 1.0)).xyz;
+    vec2 uv0; ivec2 pg0;
+    int  L = vsmSelect(lp.xy, vsmC.level, uv0, pg0);
+    if (L < 0) return 1.0;
+    // Walk COARSER until the STATIC page is mapped — same policy as the PCF path
+    // (throttle LOD bias / deferred scroll-in leave finer pages unmapped).
+    for (; L < VSM_LEVELS; ++L) {
+        vec2 t = (lp.xy - vsmC.level[L].xy) / vsmC.level[L].z;
+        if (any(lessThan(t, vec2(0.0))) || any(greaterThanEqual(t, vec2(1.0)))) continue;
+        ivec2 pg = ivec2(floor(t * float(VSM_PAGES_AXIS)));
+        if (vsmPageTable[vsmPageIndex(L, pg)] < uint(VSM_MAX_PHYS_S)) break;
+    }
+    if (L >= VSM_LEVELS) return 1.0;
+
+    float texelW = vsmC.level[L].z / float(VSM_VIRTUAL_RES);   // metres per virtual texel at L
+    float zScale = vsmC.zparams.y;                             // metres -> normalized depth
+    float tanS   = R.params3.z;                                // tan(sun cone half-angle)
+    float rMax   = max(tanS * R.params3.w, 2.0 * texelW);      // blocker-search radius, light-space m
+
+    // Does this page hold any DYNAMIC caster at all? Decided ONCE at the receiver
+    // (the same call the dyn-gate makes for the PCF path): the filter disc is
+    // small, and re-testing per tap would double the storage traffic of both
+    // passes for a flag that is uniform across a page in all but edge cases.
+    vec2 plC; uint slotSC, slotDC;
+    vsmPageAt(lp.xy, L, plC, slotSC, slotDC);
+    bool resD = slotDC < uint(VSM_MAX_PHYS);
+    bool useD = resD && (R.params.w < 0.5 || vsmDynUsed[slotDC] != 0u);
+    bool dbgD = resD && (R.prevCamPos.w > 0.5);
+
+    // ---- PASS 1: blocker search.
+    // Lift off the surface by 2 texels along the normal (the PCF path's scheme):
+    // clears the acne band POSITIONALLY so the depth bias can stay small. The
+    // per-tap slope term below then only has to cover the tap's own lateral
+    // offset on the receiver plane.
+    vec3 wpS = haveN ? wp + nrm * (2.0 * texelW) : wp;
+    vec3 lpS = (vsmC.view * vec4(wpS, 1.0)).xyz;
+    float zS = (lpS.z - vsmC.zparams.x) * zScale;
+    float biasC = (R.params2.w > 0.0) ? R.params2.w : vsmC.zparams.z;   // constant part
+    float biasD = vsmC.zparams.w;                                       // dyn atlas: casters only, tiny epsilon
+
+    int   ns   = max(int(R.params3.y), 1);
+    float sumD = 0.0, cntD = 0.0;
+    for (int i = 0; i < ns; ++i) {
+        // Tap 0 sits AT the receiver so a contact blocker can never be missed by
+        // the stochastic offsets — that tap alone reproduces the classic test.
+        vec2 off = (i == 0) ? vec2(0.0) : vsmVogel(i, ns, rot * 6.2831853) * rMax;
+        vec2 pl; uint sS, sD;
+        if (!vsmPageAt(lpS.xy + off, L, pl, sS, sD)) continue;
+        float r     = length(off);
+        float slope = min(r * tanT * zScale, 0.15 * zScale);   // low cap: the normal lift carries grazing acne
+        // Each atlas keeps its OWN bias (the static one holds the receiving
+        // ground and must absorb its self-shadow acne; the dynamic one holds
+        // casters only) — so they are tested separately, then the NEARER
+        // confirmed blocker of the two sizes the penumbra.
+        float dBest = 2.0;
+        float dS = vsmDepthS(sS, pl);
+        if (dS < zS - (biasC + slope)) dBest = dS;
+        if (useD && sD < uint(VSM_MAX_PHYS)) {
+            float dD = vsmDepthD(sD, pl);
+            if (dD < zS - biasD) dBest = min(dBest, dD);
+        }
+        if (dBest < 1.5) { sumD += dBest; cntD += 1.0; }
+    }
+
+    // Penumbra radius from the AVERAGE blocker distance. No blocker found at all
+    // => fully lit, and both output channels follow (no filter pass to run).
+    if (cntD < 0.5) { statLit = 1.0; return 1.0; }
+    float distB = max(zS - sumD / cntD, 0.0) / max(zScale, 1e-9);   // normalized -> metres
+    float w     = clamp(tanS * distB, 0.75 * texelW, rMax);
+
+    // ---- PASS 2: filter over a disc of radius w.
+    // The normal lift now scales with the FILTER footprint (a wide kernel reaches
+    // further down the receiver plane, so it needs a proportionally bigger lift),
+    // capped so the shadow cannot visibly detach from its caster.
+    vec3 wpF = haveN ? wp + nrm * min(max(w, 2.0 * texelW), kMaxNormalOffset) : wp;
+    vec3 lpF = (vsmC.view * vec4(wpF, 1.0)).xyz;
+    float zF = (lpF.z - vsmC.zparams.x) * zScale;
+
+    int   nf = max(int(R.params3.x), 1);
+    float lit = 0.0, litS = 0.0, taken = 0.0, hitD = 0.0, occDbg = 0.0;
+    // Offset the filter rotation from the search rotation: reusing one angle
+    // would line the two discs up and correlate the estimate with its own input.
+    float rotF = rot * 6.2831853 + 1.61803399;
+    for (int i = 0; i < nf; ++i) {
+        vec2 off = vsmVogel(i, nf, rotF) * w;
+        vec2 pl; uint sS, sD;
+        if (!vsmPageAt(lpF.xy + off, L, pl, sS, sD)) continue;
+        taken += 1.0;
+        float r     = length(off);
+        float slope = min(r * tanT * zScale, 0.15 * zScale);
+        float bias  = biasC + slope;
+        float occS  = vsmDepthS(sS, pl);
+        bool  shS   = (zF - bias > occS);
+        bool  sh    = shS;
+        if ((useD || dbgD) && sD < uint(VSM_MAX_PHYS)) {
+            float d = vsmDepthD(sD, pl);
+            if (useD && (zF - biasD > d)) { sh = true; hitD += 1.0; }
+            // Debug overlay modes — same meanings as the PCF path (see sampleVSM):
+            // 1 = only the darkening the dyn atlas actually adds, 2 = raw dyn
+            // occlusion, 3 = any caster DEPTH present at this texel.
+            if (dbgD) {
+                if (R.prevCamPos.w > 2.5) { if (d < 0.999) occDbg += 1.0; }
+                else if ((R.prevCamPos.w > 1.5 || !shS) && (zF - biasD > d)) occDbg += 1.0;
+            }
+        }
+        lit  += sh  ? 0.0 : 1.0;
+        litS += shS ? 0.0 : 1.0;
+    }
+    if (taken < 0.5) return 1.0;   // whole disc landed on unmapped pages
+    float inv = 1.0 / taken;
+    dynHit  = hitD   * inv;
+    dynOcc  = occDbg * inv;
+    statLit = litS   * inv;
+    return lit * inv;
+}
+
 // Reconstruct world from the prepass depth (D3D NDC, y-up — matches vsm_mark.comp / ssao.frag).
 vec3 reconWorld(vec2 uv)
 {
@@ -163,8 +390,40 @@ void main()
     vec4 world = R.invViewProj * clip;
     vec3 wp    = world.xyz / world.w;
 
+    // Receiver slope vs the sun ray for the slope-scaled bias. Normal from depth via
+    // central-min differences: at a silhouette the one-sided difference jumps across
+    // the depth gap and fabricates a near-grazing plane → pick the smaller-step side
+    // (both sides discontinuous is a 1px sliver; the tan clamp bounds the damage).
+    float tanT = 0.0;
+    vec3  nrm  = vec3(0.0);
+    bool  softOn = R.params3.x >= 1.0;            // r_vsm_soft: stochastic PCSS instead of 3x3 PCF
+    if (R.params2.w > 0.0 || softOn) {            // the soft path needs the plane too (normal lift + per-tap slope bias)
+        vec3 wxp = reconWorld(uv + vec2(R.screen.z, 0.0)), wxn = reconWorld(uv - vec2(R.screen.z, 0.0));
+        vec3 wyp = reconWorld(uv + vec2(0.0, R.screen.w)), wyn = reconWorld(uv - vec2(0.0, R.screen.w));
+        vec3 dx = (dot(wxp - wp, wxp - wp) < dot(wp - wxn, wp - wxn)) ? wxp - wp : wp - wxn;
+        vec3 dy = (dot(wyp - wp, wyp - wp) < dot(wp - wyn, wp - wyn)) ? wyp - wp : wp - wyn;
+        vec3 n  = cross(dx, dy);
+        float nl = length(n);
+        if (nl > 1e-8) {
+            nrm = n / nl;
+            // Orient off the surface toward the CAMERA (the reconstructed winding is
+            // arbitrary): the offset must lift the sample into open air, not sink it.
+            if (dot(nrm, R.curCamPos.xyz - wp) < 0.0) nrm = -nrm;
+            vec3 sunTravel = normalize(vec3(vsmC.view[0].z, vsmC.view[1].z, vsmC.view[2].z));
+            float c = abs(dot(nrm, sunTravel));
+            tanT = min(sqrt(max(1.0 - c * c, 0.0)) / max(c, 0.05), 12.0);
+        } else {
+            tanT = 12.0;   // degenerate plane → max (capped) slope slack, no offset
+        }
+    }
+
     float dynOcc, dynHit, statLit;
-    float cur  = sampleVSM(wp, dynOcc, dynHit, statLit);
+    // Per-pixel + per-frame disc rotation. Both stochastic discs derive from this
+    // one hash, so a pixel's search and filter stay coherent within a frame and
+    // decorrelate across frames — which is what lets the EMA below average them.
+    float rot  = vsmIGN(vec2(px), R.params4.x);
+    float cur  = softOn ? sampleVSMSoft(wp, nrm, tanT, rot, dynOcc, dynHit, statLit)
+                        : sampleVSM(wp, nrm, tanT, dynOcc, dynHit, statLit);
 
     // Debug refinement: a surface FACING AWAY from the sun gets no direct light — a dyn
     // shadow there changes nothing on screen (e.g. a ceiling under a roof hole crossed by
@@ -226,7 +485,12 @@ void main()
     // B = STATIC-only visibility — diagnostic channel (r_grass_debug 3; grass shading
     // now samples the atlases directly, see sampleVSM's statLit note). Raw, no EMA.
     // Under r_vsm_debug_dyn the debug dynOcc takes the channel over (the red overlay).
+    // Mode 4 = SUN-VISIBILITY forensics: B carries the final resolved lit factor —
+    // the tonemap's red overlay then marks every pixel the shadow system deems
+    // SUN-LIT (leak triage: bright wall patch + red = shadow leak; + no red = the
+    // light is NOT the sun term — ambient/hemi hunt instead).
     // A = this frame's dynHit (next frame's trailing-edge EMA cut).
-    float bOut = (R.prevCamPos.w > 0.5) ? dynOcc : statLit;
+    float bOut = (R.prevCamPos.w > 3.5) ? outShadow
+               : (R.prevCamPos.w > 0.5) ? dynOcc : statLit;
     imageStore(uOut, px, vec4(outShadow, dist, bOut, dynHit));
 }

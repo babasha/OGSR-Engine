@@ -14,6 +14,7 @@ layout(location = 2) in vec3  tBakedColor[];
 layout(location = 3) in float tSunMask[];
 layout(location = 4) in vec3  tWorldPos[];
 layout(location = 5) in vec3  tNormal[];
+layout(location = 7) in float tBakedHemi[];
 
 layout(location = 8)  patch in vec3 pnB210;
 layout(location = 9)  patch in vec3 pnB120;
@@ -32,6 +33,7 @@ layout(location = 2) out vec3  vBakedColor;
 layout(location = 3) out float vSunMask;
 layout(location = 4) out vec3  vWorldPos;
 layout(location = 5) out vec3  vNormal;
+layout(location = 7) out float vBakedHemi;
 
 layout(push_constant) uniform PushConstants {
     mat4  mvp;
@@ -62,6 +64,7 @@ void main()
     vDetailUV   = tDetailUV[0]   * uvw.x + tDetailUV[1]   * uvw.y + tDetailUV[2]   * uvw.z;
     vBakedColor = tBakedColor[0] * uvw.x + tBakedColor[1] * uvw.y + tBakedColor[2] * uvw.z;
     vSunMask    = tSunMask[0]    * uvw.x + tSunMask[1]    * uvw.y + tSunMask[2]    * uvw.z;
+    vBakedHemi  = tBakedHemi[0]  * uvw.x + tBakedHemi[1]  * uvw.y + tBakedHemi[2]  * uvw.z;
     vec3 wpLinear = tWorldPos[0] * uvw.x + tWorldPos[1] * uvw.y + tWorldPos[2] * uvw.z;
     vec3 N      = normalize(tNormal[0] * uvw.x + tNormal[1] * uvw.y + tNormal[2] * uvw.z);
     vNormal     = N;   // shading normal stays linear (R4 parity)

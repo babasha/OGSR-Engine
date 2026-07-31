@@ -3,6 +3,11 @@
 // per-vertex into a D3DCOLOR at offset 24 (tcOffset == 28 sub-layout). COLOR.bgr =
 // baked RGB lighting (point lights + bounce); COLOR.a = sun mask.
 //
+// The baked SKY ACCESS (hemi) is NOT in that colour - it rides in the alpha of the
+// packed NORMAL: `float4 Nh : NORMAL; // (nx,ny,nz,hemi occlusion)` (X-Ray
+// common_iostructs.h, v_static_color), which deffer_base_flat.ps reads back as
+// `h = I.position.w` for exactly this geometry. vBakedHemi carries it to the FS.
+//
 // NOTE: snow VOLUME is NOT applied here (see world_lmap.vert) - vertex displacement
 // detaches mixed-normal static geometry. Props get snow via the fragment only.
 
@@ -31,6 +36,7 @@ layout(location = 2) out vec3 vBakedColor;   // RGB lighting (BGR->RGB swizzle)
 layout(location = 3) out float vSunMask;
 layout(location = 4) out vec3 vWorldPos;     // statics are world-space (identity model)
 layout(location = 5) out vec3 vNormal;       // world-space normal (dynamic lights)
+layout(location = 7) out float vBakedHemi;   // NORMAL.a = baked sky access (see header)
 
 #ifdef CLUSTER_FADE
 layout(location = 6) flat out uint vFadeBits;   // cull-packed LOD fades (via firstInstance -> gl_InstanceIndex)
@@ -79,4 +85,5 @@ void main()
     // D3DCOLOR memory order is BGRA; swizzle .bgr to recover real RGB.
     vBakedColor = inColor.bgr;
     vSunMask    = inColor.a;
+    vBakedHemi  = inNormal.a;   // hemi rides in the normal's alpha, not in the colour
 }

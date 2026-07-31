@@ -9,9 +9,22 @@
 #include "light_shade.glsl"      // lightTerrainOcc/shadeDynLight/dynLights
 #include "flow_sim_sample.glsl"  // simWater*/simFlow/groundHm/waterDebugColor/flowWaves
 #include "wetness.glsl"          // applyWetness (lmap/vlit) + applyWetnessCore
+#include "bump_common.glsl"      // uTexBumpN (set 0 b4): material normal + gloss
 #include "surface_field.glsl"    // SF_* (smart heightmap; r_sf_debug viz)
 #include "surface_class.glsl"    // SC_* surface classification (r_sf_debug 5)
 #include "tex_feedback.glsl"     // txfbReport — texture-streaming GPU feedback (set 1 b30)
+
+// EARLY_ZTEST twin (glslc -DEARLY_ZTEST → *_earlyz.frag.spv): force the depth
+// test BEFORE this shader runs. The txfbReport atomic is an FS side effect, and
+// without this the driver must LATE-Z the draw (6-8x invocations vs visible,
+// Кордон 23-07-2026). With it, occluded fragments never execute — feedback
+// stays per-frame at zero occluded cost. ONLY legal on pipelines that don't
+// write depth (early tests would write before the AT discard) — the pipeline
+// cache binds this twin exactly for the no-z-write statics variants
+// (Key::noZWrite / Key::atEqual, see EarlyTwin in vk_pipeline_cache.cpp).
+#ifdef EARLY_ZTEST
+layout(early_fragment_tests) in;
+#endif
 
 // World pass - lmap variant. Final colour = albedo x baked lightmap (hemi/AO) +
 // dynamic R4-style sun (per-pixel N.L x shadow map) + env hemisphere sky fill +
@@ -196,10 +209,21 @@ void main()
     // SPEC_POM: true only for materials with a real `#` height (mat->tessellated).
     // Flat materials bake the false variant → the whole parallaxUV call and its VGPR
     // footprint vanish (same result the runtime flat-probe gave, off the register budget).
-    vec3 pomN = normalize(vNormal); float pomShadow = 1.0, pomAO = 1.0;
+    // Shading normal, flipped toward the VIEWER when it points away: X-Ray statics
+    // include one-sided zero-thickness sheets rendered two-sided (village plank
+    // walls) — seen from behind, the vertex normal points THROUGH the sheet toward
+    // the sun, so the interior "wall" shaded as sun-lit and no shadow bias could
+    // save it (receiver depth ≈ caster depth, coplanar sheets). NOT gl_FrontFacing:
+    // X-Ray content's winding is uncorrelated with its vertex normals (the D3D
+    // renderer never used facing), so trusting it inverted CORRECT normals — the
+    // wallpapered interior quad of the same wall lit up whole. dot(N, toEye) is
+    // winding-agnostic: it only answers "does this normal face the visible side".
+    vec3 vN = normalize(vNormal);
+    if (dot(vN, L.eye_pos.xyz - vWorldPos) < 0.0) vN = -vN;
+    vec3 pomN = vN; float pomShadow = 1.0, pomAO = 1.0;
     vec2 pUV = vUV;
     if (SPEC_POM)
-        pUV = parallaxUV(vUV, normalize(vNormal), vWorldPos, pomN, pomShadow, pomAO);
+        pUV = parallaxUV(vUV, vN, vWorldPos, pomN, pomShadow, pomAO);
     vec2 pDetailUV = vDetailUV + (pUV - vUV) * pc.detailScale;
 
     vec4 base   = texture(uTexDiffuse, pUV, L.spot_flash.z);   // DLSS mip bias (0 native)
@@ -209,7 +233,10 @@ void main()
     // Streaming feedback: the LOD this sample actually wanted (unclamped — negative
     // = resident mips are too coarse), before the cutout discard so even mostly-
     // discarded fences report. Includes the DLSS bias the color sample used.
-    txfbReport(pc.streamID, textureQueryLod(uTexDiffuse, pUV).y + L.spot_flash.z);
+    // SPEC_FEEDBACK = streamer master gate (off ⇒ the atomic is DCE'd away).
+    // Occlusion cost is handled by the EARLY_ZTEST twin above, not by gating.
+    if (SPEC_FEEDBACK)
+        txfbReport(pc.streamID, textureQueryLod(uTexDiffuse, pUV).y + L.spot_flash.z);
     if (pc.alphaRef >= 0.0 && base.a < pc.alphaRef) discard;
 
     // EMISSIVE-ADDITIVE (aref == -3 ONLY: effects\glow halos, selflight): unlit
@@ -232,6 +259,18 @@ void main()
     // r_wet_debug 1 (darken arrives negative): rain-map visibility.
     if (SPEC_DEBUG && L.rain_params.z < 0.0) {
         outColor = vec4(vec3(rainVis(vWorldPos)), base.a);
+        return;
+    }
+
+    // r_bump_debug: 1 = decoded WORLD normal, 2 = material gloss. The R4 unpack is
+    // .wzy for the normal and .x for gloss; a mod texture authored as a plain RGB
+    // normal map comes out of that swizzle inverted, which is trivial to spot as a
+    // colour field and nearly impossible to spot as "the walls light oddly".
+    if (SPEC_DEBUG && L.bump_params.y > 0.5) {
+        float dbgG;
+        vec3  dbgN = bumpNormal(normalize(vNormal), vWorldPos, pUV, 1.0, dbgG);
+        outColor = (L.bump_params.y > 1.5) ? vec4(vec3(dbgG), base.a)
+                                           : vec4(dbgN * 0.5 + 0.5, base.a);
         return;
     }
 
@@ -274,8 +313,13 @@ void main()
     // shadow map. sun_color/ambient arrive FINAL from vk_env_light.
     vec4  lm      = texture(uTexLmap, vLmapUV);
     float hemiOcc = dot(lm.rgb, vec3(1.0 / 3.0));
-    vec3  geomN   = normalize(vNormal);   // flat - for the sky fill (sharp cube -> perturbed = mirror)
+    vec3  geomN   = vN;   // flat, backface-flipped - for the sky fill (sharp cube -> perturbed = mirror)
     vec3  Nw      = pomN;   // POM-perturbed normal -> sun + dyn lights catch the relief
+    // MATERIAL normal + gloss (`<bump>.dds`). REFINES the POM normal rather than
+    // replacing it: parallax carries the big relief, the map carries the grain.
+    // Materials without one bind a flat/zero-gloss 1x1, so this is a no-op for them.
+    float matGloss = 0.0;
+    Nw = bumpNormal(Nw, vWorldPos, pUV, L.bump_params.x, matGloss);
     // SNOW (Surface Field consumer, r_snow): whiten by surface type x slope x sky
     // exposure - flat up-facing roofs/floors accumulate, walls/ceilings/steep none.
     // SF_SkyExposure() is ~9 rainVis gathers — skip the whole snow query when there
@@ -347,20 +391,38 @@ void main()
     // r_ibl master gate hoisted up: iblSpecular/sunSpec self-early-out at ibl_params.x,
     // but the setup around them (Vv, skyVis, wetF's ~9 rainVis gathers, roughI) ran
     // regardless. Skip it all when IBL is off (default) — output identical (0 below).
-    vec3 specIBL = vec3(0.0);
+    vec3  specIBL = vec3(0.0);
+    float specE   = 0.0;   // reflected fraction — taken OFF the diffuse below
     if (SPEC_IBL && L.ibl_params.x > 0.004) {
         vec3  Vv      = normalize(L.eye_pos.xyz - vWorldPos);
         // sky reflection only where the surface SEES sky (baked hemi × dynHemi).
         float skyVis  = smoothstep(0.12, 0.5, clamp(hemiOccL * dynHemiL, 0.0, 1.0));
-        // wet gloss gated by rainVis (open sky) + up-face; dry sheen kept subtle.
-        float wetF    = clamp(L.rain_params.y, 0.0, 1.0) * rainVis(vWorldPos) * clamp(geomN.y, 0.0, 1.0);
-        float roughI  = mix(0.55, 0.25, wetF);
-        specIBL       = iblSpecular(Nw, Vv, roughI, vec3(0.04)) * gtaoVisRaw() * skyVis;
+        // ROUGHNESS FROM THE MATERIAL (r_gloss_scale). This was a flat 0.55 for the
+        // entire world — plaster, rusted steel and glass reflecting the sky
+        // identically, which is what made r_ibl read as one lacquer film instead of
+        // material highlights. matGloss comes from the bump's .x (R4 gloss).
+        // DRY BASE ONLY. This used to drop roughness 0.55 -> 0.25 on every up-facing
+        // surface the moment it rained, which is two mistakes at once: it applied ONE
+        // material to the entire world (statics carry no gloss map in this path, so
+        // the roughness here is a stand-in, not data), and it duplicated the wet
+        // reflection that applyWetness already owns behind r_wet_refl. Two systems
+        // brightening the same pixels is why rain washed the frame out. Wet belongs to
+        // applyWetness; this stays the honest dry sky term.
+        float roughI  = clamp(0.85 - clamp(matGloss * L.bump_params.z, 0.0, 1.0) * 0.75, 0.1, 0.95);
+        vec3  Rv      = reflect(-Vv, Nw);
+        // Directional visibility along the REFLECTED ray, not just AO: the same
+        // bent-normal cone the puddle mirror uses. Plain AO let the sky glow out of
+        // crevices and from under overhangs, which is a second source of flat wash.
+        float sOcc    = specOcclusion(gtaoBentN(geomN), Rv, gtaoVisRaw());
+        float vis     = sOcc * skyVis;
+        specIBL       = iblSpecular(Nw, Vv, roughI, vec3(0.04)) * vis;
         specIBL      += L.sun_color.rgb * sunSpec(Nw, Vv, normalize(-L.sun_dir.xyz), roughI, vec3(0.04)) * sunMask;
+        specE         = iblSpecWeight(Nw, Vv, roughI, vec3(0.04)) * vis;
     }
 
     // Distance fog (R4): fade to the env haze colour with view distance.
-    vec3 col = albedo * lighting + wetRefl + specIBL;
+    // Energy: the mirrored fraction is not also transmitted (see iblSpecWeight).
+    vec3 col = albedo * lighting * (1.0 - specE) + wetRefl + specIBL;
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 

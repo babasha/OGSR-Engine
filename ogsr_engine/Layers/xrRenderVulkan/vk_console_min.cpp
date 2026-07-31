@@ -79,6 +79,12 @@ constexpr xr_token dlss_mode_token[]{
 
 float ps_r_dlss_3dss_scale_factor{1.0f};
 
+// ⚠ INERT on the Vulkan path since 2026-07-24 — kept only so the graphics options
+// screen and existing user.ltx files still resolve `r_sunshafts_mode`. The pass it
+// drove (vk_pass_sunshafts) is deleted: it sampled the FAR sun map, which under VSM
+// is left cleared = "lit everywhere", so it drew rays through walls; god rays now
+// come out of the froxel medium (r_vol / r_vol_mist), which has actual occlusion
+// and a phase function. Nothing reads this value any more.
 u32 ps_r_sunshafts_mode = SS_SS_OGSE;
 constexpr xr_token sunshafts_mode_token[]{{"st_opt_off", SS_OFF},
                                           {"volumetric", SS_VOLUMETRIC},
@@ -446,6 +452,30 @@ float ps_r_glass_opacity = 0.55f;
 // Strength multiplier; 0 = off. Live.
 float ps_r_glass_refr    = 0.5f;   // user-tuned default (2026-07-02)
 
+// COMPUTE PRE-SKINNING (r_preskin). Skin every visible skeleton leaf ONCE per
+// frame in a compute pass into a shared world-space pool, then let the ~10
+// consumer passes (depth prepass, AO normals, colour, sun cascades, point cube,
+// spot tiles, VSM pages, glass) draw that pool instead of re-running the 1-4
+// bone blend in each of their vertex shaders. Live; leaves that don't fit the
+// pool silently fall back to the old path.
+//
+// STILL UNPROVEN — the first A/B (l01_escape, 2026-07-23) came out net negative
+// but measured the WRONG WORKLOAD: of 835 sampled skeletons, 46% had 1-3 bones
+// and 84% had no animation playing (doors, lamps, physics crates, dropped guns);
+// only ~4.5% were NPC-scale (42-62 bones). 1-weight geometry can never win here
+// — its classic shader is already a single matrix fetch — so the pool was mostly
+// paying for leaves with nothing to save. Skinned_PreSkin now skips skinMode<2,
+// which removes that loss; the real question (an animated NPC crowd) is still
+// open. Numbers from that run, for reference: World/Skinned 0.31->0.31 and
+// Shadow/Dyn* unchanged, SunShadow -0.22 ms and World/Depth -0.15 ms against
+// +0.30 ms for the compute pass.
+//
+// Re-measure with MANY ANIMATED NPCs on screen before trusting either verdict,
+// and watch [VK PreSkin] skipped1W / maxBones to confirm the scene is actually
+// NPC-heavy. Note the frame is GPU-bound on statics (World/Statics ~5.3 ms of a
+// 17 ms frame), so the whole skinned budget is ~1.5 ms — the ceiling is small.
+int   ps_r_preskin       = 1;
+
 // Animated cloud layer in the sky pass (R4 RenderClouds port): two scrolling
 // cloud textures composited over the static cubemap sky. r_clouds on/off,
 // r_clouds_intensity = additive brightness, r_clouds_speed = UV scroll rate.
@@ -668,6 +698,15 @@ int   ps_r_rain_debug = 0;
 // AND forces wetness/density to 0 (dry surfaces, no rain occlusion map). Does
 // NOT change the weather — just suppresses the rain effect for testing.
 int   ps_r_rain_enable = 1;
+// r_rain_sun — how strongly the streaks catch the DIRECTIONAL light (sun, moon,
+// lightning). Drops were tinted by hemi alone, which is flat-lit rain and, worse,
+// rain a thunderbolt cannot touch: the bolt boosts sun/sky/fog colour and swings
+// sun_dir to the strike (thunderbolt.cpp), and hemi is the one field it never
+// writes. Water cylinders scatter FORWARD, so real rain lights up when you look
+// toward the light and goes near-black when you look away — one forward lobe on
+// the sun direction buys both the backlit downpour and the free lightning flash.
+// 0 = the old flat hemi look.
+float ps_r_rain_sun = 0.35f;
 
 // Global render profiler (vk_profiler). 0 = no [VK Perf] logging, 1 = periodic
 // (~5s) GPU/CPU/VRAM log, 2 = + the live ImGui overlay (Phase 2). `vk_perf`
@@ -691,6 +730,29 @@ int   ps_r_profiler = 1;
 int   ps_r_vrs      = 0;
 int   ps_r_vrs_force = 0;   // diag: force pipeline-rate NxN on the world pass (2 or 4), ignoring the SRI
 int   ps_r_vrs_static = 0;  // diag: bake a STATIC 2x2 rate into world pipelines at creation (set BEFORE loading a level)
+// Alpha-tested statics color path: depth EQUAL + no write (the prepass depth is
+// final) -> early-Z kills occluded AT layers AND transparent texels of the front
+// layer before the uber-FS runs. Found 23-07-2026 on Кордон: world-color FS
+// invocations hit 29.5M vs a 4.1M-pixel screen (7.2x overshading) staring into
+// layered AT (bushes/fences), World/Statics 10.5-11.8 ms. Live A/B.
+int   ps_r_at_equal = 1;
+// Prepass-covered statics color path: depth write OFF (prepass depth is final).
+// THE early-Z fix: the world uber-FS statically contains `discard`, and
+// discard + z-write ON disables early-Z entirely — the whole frustum's depth
+// complexity was being shaded (gpuStatics 10.8M FS inv vs ~3.5M visible,
+// r_fsinv_split, Кордон 23-07-2026). Live A/B.
+int   ps_r_z_prepass = 1;
+// Screen-size (SSA) cull of plain whole meshes in the GPU world cull: skip a
+// mesh once its bounding sphere projects under N pixels of DIAMETER. The
+// r_fsinv_split hunt (23-07-2026, Кордон) showed distant small props (<256 tris
+// never cluster/LOD) rendering full geometry to the horizon = sub-pixel
+// triangles = 8x quad-helper cost (gpuMesh 8.24M FS inv vs 2.26M visible
+// samples). Clustered/DAG geometry is exempt. 0 = off. Live.
+float ps_r_ssa_px = 2.0f;
+// Diag: split the world-color FS-invocation counter 4 ways (CPU statics flush /
+// GPU statics / dynamics / skinned) to attribute overshading. Replaces the
+// single [VK VRS] invocations line with [VK FSinv] while on. Live.
+int   ps_r_fsinv_split = 0;
 int   ps_r_uber_variants = 1; // Inc 1: 1 = lean world uber-FS spec variants (POM/SNOW/WET/IBL/DEBUG); 0 = A/B the old monolithic uber (force WS_ALL). Live-switchable.
 float ps_r_vrs_near = 40.0f;
 float ps_r_vrs_far  = 75.0f;
@@ -735,8 +797,30 @@ int   ps_r_vsm_grass_static = 1;  // far-grass hybrid: L1/L2 (12..48 m) grass RI
                                   // (dirty pages only ≈ free standing); L0 (±12 m) stays dynamic with live wind.
                                   // 0 = old behaviour: ALL grass every-frame dynamic, L0..L2.
 float ps_r_vsm_bias  = 0.0003f;   // STATIC atlas (terrain in it → needs acne slack; 0.0003 = 0.6 m at the ±1000 m z-range)
+                                  // With r_vsm_bias_min > 0 this is only the CAP of the slope-scaled bias.
 float ps_r_vsm_bias_dyn = 0.00002f;   // DYNAMIC atlas (casters only, ground never in it → epsilon over D16 quantization
                                       // + write-side raster bias; the shared 0.6 m ate grass shadows below knee height)
+float ps_r_vsm_bias_min = 0.00003f;   // STATIC receiver bias, constant part (0.00003 = 6 cm ≈ write raster bias + D16
+                                      // quantization): the resolve's NORMAL OFFSET carries the acne band now, so this
+                                      // stays small — the flat legacy 0.6 m (and any big slope slack) leaked sun
+                                      // through everything thinner than the slack. 0 = legacy constant r_vsm_bias.
+float ps_r_vsm_raster_bias  = 0.5f;   // atlas WRITE depth bias, constant (D16 units ≈ 3 cm each). The old 1.5 pushed
+                                      // every caster ~5 cm deep — most of a plank wall's thickness gone before any
+                                      // receiver got a vote. Live; changing it drops the page cache (crisp A/B).
+float ps_r_vsm_raster_slope = 1.5f;   // atlas WRITE depth bias, slope part (caster-side grazing acne; old 2.5).
+float ps_r_vol_vsm_bias = 0.00004f;   // fog (vol_inject) AIR bias vs the static atlas (0.00004 = 8 cm): air has no
+                                      // acne to hide — needs only write bias + D16 quantization. The initial 0.2 m
+                                      // lit a fog shell straight through thin roofs/walls. 0 = legacy (r_vsm_bias).
+float ps_r_vol_surf_clip = 0.15f;     // depth-rejection FRONT shell (m): also kill in-scatter within X m BEFORE the
+                                      // visible surface. The "lit shell" hugging thin sun-facing walls can't be fixed
+                                      // by any receiver bias (atlas write bias + D16 quantization ≈ plank thickness);
+                                      // fog centimetres from a wall carries no legit light anyway. 0 = off.
+float ps_r_vol_depth_reject = 0.12f;  // froxel depth-rejection slack (m): fog BEHIND the geometry of its own view
+                                      // column gets no in-scatter — kills the sunlit-outdoors glow the trilinear
+                                      // volume fetch smears onto walls around windows. 0 = off (legacy).
+                                      // MUST be well under half a froxel slice (~1 m at 8 m with the scene-far
+                                      // grid): the leaking froxel is the wall-STRADDLING one, its centre sits
+                                      // only ~0.1-0.5 m behind the surface — a bigger slack filters nothing.
 // VSM clipmap detail: base extent (m) of clipmap level 0 → finest texel = base/4096.
 // 24 m ≈ the old 4096² cascade (5.9 mm), balanced. Smaller = sharper but more pages
 // (the 2048-page atlas can overflow on wide vistas → distant pages drop, graceful).
@@ -771,6 +855,25 @@ float ps_r_vsm_ta_motion_floor = 0.30f;
 // (3) DLSS-aware — when r_dlss is on, DLSS ALSO temporally resolves the shadow (baked into
 //     the colour it upscales) → scale the VSM history weight down to avoid a double blur.
 float ps_r_vsm_ta_blend_dlss = 0.6f;
+// SOFT SHADOWS (stochastic PCSS) — replaces the fixed 3x3 PCF in vsm_resolve with a
+// blocker search + a filter disc sized by the blocker distance, so a shadow is HARD at
+// the contact point and softens with the caster's height. Both discs are Vogel spirals
+// rotated per pixel and per frame: the error lands as noise, which the temporal resolve
+// right below already exists to average away. r_vsm_soft = filter tap count (0 = the
+// legacy PCF path, byte-identical). See vsm_resolve.comp.glsl for the derivation.
+int   ps_r_vsm_soft        = 12;
+int   ps_r_vsm_soft_search = 8;
+// Sun cone HALF-angle in degrees. The sun's true value is 0.265 (a 0.53 deg disc) — at
+// that width the penumbra is ~1 cm per metre of caster height, i.e. physically right but
+// barely readable. Default is deliberately exaggerated for a cinematic look; drop to
+// 0.265 for the correct one.
+float ps_r_vsm_soft_angle  = 2.0f;
+// Max blocker search distance (m) = the widest penumbra we can resolve (angle * range).
+// A caster further than this softens no further — a graceful clamp, not a dropout.
+float ps_r_vsm_soft_range  = 30.0f;
+// Neighbourhood clamp used INSTEAD of r_vsm_ta_clamp while soft is on: the 0.24 above was
+// tuned against deterministic taps and would pin the history to the stochastic noise.
+float ps_r_vsm_soft_clamp  = 0.55f;
 // Grass casts VSM shadows (near + L0 only; reads the GPU-driven detail CASTER buffer
 // 1 frame stale). DEFAULT ON since 2026-07-03: the two blockers that parked it are gone —
 // dyn pages now resolve with the low adaptive history weight (r_vsm_ta_blend_dyn kills the
@@ -930,12 +1033,150 @@ int   ps_r_async           = 0;
 
 // Sky specular IBL (vk_ibl): prefiltered sky-cube reflections (roughness mips) +
 // a real sun GGX glint on the forward surfaces (the world sun path was diffuse-
-// only). DEFAULT ON (2026-07-04): verified across world lmap/vlit/terrain + tuned
-// (matte-dry ground, sky-visibility gate keeps indoor floors dry, wet gloss toned,
-// ~1 s fade-in). r_ibl 0 to A/B. r_ibl_spec scales it, r_ibl_debug = spec field only.
-int   ps_r_ibl             = 1;
+// only). r_ibl_spec scales it, r_ibl_debug = spec field only.
+//
+// ⛔ DEFAULT OFF SINCE 2026-07-25 — PARKED, NOT SHIPPABLE ON THIS CONTENT. Do not
+// flip this back to 1 without first fixing everything below; the machinery is sound,
+// the INPUTS are not, and the result reads as a wax coating over the whole world.
+//
+// The blocker is that a specular term needs ROUGHNESS per material and this content
+// has none. Measured, not assumed (all 118 <bump>.dds in the install, gloss = the R
+// channel): p50 0.031 / p90 0.094 / p95 0.161 / p99 0.322. X-Ray authored that channel
+// for R2's far weaker specular, so it sits in the bottom sixth of [0,1] and carries
+// almost no signal. Every consumer therefore INVENTS a roughness, and they disagree:
+//
+//   statics  world_lmap/vlit_frag_body  0.85 - gloss*scale*0.75  -> in practice 0.78-0.85
+//   NPCs     skinned.frag               0.6 flat  (cloth, leather, skin, metal alike)
+//   trees    tree.frag                  mix(0.7, 0.5, wetF)
+//   terrain  world_terrain.frag         its own
+//
+// F0 is 0.04 everywhere, so metal does not exist as a material either — the whole
+// world is one dielectric with a uniform 4% sheen. User-visible verdict (25-07): a
+// fence matte and the fence a metre away glossy, tree trunks glossy, NPCs "как воском
+// облитые". Turning r_ibl_spec down does not rescue it: sheen reads as CONTRAST against
+// a dark albedo, so it stays visible until the knob hits exactly 0.
+//
+// Two further defects found while diagnosing, both still unfixed:
+//   * env_common.glsl:200 — sunSpec multiplies by ibl_params.x but NOT .y, so
+//     r_ibl_spec silently does not scale the SUN highlight. The knob lies about its own
+//     scope, which is why dialling it read as "no effect".
+//   * skinned.frag:518 — NPCs gate the reflection by pc.hemi, a PER-OBJECT scalar,
+//     while statics gate per-pixel by sOcc*skyVis. An NPC reflects sky off the side
+//     that is pressed against a wall.
+//
+// Reviving this needs material CLASSES, which do exist even though roughness maps do
+// not: the texture path already encodes them (mtl\ wood\ crete\ ston\ glas\ grnd\ act\)
+// and is read at material load. A prefix->{roughness, F0} table feeding ALL FOUR paths
+// from one place, plus the same sky-visibility gate everywhere, is the real fix.
+// Cost of leaving it off is zero: the prefilter is gated by `if (ps_r_ibl ||
+// ps_r_sky_sh)` in vk_env_light.cpp:1001, so nothing is computed for a disabled feature.
+int   ps_r_ibl             = 0;
 float ps_r_ibl_spec        = 1.0f;
 int   ps_r_ibl_debug       = 0;
+
+// Diffuse sky irradiance via SH9 (vk_ibl + sky_sh_project.comp). The sky ambient
+// used to be ONE texel of the weather cube fetched along the surface normal at LOD
+// 0 — a point sample of a sharp skybox, not an irradiance integral. Three failures
+// compounded: it could not be blurred (the cubes ship single-mip BC), so terrain and
+// world had to feed it the FLAT geometric normal or the fill turned into a mirror,
+// killing all relief; and because X-Ray cubes are authored in the half-cube space
+// (horizon at the bottom edge), an up-facing normal always landed on the zenith
+// texel — the warm horizon band that carries nearly all the energy at dusk was
+// unreachable. Net effect at sunset: a beautifully graded sky over uniformly-lit
+// ground, which is exactly what it looked like.
+//
+// The fix projects the world-space probe onto 9 SH coefficients once per weather
+// change (~6k texel fetches, riding the prefilter's existing immediate submit) and
+// evaluates them per pixel in a few MADs. Being a real cosine-weighted integral it
+// is directional in azimuth for free, and being smooth by construction it finally
+// lets the DETAIL normal drive ambient. r_sky_sh 0 = A/B (falls back to the
+// prefiltered probe's roughest mip, which is still azimuth-correct).
+//
+// r_sky_sh_ground scales the below-horizon hemisphere during projection: the sky
+// cube's skirt is not sky radiance, it is where the ground is, so taking it at full
+// strength would light everything from underneath. ~0.3 reads as a plausible ground
+// bounce (it is still the right colour to bounce — the ground is lit by this sky).
+int   ps_r_sky_sh          = 1;
+float ps_r_sky_sh_ground   = 0.3f;
+// r_sky_sh_debug — dump each projection's coefficients: L0 (omnidirectional level),
+// L1 (the linear band: how much irradiance VARIES with direction, and toward what),
+// and aniso = |L1|/L0. This is the measurement that separates "the maths downstream
+// is wrong" from "the sky the probe sees has no direction in it" — if aniso is near
+// zero at dusk, no receiver-side fix can make terrain directional, and the missing
+// energy is elsewhere (e.g. the sun disk/aureole, which sky.frag adds ADDITIVELY at
+// draw time and is therefore absent from the cubemap the probe is built from).
+int   ps_r_sky_sh_debug    = 0;
+
+// PROCEDURAL SKY (r_sky_proc) — single-scattering Rayleigh+Mie, atmosphere.glsl.
+//
+// Measured root cause (2026-07-20): at a late sunset the weather config supplies
+// sun_color=(0.009,0.004,0.002), hemi/ambient/sky_color all NEUTRAL GREY, and the sun
+// zeroed at elevation +1.4° (X-Ray does this because the classic renderer could not do
+// twilight). So dusk had no warm light and no directional light anywhere in the data,
+// and the world rendered uniformly grey — faithfully. No receiver-side fix could reach
+// it; the light itself was missing.
+//
+// This derives sky radiance from GEOMETRY (sun elevation) instead of authored colours.
+// Sunset then emerges from physics: the low sun's path through air is ~40x longer,
+// Rayleigh strips the blue out of the beam (leaving red), and the Mie forward lobe
+// wraps a warm aureole around it while the anti-solar sky stays blue — real azimuthal
+// structure, which is exactly what the SH probe measured as absent.
+//
+// The SAME function feeds the dome AND the light probe (ibl_prefilter), so "the sky
+// you see" and "the light you get" cannot drift apart. r_sky_proc 0 = legacy cubemap.
+int   ps_r_sky_proc        = 0;      // default OFF until verified — big look change
+float ps_r_sky_intensity   = 22.0f;  // maps the model's physical units onto game exposure
+float ps_r_sky_turbidity   = 1.0f;   // aerosol multiplier: 1 = clean air, >1 = hazy/dusty
+float ps_r_sky_mie_g       = 0.76f;  // Mie anisotropy — tightness of the sun's aureole
+// Drive the DIRECTIONAL sun colour from the same atmosphere model instead of the
+// config's sun_color. This is what actually re-lights dusk: the config says 0.009,
+// physics says "warm and low". Needs r_sky_proc.
+int   ps_r_sky_sun_from_atmo = 1;
+float ps_r_sky_sun_scale     = 4.0f; // sun irradiance scale (transmittance is 0..1)
+
+// VOLUMETRIC CLOUDS (r_clouds_vol) — raymarched 3D medium, clouds.glsl + vk_clouds.
+//
+// Replaces BOTH cloud sources at once: the ones painted into the weather cubemap and
+// the flat scrolling R4 cloud dome. The painted ones need no suppression heuristic
+// (which is how this was originally planned) because the procedural sky never samples
+// that cube; and the scrolling dome is skipped in the shader when this is on — one
+// kind of cloud, never two.
+//
+// Lit by the SAME atmosphere model that draws the sky, which is the entire point: at
+// dusk the reddened low sun lights cloud UNDERSIDES warm while their tops stay cool
+// from the blue zenith, and thin edges glow through the forward scattering lobe.
+// Authored cloud colours (which measure neutral grey at that hour) cannot do this.
+int   ps_r_clouds_vol           = 0;      // default OFF — opt-in, and the most expensive effect here
+float ps_r_clouds_coverage      = 0.55f;  // 0 clear .. 1 overcast (also the shader's off switch)
+float ps_r_clouds_density       = 1.0f;
+float ps_r_clouds_detail        = 0.35f;  // edge erosion strength
+float ps_r_clouds_bottom        = 1500.f; // deck base (m)
+float ps_r_clouds_top           = 6000.f; // deck top (m) — the band the type gradient spans
+float ps_r_clouds_shape_scale   = 0.00008f;
+float ps_r_clouds_detail_scale  = 0.0008f;
+float ps_r_clouds_weather_scale = 0.000012f;
+float ps_r_clouds_wind_dir      = 45.f;   // heading (deg)
+float ps_r_clouds_wind_speed    = 12.f;   // m/s
+float ps_r_clouds_phase_g       = 0.72f;  // forward lobe (silver lining toward the sun)
+float ps_r_clouds_phase_g_back  = 0.35f;  // back lobe (glow with the sun behind you)
+float ps_r_clouds_extinction    = 0.08f;
+float ps_r_clouds_powder        = 0.7f;   // dark-edge term; 0 = pure Beer (edges wrongly bright)
+float ps_r_clouds_sun           = 12.f;
+float ps_r_clouds_ambient       = 1.0f;
+int   ps_r_clouds_steps         = 48;     // primary march budget — THE perf knob (was 96: unaffordable at fullscreen sky)
+float ps_r_clouds_max_dist      = 30000.f;// marched chord cap. 90k made low-elevation steps ~1 km — clouds fell between samples
+float ps_r_clouds_cirrus        = 0.5f;   // high 2D ice layer: the parallax that reads as "different heights"
+float ps_r_clouds_cirrus_alt    = 9000.f;
+float ps_r_clouds_cirrus_scale  = 0.00004f;
+// r_clouds_debug — show the marched coverage unlit: 1 = raw alpha, 2 = alpha x20.
+// The question a blank-looking sky raises is whether the model produces ANY density,
+// and guessing at that has already cost round trips. This answers it directly.
+int   ps_r_clouds_debug         = 0;
+// r_clouds_weather — drive coverage from the weather's own cloud weight
+// (clouds_color.w) instead of the flat cvar. Without it an hour the mod authored as
+// solid overcast renders as the same scattered puffs as a clear one, because the
+// procedural deck never looked at the weather at all.
+int   ps_r_clouds_weather       = 1;
 
 // Hi-Z occlusion cull for the GPU-driven static color pass (vk_world_gpu, Phase A
 // of cluster cull). Pass_World builds a depth pyramid from this frame's PREPASS
@@ -961,10 +1202,15 @@ int   ps_r_lods_gpu = 1;
 // composites scene*transmittance + in-scatter (HDR, pre-tonemap). = god rays
 // through geometry + depth fog (the Metro base look). Default OFF. r_vol_height 0
 // = uniform fog; r_vol_debug shows the raw integrated in-scatter pattern.
+// ⚠ The five numbers below were RE-TUNED FROM SCRATCH on 2026-07-24, in-game, after
+// the fog finally received the sky hemisphere instead of the ambient floor (see
+// r_vol_ambient). Every value tuned before that was compensating for air that could
+// not scatter sky light at all, so the old set is not a starting point — it is the
+// shape of the bug. Do not "restore" them.
 int   ps_r_vol           = 1;       // ON by default — shipped feature (god-rays + depth fog + indoor haze), ~1.5ms
-float ps_r_vol_density   = 0.02f;   // base extinction / scatter density
-float ps_r_vol_height    = 0.10f;   // height-fog falloff above eye level (0 = uniform)
-float ps_r_vol_g         = 0.80f;   // Henyey-Greenstein anisotropy (forward scatter)
+float ps_r_vol_density   = 0.005f;  // DUST layer extinction (V-1 layer 1): thin "volume in the air", NOT a fog bank — see r_vol_mist for that
+float ps_r_vol_height    = 0.40f;   // dust height falloff above the BAKED GROUND (0 = uniform)
+float ps_r_vol_g         = 0.88f;   // Henyey-Greenstein anisotropy (forward scatter) — user-verified: "makes the rays brighter near the ground"
 float ps_r_vol_intensity = 3.0f;    // in-scatter brightness multiplier (raised: fog must GLOW more than it dims to read as haze)
 float ps_r_vol_amb       = 0.60f;   // indoor ambient floor: fraction of sky ambient kept under a roof (0=pitch-dark interior, 1=no occlusion)
 // Fog AMBIENT (sky-fill) in-scatter tint scale. The fog's ambient term used to
@@ -974,9 +1220,18 @@ float ps_r_vol_amb       = 0.60f;   // indoor ambient floor: fraction of sky amb
 // air self-glows even with the sun down). The fog now tracks the env's real
 // ambient (dark/blue at night) scaled by this instead: 1.0 = env ambient as-is,
 // lower = darker night air, 0 = no ambient fog (sun beam + local lights only).
-float ps_r_vol_ambient   = 1.0f;
-float ps_r_vol_indoor    = 6.0f;    // indoor density boost: fog ×(1+this) under a roof — short interior sightlines need denser air to show
-float ps_r_vol_sun       = 3.0f;    // sun-beam in-scatter boost: directional shaft brightness (pops the god-ray through the ambient haze)
+// Scale for the fog's SKY in-scatter. Rescaled with the source: the term used to be
+// the ambient FLOOR (~0.02 in a measured frame) and now carries the real hemisphere
+// (~0.42), i.e. ~20x more light, so the old scale would blow the fog out. Anything
+// tuned before that change (a saved 4.0, say) must be re-tuned around this default.
+float ps_r_vol_ambient   = 0.15f;
+// Indoor density boost, ×(1+this) under a roof, applied to the ambient term only.
+// It existed because the fog's sky term was the ~0.02 ambient floor: indoors that
+// was nothing at all, so the air needed a x7 crutch to show up. With the real
+// hemisphere feeding it the crutch over-fogs every room — re-tuned to 0 in-game.
+// Kept as a knob (weather with heavy interior haze may want it back).
+float ps_r_vol_indoor    = 0.0f;
+float ps_r_vol_sun       = 6.0f;    // sun-beam in-scatter boost: directional shaft brightness (pops the god-ray through the ambient haze)
 
 // Atmospheric scattering (r_atmo): physical Rayleigh (blue distance) + Mie (warm
 // sun halo) in-scatter in the froxel fog = aerial perspective. NEEDS r_vol on.
@@ -991,6 +1246,14 @@ float ps_r_atmo_mie_g    = 0.76f;   // Mie forward anisotropy
 // the exposure to ease toward the metered target. 0 = instant (old snappy behaviour
 // where the image visibly darkens/brightens as you tilt between sky and ground).
 float ps_r_exp_adapt     = 1.0f;
+// Auto-exposure user knobs (vk_exposure.h reads these; tonemap + bloom share them).
+// r_expo: EV-style compensation multiplier on the metered exposure (1 = neutral).
+// r_expo_gray: metering target override; 0 = auto (0.58 gamma / 0.18 linear).
+// r_expo_min/_max: exposure clamp range (night floor / brightening ceiling).
+float ps_r_expo          = 1.0f;
+float ps_r_expo_gray     = 0.0f;
+float ps_r_expo_min      = 0.80f;
+float ps_r_expo_max      = 2.20f;
 float ps_r_vol_lights    = 2.5f;    // P2: local light (flashlight/lamp/campfire) in-scatter in fog — glow/cone strength; 0 = off
 // Forward-scatter anisotropy for LOCAL lights only (torches/lamps/campfires),
 // SEPARATE from the sun's r_vol_g (0.80). The sun's sharp forward peak is the
@@ -1021,6 +1284,218 @@ float ps_r_vol_noise     = 0.55f;   // P3: animated 3D noise on the fog density 
 float ps_r_vol_noise_scale = 0.40f; // P3 noise frequency (world units; higher = finer motes)
 float ps_r_vol_noise_speed = 0.10f; // P3 drift speed of the dust
 float ps_r_vol_soft      = 2.5f;    // cascade shadow PCF blur radius (texels): soft penumbra in fog so the cache TICK (sun creep through foliage) barely shows; 0.5 = crisp
+// r_fog_dist — range scale for the FORWARD distance fog (the legacy R4 haze in the
+// world shaders: colour = mix(colour, fog_color, dist·k)). It is a THIRD fog on top
+// of the froxel volume and the Rayleigh/Mie atmosphere, it is purely distance-based
+// (no height profile — it cannot be anchored to the ground, so it always "follows"
+// the camera), and it had no cvar at all: every r_vol_*/r_atmo experiment left it
+// untouched. 1 = weather value, >1 pushes the haze back, 0 = off (A/B).
+float ps_r_fog_dist      = 1.0f;
+// r_vol_ground_debug — forensics for the baked terrain height field: the inject
+// paints each froxel's height ABOVE THE GROUND (red 0 m → blue 10 m) instead of
+// light, with green = 1 where the value came from the map rather than the
+// eye-relative fallback. View it with r_vol_debug 1. Terrain-shaped bands that stay
+// put while you walk = the anchor works; a flat wash sliding with the camera = the
+// map read is failing.
+int   ps_r_vol_ground_debug = 0;
+// ── V-0: the froxel fog's radiometric foundation ────────────────────────────────
+// r_vol_hillaire — energy-conserving slice integration (Frostbite/Hillaire) instead
+// of "slice in-scatter × transmittance at the slice's FRONT face". The old form let
+// light born deep in a slice cross it unattenuated, so error grew with density:
+// thick fog DARKENED the scene faster than it lit it (the "dirty smoke" look) and
+// brightness was non-linear in density. 0 = legacy, for A/B.
+int   ps_r_vol_hillaire  = 1;
+// r_vol_albedo — single-scatter albedo: sigma_s = sigma_t * albedo. It was hardcoded
+// to 1, which welded "how brightly this air glows" to "how much of the world it
+// hides" — the reason thin air could not carry visible shafts. 1 = old behaviour;
+// lower = more absorbing (smoke/dust). The "god rays in clear weather" hybrid wants
+// a THIN, HIGH-albedo, strongly forward-scattering medium.
+float ps_r_vol_albedo    = 1.0f;
+// r_vol_noise_scatter — put the animated 3D noise on the SCATTERING coefficient
+// instead of the extinction (1 = new). On extinction it makes the air's opacity
+// flicker, and since the noise field drifts on a wall clock while the temporal pass
+// reprojects froxel centres, history never agrees with the current frame → the fog
+// hisses. On the scattering side the same wisps read as shape in the light and the
+// transmittance the composite multiplies by stays smooth. 0 = legacy.
+int   ps_r_vol_noise_scatter = 1;
+// ── V-1: shape. Where the fog stops being a flat pall and starts being lit air. ──
+// r_vol_ms — multiple-scattering octaves (Wrenninge). Single scatter saturates dense
+// fog at the source radiance, so shadowed air stays flat and reads as dirty grey:
+// the light that would really bounce several times inside the medium is simply
+// missing. Each octave halves the scattering weight and the phase eccentricity and
+// softens the shadow term, which is what fills shadowed fog with a soft glow.
+// Weights are normalised (shape, not gain). 1 = single scatter (old look).
+int   ps_r_vol_ms        = 3;
+// r_vol_g_back / r_vol_g_mix — the BACKWARD phase lobe. One HG lobe can only do the
+// forward halo, so the sun never dominated the ambient veil at other angles and the
+// fog looked directionless. Negative g = backward.
+float ps_r_vol_g_back    = -0.30f;
+float ps_r_vol_g_mix     = 0.25f;
+// ── V-1: TWO MEDIA LAYERS (r_vol_mist*) ────────────────────────────────────────
+// The froxel medium used to be ONE exponential layer, which cannot be both things
+// the scene needs. Tuned thin enough that clear weather stays clear (the in-game
+// answer was r_vol_density 0.005, "very light, just some volume for the scene"),
+// no gain will ever make a valley read as a fog bank; tuned thick enough for the
+// bank, the whole map turns to soup. So a SECOND, independent layer is summed into
+// the same sigma_s/sigma_t: dense, ground-hugging, with its own phase. The grid and
+// the integrator never learn there are two — cost is a few ALU in the inject.
+//   r_vol_density/_height/_g = layer 1 "DUST": thin, tall, sharp forward lobe → the
+//     god rays that should be visible even without fog.
+//   r_vol_mist*              = layer 2 "MIST": the actual fog bank.
+// 0 = off → byte-identical to the single-layer look, so this is a clean A/B.
+float ps_r_vol_mist        = 0.0f;   // mist extinction AT GROUND LEVEL (compare: dust is 0.005; a real bank is 0.1-0.5)
+float ps_r_vol_mist_h      = 4.0f;   // mist layer thickness in METRES (e-fold above the baked terrain height)
+// Mist phase. Dense water droplets scatter far less directionally than thin dust —
+// a fog bank glows as a body instead of throwing a razor shaft, and giving it the
+// dust's 0.88 forward lobe is exactly what makes cheap volumetrics look like smoke.
+float ps_r_vol_mist_g      = 0.55f;
+// r_vol_mist_relief — metres of terrain drop over which the mist fades IN. 0 = the
+// layer sits everywhere at a uniform thickness (a weather-wide fog). Above 0 the
+// inject compares this froxel's baked ground against a ~32 m neighbourhood and
+// keeps the mist only where the terrain sits BELOW its surroundings: milk in the
+// hollows and riverbeds, clear air on the ridge. Costs 4 height-map taps, and only
+// for froxels the layer actually reaches.
+float ps_r_vol_mist_relief = 0.0f;
+// r_vol_mist_micro — the SMALL scale, which the level-wide field physically cannot
+// reach: at 71 cm/texel a wheel rut or a shell crater is averaged into flat ground.
+// The RAIN map is 1024² over ±75 m around the player = 14.6 cm/texel, five times
+// finer, and it already gets rebuilt as you walk — so the mist can thicken inside
+// ruts, ditches and craters near the camera. Strength = how many times denser at
+// full dip depth (0 = off); _micro_h = the dip depth in metres at which it saturates
+// (0.25 = ankle-deep). ⚠ The rain map stores the TOP-MOST surface, so the shader
+// only trusts it where it agrees with the baked ground — under a roof or a canopy
+// this term switches itself off rather than floating mist onto the roof.
+// r_vol_mist_micro is an ABSOLUTE extinction — the density of the air at the bottom
+// of a fully-resolved dip — NOT a multiplier on r_vol_mist. That independence is the
+// whole point and was learned in game: as a multiplier, the only way to get visible
+// fog into the wheel ruts was a bank so thick the player could not stand in it. It
+// also works with r_vol_mist 0, which is a look in its own right: clear air over the
+// field, mist lying only in the tracks and ditches.
+// _micro_h is the dip depth (m) at which the effect saturates; a wheel rut measures a
+// few centimetres, so 0.10 = "a rut counts fully", 0.5 = "only real ditches count".
+float ps_r_vol_mist_micro   = 0.0f;
+float ps_r_vol_mist_micro_h = 0.10f;
+// r_vol_mist_noise — the mist layer's SHAPE. An exponential falloff has a perfectly
+// smooth top surface, and at fog-bank density that surface reads as a wall of grey
+// standing in the hollow: the layer looks like a solid filled to a level line rather
+// than fog lying in the terrain. This warps the layer's HEIGHT with fbm, so its top
+// rises and falls by ±(this many) layer thicknesses. Note r_vol_noise cannot do this
+// job — V-0 moved that one onto the scattering coefficient on purpose, where it
+// shapes light rather than shape. Defaults ON (the layer itself is off by default,
+// so r_vol_mist stays the clean A/B) and drifts slowly, like valley air.
+float ps_r_vol_mist_noise       = 0.6f;
+float ps_r_vol_mist_noise_scale = 0.05f;   // 1/m — ~20 m billows
+// ── V-1b: the bank is SCENERY — dense to look at, liveable to stand in ────────────
+// A fog bank that reads well from a hilltop (cloud lying at the foot of the slope) is
+// unpleasant to walk into: inside it, optical depth accumulates from zero metres and
+// every direction saturates to milk within a few steps. Physically correct, and not
+// what the fog is here for. So the density the player SWIMS IN is decoupled from the
+// density the player LOOKS AT — the bank stays a picture, and stepping into it costs
+// visibility without taking it away.
+//   r_vol_mist_fade   0 = off (byte-identical to the plain layer)
+//                     1 = IMMERSION: thin the whole bank once the CAMERA is in it
+//                         (this is the literal request: "walk in and it eases off")
+//                     2 = NEAR: thin only the metres around the camera, so the bank
+//                         keeps its body further out and you stand in a soft clearing
+//                     3 = both (whichever thins more wins)
+//   r_vol_mist_inside = what the mist thins DOWN to, as a multiple of the DUST layer
+//                       (r_vol_density). 2 = "twice the general haze"; expressing it
+//                       against dust rather than as a fraction keeps the knob's
+//                       meaning when the bank density changes. 0 = mist vanishes
+//                       entirely inside; a value ≥ mist/dust means no thinning at all.
+//   r_vol_mist_near   = radius (m) of the mode-2 clearing.
+// ⚠ Applies to the BANK only. The micro mist in the ruts (r_vol_mist_micro) is
+// deliberately untouched: it is thin already and it is precisely what you are meant
+// to keep seeing at your feet.
+int   ps_r_vol_mist_fade   = 1;
+float ps_r_vol_mist_inside = 2.0f;
+float ps_r_vol_mist_near   = 45.0f;
+// r_vol_mist_inside_h — the height over which "I am inside the bank" fades out.
+// ⚠ NOT the layer thickness, and tying it to that was a real bug: with a 4 m layer,
+// stepping onto a 6 m roof (or jumping off anything raised) took the eye "out" of the
+// bank, switched the thinning off, and made the world DENSER a metre higher than it
+// was below. Whether the camera shares the low ground with the bank is the hollow
+// gate's job; this only has to answer "am I above the whole thing", which is a
+// question on the scale of tens of metres — a hilltop, not a porch.
+float ps_r_vol_mist_inside_h = 25.0f;
+// ── GRASS CANOPY in the sun term (r_vol_canopy) ──────────────────────────────────
+// The fog's sun in-scatter used to walk straight through a field of grass, and no
+// amount of shadow-map work fixes that: grass only casts within ~48 m of the camera,
+// at froxel scale its shadow is a stipple that PCF averages back into "half lit", and
+// it sways, so what little survives shimmers. A field of grass is not a crowd of
+// blades, it is a MEDIUM — so the sun term is attenuated by how much canopy the light
+// had to cross (Beer-Lambert along the slant path to the sun), from a field baked
+// once per level out of the level's own detail-slot grid. Works at ANY distance,
+// never flickers, costs one texture fetch below the canopy line.
+//   r_vol_canopy   = extinction per metre of fully-covered canopy (0 = off, clean A/B)
+//   r_vol_canopy_h = taste multiplier on the authored model height (the canopy the
+//                    light sees is not the blade tip — 1.0 = as modelled)
+// ⚠ Composed with the shadow-atlas occlusion via min(), not multiply: inside 48 m
+// both describe the SAME grass, and a product would double-darken right where the
+// player stands. Verify the baked field FIRST with r_vol_ground_debug 3 + r_vol_debug 1.
+float ps_r_vol_canopy   = 1.2f;
+float ps_r_vol_canopy_h = 1.0f;
+// ── V-2: WEATHER DRIVES THE MEDIUM (r_vol_weather) ───────────────────────────────
+// The froxel fog used to read three things from the weather (sun dir, sun colour,
+// hemisphere) and take its DENSITY from a cvar, while the forward distance haze is
+// weather-driven end to end. Change the weather and one fog thickened while the
+// other stood still — two systems disagreeing in the same frame, and no knob could
+// reconcile them because they had no shared input. These fields were already in the
+// descriptor, unread:
+//   r_vol_w_flat    clouds_color.w → blends the PHASE toward isotropic. This is the
+//                   one that actually reads as overcast: dimming is eaten by
+//                   auto-exposure (the r_vol_sun 12 lesson), flattening the lobe is a
+//                   change in SHAPE — the shafts dissolve into an even glow.
+//   r_vol_w_clouds  …plus a modest damp of the sun term, r_vol_w_sky lifts the sky
+//                   term to match. ⚠ The weather's own sun_color already dims in
+//                   overcast profiles, so both stack with it — keep them modest.
+//   r_vol_w_fog_dust  fog_density scales the DUST layer. ⚠ Read this before touching
+//                   the two knobs above: fog_density is NOT "how much ground fog", it
+//                   is where the forward haze STARTS (fog_near = (1-density)*0.85*
+//                   fog_distance). Its honest counterpart is the thin tall layer,
+//                   which is itself the distance haze — and matching those two is the
+//                   whole reason V-2 exists.
+//   r_vol_w_fog     extra MIST from fog_density. DEFAULT 0, on purpose: hanging the
+//                   ground bank on that parameter shipped soup. A dry, hazy morning
+//                   sits at fog_density 0.90, which doubled the bank AND lifted it out
+//                   of the hollows — a fog day invented out of a number that never
+//                   claimed one. Raise it only if a weather set really does mean
+//                   ground fog by it.
+//   r_vol_w_rain    rain/wetness ADD to the bank — THIS is the bank's weather driver,
+//                   because ground fog is about moisture, not about sight distance.
+//                   Added, not replaced: a dry level keeps the hand-tuned look.
+// The hollow gate (r_vol_mist_relief) is relaxed in proportion to the WEATHER'S SHARE
+// of the bank: only fog the rain grew ignores the terrain, so a dry level keeps its
+// valley pattern exactly and a wet one climbs onto the ridges.
+// Transitions are smoothed by an accumulator (~45 s soak / ~3 min dry) — weather
+// changes are ramps, not steps. r_vol_weather 2 logs the inputs once a second, which
+// is the fast way to see whether THIS weather even carries them.
+int   ps_r_vol_weather    = 1;
+float ps_r_vol_w_clouds   = 0.5f;
+float ps_r_vol_w_sky      = 0.5f;
+float ps_r_vol_w_flat     = 0.7f;
+float ps_r_vol_w_fog      = 0.0f;
+float ps_r_vol_w_fog_dust = 0.5f;
+float ps_r_vol_w_rain     = 0.15f;
+// r_vol_w_wet_force — test hook. The rain-driven bank is the half of V-2 a dry level
+// can never show, and "wait for the weather script to bring rain" is a bad way to
+// verify a feature. -1 = use the real weather; 0..1 = pretend that wetness.
+float ps_r_vol_w_wet_force = -1.0f;
+// r_vol_term — isolate ONE in-scatter source in the froxel fog: 1 sun beam, 2 sky
+// ambient, 3 local lights, 4 atmosphere (Rayleigh/Mie), 5 smoke media, 0 = normal.
+// The fog is a sum of five sources and tuning it blind means pushing on whichever
+// one happens to be quiet: r_vol_sun x4 and two phase-model upgrades all landed on
+// the SUN term and were invisible away from the sun, which says something else is
+// painting the picture. This answers which, in one look.
+int   ps_r_vol_term      = 0;
+// r_vol_upsample — reconstruction filter for the froxel volume in the composite.
+// The grid is 256×144, i.e. ~7-8 screen pixels per froxel; the old composite took ONE
+// trilinear tap with a screen-STATIC dither, so the volume's own resolution showed
+// through as blocks (obvious with r_vol_ta 0) and the temporal pass had to hide it.
+// 1 = rotated 4-tap tent over ±0.5 froxel (3 extra 3D taps, ~0.05 ms at 1080p); the
+// pattern also rotates per frame WHEN an upscaler resolves, turning DLSS into free
+// supersampling of the volume instead of a preserver of fixed grain. 0 = old path.
+int   ps_r_vol_upsample  = 1;
 int   ps_r_vol_ta        = 1;       // temporal accumulation (jitter + reproject prev frame): smooths the froxel grid → clean dense fog
 float ps_r_vol_ta_blend  = 0.92f;   // history weight (EMA): higher = smoother but more ghosting on motion
 // TODO REMOVE (dead detour): the dedicated per-frame fog sun-shadow. Built to fix
@@ -1188,6 +1663,54 @@ float ps_r_puddle_level  = 0.5f;    // puddle coverage (higher = more/larger pud
 // smaller = broader pools. ~1.0 ≈ 5-6 m puddles. This is what gives DISTINCT
 // puddles instead of a uniform wet sheet on levels without an artist mask.
 float ps_r_puddle_scale  = 1.0f;
+// r_puddle_geo — put puddles in REAL ground dips. The SSFX recipe places them by
+// texture micro-height times a per-level HAND-PAINTED mask, so on a level without
+// that mask a metre-scale hollow in the asphalt collects nothing: the water level
+// only ever sees centimetre texture relief, and the macro placement is noise that
+// knows nothing about the ground. This blends in the Surface Field's concavity
+// (SF_Concavity — top-down curvature, sky-exposure gated) so water pools where the
+// ground is actually concave. 0 = pure SSFX/noise placement, 1 = follow the dips.
+float ps_r_puddle_geo    = 0.75f;
+// r_wet_dist — how far (m) wet shading survives. Ours faded over 70->35 m, so the
+// ground was wet underfoot and dry thirty steps out: on open terrain that reads as
+// a wet patch following the player rather than a rained-on world. SSFX fades its
+// wet gloss over 250->200 m (rain_patch_normal.ps). The ripple field keeps its own
+// tight fade, so the extra range is one cube tap on already-wet pixels.
+float ps_r_wet_dist      = 200.0f;
+// r_terrain_detail_dist — how far (m) the terrain detail NORMAL / cavity AO / gloss
+// survive. Was a hard 45->25 m fade: past it the ground drops its bump taps, so the
+// asphalt loses grain, micro-AO and its specular glint in one step and reads as flat
+// matte paint. SSFX samples the bump at any distance (only their POM march stops, at
+// 20 m). Costs 4 taps per terrain pixel inside the range — lower it if it shows up.
+float ps_r_terrain_detail_dist = 120.0f;
+// r_bolt_flash — how much a lightning strike lifts the HEMISPHERE light. The engine
+// spends a bolt by boosting sun_color and swinging sun_dir at the strike, which grows
+// a second sun (with god rays) wherever the renderer draws the sun — several per clap,
+// held on screen by the volume's temporal history. We hold the real sun direction
+// instead (SunDirVisual), which would cost the flash entirely, and pay it back here:
+// a strike is a huge distant AREA light, so it belongs in the sky term. 0 = no flash.
+float ps_r_bolt_flash = 1.0f;
+// Material normal + gloss on STATICS (`<bump>.dds`, see bump_common.glsl). This path
+// had neither: wall relief came only from the `#` height through POM, and the sky
+// specular ran on one invented roughness for the whole world.
+// r_bump       — normal-map strength (0 = off, the pre-existing look).
+// r_bump_debug — 1 draws the decoded WORLD normal, 2 the gloss. The R4 unpack is
+//                .wzy/.x; a mod texture authored as plain RGB would come out with
+//                inverted normals, and that is far easier to see as a colour field
+//                than as "something is off with the walls".
+// r_gloss_scale— how hard the material gloss drives the IBL roughness (R4 called
+//                this r2_gloss_factor). ⚠ INERT while r_ibl is 0 (the shipped
+//                default): roughness is consumed ONLY inside the SPEC_IBL block, so
+//                with no specular term there is nothing for it to modulate. Left
+//                wired for whoever revives IBL — see the r_ibl note above.
+//
+// r_bump itself stays ON and is INDEPENDENT of IBL: bumpNormal perturbs the shading
+// normal that sun, hemi and dynamic lights all consume, not just the reflection. That
+// half of this feature is verified good (user, 25-07: surface grain on walls reads);
+// only the gloss half died with r_ibl.
+float ps_r_bump        = 1.0f;
+int   ps_r_bump_debug  = 0;
+float ps_r_gloss_scale = 1.0f;
 
 // =========================================================================
 // EXPERIMENTAL / PARKED: WATER FLOW SIMULATION (compute, vk_water_sim).
@@ -2027,7 +2550,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vsm_tree_hull_vox_fade", &ps_r_vsm_tree_hull_vox_fade, 0.0f, 0.6f);     // dithered voxel-LOD crossfade band, fraction of handover dist (0 = hard cut); live
     CMD4(CCC_Integer, "r_vsm_tree_hull_debug", &ps_r_vsm_tree_hull_debug, 0, 2);                 // 1 = shaded hull over hull-tier trees (_dist boundary); 2 = over EVERY hulled tree (walk-up voxel inspect)
     CMD4(CCC_Float, "r_sun_boost", &ps_r_sun_boost, 0.f, 4.f);
-    CMD4(CCC_Integer, "r_linear_color", &ps_r_linear_color, 0, 1);                // linear colour pipeline; needs a level reload (format baked at texture load)
+    CMD4(CCC_Integer, "r_linear_color", &ps_r_linear_color, 0, 1);                // linear colour pipeline; LATCHED per process (ColorSpace::Active) — takes effect on next game start
     CMD4(CCC_Integer, "r_sun_night_freeze", &ps_r_sun_night_freeze, 0, 1);        // freeze the sun-shadow (VSM) update when the sun is down (no light → no cost)
     CMD4(CCC_Float,   "r_sun_night_lum",    &ps_r_sun_night_lum,    0.f, 0.5f);   // sun_color luminance threshold for "night" (secondary)
     CMD4(CCC_Float,   "r_sun_night_alt",    &ps_r_sun_night_alt,   -0.2f, 0.5f);  // to-sun.y (sun altitude) below which it's "night" (primary; 0 = horizon)
@@ -2074,6 +2597,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_point_range",        &ps_r_point_range,    0.5f, 4.0f);    // campfire/brazier light reach multiplier (volumetric points)
     CMD4(CCC_Float,   "r_glass_opacity", &ps_r_glass_opacity, 0.05f, 1.0f); // glass opacity ceiling (1 = texture alpha as in R4)
     CMD4(CCC_Float,   "r_glass_refr",    &ps_r_glass_refr,    0.0f,  3.0f); // glass refraction wobble strength (0 = off)
+    CMD4(CCC_Integer, "r_preskin",       &ps_r_preskin,       0, 1);        // compute pre-skinning: skin once per frame, not once per pass
     CMD4(CCC_Integer, "r_clouds",           &ps_r_clouds,           0, 1);         // animated cloud layer on/off
     CMD4(CCC_Float,   "r_clouds_intensity", &ps_r_clouds_intensity, 0.0f, 4.0f);   // cloud additive brightness
     CMD4(CCC_Float,   "r_clouds_speed",     &ps_r_clouds_speed,     0.0f, 8.0f);   // cloud UV scroll speed
@@ -2085,6 +2609,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_wet_debug", &ps_r_wet_debug, 0, 1);
     CMD4(CCC_Integer, "r_rain_debug", &ps_r_rain_debug, 0, 1);
     CMD4(CCC_Integer, "r_rain", &ps_r_rain_enable, 0, 1);   // master rain on/off (effect only, not weather)
+    CMD4(CCC_Float, "r_rain_sun", &ps_r_rain_sun, 0.f, 3.f); // streaks catch sun/moon/lightning (0 = flat hemi)
 
     // GPU-driven particles (gpu_particles_roadmap.md Phase 1). r_gpu_particles 1
     // runs the GPU-resident test effect (emit/simulate/draw) at the camera.
@@ -2107,6 +2632,10 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_vrs", &ps_r_vrs, 0, 2);
     CMD4(CCC_Integer, "r_vrs_force", &ps_r_vrs_force, 0, 4);
     CMD4(CCC_Integer, "r_vrs_static", &ps_r_vrs_static, 0, 1);
+    CMD4(CCC_Integer, "r_at_equal", &ps_r_at_equal, 0, 1);   // AT statics: depth EQUAL color path (live A/B)
+    CMD4(CCC_Integer, "r_fsinv_split", &ps_r_fsinv_split, 0, 1);   // diag: 4-way FS-invocation attribution in World/Color
+    CMD4(CCC_Integer, "r_z_prepass", &ps_r_z_prepass, 0, 1);       // statics color: no z-write -> early-Z with discard (live A/B)
+    CMD4(CCC_Float,   "r_ssa_px", &ps_r_ssa_px, 0.f, 16.f);        // SSA cull of plain meshes, projected-diameter px (0 = off, live)
     CMD4(CCC_Integer, "r_uber_variants", &ps_r_uber_variants, 0, 1);   // A/B: 0 = old monolithic world uber-FS
     CMD4(CCC_Float, "r_vrs_near", &ps_r_vrs_near, 0.f, 300.f);
     CMD4(CCC_Float, "r_vrs_far",  &ps_r_vrs_far,  0.f, 500.f);
@@ -2132,6 +2661,12 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vsm_base",     &ps_r_vsm_base,     8.0f, 64.0f);
     CMD4(CCC_Float,   "r_vsm_bias",     &ps_r_vsm_bias,     0.0f, 0.02f);
     CMD4(CCC_Float,   "r_vsm_bias_dyn", &ps_r_vsm_bias_dyn, 0.0f, 0.02f);
+    CMD4(CCC_Float,   "r_vsm_bias_min", &ps_r_vsm_bias_min, 0.0f, 0.02f);   // static receiver bias const part (0 = legacy flat r_vsm_bias)
+    CMD4(CCC_Float,   "r_vsm_raster_bias",  &ps_r_vsm_raster_bias,  0.0f, 16.0f);  // atlas write bias const (D16 units)
+    CMD4(CCC_Float,   "r_vsm_raster_slope", &ps_r_vsm_raster_slope, 0.0f, 16.0f);  // atlas write bias slope
+    CMD4(CCC_Float,   "r_vol_vsm_bias", &ps_r_vol_vsm_bias, 0.0f, 0.02f);   // fog air bias vs static atlas (0 = legacy)
+    CMD4(CCC_Float,   "r_vol_depth_reject", &ps_r_vol_depth_reject, 0.0f, 5.0f);   // froxel depth-rejection slack m (0 = off)
+    CMD4(CCC_Float,   "r_vol_surf_clip",    &ps_r_vol_surf_clip,    0.0f, 2.0f);   // depth-rejection front shell m (0 = off)
     CMD4(CCC_Integer, "r_vsm_grass_static", &ps_r_vsm_grass_static, 0, 1);   // far-grass static-cache hybrid (0 = all-dynamic L0..L2)
     CMD4(CCC_Integer, "r_vsm_temporal", &ps_r_vsm_temporal, 0, 1);
     CMD4(CCC_Float,   "r_vsm_ta_blend", &ps_r_vsm_ta_blend, 0.0f, 0.98f);
@@ -2140,6 +2675,11 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vsm_ta_motion",       &ps_r_vsm_ta_motion,       0.5f, 64.0f);  // (2) px of reproj motion to reach the floor
     CMD4(CCC_Float,   "r_vsm_ta_motion_floor", &ps_r_vsm_ta_motion_floor, 0.0f, 0.98f);  // (2) history weight at full motion
     CMD4(CCC_Float,   "r_vsm_ta_blend_dlss",   &ps_r_vsm_ta_blend_dlss,   0.0f, 1.0f);   // (3) history-weight scale when r_dlss on
+    CMD4(CCC_Integer, "r_vsm_soft",        &ps_r_vsm_soft,        0, 32);        // stochastic PCSS filter taps (0 = legacy 3x3 PCF)
+    CMD4(CCC_Integer, "r_vsm_soft_search", &ps_r_vsm_soft_search, 2, 16);        // blocker-search taps
+    CMD4(CCC_Float,   "r_vsm_soft_angle",  &ps_r_vsm_soft_angle,  0.1f, 8.0f);   // sun cone HALF-angle, degrees (0.265 = physical)
+    CMD4(CCC_Float,   "r_vsm_soft_range",  &ps_r_vsm_soft_range,  2.0f, 80.0f);  // max blocker distance m = widest penumbra
+    CMD4(CCC_Float,   "r_vsm_soft_clamp",  &ps_r_vsm_soft_clamp,  0.0f, 1.0f);   // temporal clamp while soft is on (noise must pass)
     CMD4(CCC_Integer, "r_vsm_grass",      &ps_r_vsm_grass,      0, 1);
     CMD4(CCC_Float,   "r_vsm_grass_dist", &ps_r_vsm_grass_dist, 4.0f, 48.0f);
     CMD4(CCC_Integer, "r_vsm_tree_vrs",   &ps_r_vsm_tree_vrs,   0, 1);   // 2x2 coarse crown-shadow shading (A/B; parked — no gain)
@@ -2150,7 +2690,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vsm_lod_dist",   &ps_r_vsm_lod_dist,   0.0f, 500.0f);
     CMD4(CCC_Integer, "r_vsm_mark_half",  &ps_r_vsm_mark_half,  0, 1);
     CMD4(CCC_Integer, "r_vsm_dyn_gate",   &ps_r_vsm_dyn_gate,   0, 1);
-    CMD4(CCC_Integer, "r_vsm_debug_dyn",  &ps_r_vsm_debug_dyn,  0, 3);   // red overlay: dyn-atlas (NPC/grass) shadows; 2 = RAW occlusion (no static/orientation gate); 3 = PRESENCE (any dyn depth, no z-test)
+    CMD4(CCC_Integer, "r_vsm_debug_dyn",  &ps_r_vsm_debug_dyn,  0, 4);   // red overlay: dyn-atlas (NPC/grass) shadows; 2 = RAW occlusion (no static/orientation gate); 3 = PRESENCE (any dyn depth, no z-test); 4 = SUN VISIBILITY (red = shadow system says sun-lit)
     CMD4(CCC_Integer, "r_vsm_cache",      &ps_r_vsm_cache,      0, 1);
     CMD4(CCC_Integer, "r_vsm_cache_refresh", &ps_r_vsm_cache_refresh, 1, 64);
     CMD4(CCC_Integer, "r_vsm_throttle",        &ps_r_vsm_throttle, 0, 1);                 // cost-feedback LOD bias (A/B)
@@ -2196,6 +2736,42 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_ibl",             &ps_r_ibl,             0, 1);
     CMD4(CCC_Float,   "r_ibl_spec",        &ps_r_ibl_spec,        0.f, 4.f);
     CMD4(CCC_Integer, "r_ibl_debug",       &ps_r_ibl_debug,       0, 1);
+    // Diffuse sky irradiance via SH9 (0 = A/B against the prefiltered probe mip).
+    CMD4(CCC_Integer, "r_sky_sh",          &ps_r_sky_sh,          0, 1);
+    CMD4(CCC_Float,   "r_sky_sh_ground",   &ps_r_sky_sh_ground,   0.f, 1.f);
+    CMD4(CCC_Integer, "r_sky_sh_debug",    &ps_r_sky_sh_debug,    0, 1);
+    // Procedural Rayleigh+Mie sky: feeds the dome AND the light probe from one model.
+    CMD4(CCC_Integer, "r_sky_proc",        &ps_r_sky_proc,        0, 1);
+    CMD4(CCC_Float,   "r_sky_intensity",   &ps_r_sky_intensity,   0.f, 200.f);
+    CMD4(CCC_Float,   "r_sky_turbidity",   &ps_r_sky_turbidity,   0.f, 20.f);
+    CMD4(CCC_Float,   "r_sky_mie_g",       &ps_r_sky_mie_g,       0.f, 0.99f);
+    CMD4(CCC_Integer, "r_sky_sun_from_atmo", &ps_r_sky_sun_from_atmo, 0, 1);
+    CMD4(CCC_Float,   "r_sky_sun_scale",   &ps_r_sky_sun_scale,   0.f, 40.f);
+    // Volumetric clouds (raymarched). Needs r_sky_proc for its lighting to make sense.
+    CMD4(CCC_Integer, "r_clouds_vol",           &ps_r_clouds_vol,           0, 1);
+    CMD4(CCC_Float,   "r_clouds_coverage",      &ps_r_clouds_coverage,      0.f, 1.f);
+    CMD4(CCC_Float,   "r_clouds_density",       &ps_r_clouds_density,       0.f, 8.f);
+    CMD4(CCC_Float,   "r_clouds_detail",        &ps_r_clouds_detail,        0.f, 1.f);
+    CMD4(CCC_Float,   "r_clouds_bottom",        &ps_r_clouds_bottom,        200.f, 12000.f);
+    CMD4(CCC_Float,   "r_clouds_top",           &ps_r_clouds_top,           400.f, 20000.f);
+    CMD4(CCC_Float,   "r_clouds_shape_scale",   &ps_r_clouds_shape_scale,   0.000001f, 0.01f);
+    CMD4(CCC_Float,   "r_clouds_detail_scale",  &ps_r_clouds_detail_scale,  0.000001f, 0.05f);
+    CMD4(CCC_Float,   "r_clouds_weather_scale", &ps_r_clouds_weather_scale, 0.0000001f, 0.01f);
+    CMD4(CCC_Float,   "r_clouds_wind_dir",      &ps_r_clouds_wind_dir,      0.f, 360.f);
+    CMD4(CCC_Float,   "r_clouds_wind_speed",    &ps_r_clouds_wind_speed,    0.f, 200.f);
+    CMD4(CCC_Float,   "r_clouds_phase_g",       &ps_r_clouds_phase_g,       0.f, 0.99f);
+    CMD4(CCC_Float,   "r_clouds_phase_g_back",  &ps_r_clouds_phase_g_back,  0.f, 0.99f);
+    CMD4(CCC_Float,   "r_clouds_extinction",    &ps_r_clouds_extinction,    0.001f, 2.f);
+    CMD4(CCC_Float,   "r_clouds_powder",        &ps_r_clouds_powder,        0.f, 1.f);
+    CMD4(CCC_Float,   "r_clouds_sun",           &ps_r_clouds_sun,           0.f, 200.f);
+    CMD4(CCC_Float,   "r_clouds_ambient",       &ps_r_clouds_ambient,       0.f, 20.f);
+    CMD4(CCC_Integer, "r_clouds_steps",         &ps_r_clouds_steps,         16, 256);
+    CMD4(CCC_Float,   "r_clouds_max_dist",      &ps_r_clouds_max_dist,      5000.f, 400000.f);
+    CMD4(CCC_Float,   "r_clouds_cirrus",        &ps_r_clouds_cirrus,        0.f, 2.f);
+    CMD4(CCC_Float,   "r_clouds_cirrus_alt",    &ps_r_clouds_cirrus_alt,    2000.f, 20000.f);
+    CMD4(CCC_Float,   "r_clouds_cirrus_scale",  &ps_r_clouds_cirrus_scale,  0.0000001f, 0.01f);
+    CMD4(CCC_Integer, "r_clouds_debug",         &ps_r_clouds_debug,         0, 2);
+    CMD4(CCC_Integer, "r_clouds_weather",       &ps_r_clouds_weather,       0, 1);
 
     // Hi-Z occlusion cull of the GPU-driven static color pass (vk_world_gpu).
     CMD4(CCC_Integer, "r_hzb_cull", &ps_r_hzb_cull, 0, 1);
@@ -2216,6 +2792,11 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_atmo_mie_g",    &ps_r_atmo_mie_g,    0.0f, 0.95f);
     // Auto-exposure temporal adaptation (eye adaptation) — seconds; 0 = instant.
     CMD4(CCC_Float,   "r_exp_adapt",     &ps_r_exp_adapt,     0.0f, 5.0f);
+    // Auto-exposure user knobs (all live; see vk_exposure.h).
+    CMD4(CCC_Float,   "r_expo",          &ps_r_expo,          0.1f, 4.0f);
+    CMD4(CCC_Float,   "r_expo_gray",     &ps_r_expo_gray,     0.0f, 1.0f);
+    CMD4(CCC_Float,   "r_expo_min",      &ps_r_expo_min,      0.1f, 2.0f);
+    CMD4(CCC_Float,   "r_expo_max",      &ps_r_expo_max,      0.5f, 8.0f);
     CMD4(CCC_Float,   "r_vol_amb",       &ps_r_vol_amb,       0.0f, 1.0f);
     CMD4(CCC_Float,   "r_vol_ambient",   &ps_r_vol_ambient,   0.0f, 4.0f);   // fog sky-fill tint scale (lower = darker night air; was tied to r_ambient_floor)
     CMD4(CCC_Float,   "r_vol_indoor",    &ps_r_vol_indoor,    0.0f, 16.0f);
@@ -2238,9 +2819,41 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vol_noise_speed", &ps_r_vol_noise_speed, 0.0f, 1.0f);
     CMD4(CCC_Float,   "r_vol_soft",      &ps_r_vol_soft,      0.5f, 8.0f);
     CMD4(CCC_Integer, "r_vol_ta",        &ps_r_vol_ta,        0, 1);
+    CMD4(CCC_Integer, "r_vol_upsample",  &ps_r_vol_upsample,  0, 1);   // volume reconstruction filter in the composite (0 = old 1-tap)
+    CMD4(CCC_Float,   "r_fog_dist",      &ps_r_fog_dist,      0.0f, 8.0f);   // forward distance-fog range scale (0 = off, 1 = weather)
+    CMD4(CCC_Integer, "r_vol_ground_debug", &ps_r_vol_ground_debug, 0, 3);   // 1 = height above baked terrain, 2 = micro-relief in the rain map, 3 = baked grass canopy (view with r_vol_debug 1)
+    CMD4(CCC_Integer, "r_vol_hillaire",      &ps_r_vol_hillaire,      0, 1);        // energy-conserving slice integration (0 = legacy A/B)
+    CMD4(CCC_Float,   "r_vol_albedo",        &ps_r_vol_albedo,        0.0f, 1.0f);  // single-scatter albedo (sigma_s = sigma_t x albedo)
+    CMD4(CCC_Integer, "r_vol_noise_scatter", &ps_r_vol_noise_scatter, 0, 1);        // animated noise on scattering, not extinction (0 = legacy)
+    CMD4(CCC_Integer, "r_vol_ms",            &ps_r_vol_ms,            1, 4);        // multiple-scattering octaves (1 = single scatter)
+    CMD4(CCC_Float,   "r_vol_g_back",        &ps_r_vol_g_back,       -0.9f, 0.0f);  // backward phase lobe g
+    CMD4(CCC_Float,   "r_vol_g_mix",         &ps_r_vol_g_mix,         0.0f, 1.0f);  // backward lobe weight (0 = single lobe)
+    CMD4(CCC_Float,   "r_vol_mist",          &ps_r_vol_mist,          0.0f, 2.0f);   // V-1 layer 2: ground-mist density at ground level (0 = single layer)
+    CMD4(CCC_Float,   "r_vol_mist_h",        &ps_r_vol_mist_h,        0.25f, 64.0f); // ground-mist thickness (m)
+    CMD4(CCC_Float,   "r_vol_mist_g",        &ps_r_vol_mist_g,        0.0f, 0.95f);  // ground-mist phase (droplets scatter less directionally than dust)
+    CMD4(CCC_Float,   "r_vol_mist_relief",   &ps_r_vol_mist_relief,   0.0f, 40.0f);  // terrain drop (m) the mist fades in over (0 = layer is everywhere)
+    CMD4(CCC_Float,   "r_vol_mist_noise",       &ps_r_vol_mist_noise,       0.0f, 2.0f);    // mist height-warp: billowing top instead of a flat lid (0 = smooth exponential)
+    CMD4(CCC_Float,   "r_vol_mist_noise_scale", &ps_r_vol_mist_noise_scale, 0.005f, 0.5f);  // size of the billows (1/m; 0.05 = ~20 m)
+    CMD4(CCC_Float,   "r_vol_mist_micro",    &ps_r_vol_mist_micro,    0.0f, 4.0f);   // ABSOLUTE density of mist pooling in ruts/craters, independent of r_vol_mist (0 = off)
+    CMD4(CCC_Float,   "r_vol_mist_micro_h",  &ps_r_vol_mist_micro_h,  0.02f, 2.0f);  // dip depth (m) at which the micro effect saturates
+    CMD4(CCC_Integer, "r_vol_mist_fade",     &ps_r_vol_mist_fade,     0, 3);         // thin the bank you are STANDING IN: 0 off, 1 immersion, 2 near-camera, 3 both
+    CMD4(CCC_Float,   "r_vol_mist_inside",   &ps_r_vol_mist_inside,   0.0f, 64.0f);  // what it thins down to, as a MULTIPLE OF r_vol_density (2 = twice the general haze)
+    CMD4(CCC_Float,   "r_vol_mist_near",     &ps_r_vol_mist_near,     1.0f, 200.0f); // radius (m) of the mode-2 clearing around the camera
+    CMD4(CCC_Float,   "r_vol_mist_inside_h", &ps_r_vol_mist_inside_h, 1.0f, 200.0f); // height (m) the immersion fades out over — a hilltop, NOT a rooftop
+    CMD4(CCC_Float,   "r_vol_canopy",        &ps_r_vol_canopy,        0.0f, 8.0f);   // grass canopy occlusion of the fog's sun term (0 = off, grass invisible to the sun as before)
+    CMD4(CCC_Float,   "r_vol_canopy_h",      &ps_r_vol_canopy_h,      0.1f, 4.0f);   // canopy height multiplier over the authored detail-model height
+    CMD4(CCC_Integer, "r_vol_weather",       &ps_r_vol_weather,       0, 2);         // V-2: weather drives the medium (0 = manual cvars only, 1 = on, 2 = on + log the inputs)
+    CMD4(CCC_Float,   "r_vol_w_clouds",      &ps_r_vol_w_clouds,      0.0f, 1.0f);   // overcast damping of the fog's sun term (1 = full overcast kills it)
+    CMD4(CCC_Float,   "r_vol_w_sky",         &ps_r_vol_w_sky,         0.0f, 4.0f);   // overcast lift of the sky term
+    CMD4(CCC_Float,   "r_vol_w_flat",        &ps_r_vol_w_flat,        0.0f, 1.0f);   // overcast flattens the phase toward isotropic (the knob that actually READS as overcast)
+    CMD4(CCC_Float,   "r_vol_w_fog",         &ps_r_vol_w_fog,         0.0f, 2.0f);   // extra MIST from fog_density (0 = off; fog_density means sight distance, not ground fog)
+    CMD4(CCC_Float,   "r_vol_w_fog_dust",    &ps_r_vol_w_fog_dust,    0.0f, 8.0f);   // dust density gain at fog_density 1 (small: dust makes rays, not fog)
+    CMD4(CCC_Float,   "r_vol_w_rain",        &ps_r_vol_w_rain,        0.0f, 2.0f);   // mist density added at full wetness
+    CMD4(CCC_Float,   "r_vol_w_wet_force",   &ps_r_vol_w_wet_force,  -1.0f, 1.0f);   // test hook: -1 = real weather, 0..1 = pretend this wetness (see the rain fog without waiting for rain)
+    CMD4(CCC_Integer, "r_vol_term",          &ps_r_vol_term,          0, 5);        // isolate one in-scatter source (1 sun 2 ambient 3 lights 4 atmo 5 smoke)
     CMD4(CCC_Float,   "r_vol_ta_blend",  &ps_r_vol_ta_blend,  0.0f, 0.98f);
     CMD4(CCC_Integer, "r_vol_shadow",    &ps_r_vol_shadow,    0, 1);
-    CMD4(CCC_Integer, "r_vol_debug",     &ps_r_vol_debug,     0, 1);
+    CMD4(CCC_Integer, "r_vol_debug",     &ps_r_vol_debug,     0, 4);   // 1 = raw in-scatter, 3 = froxel sun visibility, 4 = occlusion source (green VSM / red miss->skyVis / blue cascade)
 
     // Dynamic-light terrain/static occlusion (ground-height map + per-light march).
     CMD4(CCC_Integer, "r_light_occ", &ps_r_light_occ, 0, 1);
@@ -2276,9 +2889,16 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_terrain_debug", &ps_r_terrain_debug, 0, 9);     // ...5 beam directLit,6 beam mask,7 beam gap(red),8 ground-deposit sampled in-scatter,9 deposit gate(red)/inscat(green)
     CMD4(CCC_Float, "r_terrain_gloss", &ps_r_terrain_gloss, 0.f, 2.f);   // terrain dry sun-gloss strength
     CMD4(CCC_Integer, "r_puddle_debug", &ps_r_puddle_debug, 0, 2);       // 0 off, 1 coverage, 2 micro-height/flow
-    CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 1);           // SSS puddles (default puddle source)
+    CMD4(CCC_Integer, "r_puddle_sss", &ps_r_puddle_sss, 0, 2);           // 0 off, 1 our tuned water body, 2 SSFX-strict shading
     CMD4(CCC_Float, "r_puddle_level", &ps_r_puddle_level, 0.f, 1.f);     // puddle coverage (more/larger puddles)
     CMD4(CCC_Float, "r_puddle_scale", &ps_r_puddle_scale, 0.1f, 6.f);    // puddle size (bigger = smaller pools)
+    CMD4(CCC_Float, "r_puddle_geo", &ps_r_puddle_geo, 0.f, 1.f);         // puddles follow REAL ground dips (Surface Field concavity)
+    CMD4(CCC_Float, "r_wet_dist", &ps_r_wet_dist, 20.f, 400.f);          // range (m) wet shading survives to (SSFX ~200)
+    CMD4(CCC_Float, "r_terrain_detail_dist", &ps_r_terrain_detail_dist, 30.f, 400.f); // range (m) terrain detail normal/AO/gloss survive to
+    CMD4(CCC_Float, "r_bolt_flash", &ps_r_bolt_flash, 0.f, 4.f);         // lightning lifts the sky/hemi light (0 = no flash)
+    CMD4(CCC_Float, "r_bump", &ps_r_bump, 0.f, 2.f);                     // static material normal-map strength (0 = off)
+    CMD4(CCC_Integer, "r_bump_debug", &ps_r_bump_debug, 0, 2);           // 1 = decoded world normal, 2 = material gloss
+    CMD4(CCC_Float, "r_gloss_scale", &ps_r_gloss_scale, 0.f, 4.f);       // material gloss -> IBL roughness (R4 r2_gloss_factor)
     CMD4(CCC_Integer, "r_sf", &ps_r_sf, 0, 1);                  // Surface Field master enable
     CMD4(CCC_Integer, "r_sf_debug", &ps_r_sf_debug, 0, 5);      // 0 off,1 height,2 slope,3 curvature,4 sky,5 canopy
     CMD4(CCC_Float, "r_sf_eps", &ps_r_sf_eps, 0.25f, 8.f);      // derive finite-difference epsilon (m)

@@ -32,6 +32,14 @@ for %%f in (*.comp.glsl) do call :one "%%f" compute
 for %%f in (*.tesc.glsl) do call :one "%%f" tesscontrol
 for %%f in (*.tese.glsl) do call :one "%%f" tesseval
 
+REM EARLY_ZTEST twins of the world FS (forced early depth test; bound only to
+REM no-z-write statics pipelines by EarlyTwin in vk_pipeline_cache.cpp). Same
+REM sources, -DEARLY_ZTEST, distinct .spv names.
+call :onedef "world_lmap.frag.glsl"      fragment EARLY_ZTEST "world_lmap_earlyz.frag.spv"
+call :onedef "world_vlit.frag.glsl"      fragment EARLY_ZTEST "world_vlit_earlyz.frag.spv"
+call :onedef "world_lmap_fade.frag.glsl" fragment EARLY_ZTEST "world_lmap_fade_earlyz.frag.spv"
+call :onedef "world_vlit_fade.frag.glsl" fragment EARLY_ZTEST "world_vlit_fade_earlyz.frag.spv"
+
 if %ERR% NEQ 0 (
     echo.
     echo BUILD FAILED: %ERR% shader had errors.
@@ -64,5 +72,16 @@ if errorlevel 1 (
     set /a ERR+=1
 ) else (
     echo   ok: %~1
+)
+goto :eof
+
+:onedef
+REM %1 = source .glsl (quoted), %2 = stage, %3 = preprocessor define, %4 = output .spv (quoted)
+"%GLSLC%" --target-env=vulkan1.3 -fshader-stage=%2 -D%3 "%~1" -o "%~4"
+if errorlevel 1 (
+    echo   FAILED: %~1 [%3]
+    set /a ERR+=1
+) else (
+    echo   ok: %~4
 )
 goto :eof

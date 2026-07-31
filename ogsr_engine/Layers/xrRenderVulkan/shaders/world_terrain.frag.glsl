@@ -8,6 +8,7 @@
 #include "cluster_lights.glsl"   // clustered forward (set 1 b17..19, r_clustered)
 #include "shadow_common.glsl"    // spotShadowF/pointShadowF/cascTap/cascSample/sunShadow
 #include "env_common.glsl"       // gtaoVis/gtaoBentN/coloredAO/skyAmbient/rainVis
+#include "surface_field.glsl"    // SF_Concavity — real ground dips for puddle placement (r_puddle_geo)
 #include "light_shade.glsl"      // lightTerrainOcc/shadeDynLight/dynLights
 #include "flow_sim_sample.glsl"  // simWater*/simFlow/groundHm/waterDebugColor/flowWaves
 #include "wetness.glsl"          // applyWetnessTerrain + applyWetnessCore
@@ -152,6 +153,18 @@ float sssPuddle(vec3 N, vec3 wp, float detH)
     // Macro body variation: soft (0.35 floor), not the old binary placement —
     // the heightfield decides WHERE inside a body the water actually sits.
     float macro = 0.35 + 0.65 * puddlesMaskProc(wp.xz, clamp(wet * 1.4, 0.0, 1.0), L.pom_params7.w);
+    // REAL DIPS (r_puddle_geo). Everything above is texture-scale: the water level is
+    // compared against detail micro-height (centimetres, tiling every metre or two),
+    // and WHERE the pools go is decided by noise. SSFX gets away with that because a
+    // per-level artist mask paints the hollows in; without one, a metre-deep dip in
+    // the asphalt stays dry while the noise puts water on the crown of the road.
+    // SF_Concavity is the top-down curvature of the actual ground (sky-exposure
+    // gated, so nothing pools under a roof), which is the signal that was missing.
+    // The noise keeps a floor so a genuinely flat yard still breaks up rather than
+    // sheeting over uniformly.
+    float geo = L.puddle_geo.x;
+    if (geo > 0.001)
+        macro = mix(macro, max(macro * 0.25, SF_Concavity(wp)), geo);
     return puddles * macro * slope;
 }
 
@@ -278,7 +291,14 @@ void main()
     vec3  Nw      = geomN;                 // base normal; detailNormal perturbs it near so sun/dyn catch the relief
     // Detail normal mapping: the primary ground-relief source. Faded to 0 by
     // distance so far terrain skips the 4 taps + AO + gloss entirely.
-    float dnStr  = L.pom_params4.y * smoothstep(45.0, 25.0, distance(L.eye_pos.xyz, vWorldPos));
+    // RANGE (r_terrain_detail_dist). This was a hard 45->25 m fade, which is why our
+    // asphalt goes flat matte paint a few dozen metres out: past it the 4 bump taps
+    // are skipped, so the ground loses its normal map, its cavity AO AND its gloss
+    // (glossT stays 0 -> no dry specular at all). SSFX samples the bump at ANY
+    // distance — only the POM MARCH attenuates (their dist_att, 20 m) — so their
+    // road keeps its grain and its glint to the horizon.
+    float dnFar  = max(L.puddle_geo.z, 30.0);
+    float dnStr  = L.pom_params4.y * smoothstep(dnFar, dnFar * 0.55, distance(L.eye_pos.xyz, vWorldPos));
     float cav    = 0.0;
     float glossT = 0.0;
     if (dnStr > 0.0)
@@ -505,16 +525,25 @@ void main()
     // r_ibl master gate hoisted up: iblSpecular self-early-outs at ibl_params.x, but
     // Vv/wetF's rainVis gathers/roughI ran regardless. Skip when IBL is off (default)
     // — output identical (iblSpecular returned 0 below the same threshold).
-    vec3 specIBL = vec3(0.0);
+    vec3  specIBL = vec3(0.0);
+    float specE   = 0.0;   // reflected fraction — taken OFF the diffuse below
     if (SPEC_IBL && L.ibl_params.x > 0.004) {
         vec3  Vv      = normalize(L.eye_pos.xyz - vWorldPos);
-        float wetF    = clamp(L.rain_params.y, 0.0, 1.0) * rainVis(vWorldPos);
-        float roughI  = mix(0.9, 0.5, wetF);
-        specIBL       = iblSpecular(Nw, Vv, roughI, vec3(0.04)) * gtaoVisRaw() * (0.08 + 0.45 * wetF);
+        // DRY BASE ONLY. The wet half used to live here too (roughness 0.9 -> 0.5,
+        // strength scaled by wetness), on top of the wet reflection applyWetness
+        // already produces — the same pixels brightened twice every time it rained.
+        // One owner per effect: wet ground is applyWetness's (r_wet_refl), this is
+        // the faint dry sky tint that keeps matte dirt from looking cut out.
+        const float roughI = 0.9;
+        vec3  Rv      = reflect(-Vv, Nw);
+        float vis     = specOcclusion(gtaoBentN(geomN), Rv, gtaoVisRaw()) * 0.08;
+        specIBL       = iblSpecular(Nw, Vv, roughI, vec3(0.04)) * vis;
+        specE         = iblSpecWeight(Nw, Vv, roughI, vec3(0.04)) * vis;
     }
 
     // Distance fog (R4).
-    vec3 col = albedo * lighting + drySpec + wetRefl + specIBL;
+    // Energy: the mirrored fraction is not also transmitted (see iblSpecWeight).
+    vec3 col = albedo * lighting * (1.0 - specE) + drySpec + wetRefl + specIBL;
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 

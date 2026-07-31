@@ -348,6 +348,12 @@ public:
     // True while a thunderbolt is flashing (it transiently overwrites the env
     // sun_dir — shadow cascades must freeze their sun while this is set).
     bool IsThunderboltActive() const;
+    // Flash colour a bolt is adding this frame (0 when idle). The bolt ALSO swings
+    // CurrentEnv->sun_dir at the strike, which puts a duplicate sun -- with god rays
+    // -- wherever the renderer draws "the sun". A renderer that holds the real sun
+    // direction can spend this as sky light instead and get the flash without the
+    // second sun. See CEffect_Thunderbolt::Flash.
+    const Fvector& ThunderboltFlash() const;
     void StopWeatherFX();
 
     void SetWeather(shared_str name, bool forced = false);

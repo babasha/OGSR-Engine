@@ -67,6 +67,7 @@ bool        AtlasReady();      // true once the atlas has been rendered (valid S
 // without the screen-space mask's parallax. Valid once AtlasReady().
 VkImageView GetDynAtlasView();
 VkBuffer    GetDynPageTableHandle();
+VkBuffer    GetDynUsedHandle();      // dyn slot -> has-caster flag (skip empty dyn pages)
 
 // Temporal resolve (TAA-for-shadows): after RenderAtlas, with `sceneDepth` back in
 // SHADER_READ_ONLY, run the screen-space resolve — sample the atlas per pixel, blend

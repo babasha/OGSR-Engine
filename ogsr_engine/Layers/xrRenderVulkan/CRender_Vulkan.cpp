@@ -50,7 +50,7 @@ extern int ps_r_dlss_fg_mult;   // r_dlss_fg_mult — frame multiplier 2..6
 #include "vk_wallmarks.h"        // VK::Wallmarks — bullet holes / decals on level geometry
 #include "vk_rain.h"             // VK::Pass_Rain — rain drops/splashes + thunderbolt
 #include "vk_pass_shadow.h"      // VK::Pass_SunShadow (sun shadow caster, before World)
-#include "vk_pass_sunshafts.h"   // VK::Pass_SunShafts (volumetric god rays, after Sky)
+#include "vk_pass_skinned.h"     // VK::Skinned_PreSkin (compute pre-skinning, before every consumer)
 #include "vk_pass_lightcones.h"  // VK::Pass_LightCones (per-light volumetric beams)
 #include "vk_light.h"            // VK::vkLight (dynamic point/spot lights, STEP 3)
 #include "vk_instance_gpu.h"     // VK::InstanceGPU (host scene → GPU-driven instanced casters)
@@ -1521,6 +1521,13 @@ void CRender::Render()
         // Sky + the editor overlay draw onto a defined target with depth=1.0. No-ops in
         // game mode (guarded by VKEditor::Active()).
         VK::RegisterPass("EditorClear", [](VK::FrameContext& c) { VKEditor::ClearTargets(c); });
+        // COMPUTE PRE-SKINNING (r_preskin) before any consumer: skins every
+        // visible skeleton leaf ONCE into a shared world-space pool, so the
+        // shadow/prepass/colour/VSM passes below draw pre-transformed geometry
+        // instead of re-running the bone blend in each of their vertex shaders.
+        // Must sit outside a render pass (it dispatches compute) — hence its own
+        // registered pass rather than a call inside Pass_SunShadow.
+        VK::RegisterPass("PreSkin", [](VK::FrameContext& c) { VK::Skinned_PreSkin(c.cmd); });
         // Sun shadow caster FIRST: renders static world depth from the sun POV into
         // the shadow map (own depth target), leaves it SHADER_READ for the receivers.
         VK::RegisterPass("SunShadow", [](VK::FrameContext& c) { VK::Pass_SunShadow(c); });
@@ -1562,9 +1569,12 @@ void CRender::Render()
         // ExecutePostTonemap call after Tonemap; skip the HDR pass so the queued lines
         // survive. The Spike (-vk_spike, in-level) still uses this HDR overlay path.
         VK::RegisterPass("EditorOverlay", [](VK::FrameContext& c) { if (!VKEditor::Active()) EditorOverlay::Execute(c); });
-        // Volumetric sun shafts (god rays): fullscreen raymarch vs the sun shadow
-        // map, additive over the lit scene. After Sky so rays glow against it too.
-        VK::RegisterPass("Shafts", [](VK::FrameContext& c) { VK::Pass_SunShafts(c); });
+        // (Sun shafts used to be registered here — a fullscreen additive raymarch of
+        // the FAR sun map. Removed 2026-07-24: under VSM that map is deliberately left
+        // cleared = "fully lit", so the pass painted warm rays THROUGH walls and had to
+        // be gated off entirely; and god rays are now the froxel volumetrics' job, where
+        // they come out of a real medium with a phase function instead of a screen
+        // effect layered on top. See [[vulkan-vsm-light-leak-fix]] / the fog V-1 layers.)
         // Per-light volumetric cones: real raymarched beams for the volumetric
         // spots (headlights/searchlights/pole lamps) — replaces the R4
         // lightplanes texture-sheet fakes. Additive over the lit scene.

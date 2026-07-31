@@ -34,7 +34,6 @@
 #include "vk_clustered.h"      // VK::Clustered::Destroy() — clustered forward teardown
 #include "vk_async.h"          // VK::Async::Destroy() — async compute teardown
 #include "vk_volumetrics.h"    // VK::Vol::Init/Destroy() — froxel volumetrics
-#include "vk_pass_sunshafts.h" // VK::SunShafts_Destroy()
 #include "vk_pass_lightcones.h" // VK::LightCones_Destroy()
 #include "vk_pass_shadow.h"    // VK::SunShadow_Destroy() — grass-spot caster pipeline
 #include "vk_pass_skinned.h"   // VK::Skinned_Destroy() — frees the bone SSBO at teardown
@@ -255,7 +254,6 @@ void vkRenderDeviceRender::Destroy()
     VK::BloomPass::Destroy();           Msg("[VK] DevRender::Destroy: BloomPass done");
     VK::TonemapPass::Destroy();         Msg("[VK] DevRender::Destroy: TonemapPass done");
     VK::SceneColor::Destroy();          Msg("[VK] DevRender::Destroy: SceneColor done");
-    VK::SunShafts_Destroy();            Msg("[VK] DevRender::Destroy: SunShafts done");
     VK::LightCones_Destroy();           Msg("[VK] DevRender::Destroy: LightCones done");
     VK::Skinned_Destroy();              Msg("[VK] DevRender::Destroy: SkinnedPass done");
     VK::EnvLight::Destroy();            Msg("[VK] DevRender::Destroy: EnvLight done");

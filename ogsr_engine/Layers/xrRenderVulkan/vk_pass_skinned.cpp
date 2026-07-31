@@ -14,6 +14,7 @@
 #include "vk_FBasicVisual.h"            // pulls vk_SkeletonCompat.h (dxRender_Visual->vkRender_Visual, vk_Visual.h)
 #include "CRender_Vulkan.h"
 #include "../xrRender/SkeletonCustom.h" // CKinematics
+#include "../xrRender/SkeletonAnimated.h" // CKinematicsAnimated (blend-count diag)
 
 #include "vk_pass_skinned.h"
 #include "vk_pass_ssao.h"              // SSAOPass::GetNormalFormat â€” NPC normal G-buffer target
@@ -30,6 +31,7 @@
 #include "vk_env_light.h"             // EnvLight â€” shared per-frame sun/hemi/ambient UBO (set 2)
 #include "vk_shadow.h"                // ShadowMap::SphereVisible â€” caster culling
 #include "vk_pass_lightcones.h"       // SynthCones::Submit â€” lightplanes-derived beam cones
+#include "vk_profiler.h"              // VK_CPU_PROBE â€” pre-skinning CPU cost
 #include "../../xr_3da/device.h"      // Device.mFullTransform_hud (HUD projection), dwFrame
 
 #include <unordered_map>
@@ -37,6 +39,7 @@
 // Console cvar at GLOBAL scope â€” a block-scope extern inside namespace VK would mangle as
 // VK::ps_r_vsm_npc_dist -> LNK2001 (same trick as vk_pass_shadow's externs).
 extern float ps_r_vsm_npc_dist;   // VSM NPC shadow cull distance (m); 0 = no cull
+extern int   ps_r_preskin;        // compute pre-skinning on/off (A/B)
 
 namespace VK {
 
@@ -87,6 +90,59 @@ namespace {
 
     constexpr u32 kMaxBones       = 16384;   // bone-matrix slots PER frame-in-flight (~1 MB each)
     constexpr u32 kFramesInFlight = CVulkanCommandManager::FRAMES_IN_FLIGHT;
+
+    // ---------------------------------------------------------------------
+    // COMPUTE PRE-SKINNING (r_preskin) â€” see Skinned_PreSkin / preskin.comp.
+    // ---------------------------------------------------------------------
+    VkPipeline            s_psPipe    = VK_NULL_HANDLE;
+    VkPipelineLayout      s_psLayout  = VK_NULL_HANDLE;
+    VkDescriptorSetLayout s_psSetL    = VK_NULL_HANDLE;
+    VkDescriptorPool      s_psPool    = VK_NULL_HANDLE;
+    VkDescriptorSet       s_psSet     = VK_NULL_HANDLE;
+    CVulkanBuffer         s_psBuf;                        // shared output pool (GPU-only)
+    bool                  s_psInited  = false;
+    bool                  s_psFailed  = false;
+
+    // Output layout = vertHW_1W (36 B). Chosen so the EXISTING skinned pipelines
+    // consume it unchanged (see preskin.comp's header).
+    constexpr u32 kPsStride     = 36;
+    constexpr u32 kPsBytesSlot  = 12u << 20;              // per frame-in-flight (~349k verts)
+    constexpr u32 kPsVertsSlot  = kPsBytesSlot / kPsStride;
+
+    // Must match preskin.comp's push block. The 8-byte device address goes first
+    // so the struct needs no padding.
+    struct PreSkinPush { VkDeviceAddress src; u32 vertCount, srcStrideDW, dstFirst, skinMode, baseBone, boneCount; };
+    static_assert(sizeof(PreSkinPush) == 32, "must match preskin.comp PC block");
+
+    // This frame's pool residency: leaf visual -> first vertex in the pool.
+    // Rebuilt from scratch every frame; empty when r_preskin is 0, so every draw
+    // site falls back to the classic per-pass skinning with no extra branch.
+    std::unordered_map<const void*, u32> s_psMap;
+    u32 s_psFrame     = u32(-1);
+    u32 s_identityBone = 0;      // bone slot holding IDENTITY for this frame's region
+    u32 s_psLeaves = 0, s_psVerts = 0, s_psPeak = 0, s_psOverflow = 0;
+    u32 s_psSkipped1W = 0, s_psMaxBones = 0;   // diag: how prop-heavy is this scene?
+
+    // Where a leaf's vertices come from THIS frame. Pre-skinned leaves are drawn
+    // as 1-weight geometry against the identity bone (the blend already happened
+    // in compute); everything else keeps the real bones and its own vertHW stride.
+    struct DrawSrc { VkBuffer vb; s32 firstVertex; u32 stride; u32 skinMode; u32 baseBone; u32 boneCount; };
+
+    static DrawSrc ResolveDrawSrc(const void* leaf, const VK_Render_Mesh* mesh, u16 rmode,
+                                  u32 baseBone, u32 boneCount)
+    {
+        // The frame check is not paranoia: the pool region is picked by the
+        // in-flight slot, so a map left over from an earlier frame would point a
+        // draw at another slot's vertices. Any frame where the PreSkin pass did
+        // not run therefore falls through to the classic path.
+        if (s_psFrame == Device.dwFrame && !s_psMap.empty()) {
+            auto it = s_psMap.find(leaf);
+            if (it != s_psMap.end())
+                return { s_psBuf.GetHandle(), (s32)it->second, kPsStride, 1u, s_identityBone, 1u };
+        }
+        return { mesh->p_rm_Vertices->GetHandle(), (s32)mesh->vBase, mesh->vStride,
+                 (rmode <= 2u) ? 1u : (u32(rmode) - 1u), baseBone, boneCount };
+    }
     // Set 2 (per-frame sun/hemi/ambient) is the shared EnvLight set â€” see vk_env_light.{h,cpp}.
 
     // Push block â€” must match skinned.{vert,frag}.glsl PushConstants. hudMode (read
@@ -787,7 +843,8 @@ namespace {
                     // draws the REAL volumetric cone from the synthesized light.
                     continue;
                 }
-                VkPipeline pipe = GetPipeline(mesh->vStride, emissive ? 1u : (glass ? 2u : 0u));
+                const DrawSrc ds = ResolveDrawSrc(child, mesh, rmode, u.baseBone, u.boneCount);
+                VkPipeline pipe = GetPipeline(ds.stride, emissive ? 1u : (glass ? 2u : 0u));
                 if (pipe == VK_NULL_HANDLE) continue;
 
                 if (pipe != lastPipe) {
@@ -811,17 +868,16 @@ namespace {
                 // Bit 4 (16) = emissive-add flag for the fragment (unlit output);
                 // bit 5 (32) = glass (skip the alpha test, cap the blend alpha);
                 // the vertex shader masks them off before the skinning switch.
-                u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+                u32 skinMode = ds.skinMode;
                 if (emissive) skinMode |= 16u;
                 if (glass)    skinMode |= 32u;
-                SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, hudMode, u.hemi };
+                SkinPush pc{ viewProj, skinMode, ds.baseBone, ds.boneCount, hudMode, u.hemi };
                 vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
-                VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
                 VkDeviceSize vbOff = 0;
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &ds.vb, &vbOff);
                 vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
-                vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+                vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, ds.firstVertex, 0);
                 ++nDraw;
             }
         }
@@ -853,21 +909,20 @@ void Skinned_RenderGlassDistort(VkCommandBuffer cmd, const Fmatrix& viewProj, fl
             VK_Render_Mesh* mesh = nullptr; u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
             if (!child->m_bModelGlass) continue;
-            VkPipeline pipe = GetPipeline(mesh->vStride, 3u);
+            const DrawSrc ds = ResolveDrawSrc(child, mesh, rmode, u.baseBone, u.boneCount);
+            VkPipeline pipe = GetPipeline(ds.stride, 3u);
             if (pipe == VK_NULL_HANDLE) continue;
             if (pipe != lastPipe) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &s_set, 0, nullptr);   // set0 = bones
                 lastPipe = pipe;
             }
-            u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
-            SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, 0.0f, strength };
+            SkinPush pc{ viewProj, ds.skinMode, ds.baseBone, ds.boneCount, 0.0f, strength };
             vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
             VkDeviceSize vbOff = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &ds.vb, &vbOff);
             vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
-            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, ds.firstVertex, 0);
         }
     }
 }
@@ -893,6 +948,14 @@ void Skinned_UploadBones()
     u32 cursor      = slot * kMaxBones;
     const u32 limit = cursor + kMaxBones;
 
+    // Slot 0 of this frame's region is reserved for IDENTITY: pre-skinned leaves
+    // are drawn as 1-weight geometry pointing at it, so the consumer shaders'
+    // `S * pos` / `mat3(S) * nrm` pass the already-skinned world values through
+    // untouched (see Skinned_PreSkin). Costs one matrix per frame.
+    s_identityBone = cursor;
+    s_boneMapped[cursor].identity();
+    ++cursor;
+
     auto uploadList = [&](const xr_vector<DynVisual>& list, xr_vector<SkelUpload>& out) {
         for (const DynVisual& d : list)
         {
@@ -917,6 +980,27 @@ void Skinned_UploadBones()
             const u32 base = cursor;
             for (u16 i = 0; i < bc; ++i)
                 s_boneMapped[cursor + i].mul(d.xform, K->LL_GetTransform_R(i));
+
+            // diag: sample skeletons round-robin -- if a
+            // bone lands kilometres from its object xform (never-animated bones,
+            // garbage matrices), the mesh "draws" but collapses off-screen.
+            // blends: are the PlayCycle'd loops actually attached to this visual?
+            {
+                static u32 s_boneDiag = 0;
+                if (++s_boneDiag % 501 == 1)
+                {
+                    const Fmatrix& b0 = s_boneMapped[base];
+                    const Fmatrix& bl = s_boneMapped[base + bc - 1];
+                    u32 nBlends = 0;
+                    if (auto* ka = dynamic_cast<CKinematicsAnimated*>(K))
+                        for (u32 p = 0; p < 4; ++p)
+                            nBlends += ka->LL_PartBlendsCount(p);
+                    VisMask vm = K->LL_GetBonesVisible();
+                    const Fvector mT0 = K->LL_GetBoneInstance(0).mTransform.c;
+                    Msg("[VK Skinned] up-diag: bones=%u blends=%u vis=0x%llx/0x%llx mT0=(%.2f,%.2f,%.2f) xform=(%.1f,%.1f,%.1f) bone0=(%.1f,%.1f,%.1f) boneN=(%.1f,%.1f,%.1f)",
+                        bc, nBlends, vm._visimask.flags, vm._visimask_ex.flags, VPUSH(mT0), VPUSH(d.xform.c), VPUSH(b0.c), VPUSH(bl.c));
+                }
+            }
             cursor += bc;
             out.push_back({ K, d.xform, base, bc, d.hemi });
         }
@@ -932,6 +1016,206 @@ void Skinned_UploadBones()
     // its prev poses too — last frame's SSBO region stays live (FRAMES_IN_FLIGHT>=2).
     for (const SkelUpload& u : s_uploadsHud)
         s_curBoneMapHud[u.K] = { u.baseBone, (u32)u.boneCount };
+}
+
+// ===========================================================================
+//  COMPUTE PRE-SKINNING  (r_preskin)
+// ===========================================================================
+namespace {
+
+static bool PreSkinInit()
+{
+    if (s_psInited) return !s_psFailed;
+    s_psInited = true;
+
+    VkShaderModule cs = g_ShaderManager->Load("preskin.comp.spv");
+    if (cs == VK_NULL_HANDLE) {
+        Msg("![VK PreSkin] preskin.comp.spv missing - falling back to per-pass skinning");
+        s_psFailed = true; return false;
+    }
+
+    // set 0: binding 0 = the SAME bone SSBO the graphics pipelines read,
+    //        binding 1 = the shared output pool.
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1] = b[0]; b[1].binding = 1;
+    VkDescriptorSetLayoutCreateInfo slci{};
+    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    slci.bindingCount = 2; slci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_psSetL) != VK_SUCCESS) {
+        Msg("![VK PreSkin] set layout failed"); s_psFailed = true; return false;
+    }
+
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_psPool) != VK_SUCCESS) {
+        Msg("![VK PreSkin] descriptor pool failed"); s_psFailed = true; return false;
+    }
+    VkDescriptorSetAllocateInfo dai{};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = s_psPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_psSetL;
+    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_psSet) != VK_SUCCESS) {
+        Msg("![VK PreSkin] descriptor set alloc failed"); s_psFailed = true; return false;
+    }
+
+    // gpuOnly=TRUE is mandatory: a STORAGE buffer without it gets
+    // HOST_ACCESS_SEQUENTIAL_WRITE, so VMA puts it in the BAR heap or plain
+    // system RAM and every read rides PCIe (see vk_buffer.h's warning and the
+    // VSM saga). Nothing on the CPU ever touches this pool.
+    s_psBuf.Create(VkDeviceSize(kPsBytesSlot) * kFramesInFlight,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, /*gpuOnly*/ true);
+    if (!s_psBuf.IsValid()) { Msg("![VK PreSkin] pool alloc failed"); s_psFailed = true; return false; }
+    Prof::NameBuffer(s_psBuf.GetHandle(), "PreSkinPool");
+
+    VkDescriptorBufferInfo bi[2] = {
+        { s_boneSSBO.GetHandle(), 0, VK_WHOLE_SIZE },
+        { s_psBuf.GetHandle(),    0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet w[2]{};
+    for (u32 i = 0; i < 2; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = s_psSet; w[i].dstBinding = i; w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
+    }
+    vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PreSkinPush) };
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1; plci.pSetLayouts = &s_psSetL;
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_psLayout) != VK_SUCCESS) {
+        Msg("![VK PreSkin] pipeline layout failed"); s_psFailed = true; return false;
+    }
+
+    VkComputePipelineCreateInfo cpi{};
+    cpi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = cs;
+    cpi.stage.pName  = "main";
+    cpi.layout       = s_psLayout;
+    if (vkCreateComputePipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &s_psPipe) != VK_SUCCESS) {
+        Msg("![VK PreSkin] compute pipeline failed"); s_psFailed = true; return false;
+    }
+
+    Msg("[VK PreSkin] init OK (pool %u MB/slot x%u = %u verts/slot, stride %u)",
+        kPsBytesSlot >> 20, kFramesInFlight, kPsVertsSlot, kPsStride);
+    return true;
+}
+
+}  // anon namespace
+
+// Skin every visible leaf ONCE into the shared pool. Registered as the "PreSkin"
+// pass so it runs before Pass_SunShadow (the earliest consumer) and outside any
+// dynamic-rendering scope. Leaves that don't fit keep the classic per-pass
+// skinning: s_psMap simply has no entry for them.
+void Skinned_PreSkin(VkCommandBuffer cmd)
+{
+    if (!Init()) return;
+    if (s_psFrame == Device.dwFrame) return;   // once per frame
+    s_psFrame = Device.dwFrame;
+
+    Skinned_UploadBones();   // CPU bones + the identity slot this pass points at
+
+    s_psMap.clear();
+    s_psLeaves = s_psVerts = s_psOverflow = s_psSkipped1W = s_psMaxBones = 0;
+    if (!ps_r_preskin) return;                             // A/B: fall back to per-pass skinning
+    if (s_uploads.empty() && s_uploadsHud.empty()) return;
+    if (!PreSkinInit()) return;
+
+    VK_CPU_PROBE("cpu:PreSkin");
+
+    const u32 slot   = CommandManager.GetCurrentFrame();
+    u32       cursor = slot * kPsVertsSlot;
+    const u32 limit  = cursor + kPsVertsSlot;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_psPipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_psLayout, 0, 1, &s_psSet, 0, nullptr);
+
+    auto skinList = [&](const xr_vector<SkelUpload>& list) {
+        for (const SkelUpload& u : list)
+        {
+            if (u.boneCount > s_psMaxBones) s_psMaxBones = u.boneCount;
+            for (auto* child : u.K->children)
+            {
+                VK_Render_Mesh* mesh = nullptr;
+                u16 rmode = 0;
+                if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
+                // Lightplanes fans are never drawn (Pass_LightCones renders the
+                // synthesized cone instead) - skinning them would be pure waste.
+                if (child->m_bLitBlend) continue;
+
+                // 1-WEIGHT GEOMETRY CAN NEVER WIN HERE — skip it.
+                // RM_SINGLE / RM_SKINNING_1B both map to skinMode 1, whose classic
+                // vertex shader is already a SINGLE matrix fetch (`S = bones[idx]`).
+                // Pre-skinning would replace that with... a single matrix fetch of
+                // the identity, and still pay the compute dispatch + pool write.
+                // Measured on l01_escape 2026-07-23: 46% of the 583 visible leaves
+                // were 1-3 bone props (doors, lamps, physics crates, dropped guns)
+                // and they dominated the pool, which is why the first A/B came out
+                // net negative. Only a real multi-bone blend (2W/3W/4W — NPCs) has
+                // anything to save.
+                const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+                if (skinMode < 2u) { ++s_psSkipped1W; continue; }
+
+                const u32 vc = mesh->vCount;
+                if (!vc || !mesh->vAddr) continue;         // not addressable -> classic path
+                if (cursor + vc > limit) { ++s_psOverflow; continue; }   // pool full -> classic path
+
+                PreSkinPush pc{};
+                pc.src         = mesh->vAddr + VkDeviceSize(mesh->vBase) * mesh->vStride;
+                pc.vertCount   = vc;
+                pc.srcStrideDW = mesh->vStride / 4u;
+                pc.dstFirst    = cursor;
+                pc.skinMode    = skinMode;
+                pc.baseBone    = u.baseBone;
+                pc.boneCount   = (u32)u.boneCount;
+                vkCmdPushConstants(cmd, s_psLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                vkCmdDispatch(cmd, (vc + 63u) / 64u, 1, 1);
+
+                s_psMap[(const void*)child] = cursor;
+                cursor += vc;
+                ++s_psLeaves;
+            }
+        }
+    };
+    skinList(s_uploads);
+    skinList(s_uploadsHud);
+
+    s_psVerts = cursor - slot * kPsVertsSlot;
+    if (s_psVerts > s_psPeak) s_psPeak = s_psVerts;
+
+    if (!s_psLeaves) {
+        // Nothing multi-bone on screen. Worth saying out loud: it means every
+        // skinned leaf this frame was 1-weight prop geometry, so any measurement
+        // taken here says nothing about pre-skinning on an NPC crowd.
+        static u32 s_idle = 0;
+        if (++s_idle % 601 == 1)
+            Msg("[VK PreSkin] idle: 0 multi-bone leaves (skipped1W=%u, maxBones=%u) - prop-only scene",
+                s_psSkipped1W, s_psMaxBones);
+        return;
+    }
+
+    // The pool is read as vertex attributes by every consumer from here on.
+    VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    static bool s_first = false;
+    if (!s_first) { s_first = true;
+        Msg("[VK PreSkin] first dispatch: leaves=%u verts=%u (%u%% of slot) skeletons=%zu+%zu",
+            s_psLeaves, s_psVerts, (s_psVerts * 100u) / kPsVertsSlot, s_uploads.size(), s_uploadsHud.size()); }
+    static u32 s_pulse = 0;
+    if (++s_pulse % 601 == 1)
+        Msg("[VK PreSkin] leaves=%u verts=%u peak=%u/%u overflow=%u | skipped1W=%u maxBones=%u",
+            s_psLeaves, s_psVerts, s_psPeak, kPsVertsSlot, s_psOverflow, s_psSkipped1W, s_psMaxBones);
 }
 
 void Skinned_CollectFeet(xr_vector<Fvector>& out, u32 maxFeet)
@@ -1107,7 +1391,8 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
             if (child->m_bEmissiveAdd || child->m_bModelGlass || child->m_bLitBlend) continue;   // marks/glass don't cast shadows
 
-            VkPipeline pipe = GetShadowPipeline(mesh->vStride);
+            const DrawSrc ds = ResolveDrawSrc(child, mesh, rmode, u.baseBone, u.boneCount);
+            VkPipeline pipe = GetShadowPipeline(ds.stride);
             if (pipe == VK_NULL_HANDLE) continue;
 
             if (pipe != lastPipe) {
@@ -1120,15 +1405,13 @@ void Skinned_RenderShadow(VkCommandBuffer cmd, const Fmatrix& lightVP,
                 boundBones = true;
             }
 
-            const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
-            SkinPush pc{ lightVP, skinMode, u.baseBone, (u32)u.boneCount, 0.0f, 1.0f };
+            SkinPush pc{ lightVP, ds.skinMode, ds.baseBone, ds.boneCount, 0.0f, 1.0f };
             vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
-            VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
             VkDeviceSize vbOff = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &ds.vb, &vbOff);
             vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
-            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, ds.firstVertex, 0);
             ++nDraw;
         }
     }
@@ -1170,7 +1453,8 @@ static void RenderSkinnedCasters(VkCommandBuffer cmd, const Fmatrix& viewProj, V
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
             if (child->m_bEmissiveAdd || child->m_bModelGlass || child->m_bLitBlend) continue;   // marks/glass: blended, no depth
 
-            VkPipeline pipe = getPipe(mesh->vStride);
+            const DrawSrc ds = ResolveDrawSrc(child, mesh, rmode, u.baseBone, u.boneCount);
+            VkPipeline pipe = getPipe(ds.stride);
             if (pipe == VK_NULL_HANDLE) continue;
 
             if (pipe != lastPipe) {
@@ -1193,15 +1477,13 @@ static void RenderSkinnedCasters(VkCommandBuffer cmd, const Fmatrix& viewProj, V
                 lastMatSet = matSet;
             }
 
-            const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
-            SkinPush pc{ viewProj, skinMode, u.baseBone, (u32)u.boneCount, 0.0f, 1.0f };
+            SkinPush pc{ viewProj, ds.skinMode, ds.baseBone, ds.boneCount, 0.0f, 1.0f };
             vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
-            VkBuffer vb = mesh->p_rm_Vertices->GetHandle();
             VkDeviceSize vbOff = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOff);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &ds.vb, &vbOff);
             vkCmdBindIndexBuffer(cmd, mesh->p_rm_Indices->GetHandle(), 0, mesh->iType);
-            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, (s32)mesh->vBase, 0);
+            vkCmdDrawIndexed(cmd, mesh->iCount, 1, mesh->iBase, ds.firstVertex, 0);
         }
     }
 }
@@ -1414,14 +1696,15 @@ void Skinned_CollectCasters(xr_vector<VsmSkinnedCaster>& out)
             VK_Render_Mesh* mesh = nullptr; u16 rmode = 0;
             if (!ResolveSkinnedLeaf(child, mesh, rmode)) continue;
             if (child->m_bEmissiveAdd) continue;   // collimator marks don't cast
+            const DrawSrc ds = ResolveDrawSrc(child, mesh, rmode, u.baseBone, u.boneCount);
             VsmSkinnedCaster sc{};
             sc.sphere_P     = c;            sc.sphere_R = r;
-            sc.index_count  = mesh->iCount; sc.ib_first = mesh->iBase; sc.first_vertex = (s32)mesh->vBase;
-            sc.vb           = mesh->p_rm_Vertices->GetHandle();
+            sc.index_count  = mesh->iCount; sc.ib_first = mesh->iBase; sc.first_vertex = ds.firstVertex;
+            sc.vb           = ds.vb;
             sc.ib           = mesh->p_rm_Indices->GetHandle();
-            sc.iType        = mesh->iType;  sc.stride   = mesh->vStride;
-            sc.base_bone    = u.baseBone;   sc.bone_count = (u32)u.boneCount;
-            sc.skin_mode    = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+            sc.iType        = mesh->iType;  sc.stride   = ds.stride;
+            sc.base_bone    = ds.baseBone;  sc.bone_count = ds.boneCount;
+            sc.skin_mode    = ds.skinMode;
             out.push_back(sc);
         }
     }
@@ -1471,6 +1754,12 @@ void Pass_Skinned(FrameContext& ctx)
     static bool s_diag = false;
     if (!s_diag) { s_diag = true; Msg("[VK Skinned] first Pass_Skinned: dynVis=%zu hud=%zu draws=%u hudDraws=%u (slot=%u)",
                                       s_uploads.size(), s_uploadsHud.size(), nDraw, nHud, CommandManager.GetCurrentFrame()); }
+    // pulse diag (two-player invisibility hunt): proves per-frame whether the
+    // main view collected any dynamics and whether their leaves really drew.
+    // Odd modulus on purpose -- even throttles latch with two clients.
+    static u32 s_pulse = 0;
+    if (++s_pulse % 127 == 1)
+        Msg("[VK Skinned] pulse: dynVis=%zu hud=%zu ups=%zu draws=%u", g_DynamicVisuals.size(), g_HudVisuals.size(), s_uploads.size(), nDraw);
 }
 
 void Skinned_Destroy()
@@ -1494,6 +1783,20 @@ void Skinned_Destroy()
     s_curBoneMap.clear(); s_prevBoneMap.clear();
     s_curBoneMapHud.clear(); s_prevBoneMapHud.clear();
     s_uploads.clear(); s_uploadsHud.clear(); s_uploadFrame = u32(-1);
+
+    // Compute pre-skinning. s_psMap MUST be dropped here: its keys are leaf
+    // visuals that a level unload frees, and its values index a pool that no
+    // longer exists.
+    s_psMap.clear(); s_psFrame = u32(-1);
+    s_psLeaves = s_psVerts = s_psPeak = s_psOverflow = 0;
+    if (s_psPipe)   { vkDestroyPipeline(VulkanHW.m_Device, s_psPipe, nullptr); s_psPipe = VK_NULL_HANDLE; }
+    if (s_psLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_psLayout, nullptr); s_psLayout = VK_NULL_HANDLE; }
+    if (s_psPool)   { vkDestroyDescriptorPool(VulkanHW.m_Device, s_psPool, nullptr); s_psPool = VK_NULL_HANDLE; }
+    if (s_psSetL)   { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_psSetL, nullptr); s_psSetL = VK_NULL_HANDLE; }
+    s_psBuf.Destroy();
+    s_psSet = VK_NULL_HANDLE;
+    s_psInited = false; s_psFailed = false;
+
     if (s_mvLayout)  { vkDestroyPipelineLayout(VulkanHW.m_Device, s_mvLayout, nullptr); s_mvLayout = VK_NULL_HANDLE; }
     if (s_layout)    { vkDestroyPipelineLayout(VulkanHW.m_Device, s_layout, nullptr); s_layout = VK_NULL_HANDLE; }
     if (s_pool)      { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }

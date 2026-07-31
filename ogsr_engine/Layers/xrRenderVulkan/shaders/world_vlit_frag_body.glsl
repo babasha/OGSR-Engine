@@ -9,9 +9,17 @@
 #include "light_shade.glsl"      // lightTerrainOcc/shadeDynLight/dynLights
 #include "flow_sim_sample.glsl"  // simWater*/simFlow/groundHm/waterDebugColor/flowWaves
 #include "wetness.glsl"          // applyWetness (lmap/vlit) + applyWetnessCore
+#include "bump_common.glsl"      // uTexBumpN (set 0 b4): material normal + gloss
 #include "surface_field.glsl"    // SF_* (smart heightmap; r_sf_debug viz)
 #include "surface_class.glsl"    // SC_* surface classification (r_sf_debug 5)
 #include "tex_feedback.glsl"     // txfbReport — texture-streaming GPU feedback (set 1 b30)
+
+// EARLY_ZTEST twin — see world_lmap_frag_body.glsl for the full rationale
+// (forces early depth test so the feedback atomic never runs occluded; bound
+// only to no-z-write statics pipelines by EarlyTwin in vk_pipeline_cache.cpp).
+#ifdef EARLY_ZTEST
+layout(early_fragment_tests) in;
+#endif
 
 // World pass - vert-lit variant. Final colour = albedo x (baked vertex lighting
 // + dynamic R4-style sun + env hemi sky fill gated by bake occlusion + ambient).
@@ -39,6 +47,7 @@ layout(location = 2) in  vec3  vBakedColor;
 layout(location = 3) in  float vSunMask;     // (legacy per-vertex sun mask; sun is now dynamic)
 layout(location = 4) in  vec3  vWorldPos;
 layout(location = 5) in  vec3  vNormal;
+layout(location = 7) in  float vBakedHemi;   // NORMAL.a = baked sky access (see world_vlit_vert_body)
 layout(location = 0) out vec4  outColor;
 
 // POM heightfield from the `#` alpha, high-passed - see world_lmap.frag.
@@ -175,17 +184,24 @@ void main()
 #endif
     // SPEC_POM: true only for materials with a real `#` height (mat->tessellated) —
     // flat materials bake the false variant, dropping the parallaxUV call + its VGPRs.
-    vec3 pomN = normalize(vNormal); float pomShadow = 1.0, pomAO = 1.0;
+    // Shading normal, flipped toward the VIEWER when it points away (see world_lmap:
+    // one-sided zero-thickness sheets shade their back as sun-lit — un-shadowable;
+    // dot(N, toEye), NOT gl_FrontFacing — X-Ray winding is uncorrelated with normals).
+    vec3 vN = normalize(vNormal);
+    if (dot(vN, L.eye_pos.xyz - vWorldPos) < 0.0) vN = -vN;
+    vec3 pomN = vN; float pomShadow = 1.0, pomAO = 1.0;
     vec2 pUV = vUV;
     if (SPEC_POM)
-        pUV = parallaxUV(vUV, normalize(vNormal), vWorldPos, pomN, pomShadow, pomAO);
+        pUV = parallaxUV(vUV, vN, vWorldPos, pomN, pomShadow, pomAO);
     vec2 pDetailUV = vDetailUV + (pUV - vUV) * pc.detailScale;
 
     vec4 base   = texture(uTexDiffuse, pUV, L.spot_flash.z);   // DLSS mip bias (0 native)
     // Alpha UNBIASED for the cutout test (see world_lmap — coverage shrink fix).
     if (L.spot_flash.z != 0.0) base.a = texture(uTexDiffuse, pUV).a;
     // Streaming feedback — see world_lmap (before the discard so cutouts report too).
-    txfbReport(pc.streamID, textureQueryLod(uTexDiffuse, pUV).y + L.spot_flash.z);
+    // SPEC_FEEDBACK = streamer master gate; occlusion cost handled by EARLY_ZTEST.
+    if (SPEC_FEEDBACK)
+        txfbReport(pc.streamID, textureQueryLod(uTexDiffuse, pUV).y + L.spot_flash.z);
     if (pc.alphaRef >= 0.0 && base.a < pc.alphaRef) discard;
 
     // EMISSIVE-ADDITIVE (aref == -3 ONLY: glow halos / selflight) — unlit
@@ -206,6 +222,14 @@ void main()
     // r_wet_debug 1: rain-map visibility.
     if (SPEC_DEBUG && L.rain_params.z < 0.0) {
         outColor = vec4(vec3(rainVis(vWorldPos)), base.a);
+        return;
+    }
+    // r_bump_debug — see world_lmap_frag_body.glsl (channel-convention check).
+    if (SPEC_DEBUG && L.bump_params.y > 0.5) {
+        float dbgG;
+        vec3  dbgN = bumpNormal(normalize(vNormal), vWorldPos, pUV, 1.0, dbgG);
+        outColor = (L.bump_params.y > 1.5) ? vec4(vec3(dbgG), base.a)
+                                           : vec4(dbgN * 0.5 + 0.5, base.a);
         return;
     }
     // r_puddle_debug: sim on -> depth/flow; else the SSS puddle coverage (grayscale).
@@ -242,8 +266,11 @@ void main()
 
     // Lighting: baked vertex color (point lights + bounce) + dynamic R4-style sun
     // (per-pixel N.L x shadow map) + env hemi sky fill + ambient floor.
-    vec3  geomN   = normalize(vNormal);   // flat - for the sky fill (sharp cube -> perturbed = mirror)
+    vec3  geomN   = vN;   // flat, backface-flipped - for the sky fill (sharp cube -> perturbed = mirror)
     vec3  Nw      = pomN;   // POM-perturbed normal -> sun + dyn lights catch the relief
+    // Material normal + gloss — see world_lmap_frag_body.glsl.
+    float matGloss = 0.0;
+    Nw = bumpNormal(Nw, vWorldPos, pUV, L.bump_params.x, matGloss);
     // SNOW (Surface Field consumer, r_snow): whiten by surface type x slope x sky
     // exposure - flat up-facing props accumulate, vertical/under-cover none.
     // SF_SkyExposure() is ~9 rainVis gathers — skip the whole snow query when there
@@ -262,10 +289,19 @@ void main()
         sunMask *= sunSh * pomShadow;
     }
 
-    // vlit has NO lightmap occlusion, so gate the sky fill by BOTH pc.dynHemi
-    // (ray-traced sky visibility for dynamics) AND the baked vertex brightness
-    // (occlusion for static vlit geometry). Small floor keeps open outdoor vlit lit.
-    float bakeOcc = clamp(dot(vBakedColor, vec3(0.299, 0.587, 0.114)) * 2.5, 0.15, 1.0);
+    // Sky-fill occlusion. vlit has no lightmap, but it is NOT missing the data:
+    // X-Ray bakes the sky access into the packed NORMAL's alpha (v_static_color
+    // `Nh : NORMAL // (nx,ny,nz,hemi occlusion)`), which deffer_base_flat.ps reads
+    // straight back as `h = I.position.w`. This is the lmap path's `hemiOcc` twin,
+    // so it enters the sky term with the SAME weight (no extra 0.5 below).
+    //
+    // It used to be guessed from the baked vertex COLOUR instead — but that channel
+    // holds offline POINT lights, which outdoors is nothing at all: measured over
+    // level.geom, mean luminance is 0.006 on Cordon and exactly 0.000 on Pripyat
+    // (its vertex colour AND sun mask are 100% zero). So the guess collapsed to its
+    // own 0.15 floor for every vert-lit static on the map, open sky or basement
+    // alike — benches, kerbs and fences rendered as if standing in the dark.
+    float bakeOcc = clamp(vBakedHemi, 0.0, 1.0);
     vec3  occ      = coloredAO(gtaoVis(), albedo) * pomAO * ssilBoost();   // GTAO x POM AO x SSIL bounce (ambient only)
     // dynHemi < -0.5 = dynamic visual (sign = "model xform follows" flag for the VS);
     // real ray-traced sky visibility is -dynHemi-1.
@@ -274,7 +310,7 @@ void main()
     vec3 lighting = vBakedColor * 1.5
                   + L.sun_color.rgb  * sunMask
                   // Detail normal, not geomN — see the note in world_terrain.frag.
-                  + skyAmbient(gtaoBentN(Nw)) * (L.sky_params.y * 0.5 * dynHemiL * bakeOcc) * occ
+                  + skyAmbient(gtaoBentN(Nw)) * (bakeOcc * L.sky_params.y * dynHemiL) * occ
                   + L.ambient.rgb * occ * skyAmbientGate(vWorldPos)   // flat sky fill gated by sky visibility (no indoor leak)
                   + dynLights(vWorldPos, Nw);
 
@@ -305,19 +341,26 @@ void main()
     // Sky specular IBL + sun GGX glint (r_ibl) — see world_lmap.frag.
     // r_ibl master gate hoisted up (see world_lmap.frag): skip Vv/skyVis/wetF's
     // rainVis gathers/roughI when IBL is off (default) — output identical (0 below).
-    vec3 specIBL = vec3(0.0);
+    vec3  specIBL = vec3(0.0);
+    float specE   = 0.0;   // reflected fraction — taken OFF the diffuse below
     if (SPEC_IBL && L.ibl_params.x > 0.004) {
         vec3  Vv      = normalize(L.eye_pos.xyz - vWorldPos);
         // sky reflection only where the sky is visible (dynHemi × baked vertex occ).
         float skyVis  = smoothstep(0.12, 0.5, clamp(dynHemiL * bakeOcc, 0.0, 1.0));
-        float wetF    = clamp(L.rain_params.y, 0.0, 1.0) * rainVis(vWorldPos) * clamp(geomN.y, 0.0, 1.0);
-        float roughI  = mix(0.55, 0.25, wetF);
-        specIBL       = iblSpecular(Nw, Vv, roughI, vec3(0.04)) * gtaoVisRaw() * skyVis;
+        // DRY BASE ONLY + directional occlusion + energy — see world_lmap.frag for
+        // the full reasoning (wet is applyWetness's job, one owner per effect).
+        // Roughness from the MATERIAL gloss (r_gloss_scale) — see world_lmap.frag.
+        float roughI  = clamp(0.85 - clamp(matGloss * L.bump_params.z, 0.0, 1.0) * 0.75, 0.1, 0.95);
+        vec3  Rv      = reflect(-Vv, Nw);
+        float vis     = specOcclusion(gtaoBentN(geomN), Rv, gtaoVisRaw()) * skyVis;
+        specIBL       = iblSpecular(Nw, Vv, roughI, vec3(0.04)) * vis;
         specIBL      += L.sun_color.rgb * sunSpec(Nw, Vv, normalize(-L.sun_dir.xyz), roughI, vec3(0.04)) * sunMask;
+        specE         = iblSpecWeight(Nw, Vv, roughI, vec3(0.04)) * vis;
     }
 
     // Distance fog (R4).
-    vec3 col = albedo * lighting + wetRefl + specIBL;
+    // Energy: the mirrored fraction is not also transmitted (see iblSpecWeight).
+    vec3 col = albedo * lighting * (1.0 - specE) + wetRefl + specIBL;
     float fog = clamp(length(vWorldPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 

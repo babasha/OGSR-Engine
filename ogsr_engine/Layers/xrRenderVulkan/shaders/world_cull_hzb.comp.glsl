@@ -41,7 +41,7 @@ layout(push_constant) uniform PC {
     vec4 viewDir;           // .xyz normalized camera forward (view-Z LOD projection)
     vec4 lodParams;         // x = pxScale/thresholdPx, y = min dist clamp, z = fade band, w = 1/tan(fovY/2)
     uint numGroups;
-    uint unused0;           // was maxGroupMesh (uniform regions) — kept for layout stability
+    float ssaCull;          // SSA cull: 2·pxScale/r_ssa_px, 0 = off (was unused0)
     uint total;             // number of cullable entries (meshes + r_cluster clusters)
     uint _pad;
 } pc;
@@ -68,6 +68,13 @@ void main()
     // ---- Frustum cull (6 planes vs sphere; same test as world_cull.comp) ----
     for (int i = 0; i < 6; ++i)
         if (dot(pc.frustumPlanes[i].xyz, c) + pc.frustumPlanes[i].w < -r) return;   // outside
+
+    // ---- SSA cull (r_ssa_px) — MUST match world_cull.comp (see rationale there):
+    // plain whole meshes (flags bit1) under the projected-diameter threshold.
+    if (pc.ssaCull > 0.0 && (m.flags & 2u) != 0u) {
+        float dz = max(pc.lodParams.y, dot(pc.viewDir.xyz, c - pc.cameraPos.xyz) - r);
+        if (r * pc.ssaCull < dz) return;
+    }
 
     // ---- Stage B residency (identical to world_cull.comp) ----
     uint sb = (streamBits[l >> 4u] >> ((l & 15u) * 2u)) & 3u;

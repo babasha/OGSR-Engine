@@ -943,6 +943,7 @@ void CDetailManager::LoadDetailTextures()
     vkCreateSampler(VulkanHW.m_Device, &sci, nullptr, &m_DetailSampler);
 
     m_DetailTextures.resize(objects.size(), nullptr);
+    std::unordered_map<std::string, VK::CVulkanTexture*> byPath;   // dedup: see m_DetailTexOwned
     for (size_t i = 0; i < objects.size(); ++i) {
         const VK::CDetail* obj = objects[i];
         if (!obj || obj->m_TextureName.size() == 0) continue;
@@ -959,6 +960,13 @@ void CDetailManager::LoadDetailTextures()
             }
         }
 
+        // Share by resolved path: detail objects almost always name the SAME level
+        // atlas, and a texture object per object meant a full GPU copy per object.
+        if (auto it = byPath.find(full); it != byPath.end()) {
+            m_DetailTextures[i] = it->second;
+            continue;
+        }
+
         auto* tex = xr_new<VK::CVulkanTexture>();
         // Grass blade albedo — Colour. The stream class is passed explicitly only
         // because the colourspace argument follows it; it keeps the historical
@@ -971,6 +979,8 @@ void CDetailManager::LoadDetailTextures()
             continue;
         }
         m_DetailTextures[i] = tex;
+        m_DetailTexOwned.push_back(tex);
+        byPath.emplace(full, tex);
     }
 
     // SSFX wind flow map (s_waves). Sampled in the grass vertex shader to drive
@@ -997,9 +1007,11 @@ void CDetailManager::LoadDetailTextures()
 
 void CDetailManager::DestroyDetailTextures()
 {
-    for (auto* t : m_DetailTextures) {
+    // Free the OWNER list — m_DetailTextures holds repeated references into it.
+    for (auto* t : m_DetailTexOwned) {
         if (t) { t->Destroy(); xr_delete(t); }
     }
+    m_DetailTexOwned.clear();
     m_DetailTextures.clear();
     if (m_WaveTex) { m_WaveTex->Destroy(); xr_delete(m_WaveTex); m_WaveTex = nullptr; }
 

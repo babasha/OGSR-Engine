@@ -13,6 +13,10 @@
 
 #include "../xrRender/ETextureParams.h"   // STextureParams::Load + flDiffuseDetail flag
 
+// r_bump — material normal/gloss strength. 0 also SKIPS loading `<bump>.dds` here, so
+// the cvar gates VRAM cost and not just shading (see the load site below).
+extern float ps_r_bump;
+
 #include <unordered_map>
 #include <string>
 #include <array>
@@ -78,6 +82,21 @@ namespace {
     std::vector<VkDescriptorSet> s_FreeSets;
     std::mutex                   s_StreamMutex;   // guards the 3 containers above
 
+    // Base-diffuse cache, keyed by RESOLVED PATH and shared by reference — the
+    // sibling every other texture role already had. A material is identified by
+    // (diffuse|lmap|shader), and one diffuse legitimately pairs with many lmaps, so
+    // creating the image inside GetOrCreate meant one .dds became as many GPU images
+    // as it had material keys. ⚠ MEASURED on Pripyat before this cache existed:
+    // 617 files resident 2+ times, 809 redundant copies, 780 MB — a QUARTER of the
+    // level's 3136 MB texture footprint, with `build_details.dds` alone held 29
+    // times (298 MB). Invisible in every other metric: the class totals count the
+    // copies as legitimate residency.
+    // Sharing is safe because the swap path was already written for it — the
+    // streamer's rebind callback walks every material and rewrites each set whose
+    // base or bumpn matches the swapped texture (that is how `<bump>` maps, shared
+    // by name since day one, have always worked).
+    std::unordered_map<std::string, CVulkanTexture*>   s_DiffuseTexCache;
+
     // Detail-texture cache (shared by reference across materials).
     std::unordered_map<std::string, CVulkanTexture*>   s_DetailTexCache;
     CVulkanTexture*                                    s_GreyDetail   = nullptr;  // 1×1 0.5-grey fallback
@@ -92,6 +111,13 @@ namespace {
     // a TES sampling it produces zero displacement.
     std::unordered_map<std::string, CVulkanTexture*>   s_BumpTexCache;
     CVulkanTexture*                                    s_FlatBump     = nullptr;
+
+    // Material NORMAL+GLOSS (`<bump>.dds`, R4 packing: normal = tex.wzy*2-1,
+    // gloss = tex.x), binding 4. Fallback is 1x1 (13,255,128,128) = a flat tangent normal
+    // with the MEASURED median gloss of the installed content, so a material without a
+    // bump shades like its neighbours that have one (see the note at its creation).
+    std::unordered_map<std::string, CVulkanTexture*>   s_BumpNTexCache;
+    CVulkanTexture*                                    s_FlatBumpN    = nullptr;
 
     // --- Terrain splatting resources (R4 CBlender_BmmD) ---
     // Separate 7-binding set {base, mask, dt_r, dt_g, dt_b, dt_a, lmap} +
@@ -170,18 +196,19 @@ namespace {
     }
 
     void WriteSet(VkDescriptorSet set, VkImageView baseView,
-                  VkImageView detailView, VkImageView lmapView, VkImageView bumpxView)
+                  VkImageView detailView, VkImageView lmapView, VkImageView bumpxView,
+                  VkImageView bumpnView)
     {
-        VkDescriptorImageInfo ii[4]{};
-        VkImageView views[4] = { baseView, detailView, lmapView, bumpxView };
-        for (int i = 0; i < 4; ++i) {
+        VkDescriptorImageInfo ii[5]{};
+        VkImageView views[5] = { baseView, detailView, lmapView, bumpxView, bumpnView };
+        for (int i = 0; i < 5; ++i) {
             ii[i].sampler     = s_Sampler;
             ii[i].imageView   = views[i];
             ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
-        VkWriteDescriptorSet w[4]{};
-        for (int i = 0; i < 4; ++i) {
+        VkWriteDescriptorSet w[5]{};
+        for (int i = 0; i < 5; ++i) {
             w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet          = set;
             w[i].dstBinding      = (u32)i;
@@ -189,7 +216,7 @@ namespace {
             w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[i].pImageInfo      = &ii[i];
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanHW.m_Device, 5, w, 0, nullptr);
     }
 
     CVulkanTexture* GetOrLoadLmapTex(const char* lmap_name)
@@ -337,7 +364,9 @@ namespace {
     // all four share TexStreamClass::Terrain. Keys stay distinct via the name suffixes.
     CVulkanTexture* GetOrLoadGameTex(std::unordered_map<std::string, CVulkanTexture*>& cache,
                                      const char* name, CVulkanTexture* fallback,
-                                     TexColorSpace colorSpace = TexColorSpace::Data)
+                                     TexColorSpace colorSpace = TexColorSpace::Data,
+                                     TexStreamClass klass = TexStreamClass::Terrain,
+                                     bool alphaOnly = false)
     {
         if (!name || !name[0]) return fallback;
         std::string key(name);
@@ -352,10 +381,13 @@ namespace {
             if (!FS.exist(full)) { cache.emplace(std::move(key), fallback); return fallback; }
         }
         auto* tex = xr_new<CVulkanTexture>();
-        // Shared loader for terrain detail/normal/height + mask + bump# maps — all
-        // "tracked, budget-fit only, never mip-streamed" (Terrain and Bump behave
-        // identically in the streamer). Keeps them full-res unless VRAM is tight.
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::Terrain, colorSpace)) {
+        // Shared loader for terrain detail/normal/height + mask + bump maps. The CLASS
+        // decides residency policy: Terrain = tracked, budget-fit only, never streamed
+        // (a handful of tiled textures); Bump = mip-streamed like base diffuse, because
+        // there is one per MATERIAL and a big level has thousands (Pripyat: 1591).
+        // alphaOnly = "we sample .a and nothing else" → the loader may halve it to BC4.
+        tex->SetAlphaOnly(alphaOnly);
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, klass, colorSpace)) {
             xr_delete(tex);
             cache.emplace(std::move(key), fallback);
             return fallback;
@@ -517,7 +549,7 @@ namespace {
         m->alphaRef     = -1.0f;
         m->set          = AllocateSet();
         if (m->set != VK_NULL_HANDLE)
-            WriteSet(m->set, m->view, m->view_detail, m->view_lmap, s_FlatBump->GetView());
+            WriteSet(m->set, m->view, m->view_detail, m->view_lmap, s_FlatBump->GetView(), s_FlatBumpN->GetView());
         return m;
     }
 }
@@ -586,13 +618,21 @@ void RebindStreamedTexture(CVulkanTexture* t)
     const VkImageView nv = t->GetView();
     for (auto& kv : s_Cache) {
         WorldMaterial* m = kv.second;
-        if (!m || m->tex != t) continue;
-        m->view = nv;
+        if (!m) continue;
+        // `t` is either this material's base diffuse or its `<bump>` normal — both
+        // classes are mip-streamed. A bump is shared by name across many materials,
+        // so this loop legitimately rewrites several sets for one swap.
+        const bool isBase = (m->tex       == t);
+        const bool isBumpN = (m->tex_bumpn == t);
+        if (!isBase && !isBumpN) continue;
+        if (isBase)  m->view       = nv;
+        if (isBumpN) m->view_bumpn = nv;
 
         VkDescriptorSet ns = AllocateSet();
         if (ns == VK_NULL_HANDLE) continue;   // pool exhausted — keep the old set/view pair
-        WriteSet(ns, nv, m->view_detail, m->view_lmap,
-                 m->view_bump != VK_NULL_HANDLE ? m->view_bump : s_FlatBump->GetView());
+        WriteSet(ns, m->view, m->view_detail, m->view_lmap,
+                 m->view_bump  != VK_NULL_HANDLE ? m->view_bump  : s_FlatBump->GetView(),
+                 m->view_bumpn != VK_NULL_HANDLE ? m->view_bumpn : s_FlatBumpN->GetView());
 
         VkDescriptorSet old = m->set;
         m->set = ns;
@@ -612,8 +652,13 @@ bool Init()
     // are fragment-only; binding 3 is sampled by the tessellation evaluation
     // shader (displacement height in its alpha). Four bindings per set
     // requires the pool descriptorCount to be 4× maxSets.
-    VkDescriptorSetLayoutBinding b[4]{};
-    for (int i = 0; i < 4; ++i) {
+    // Binding 4 = `<bump>.dds`: the material's tangent NORMAL (R4 packing: n =
+    // tex.wzy*2-1) plus its GLOSS in .x. Statics had no normal map at all in this
+    // forward path — wall relief came only from the `#` height via POM — and no
+    // per-material gloss, so the sky specular ran on one invented roughness for the
+    // whole world (see world_lmap_frag_body). Same texture answers both.
+    VkDescriptorSetLayoutBinding b[5]{};
+    for (int i = 0; i < 5; ++i) {
         b[i].binding         = (u32)i;
         b[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         b[i].descriptorCount = 1;
@@ -624,7 +669,7 @@ bool Init()
 
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 4;
+    lci.bindingCount = 5;
     lci.pBindings    = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
         Msg("![VK WorldMaterial] CreateDescriptorSetLayout failed");
@@ -646,7 +691,7 @@ bool Init()
     constexpr u32 kMaxSets = 16384;
     VkDescriptorPoolSize ps{};
     ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps.descriptorCount = kMaxSets * 4;   // 4 image samplers per set
+    ps.descriptorCount = kMaxSets * 5;   // 5 image samplers per set (base/detail/lmap/bump#/bump)
 
     VkDescriptorPoolCreateInfo pci{};
     pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -707,6 +752,31 @@ bool Init()
         const u8 flat[4] = { 128, 128, 128, 255 };
         s_FlatBump = xr_new<CVulkanTexture>();
         s_FlatBump->CreateFromData(flat, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
+    }
+
+    // Flat normal + NEUTRAL gloss fallback for binding 4. The R4 unpack is
+    // n = tex.wzy*2-1, so a flat (0,0,1) tangent normal needs w=0.5, z=0.5, y=1.0.
+    //
+    // ⚠ The gloss byte is picked from MEASURED CONTENT, and the obvious-looking choice
+    // is the wrong one. Every <bump>.dds in this install was probed (118 files, gloss =
+    // the R channel): p50 = 0.031, p90 = 0.094, p95 = 0.161, p99 = 0.322. X-Ray authored
+    // these for R2's much weaker specular, so real gloss lives in the bottom sixth of
+    // the range and 90% of the world lands in roughness 0.78-0.85.
+    //
+    // The first attempt here was 102 (0.4), reasoned as "reproduce the pre-feature flat
+    // roughness 0.55 so materials without data keep their old look". That is coherent
+    // with HISTORY and incoherent with NEIGHBOURS, which is what the eye actually reads:
+    // 0.4 sits at the p99.7 of the content, so a material with no bump came out glossier
+    // than 99.7% of the materials that have one. User-visible as two adjacent fences,
+    // the one WITHOUT data looking lacquered next to the one with it.
+    //
+    // 13 (0.051) sits between the content's p50 and p75 — a no-data material now shades
+    // like a typical material that has data. Re-measure before changing this: the right
+    // value is a property of the installed textures, not a taste constant.
+    {
+        const u8 flatN[4] = { 13, 255, 128, 128 };    // r = gloss 0.051 ~ content median (p50 0.031 / p75 0.063)
+        s_FlatBumpN = xr_new<CVulkanTexture>();
+        s_FlatBumpN->CreateFromData(flatN, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 4);
     }
 
     s_Default = CreateDefaultWhite();
@@ -822,10 +892,21 @@ void Destroy()
     for (auto& kv : s_Cache) {
         if (!kv.second) continue;
         if (kv.second == s_Default) continue;  // s_Cache may alias s_Default for failed lookups
-        if (kv.second->tex) { kv.second->tex->Destroy(); xr_delete(kv.second->tex); }
+        // NB: `tex` is NOT freed here — base diffuses are shared by resolved path
+        // across material keys (s_DiffuseTexCache owns them, freed once below).
+        // Deleting per material would double-free every shared one.
         xr_delete(kv.second);
     }
     s_Cache.clear();
+
+    // Base diffuses are shared (one entry per unique .dds path); free once.
+    for (auto& kv : s_DiffuseTexCache) {
+        if (kv.second) {
+            kv.second->Destroy();
+            xr_delete(kv.second);
+        }
+    }
+    s_DiffuseTexCache.clear();
 
     // Detail textures are shared (one entry per unique detail name); free once.
     for (auto& kv : s_DetailTexCache) {
@@ -869,6 +950,21 @@ void Destroy()
         s_FlatBump->Destroy();
         xr_delete(s_FlatBump);
         s_FlatBump = nullptr;
+    }
+
+    // Material normal+gloss textures (binding 4), shared by reference.
+    for (auto& kv : s_BumpNTexCache) {
+        if (kv.second && kv.second != s_FlatBumpN) {
+            kv.second->Destroy();
+            xr_delete(kv.second);
+        }
+    }
+    s_BumpNTexCache.clear();
+
+    if (s_FlatBumpN) {
+        s_FlatBumpN->Destroy();
+        xr_delete(s_FlatBumpN);
+        s_FlatBumpN = nullptr;
     }
 
     // Terrain splat resources. s_TerrainDetail[] alias entries in
@@ -1009,17 +1105,25 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
         return s_Default;
     }
 
-    auto* tex = xr_new<CVulkanTexture>();
     // Base diffuse — the big VRAM consumer: eligible for the texture_lod quality
     // slider AND dynamic mip streaming (r_txstream).
     // Colour: this is the base albedo for BOTH world statics and every skinned visual
     // (characters, weapons and trees all resolve through WorldMaterialCache::GetOrCreate
     // — vk_Visual.cpp), so this one call site covers essentially all lit albedo.
-    if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::WorldDiffuse,
-                      TexColorSpace::Color)) {
-        xr_delete(tex);
-        s_Cache.emplace(std::move(key), s_Default);
-        return s_Default;
+    // Keyed by resolved path (NOT by the material key): several materials sharing a
+    // diffuse must share the image — see s_DiffuseTexCache.
+    CVulkanTexture* tex = nullptr;
+    if (auto dit = s_DiffuseTexCache.find(full); dit != s_DiffuseTexCache.end()) {
+        tex = dit->second;
+    } else {
+        tex = xr_new<CVulkanTexture>();
+        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::WorldDiffuse,
+                          TexColorSpace::Color)) {
+            xr_delete(tex);
+            s_Cache.emplace(std::move(key), s_Default);
+            return s_Default;
+        }
+        s_DiffuseTexCache.emplace(full, tex);
     }
 
     // Terrain bases opt out of dynamic streaming (vk_terrain_cache captures the
@@ -1046,13 +1150,63 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     CVulkanTexture* bumpx_tex = s_FlatBump;
     if (!wmark && alphaRef < 0.0f && thm.has_bump) {
         std::string bumpx_name = thm.bump_name + "#";
-        bumpx_tex = GetOrLoadGameTex(s_BumpTexCache, bumpx_name.c_str(), s_FlatBump);
+        // alphaOnly: every sampler of uTexBumpX reads `.a` (POM march, the flat-material
+        // early-out, the TES displacement) — the colour blocks are a measured neutral
+        // 0.5 fill, so the loader repacks these BC3 files to half-size BC4.
+        bumpx_tex = GetOrLoadGameTex(s_BumpTexCache, bumpx_name.c_str(), s_FlatBump,
+                                     TexColorSpace::Data, TexStreamClass::Terrain, /*alphaOnly*/ true);
         // Tess diag: report every material that DID / DID NOT pick up a height
         // texture, so "why is this wall flat?" is answerable from the log.
         // (.thm has a bump assoc but the `#` height texture may be missing.)
         Msg("[VK Tess] '%s': bump '%s' -> %s ('%s#')", diffuse_name, thm.bump_name.c_str(),
             (bumpx_tex != s_FlatBump) ? "TESSELLATED (height loaded)" : "NO height tex, stays flat",
             thm.bump_name.c_str());
+    }
+
+    // Material NORMAL + GLOSS (`<bump>.dds`). Deliberately NOT behind the tess gate
+    // above: that one exists because displaced geometry must match the depth prepass
+    // coverage, which is irrelevant here — a normal map changes shading, never
+    // coverage. So alpha-tested fences and wallmark decals get their normals too.
+    // TexStreamClass::Bump = subject to the LOAD-TIME budget fit (unlike the `#` height
+    // above, which stays Terrain-class and is pinned). There is one of these per
+    // material, so on a big level they are a first-class VRAM consumer, not a handful
+    // of tiled maps: Pripyat loads ~1590 of them, 491 MB even after the budget shrank
+    // them.
+    //
+    // ⚠ r_bump 0 SKIPS THE LOAD ENTIRELY — it is a memory gate, not just a shading
+    // gate. Gating only the shader (as this first shipped) left the whole cost in VRAM
+    // for a feature that was switched off, which is why "r_bump 0" did not rescue
+    // Pripyat from an out-of-memory. Read at material-load time: flipping the cvar
+    // live changes shading immediately, but reclaiming/loading the textures needs a
+    // level reload.
+    CVulkanTexture* bumpn_tex = s_FlatBumpN;
+    if (thm.has_bump && ps_r_bump > 0.0f) {
+        bumpn_tex = GetOrLoadGameTex(s_BumpNTexCache, thm.bump_name.c_str(), s_FlatBumpN,
+                                     TexColorSpace::Data, TexStreamClass::Bump);
+        // Tie it to this material's diffuse so the streamer can manage it: a normal
+        // map gets no GPU feedback of its own, so it inherits the wanted resolution of
+        // the surface it is painted on. Without the link the whole Bump class can only
+        // be cut at LOAD and never recovers — on a small card that is a permanently
+        // flat-shaded world, not a temporary one.
+        if (bumpn_tex != s_FlatBumpN)
+            VK::TextureStreamer::Instance().LinkCompanion(tex, bumpn_tex);
+    }
+    // Coverage diagnostic. "Two identical fences shade differently" is answerable
+    // only from this: a material is missing its normal+gloss either because its .thm
+    // declares no bump at all, or because the declared `<bump>.dds` failed to load —
+    // and those two look the same in the gloss debug view. Counters are cumulative
+    // for the process (this cache is never reset per level, by design), so the last
+    // line in the log carries the running totals.
+    {
+        static u32 s_bumpOk = 0, s_bumpNone = 0, s_bumpMiss = 0;
+        if (!thm.has_bump)                    ++s_bumpNone;
+        else if (bumpn_tex == s_FlatBumpN)    ++s_bumpMiss;
+        else                                  ++s_bumpOk;
+        Msg("[VK Bump] '%s': %s%s%s (loaded %u / no-assoc %u / missing %u)", diffuse_name,
+            thm.has_bump ? "bump '" : "NO .thm bump association",
+            thm.has_bump ? thm.bump_name.c_str() : "",
+            thm.has_bump ? (bumpn_tex != s_FlatBumpN ? "' -> LOADED" : "' -> MISSING .dds") : "",
+            s_bumpOk, s_bumpNone, s_bumpMiss);
     }
 
     // Lightmap from the level shader's 3rd texture slot. Vert-lit / non-
@@ -1074,6 +1228,9 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     m->name         = diffuse_name;
     m->tessellated  = (bumpx_tex != s_FlatBump);
     m->view_bump    = bumpx_tex->GetView();
+    m->view_bumpn   = bumpn_tex->GetView();
+    m->hasBumpN     = (bumpn_tex != s_FlatBumpN);
+    m->tex_bumpn    = (bumpn_tex != s_FlatBumpN) ? bumpn_tex : nullptr;   // streamer rebind key
     // GPU-feedback slot of the base diffuse — pushed to the world FS so it can
     // report the actually-sampled LOD (0xFFFFFFFF = not streamable, shader skips).
     m->streamID     = VK::TextureStreamer::Instance().GetFeedbackSlot(tex);
@@ -1086,7 +1243,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
         s_Cache.emplace(std::move(key), s_Default);
         return s_Default;
     }
-    WriteSet(m->set, m->view, m->view_detail, m->view_lmap, bumpx_tex->GetView());
+    WriteSet(m->set, m->view, m->view_detail, m->view_lmap, bumpx_tex->GetView(), bumpn_tex->GetView());
 
     // ----- Terrain splatting: diffuse under "terrain\" gets the 7-binding set.
     // Mask = "<diffuse>_mask"; details = the 4 channel defaults; detail UV

@@ -81,6 +81,18 @@ public:
     // off for the dynamic-visuals flush. Default on.
     void SetAllowTess(bool b) { m_AllowTess = b; }
 
+    // AT statics color optimization (r_at_equal): Pass_World arms this for the
+    // STATIC flush only (the prepass wrote these items' final depth), so aref>=0
+    // items draw with depth EQUAL + no write. Dynamics are guarded per-item too
+    // (non-identity xform), but keep it off for any flush whose items are not in
+    // the depth prepass. Default off.
+    void SetATEqual(bool b) { m_ATEqual = b; }
+
+    // r_z_prepass companion (armed for the same static flush): opaque statics
+    // drop the redundant color-pass depth write so the discard-bearing uber-FS
+    // keeps EARLY-Z (discard + z-write ON = late-Z on real HW). Default off.
+    void SetPrepassZ(bool b) { m_PrepassZ = b; }
+
     // Depth-only flush: binds PipelineCache depth pipelines (by stride) and
     // pushes mvp = item.xform · vp per item. No materials/colour — position
     // only. Used by the sun/spot shadow casters AND the camera depth prepass;
@@ -113,6 +125,8 @@ private:
     xr_vector<DrawItem> m_GlassItems;   // late translucent panes (see FlushGlass)
     float               m_SubmitHemi = 1.0f;
     bool                m_AllowTess  = true;
+    bool                m_ATEqual    = false;   // see SetATEqual
+    bool                m_PrepassZ   = false;   // see SetPrepassZ
 };
 
 extern RenderQueue g_RenderQueue;

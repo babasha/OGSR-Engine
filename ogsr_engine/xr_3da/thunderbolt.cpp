@@ -299,7 +299,10 @@ void CEffect_Thunderbolt::OnFrame(shared_str id, float period, float duration)
     if (state == stWorking)
     {
         if (current_time > life_time)
+        {
             state = stIdle;
+            current_flash.set(0.f, 0.f, 0.f);
+        }
         current_time += Device.fTimeDelta;
         Fvector fClr;
         int frame;
@@ -308,6 +311,10 @@ void CEffect_Thunderbolt::OnFrame(shared_str id, float period, float duration)
 
         lightning_phase = 1.5f * (current_time / life_time);
         clamp(lightning_phase, 0.f, 1.f);
+
+        // Publish the flash for renderers that refuse the fake-sun trick below and
+        // want to spend it as sky light instead (see Flash()).
+        current_flash.set(fClr);
 
         CEnvironment& environment = g_pGamePersistent->Environment();
 

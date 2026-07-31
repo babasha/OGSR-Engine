@@ -41,6 +41,7 @@ extern float    ps_r2_no_details_radius;
 extern float    ps_r2_no_rain_radius;  // splash-free radius around the camera
 extern int      ps_r_rain_debug;       // r_rain_debug — solid red streaks (geometry vs texture triage)
 extern int      ps_r_rain_enable;      // r_rain — master rain on/off
+extern float    ps_r_rain_sun;         // r_rain_sun — forward-scatter lobe on the sun/moon/lightning direction
 
 namespace {
 
@@ -309,9 +310,25 @@ public:
         // colour is ONLY that lift: hemi × brightness; no fog paint-over (that
         // alpha-blend version read as a downpour of tracers vs R4's drizzle).
         const auto* E = g_pGamePersistent->Environment().CurrentEnv;
-        u32 u_drop_color = color_rgba_f(_min(E->hemi_color.x * 0.6f, 1.f),
-                                        _min(E->hemi_color.y * 0.6f, 1.f),
-                                        _min(E->hemi_color.z * 0.6f, 1.f),
+        // DIRECTIONAL term (r_rain_sun). Hemi alone is flat-lit rain, and it is also
+        // rain a thunderbolt cannot reach: the bolt boosts sun/sky/fog colour and
+        // points sun_dir at the strike (thunderbolt.cpp:314-325), and hemi is the one
+        // field it never writes — so the whole downpour ignored every flash.
+        // A falling drop is a water cylinder: it scatters FORWARD, so a downpour
+        // lights up when the light is BEHIND it (you look toward the sun/moon/bolt)
+        // and goes near-black when the light is behind YOU. That is one lobe on the
+        // sun direction, and it delivers the lightning flash through the same path —
+        // the bolt swings sun_dir at the camera's part of the sky, so a strike ahead
+        // of the player rips through the rain while one behind him only glows.
+        // A floor is kept (0.12) so drops never fully vanish side-on.
+        Fvector sunD = E->sun_dir;
+        sunD.normalize_safe();
+        const float fwd = -Device.vCameraDirection.dotproduct(sunD);   // +1 = looking INTO the light
+        const float g = _max(0.f, fwd);
+        const float lobe = ps_r_rain_sun * (0.12f + 0.88f * g * g * g);
+        u32 u_drop_color = color_rgba_f(_min(E->hemi_color.x * 0.6f + E->sun_color.x * lobe, 1.f),
+                                        _min(E->hemi_color.y * 0.6f + E->sun_color.y * lobe, 1.f),
+                                        _min(E->hemi_color.z * 0.6f + E->sun_color.z * lobe, 1.f),
                                         factor_visual * 0.32f);
         // Splashes stay alpha-blended (their texture alpha works): fog+hemi mix.
         const u32 u_splash_color = color_rgba_f(_min(E->fog_color.x + E->hemi_color.x * 0.4f, 1.f),

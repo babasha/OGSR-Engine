@@ -126,6 +126,16 @@ layout(set = ENV_SET, binding = 0) uniform Lighting {
     //   z = probe top mip (the fallback's diffuse LOD), w reserved.
     // Appended last (prefix-safe).
     vec4 sh_params;
+    // Puddles in REAL ground dips (r_puddle_geo). The SSFX recipe places puddles by
+    // texture micro-height + a per-level artist mask, so a metre-scale hollow in the
+    // asphalt collects nothing — the water level only ever sees centimetre texture
+    // relief. x blends the Surface Field's concavity (SF_Concavity, the top-down map)
+    // into the macro placement instead. Appended last (prefix-safe).
+    vec4 puddle_geo;         // x = geo blend 0..1, y = wet reflection range (m), z = terrain detail range (m), w reserved
+    // Material normal+gloss on statics (bump_common.glsl). x = normal strength
+    // (r_bump), y = debug view (r_bump_debug: 1 world normal, 2 gloss), z = gloss
+    // scale into IBL roughness (r_gloss_scale), w reserved. Appended last.
+    vec4 bump_params;
 } L;
 
 // Splat-mask UV: baked world-space mask (mask-less maps) or the material's own

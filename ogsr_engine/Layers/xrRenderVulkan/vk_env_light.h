@@ -149,8 +149,16 @@ struct LightUBO {
     // used only by the raw-cube last resort), z = probe top mip, w reserved.
     // Appended last (prefix-safe).
     float sh_params[4];
+    // Puddles in REAL ground dips (r_puddle_geo): blends the Surface Field concavity
+    // into the puddle macro placement, which otherwise only knows texture-scale
+    // micro-height. Appended last (prefix-safe).
+    float puddle_geo[4];      // x = geo blend 0..1, y = wet reflection range (m, r_wet_dist), z = terrain detail range (m), w reserved
+    // Material normal+gloss on statics (`<bump>.dds`, set 0 binding 4). x = normal
+    // strength (r_bump), y = debug view (r_bump_debug), z = gloss scale feeding the
+    // IBL roughness (r_gloss_scale), w reserved. Appended last (prefix-safe).
+    float bump_params[4];
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16 + 64 + 64 * Lights::kMaxShadowSpots + 64 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16 + 64 + 64 * Lights::kMaxShadowSpots + 64 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
 // Per-field offset guards. The size-only assert above still passes if two equal-
 // sized fields are swapped; these pin the layout at structural anchors and across
@@ -171,5 +179,9 @@ VkDescriptorSetLayout GetSetLayout();          // the shared set layout (binding
 void                  Update(u32 slot);        // fill slot's UBO from env; remember it as the current set
 VkDescriptorSet       GetCurrentSet();         // set chosen by the last Update() this frame
 const float*          TerrainChOff();          // per-level SSFX channel depth offsets (terrain_details.ltx), float[4]
+// Sun direction for anything that DRAWS the sun (sky disc, volumetric sun beam).
+// Identical to CurrentEnv->sun_dir except during a thunderbolt, when the engine
+// hijacks that field to point at the strike — see CEnvironment::ThunderboltFlash.
+const Fvector&        SunDirVisual();
 
 }}  // namespace VK::EnvLight

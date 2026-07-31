@@ -40,7 +40,7 @@ namespace VKEditor { int HostModelCount(); }
 // r_vol composite knobs (global scope — C-linkage console symbols).
 extern int ps_r_vol;
 extern int ps_r_vol_debug;
-extern int ps_r_linear_color;   // linear colour pipeline — decides whether we owe the display an OETF
+#include "vk_color_space.h"     // ColorSpace::Active() — latched linear-pipeline selector (OETF gate)
 // SSIL composite knobs (global scope — block-scope extern inside the namespace
 // would mangle as VK::* → LNK2001).
 extern int   ps_r_ssil_enable;
@@ -48,6 +48,7 @@ extern int   ps_r_ssil_debug;
 extern float ps_r_ssil_strength;
 extern float ps_r_dither;   // final 8-bit output dither amplitude (LSBs; 0 = off)
 extern int   ps_r_vsm_debug_dyn;   // red overlay of VSM dyn-atlas (NPC/grass) shadows
+extern int   ps_r_vol_upsample;    // froxel-volume reconstruction filter in the composite (0 = old single tap)
 extern float ps_r_exp_adapt;       // auto-exposure temporal adaptation time constant (s; 0 = instant)
 extern float ps_r_dlss_sharp;      // CAS sharpen on the DLSS output (0 = off)
 extern int   ps_r_dlss_debug;      // DLSS debug view: 1=CAS heatmap, 2=split, 3=gate flag
@@ -92,12 +93,12 @@ namespace {
     // sky-heavy frame average pushed our exposure into the 0.6 floor and the
     // whole foreground went darker/flatter than R4. Raise the target + floor.
     // Auto-exposure inputs live in vk_exposure.h (shared with vk_pass_bloom.cpp).
-    using Exposure::kMiddleGray;   // exposure target (our HDR scale)
+    using Exposure::MiddleGray;    // exposure target (per color pipeline — see vk_exposure.h)
     using Exposure::kLowLum;       // R4 ps_r2_tonemap_low_lum
-    using Exposure::kExpMin;       // exposure clamp lo
-    using Exposure::kExpMax;       // exposure clamp hi
+    using Exposure::ExpMin;        // exposure clamp lo (r_expo_min, live)
+    using Exposure::ExpMax;        // exposure clamp hi (r_expo_max, live)
+    using Exposure::ExpComp;       // user compensation (r_expo, live)
     constexpr float kWhitePoint  = 11.2f;    // R4 tonemap_sRGB fWhiteIntensity
-    constexpr float kExpComp     = 1.0f;     // overall compensation knob
     constexpr float kBloomIntensity = 0.8f;  // bloom add strength (blend_soft analog)
 
     // Does the presentation surface apply the sRGB OETF itself? If it does, the shader
@@ -118,7 +119,8 @@ namespace {
         }
     }
 
-    struct TonemapPush { float p0[4]; float p1[4]; float p2[4]; float p3[4]; float p4[4]; float p5[4]; float p6[4]; };
+    struct TonemapPush { float p0[4]; float p1[4]; float p2[4]; float p3[4]; float p4[4]; float p5[4]; float p6[4]; float p7[4]; };
+    static_assert(sizeof(TonemapPush) == 128, "must match tonemap.frag PC block (128 B = the guaranteed push limit)");
 
     // ---- Temporal auto-exposure (eye adaptation) ----------------------------------
     // The instantaneous exposure (middlegray / metered avg-luminance) makes the image
@@ -236,7 +238,7 @@ bool Init()
     s_expFrame  = 0; s_exposure = 1.0f; s_expValid = false;
 
     Msg("[VK Tonemap] Init OK (auto-exposure mg=%.2f white=%.2f clamp[%.2f,%.2f])",
-        kMiddleGray, kWhitePoint, kExpMin, kExpMax);
+        MiddleGray(), kWhitePoint, ExpMin(), ExpMax());
     return true;
 }
 
@@ -278,11 +280,16 @@ void Pass_TonemapComposite(FrameContext& ctx)
             const u16* h = reinterpret_cast<const u16*>(s_expMapped + size_t(slot) * 8);
             float r = HalfToFloat(h[0]), g = HalfToFloat(h[1]), b = HalfToFloat(h[2]);
             float avgLum = std::max(r * 0.2126f + g * 0.7152f + b * 0.0722f, 1e-4f);
-            float target = std::min(std::max(kMiddleGray / (avgLum + kLowLum), kExpMin), kExpMax) * kExpComp;
+            float target = std::min(std::max(MiddleGray() / (avgLum + kLowLum), ExpMin()), ExpMax()) * ExpComp();
             float dt  = (Device.fTimeDelta > 0.f && Device.fTimeDelta < 0.25f) ? Device.fTimeDelta : 0.016f;
             float tau = ps_r_exp_adapt;
-            if (tau > 0.001f) s_exposure += (target - s_exposure) * (1.0f - expf(-dt / tau));
-            else              s_exposure  = target;
+            // First MEASURED value snaps: easing toward it from the arbitrary 1.0
+            // seed showed as a visible "brightness ramp" on level entry (worse in
+            // linear mode, whose steady-state exposure sits higher). Adaptation
+            // stays smooth for every later change — that part is eye-adaptation
+            // by design.
+            if (!s_expValid || tau <= 0.001f) s_exposure  = target;
+            else                              s_exposure += (target - s_exposure) * (1.0f - expf(-dt / tau));
             s_expValid = true;
         }
         // The editor used to pin ps_r2_img_gamma = 2.2 and ps_r2_img_cg here. Both are
@@ -436,9 +443,9 @@ void Pass_TonemapComposite(FrameContext& ctx)
     TonemapPush push{};
     push.p0[0] = kWhitePoint;
     push.p0[1] = float(SceneColor::MipLevels() - 1);   // top-mip LOD = whole-frame average
-    push.p0[2] = kMiddleGray;
+    push.p0[2] = MiddleGray();
     push.p0[3] = kLowLum;
-    push.p1[0] = kExpMin; push.p1[1] = kExpMax; push.p1[2] = kExpComp;
+    push.p1[0] = ExpMin(); push.p1[1] = ExpMax(); push.p1[2] = ExpComp();
     // Bloom was forced OFF in the editor so the grid and gizmo lines would stay
     // crisp instead of glowing. That reason no longer holds: both now draw
     // POST-tonemap (EditorOverlay::ExecutePostTonemap), where bloom cannot reach
@@ -489,7 +496,7 @@ void Pass_TonemapComposite(FrameContext& ctx)
     // refinement, and it would have to give up that composition.
     const bool  isEditor     = Core.Params && strstr(Core.Params, "-vk_editor");
     const bool  hwSrgb       = IsSrgbFormat(Swapchain.m_Format);
-    const bool  wantEncode   = (ps_r_linear_color != 0) || isEditor;
+    const bool  wantEncode   = ColorSpace::Active() || isEditor;
     const float displayGamma = (wantEncode && !hwSrgb) ? 2.2f : 1.0f;
     const float userGamma    = (ps_r2_img_gamma > 0.05f) ? ps_r2_img_gamma : 1.0f;
     push.p2[2] = 1.0f / (displayGamma * userGamma);
@@ -543,6 +550,21 @@ void Pass_TonemapComposite(FrameContext& ctx)
     // DLSS debug view (r_dlss_debug): magnitude = mode, SIGN = whether the composite
     // actually reads the DLSS output this frame (the gate the shader can't see).
     push.p6[3] = resolvedUp ? float(ps_r_dlss_debug) : -float(ps_r_dlss_debug);
+    // ---- Volume RECONSTRUCTION (r_vol_upsample) ----------------------------------
+    // The froxel grid is 256×144 — roughly 7-8 screen pixels per froxel — and the
+    // composite resolved it with ONE trilinear tap plus a screen-STATIC dither. With
+    // the temporal accumulation off that reads as raw 256×144 upscale ("PS1 pixels");
+    // with it on, the grid hides but boils. A rotated 4-tap reconstruction filter
+    // costs 3 extra 3D taps and removes the blockiness the volume can never carry.
+    push.p7[0] = volOn ? float(ps_r_vol_upsample) : 0.0f;
+    // Per-frame rotation of the sampling pattern — ONLY when a temporal upscaler
+    // resolves this frame. Under DLSS a rotating pattern is free supersampling (it
+    // averages the offsets across frames); a STATIC one is the opposite — DLSS reads
+    // the fixed grain as real detail and preserves it. Without an upscaler an
+    // animated pattern would just crawl, so it stays frozen.
+    push.p7[1] = resolvedUp ? float(Device.dwFrame & 63u) : 0.0f;
+    push.p7[2] = 0.0f;
+    push.p7[3] = 0.0f;
     // One-shot gate log on every state change — pairs with r_dlss_debug 3.
     {
         static int s_lastResolved = -1;

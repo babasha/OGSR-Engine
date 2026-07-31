@@ -28,10 +28,10 @@ namespace {
     constexpr float kThreshold = 0.85f;
     constexpr float kKnee      = 0.35f;
     // Auto-exposure params — shared with vk_pass_tonemap.cpp via vk_exposure.h.
-    using Exposure::kMiddleGray;
+    using Exposure::MiddleGray;   // per color pipeline (see vk_exposure.h) — MUST match the tonemap
     using Exposure::kLowLum;
-    using Exposure::kExpMin;
-    using Exposure::kExpMax;
+    using Exposure::ExpMin;
+    using Exposure::ExpMax;
 
     bool                  s_inited = false;
     VkPipeline            s_PipeBuild = VK_NULL_HANDLE;
@@ -242,8 +242,8 @@ void Execute(VkCommandBuffer cmd, u32 imageIndex, VkExtent2D sceneExtent, u32 sc
     // 1) Bright pass: scene (mips, SHADER_READ after GenerateMips) → A.
     toColor(0);
     BuildPush bp{};
-    bp.p0[0] = quarterLod; bp.p0[1] = topLod; bp.p0[2] = kMiddleGray; bp.p0[3] = kLowLum;
-    bp.p1[0] = kExpMin;    bp.p1[1] = kExpMax; bp.p1[2] = kThreshold; bp.p1[3] = kKnee;
+    bp.p0[0] = quarterLod; bp.p0[1] = topLod; bp.p0[2] = MiddleGray(); bp.p0[3] = kLowLum;
+    bp.p1[0] = ExpMin();   bp.p1[1] = ExpMax(); bp.p1[2] = kThreshold; bp.p1[3] = kKnee;
     Draw(cmd, s_view[0], s_PipeBuild, s_SetScene[imageIndex < kMaxImages ? imageIndex : 0], &bp, sizeof(bp));
     toRead(0);
 

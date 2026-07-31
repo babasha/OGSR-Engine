@@ -297,6 +297,92 @@ void StatsEnd(VkCommandBuffer cmd, u32 frameIndex)
     s_statsOpen = false;
 }
 
+// ---- r_fsinv_split: FS-invocation attribution (see vk_vrs.h) ----------------
+// 0=CPU statics flush, 1=GPU terrain groups, 2=GPU mesh groups, 3=dynamics,
+// 4=skinned. Plus an OCCLUSION query (SAMPLES_PASSED, precise) around the GPU
+// statics draw: samples exclude helper lanes and discarded/failed fragments, so
+// invocations >> samples ⇒ quad-helper inflation / late-Z waste, while
+// samples ≈ invocations ⇒ genuinely multi-shaded pixels (duplicate draws).
+static constexpr u32 kSub = 5;
+VkQueryPool s_subPool    = VK_NULL_HANDLE;
+VkQueryPool s_occPool    = VK_NULL_HANDLE;
+bool        s_subUsed[N] = {};
+int         s_subOpen    = -1;
+bool        s_occOpen    = false;
+
+void SubStatsReset(VkCommandBuffer cmd, u32 frameIndex)
+{
+    if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+    if (s_subPool == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo qci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qci.queryType          = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        qci.queryCount         = N * kSub;
+        qci.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        if (vkCreateQueryPool(VulkanHW.m_Device, &qci, nullptr, &s_subPool) != VK_SUCCESS) {
+            s_subPool = VK_NULL_HANDLE; return;
+        }
+        VkQueryPoolCreateInfo oci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        oci.queryType  = VK_QUERY_TYPE_OCCLUSION;
+        oci.queryCount = N;
+        if (vkCreateQueryPool(VulkanHW.m_Device, &oci, nullptr, &s_occPool) != VK_SUCCESS)
+            s_occPool = VK_NULL_HANDLE;   // split still works without samples
+    }
+    const u32 slot = frameIndex % N;
+    // Harvest the slot recorded N frames ago (its fence has been waited).
+    if (s_subUsed[slot]) {
+        u64 inv[kSub] = {};
+        if (vkGetQueryPoolResults(VulkanHW.m_Device, s_subPool, slot * kSub, kSub, sizeof(inv), inv,
+                                  sizeof(u64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            u64 smp = 0;
+            if (s_occPool != VK_NULL_HANDLE)
+                vkGetQueryPoolResults(VulkanHW.m_Device, s_occPool, slot, 1, sizeof(smp), &smp,
+                                      sizeof(smp), VK_QUERY_RESULT_64_BIT);
+            static u32 s_lastLog = 0;
+            if (Device.dwTimeGlobal > s_lastLog + 3000) {
+                s_lastLog = Device.dwTimeGlobal;
+                Msg("[VK FSinv] cpuFlush=%.2fM gpuTerrain=%.2fM gpuMesh=%.2fM dyn=%.2fM skin=%.2fM | total=%.2fM | gpuSamplesPassed=%.2fM",
+                    double(inv[0]) / 1e6, double(inv[1]) / 1e6, double(inv[2]) / 1e6, double(inv[3]) / 1e6,
+                    double(inv[4]) / 1e6,
+                    double(inv[0] + inv[1] + inv[2] + inv[3] + inv[4]) / 1e6, double(smp) / 1e6);
+            }
+        }
+        s_subUsed[slot] = false;
+    }
+    vkCmdResetQueryPool(cmd, s_subPool, slot * kSub, kSub);   // outside the render pass
+    if (s_occPool != VK_NULL_HANDLE) vkCmdResetQueryPool(cmd, s_occPool, slot, 1);
+    s_subOpen = -1;
+    s_occOpen = false;
+}
+
+void SubOccBegin(VkCommandBuffer cmd, u32 frameIndex)
+{
+    if (s_occPool == VK_NULL_HANDLE || s_occOpen) return;
+    vkCmdBeginQuery(cmd, s_occPool, frameIndex % N, VK_QUERY_CONTROL_PRECISE_BIT);
+    s_occOpen = true;
+}
+
+void SubOccEnd(VkCommandBuffer cmd, u32 frameIndex)
+{
+    if (s_occPool == VK_NULL_HANDLE || !s_occOpen) return;
+    vkCmdEndQuery(cmd, s_occPool, frameIndex % N);
+    s_occOpen = false;
+}
+
+void SubStatsBegin(VkCommandBuffer cmd, u32 frameIndex, u32 idx)
+{
+    if (s_subPool == VK_NULL_HANDLE || idx >= kSub || s_subOpen >= 0) return;
+    vkCmdBeginQuery(cmd, s_subPool, (frameIndex % N) * kSub + idx, 0);
+    s_subOpen = (int)idx;
+}
+
+void SubStatsEnd(VkCommandBuffer cmd, u32 frameIndex, u32 idx)
+{
+    if (s_subPool == VK_NULL_HANDLE || s_subOpen != (int)idx) return;
+    vkCmdEndQuery(cmd, s_subPool, (frameIndex % N) * kSub + idx);
+    s_subOpen = -1;
+    if (idx == kSub - 1) s_subUsed[frameIndex % N] = true;
+}
+
 void CmdSetRate(VkCommandBuffer cmd)
 {
     // The world-color pipelines carry a FRAGMENT_SHADING_RATE dynamic state whenever
@@ -360,6 +446,11 @@ void Destroy()
     if (s_statsPool) { vkDestroyQueryPool(VulkanHW.m_Device, s_statsPool, nullptr); s_statsPool = VK_NULL_HANDLE; }
     for (u32 i = 0; i < N; ++i) s_statsUsed[i] = false;
     s_statsOpen = false;
+    if (s_subPool) { vkDestroyQueryPool(VulkanHW.m_Device, s_subPool, nullptr); s_subPool = VK_NULL_HANDLE; }
+    if (s_occPool) { vkDestroyQueryPool(VulkanHW.m_Device, s_occPool, nullptr); s_occPool = VK_NULL_HANDLE; }
+    for (u32 i = 0; i < N; ++i) s_subUsed[i] = false;
+    s_subOpen = -1;
+    s_occOpen = false;
     if (s_pipe)          { vkDestroyPipeline(VulkanHW.m_Device, s_pipe, nullptr); s_pipe = VK_NULL_HANDLE; }
     if (s_layout)        { vkDestroyPipelineLayout(VulkanHW.m_Device, s_layout, nullptr); s_layout = VK_NULL_HANDLE; }
     if (s_pool)          { vkDestroyDescriptorPool(VulkanHW.m_Device, s_pool, nullptr); s_pool = VK_NULL_HANDLE; }

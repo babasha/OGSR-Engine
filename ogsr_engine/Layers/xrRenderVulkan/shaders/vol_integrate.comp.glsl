@@ -40,6 +40,10 @@ layout(set = 0, binding = 0) uniform Vol {
 layout(set = 0, binding = 1, rgba16f) uniform readonly  image3D uScatter;     // rgb=in-scatter, a=extinction
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D uIntegrated;  // rgb=accum, a=transmittance
 
+layout(push_constant) uniform PC {
+    vec4 p;   // x = r_vol_hillaire (0 = legacy front-face accumulation), yzw reserved
+} pc;
+
 void main()
 {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -60,10 +64,36 @@ void main()
         vec4  s   = imageLoad(uScatter, ivec3(px, z));
         float ext = max(s.a, 0.0);
 
-        // In-scatter contributed by this slice, attenuated by transmittance to
-        // its front face; then advance the transmittance through the slice.
-        accum += s.rgb * T * sliceLen;
-        T     *= exp(-ext * sliceLen);
+        // V-0 — ENERGY-CONSERVING SLICE INTEGRAL (Hillaire, Frostbite 2015).
+        //
+        // The legacy line was `accum += s.rgb * T * sliceLen`: the slice's whole
+        // in-scatter attenuated by the transmittance at its FRONT FACE. Light born at
+        // the back of a slice therefore travelled the slice for free, and the error
+        // grows with density — so thickening the fog DARKENED the scene faster than it
+        // lit it (the "dirty cigarette smoke" look), brightness was non-linear in
+        // density, and Z showed banding wherever slices are thick.
+        //
+        // The closed form integrates in-scatter ALONG the slice against its own
+        // attenuation: ∫₀ᵈ S·exp(-σt)dt = (S - S·exp(-σd)) / σ. As σ→0 this tends to
+        // S·d, i.e. it degrades exactly into the old formula for thin air — the
+        // difference shows up precisely where the old one was wrong.
+        float sliceT = exp(-ext * sliceLen);
+        if (pc.p.x > 0.5) {
+            // ⚠ The closed form has a REMOVABLE SINGULARITY at sigma = 0: numerator and
+            // denominator both vanish, and `/max(ext,1e-6)` does not rescue it — it
+            // computes 0/1e-6 = 0, i.e. air with no extinction emits NOTHING. That is
+            // silently wrong for any emissive-but-transparent volume, and it blacked out
+            // every debug view that pins extinction to 0 to read "at full range"
+            // (r_vol_debug 3/4 and the ground forensics) from the day V-0 landed.
+            // Take the analytic limit S*d there instead — which is also exactly the
+            // legacy formula, so thin air is continuous across the branch.
+            vec3 sInt = (ext > 1e-4) ? (s.rgb - s.rgb * sliceT) / ext
+                                     : s.rgb * sliceLen;
+            accum += sInt * T;
+        } else {
+            accum += s.rgb * T * sliceLen;   // legacy A/B (r_vol_hillaire 0)
+        }
+        T *= sliceT;
 
         imageStore(uIntegrated, ivec3(px, z), vec4(accum, T));
     }

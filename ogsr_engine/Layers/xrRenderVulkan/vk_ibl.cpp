@@ -16,6 +16,8 @@
 #include "vk_buffer.h"           // CVulkanBuffer (SH coefficient SSBO)
 #include <cmath>
 
+extern int ps_r_sky_sh_debug;   // r_sky_sh_debug — dump the projected SH coefficients (L0/L1/aniso)
+
 namespace VK { namespace IBL {
 
 namespace {
@@ -46,6 +48,7 @@ namespace {
     constexpr VkDeviceSize kSHBytes = 9 * 4 * sizeof(float);   // vec4[9], std430
 
     CVulkanBuffer         s_shBuf;
+    CVulkanBuffer         s_shRead;    // host-visible mirror for the r_sky_sh_debug dump
     bool                  s_shReady = false;
     VkDescriptorSetLayout s_shSetL  = VK_NULL_HANDLE;
     VkDescriptorPool      s_shPool  = VK_NULL_HANDLE;
@@ -58,8 +61,18 @@ namespace {
     // a rotated dome is a genuinely different probe, not the same one viewed anew.
     VkImageView s_last0 = VK_NULL_HANDLE, s_last1 = VK_NULL_HANDLE;
     float       s_lastW = -1.f, s_lastRot = -1e9f, s_lastGround = -1.f;
+    float       s_lastTint[3] = { -1.f, -1.f, -1.f };
+    float       s_lastSun[3]  = { -9.f, -9.f, -9.f };
+    int         s_lastProc    = -1;
+    float       s_lastAtmo[3] = { -1.f, -1.f, -1.f };   // intensity / turbidity / mieG
 
-    struct Push { float p[4]; };   // p.x = weight, p.y = face size, p.z = sky rotation
+    // p[0..3]   = weight / face size / sky rotation (prefilter) or mip / face / ground
+    //             (SH projection)
+    // p[4..6]   = sky_color tint
+    // p[8..10]  = direction TO the sun
+    // p[12..15] = procedural sky: enable / intensity / turbidity / Mie g
+    // One struct for both pipelines so the push range matches.
+    struct Push { float p[16]; };
 
     // Barrier a mip range (all 6 layers) between layouts.
     void BarrierMips(VkCommandBuffer cmd, u32 baseMip, u32 mipCount,
@@ -164,8 +177,14 @@ bool Init()
         // GPU-only: written by this compute, read by the forward fragment shaders.
         // (Without gpuOnly every storage buffer lands in HOST_VISIBLE memory and the
         //  shader reads it over PCIe — the vk_buffer.h warning.)
-        s_shBuf.Create(kSHBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+        s_shBuf.Create(kSHBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                       VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
         if (s_shBuf.GetHandle() == VK_NULL_HANDLE) { Msg("![VK IBL] SH buffer create failed"); break; }
+        // Host-visible mirror, so r_sky_sh_debug can print what was actually
+        // projected. The projection runs on the fence-waited immediate queue, so a
+        // copy issued in the same submit is readable the moment Update returns —
+        // no extra sync, and nothing is read unless the cvar is on.
+        s_shRead.Create(kSHBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
 
         VkDescriptorSetLayoutBinding sb[2]{};
         sb[0].binding = 0; sb[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sb[0].descriptorCount = 1; sb[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -209,12 +228,19 @@ bool Init()
 
 bool Ready() { return s_ready && !s_failed && s_hasContent; }
 
-void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, float weight,
-            float skyRotation, float groundBounce)
+void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyDesc& sky)
 {
     if (!s_ready || s_failed) return;
-    if (sky0 == VK_NULL_HANDLE || skySampler == VK_NULL_HANDLE) return;   // no real sky cubes yet
+    // The procedural sky needs no cube at all — it IS the source. Only the legacy
+    // path is blocked on the weather textures being up.
+    if (!sky.proc && (sky0 == VK_NULL_HANDLE || skySampler == VK_NULL_HANDLE)) return;
+    if (sky0 == VK_NULL_HANDLE || skySampler == VK_NULL_HANDLE) return;   // descriptors still need something bound
     if (sky1 == VK_NULL_HANDLE) sky1 = sky0;
+
+    const float  weight       = sky.weight;
+    const float  skyRotation  = sky.rotation;
+    const float  groundBounce = sky.groundBounce;
+    const float* skyTint      = sky.tint;
 
     // Rotation moves the probe just as much as a cube swap does, so it gates the
     // refresh too. The threshold is ~0.6° — below that the SH9 result is visually
@@ -224,6 +250,24 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, float weig
                        || (std::fabs(weight - s_lastW) > 0.02f)
                        || (std::fabs(skyRotation - s_lastRot) > 0.01f)
                        || (std::fabs(groundBounce - s_lastGround) > 0.01f)
+                       // The tint is time-of-day: it is what makes the probe track dusk,
+                       // so it must gate the refresh. 0.02 keeps re-projection to roughly
+                       // the same cadence the cross-fade already causes.
+                       || (std::fabs(skyTint[0] - s_lastTint[0]) > 0.02f)
+                       || (std::fabs(skyTint[1] - s_lastTint[1]) > 0.02f)
+                       || (std::fabs(skyTint[2] - s_lastTint[2]) > 0.02f)
+                       // Procedural sky: the SUN is the model's only real input, so the
+                       // probe is stale as soon as it moves. 0.02 on the direction vector
+                       // is ~1.1 deg — the prefilter is a fence-waited submit and the
+                       // atmosphere march is not free, so re-projecting on every
+                       // arc-minute would be a visible hitch for no visible gain.
+                       || (sky.proc ? 1 : 0) != s_lastProc
+                       || (sky.proc && (std::fabs(sky.sunDir[0] - s_lastSun[0]) > 0.02f
+                                     || std::fabs(sky.sunDir[1] - s_lastSun[1]) > 0.02f
+                                     || std::fabs(sky.sunDir[2] - s_lastSun[2]) > 0.02f
+                                     || std::fabs(sky.intensity - s_lastAtmo[0]) > 0.01f
+                                     || std::fabs(sky.turbidity - s_lastAtmo[1]) > 0.01f
+                                     || std::fabs(sky.mieG      - s_lastAtmo[2]) > 0.01f))
                        || !s_hasContent;
     if (!changed) return;
 
@@ -251,6 +295,10 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, float weig
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_layout, 0, 1, &s_set, 0, nullptr);
     Push pc{}; pc.p[0] = weight; pc.p[1] = float(kFace); pc.p[2] = skyRotation;
+    pc.p[4] = skyTint[0]; pc.p[5] = skyTint[1]; pc.p[6] = skyTint[2];
+    pc.p[8] = sky.sunDir[0]; pc.p[9] = sky.sunDir[1]; pc.p[10] = sky.sunDir[2];
+    pc.p[12] = sky.proc ? 1.f : 0.f;
+    pc.p[13] = sky.intensity; pc.p[14] = sky.turbidity; pc.p[15] = sky.mieG;
     vkCmdPushConstants(cmd, s_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (kFace + 7) / 8, (kFace + 7) / 8, 6);
 
@@ -302,19 +350,56 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, float weig
         bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bb.buffer = s_shBuf.GetHandle(); bb.offset = 0; bb.size = kSHBytes;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 1, &bb, 0, nullptr);
+
+        if (ps_r_sky_sh_debug && s_shRead.GetHandle() != VK_NULL_HANDLE) {
+            VkBufferCopy rc{ 0, 0, kSHBytes };
+            vkCmdCopyBuffer(cmd, s_shBuf.GetHandle(), s_shRead.GetHandle(), 1, &rc);
+        }
     }
 
     CommandManager.EndAndSubmitImmediate(cmd);   // fence-waited
 
     s_last0 = sky0; s_last1 = sky1; s_lastW = weight;
     s_lastRot = skyRotation; s_lastGround = groundBounce;
+    s_lastTint[0] = skyTint[0]; s_lastTint[1] = skyTint[1]; s_lastTint[2] = skyTint[2];
+    s_lastSun[0] = sky.sunDir[0]; s_lastSun[1] = sky.sunDir[1]; s_lastSun[2] = sky.sunDir[2];
+    s_lastProc = sky.proc ? 1 : 0;
+    s_lastAtmo[0] = sky.intensity; s_lastAtmo[1] = sky.turbidity; s_lastAtmo[2] = sky.mieG;
     if (s_shPipe != VK_NULL_HANDLE) s_shReady = true;
     if (!s_hasContent) {
         s_hasContent = true;
         Msg("[VK IBL] first prefilter done (weight=%.2f, skyRot=%.3f rad, SH9 %s)",
             weight, skyRotation, s_shReady ? "projected" : "off");
+    }
+
+    // r_sky_sh_debug: report what the projection actually produced. The question a
+    // flat-looking dusk raises is not "did SH run" but "does the sky the probe sees
+    // carry any azimuthal energy at all" — and that is exactly the L0 vs L1 ratio.
+    //   L0  = the omnidirectional average (how bright the sky is overall),
+    //   L1  = the linear band; its length is how much the irradiance VARIES with
+    //         direction, and its direction is where the sky is brightest.
+    // aniso = |L1|/L0 near 0 means a uniform sky dome: no amount of correct maths
+    // downstream can make terrain directional, because the source has no direction.
+    if (ps_r_sky_sh_debug && s_shRead.GetHandle() != VK_NULL_HANDLE) {
+        if (const float* c = static_cast<const float*>(s_shRead.Map())) {
+            auto lum = [](const float* v) { return 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]; };
+            const float l0 = lum(c + 0);
+            // Basis order (sky_sh_project.comp): 1 = y, 2 = z, 3 = x.
+            const float dx = lum(c + 12), dy = lum(c + 4), dz = lum(c + 8);
+            const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+            const float aniso = (l0 > 1e-6f) ? (len / l0) : 0.f;
+            Msg("[VK SH] L0=(%.4f,%.4f,%.4f) lum=%.4f | L1 dir=(%.2f,%.2f,%.2f) len=%.4f | aniso=%.3f "
+                "| azimuth=%.1f deg | skyRot=%.1f deg | ground=%.2f",
+                c[0], c[1], c[2], l0,
+                (len > 1e-6f) ? dx / len : 0.f, (len > 1e-6f) ? dy / len : 0.f, (len > 1e-6f) ? dz / len : 0.f,
+                len, aniso, atan2f(dz, dx) * 57.2957795f, skyRotation * 57.2957795f, groundBounce);
+            Msg("[VK SH]   tint sky_color=(%.3f,%.3f,%.3f) x1.7  (probe = raw cube x tint)",
+                skyTint[0], skyTint[1], skyTint[2]);
+            s_shRead.Unmap();
+        }
     }
 }
 
@@ -332,6 +417,7 @@ void Destroy()
     if (s_shPool)   { vkDestroyDescriptorPool(VulkanHW.m_Device, s_shPool, nullptr); s_shPool = VK_NULL_HANDLE; }
     if (s_shSetL)   { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_shSetL, nullptr); s_shSetL = VK_NULL_HANDLE; }
     s_shBuf.Destroy();
+    s_shRead.Destroy();
     s_shSet = VK_NULL_HANDLE; s_shReady = false;
     if (s_pipe)    { vkDestroyPipeline(VulkanHW.m_Device, s_pipe, nullptr); s_pipe = VK_NULL_HANDLE; }
     if (s_layout)  { vkDestroyPipelineLayout(VulkanHW.m_Device, s_layout, nullptr); s_layout = VK_NULL_HANDLE; }

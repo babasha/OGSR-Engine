@@ -72,9 +72,25 @@ u32  s_zoneDepth = 0;                 // current open-zone nesting depth (0 whil
 bool s_slotWritten[kSlots] = {};
 u32  s_slotZoneN [kSlots]  = {};
 
-// ---- persistent per-zone stats (index = open order; order is stable/frame) ----
+// ---- persistent per-zone stats, slot INTERNED BY NAME ----
+// The index used to be the zone's open order, on the assumption that the order
+// is stable frame to frame. IT IS NOT: conditional passes (VolSmoke, Shadow/Far,
+// Glass, VSM/*, World/Compose*) skip whole frames, and a pass that skips shifts
+// every LATER zone down one index. The history ring lives in the slot, so
+// "World/Color" would quietly accumulate "World/Skinned" samples and vice versa.
+// Observed 2026-07-23: an r_preskin A/B straddled a VolSmoke transition and read
+// World/Color=0.00(0.00/0.00) next to World/Skinned=4.60 while their parent
+// World zone was unchanged at 8.99 vs 9.00 -- a 6x "win" that was pure
+// misattribution. Any per-zone A/B taken before this fix is suspect.
+//
+// Fix: the stat slot is interned by name (stable for the process lifetime) while
+// the QUERY index stays the contiguous open order, so every query in [0, nz) is
+// still written and reset every frame and we never have to reason about query
+// availability. s_slotMap remembers, per in-flight slot, which stat slot each
+// query index belonged to when that frame was recorded.
 ZoneStat s_zone[kMaxZones]   = {};
-u32      s_zoneCount         = 0;     // highest zone count seen
+u32      s_zoneCount         = 0;     // number of INTERNED zones (never shrinks)
+u8       s_slotMap[kSlots][kMaxZones] = {};   // [in-flight slot][query idx] -> stat slot
 LARGE_INTEGER s_cpuStart[kMaxZones]{};
 LARGE_INTEGER s_qpcFreq{};
 
@@ -264,10 +280,18 @@ void FrameBegin(VkCommandBuffer cmd, u32 frameIndex)
         if (nz && vkGetQueryPoolResults(VulkanHW.m_Device, s_pool, base, nz * 2,
                                         sizeof(u64) * nz * 2, q, sizeof(u64),
                                         VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            // Fold each query pair into the stat slot it belonged to WHEN THAT
+            // FRAME WAS RECORDED — not into the current frame's open order.
+            u64 folded = 0;   // kMaxZones == 64, one bit per stat slot
             for (u32 z = 0; z < nz; ++z) {
-                const float ms = float(double(q[z * 2 + 1] - q[z * 2]) * s_periodNs * 1e-6);
-                if (ms >= 0.f && ms < 1000.f) FoldSample(s_zone[z], ms);
+                const u32   stat = s_slotMap[s_curSlot][z];
+                const float ms   = float(double(q[z * 2 + 1] - q[z * 2]) * s_periodNs * 1e-6);
+                if (ms >= 0.f && ms < 1000.f) { FoldSample(s_zone[stat], ms); folded |= (1ull << stat); }
             }
+            // A pass that did not run in that frame must stop contributing its
+            // stale gpuLast to gpu_total (its history is left intact).
+            for (u32 i = 0; i < s_zoneCount; ++i)
+                if (!(folded & (1ull << i))) s_zone[i].gpuLast = 0.f;
         }
     }
 
@@ -327,26 +351,37 @@ void DumpCheckpoints(const char* why)
     Msg("![VK Chk] ===== end post-mortem =====");
 }
 
+// Stable stat slot for a zone name. Linear scan: kMaxZones is 64 and this runs
+// once per pass per frame, so it is far cheaper than the misattribution it ends.
+static u32 InternZone(const char* name)
+{
+    for (u32 i = 0; i < s_zoneCount; ++i)
+        if (0 == strcmp(s_zone[i].name, name)) return i;
+    if (s_zoneCount >= kMaxZones) return kMaxZones - 1;   // saturate rather than alias slot 0
+    const u32 i = s_zoneCount++;
+    xr_strcpy(s_zone[i].name, name);
+    return i;
+}
+
 int ZoneBegin(VkCommandBuffer cmd, const char* name)
 {
     Checkpoint(cmd, name);   // GPU progress marker (post-mortem on device loss)
 
-    const int z = (int)s_curZoneN;
-    if (z >= (int)kMaxZones) { CmdBeginLabel(cmd, name); return -1; }  // overflow: label only
+    const int q = (int)s_curZoneN;                                     // query index = open order
+    if (q >= (int)kMaxZones) { CmdBeginLabel(cmd, name); return -1; }  // overflow: label only
 
-    // stable name for this slot index
-    xr_strcpy(s_zone[z].name, name);
-    s_zone[z].depth = s_zoneDepth++;   // 0 = top-level pass; nested children are excluded from gpu_total
-    QueryPerformanceCounter(&s_cpuStart[z]);
+    const u32 stat = InternZone(name);                                 // stats index = by name
+    s_slotMap[s_curSlot][q] = (u8)stat;
+    s_zone[stat].depth = s_zoneDepth++;   // 0 = top-level pass; nested children are excluded from gpu_total
+    QueryPerformanceCounter(&s_cpuStart[q]);
 
     if (s_pool)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_pool,
-                            s_curSlot * kQueriesSlot + z * 2);
+                            s_curSlot * kQueriesSlot + q * 2);
     CmdBeginLabel(cmd, name);
 
     s_curZoneN++;
-    if (s_curZoneN > s_zoneCount) s_zoneCount = s_curZoneN;
-    return z;
+    return q;
 }
 
 void ZoneEnd(VkCommandBuffer cmd, int zone)
@@ -358,7 +393,7 @@ void ZoneEnd(VkCommandBuffer cmd, int zone)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_pool,
                             s_curSlot * kQueriesSlot + zone * 2 + 1);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    s_zone[zone].cpuLast = (float)QpcMs(s_cpuStart[zone], now);
+    s_zone[s_slotMap[s_curSlot][zone]].cpuLast = (float)QpcMs(s_cpuStart[zone], now);
 }
 
 // CPU probes (see header): named per-frame wall-time accumulators for main-
@@ -373,6 +408,20 @@ namespace {
 void FrameEnd(VkCommandBuffer cmd)
 {
     Checkpoint(cmd, "FrameEnd");   // a hang AFTER the last pass (present chain) still shows
+
+    // A pass that did not run THIS frame must not report last time's cpuLast:
+    // [VK CPUzones] is read next frame (MaybeLog runs right after FrameBegin), so
+    // a stale value would show a cadence-gated pass (spot tiles, VSM, Glass) as if
+    // it had recorded commands. That is how "children cost more CPU than their
+    // parent" showed up in the 23-07 logs. Same discipline as the gpuLast reset in
+    // FrameBegin — see the s_slotMap note at the top of this file.
+    {
+        u64 ran = 0;
+        for (u32 q = 0; q < s_curZoneN && q < kMaxZones; ++q) ran |= (1ull << s_slotMap[s_curSlot][q]);
+        for (u32 i = 0; i < s_zoneCount; ++i)
+            if (!(ran & (1ull << i))) s_zone[i].cpuLast = 0.f;
+    }
+
     s_slotWritten[s_curSlot] = true;
     s_slotZoneN [s_curSlot]  = s_curZoneN;
 

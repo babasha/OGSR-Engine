@@ -48,8 +48,24 @@ struct WorldMaterial
     // flat depth prepass exactly). Others bind a 1×1 zero-alpha fallback.
     bool            tessellated  = false;
     // Binding-3 view, kept so a streaming refresh can rewrite a FRESH set with
-    // all four bindings (the old set stays untouched for in-flight frames).
+    // all five bindings (the old set stays untouched for in-flight frames).
     VkImageView     view_bump    = VK_NULL_HANDLE;
+
+    // Set 0, binding 4 = `<bump>.dds`: the material's tangent NORMAL (R4 packing:
+    // n = tex.wzy*2-1) and its GLOSS in .x. Unlike the `#` height above this is NOT
+    // gated on tessellation eligibility — a normal map changes shading, never
+    // coverage, so alpha-tested and decal materials take it too. `hasBumpN` is
+    // false when the 1×1 flat-normal/zero-gloss fallback is bound, which lets the
+    // shader variant compile the whole branch out.
+    VkImageView     view_bumpn   = VK_NULL_HANDLE;
+    bool            hasBumpN     = false;
+    // The texture BEHIND view_bumpn. Needed because `<bump>` maps are mip-streamed
+    // (TexStreamClass::Bump): when the streamer swaps a bump's residency it hands the
+    // rebind callback a CVulkanTexture*, and without this back-pointer the callback
+    // could only match base diffuse — leaving every bump descriptor dangling at the
+    // first promotion. Bumps are SHARED across materials (cached by name), so one
+    // swap legitimately rewrites many sets.
+    CVulkanTexture* tex_bumpn    = nullptr;
 
     VkDescriptorSet set      = VK_NULL_HANDLE;
     float           alphaRef = -1.0f;

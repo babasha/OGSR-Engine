@@ -46,6 +46,21 @@ void        CmdSetPipelineRate(VkCommandBuffer cmd, u32 w, u32 h);
 // N-frames-old result into the log), End after vkCmdEndRendering.
 void        StatsBegin(VkCommandBuffer cmd, u32 frameIndex);
 void        StatsEnd(VkCommandBuffer cmd, u32 frameIndex);
+// Diag (r_fsinv_split): 4-way FS-invocation attribution INSIDE the world color
+// pass — 0=CPU statics flush, 1=GPU statics, 2=dynamics, 3=skinned. Sequential
+// (never nested — Vulkan allows one active pipeline-stats query at a time), so
+// it REPLACES the StatsBegin/End bracket while active. SubStatsReset must run
+// OUTSIDE the rendering scope (vkCmdResetQueryPool restriction) — it also
+// harvests+logs the N-frames-old results. Begin/End wrap each region inside.
+// Regions: 0=CPU statics flush, 1=GPU terrain, 2=GPU meshes, 3=dynamics,
+// 4=skinned (marks the frame's results ready). SubOcc* wraps the GPU statics
+// draw with a precise OCCLUSION query (samples passed) — may run concurrently
+// with the pipeline-stats queries (different query type).
+void        SubStatsReset(VkCommandBuffer cmd, u32 frameIndex);
+void        SubStatsBegin(VkCommandBuffer cmd, u32 frameIndex, u32 idx);
+void        SubStatsEnd(VkCommandBuffer cmd, u32 frameIndex, u32 idx);
+void        SubOccBegin(VkCommandBuffer cmd, u32 frameIndex);
+void        SubOccEnd(VkCommandBuffer cmd, u32 frameIndex);
 void        Destroy();
 
 }} // namespace VK::VRS

@@ -20,6 +20,7 @@
 #include "vk_buffer.h"          // CVulkanBuffer
 #include "vk_pipeline_cache.h"  // PipelineCache pipelines/layouts
 #include "vk_env_light.h"       // EnvLight::GetCurrentSet (set 1, terrain snow-depth)
+#include "vk_vrs.h"             // SubStats* — r_fsinv_split terrain/mesh attribution
 #include "vk_scene_color.h"     // HDR scene target format (cluster debug overlay)
 #include "vk_swapchain.h"       // Swapchain.m_DepthFormat (cluster debug overlay)
 #include "vk_shaders.h"         // g_ShaderManager
@@ -45,6 +46,8 @@ extern int ps_r_cl_audit;       // draw-command audit (white-polygon forensics) 
 extern float ps_r_tess;         // global tessellation toggle — decides tessellated-material routing at Build
 extern int ps_r_pool_compact;   // Stage B (б): free cluster-repacked slices from the level VB/IB pools — read at load
 extern int ps_r_gpu_shadows_at; // AT casters through the cluster shadow cull/draw (live A/B; cull+draw read it in the same record)
+extern float ps_r_ssa_px;       // SSA cull of plain whole meshes: projected-diameter threshold in px (0 = off) — live
+extern int ps_r_fsinv_split;    // FS-invocation attribution diag — also arms the [VK Cut] view-cut composition log
 
 namespace VK { namespace WorldGPU {
 
@@ -76,10 +79,10 @@ struct Group {
 
 // lodParams: x = viewportH/(2·tan(fovY/2))/thresholdPx (projected-error scale),
 // y = min camera distance clamp; z,w spare.
-struct CullPush { Fvector4 planes[6]; Fvector4 cameraPos; Fvector4 viewDir; Fvector4 lodParams; u32 numGroups, unused0 /*was maxGroupMesh*/, total, _pad; };
+struct CullPush { Fvector4 planes[6]; Fvector4 cameraPos; Fvector4 viewDir; Fvector4 lodParams; u32 numGroups; float ssaCull /*2·pxScale/r_ssa_px, 0=off (was unused0)*/; u32 total, _pad; };
 // Hi-Z occlusion cull push (240 B) — matches world_cull_hzb.comp `PC`, same shape
 // as the proven detail_generate.comp push (viewProj + planes + cameraPos).
-struct CullColorPush { Fmatrix viewProj; Fvector4 planes[6]; Fvector4 cameraPos; Fvector4 viewDir; Fvector4 lodParams; u32 numGroups, unused0 /*was maxGroupMesh*/, total, _pad; };
+struct CullColorPush { Fmatrix viewProj; Fvector4 planes[6]; Fvector4 cameraPos; Fvector4 viewDir; Fvector4 lodParams; u32 numGroups; float ssaCull /*2·pxScale/r_ssa_px, 0=off (was unused0)*/; u32 total, _pad; };
 
 bool s_built = false;
 u32  s_total = 0;          // total cullable ENTRIES (meshes + clusters) = dispatch size
@@ -224,6 +227,15 @@ Fvector4 LodParams()
                       canFade ? _max(0.f, ps_r_cluster_fade) : 0.f,
                       1.f / _max(0.05f, tanf(fovR * 0.5f)));
     return p;
+}
+
+// SSA cull factor (r_ssa_px): shader culls a plain mesh when
+// r · ssaCull < viewZ  ⟺  projected sphere DIAMETER < r_ssa_px pixels.
+static float SsaCull()
+{
+    if (ps_r_ssa_px <= 0.f) return 0.f;
+    const float pxScale = float(Device.dwHeight) / (2.f * tanf(deg2rad(Device.fFOV) * 0.5f));
+    return 2.f * pxScale / ps_r_ssa_px;
 }
 
 void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
@@ -1634,7 +1646,10 @@ void Build()
         DrawnSlice(fv, m.ib_first, m.index_count);
         m.first_vertex = fv->m_mesh.vBase;
         m.group        = 0;   // assigned after grouping
-        m.flags        = flags;
+        // bit1 = plain WHOLE mesh → SSA-cullable (r_ssa_px). Only set here:
+        // clusters (even parentError=INF orphans) must never SSA-cull — a large
+        // surface's small clusters would evaporate chunk by chunk at range.
+        m.flags        = flags | 2u;
         m.lodSelf.set(m.sphere_P.x, m.sphere_P.y, m.sphere_P.z, m.sphere_R);
         m.selfError    = 0.f;        // plain mesh: exact geometry ...
         m.parentError  = kErrInf;    // ... with no coarser parent → always drawn
@@ -2113,9 +2128,58 @@ void Cull(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& camPos, c
     pc.cameraPos.set(camPos.x, camPos.y, camPos.z, 0.f);
     pc.viewDir.set(viewDir.x, viewDir.y, viewDir.z, 0.f);
     pc.lodParams = LodParams();
-    pc.numGroups = nGroups; pc.unused0 = 0; pc.total = s_total;
+    pc.numGroups = nGroups; pc.ssaCull = SsaCull(); pc.total = s_total;
     vkCmdPushConstants(cmd, s_cullLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (s_total + 255) / 256, 1, 1);
+
+    // r_fsinv_split companion — [VK Cut]: THIS view's drawn-cut composition with
+    // TRIANGLE sums, CPU-recomputed (frustum + SSA + residency + DAG cut mirror
+    // the shader). Attributes the FS-invocation load to entry classes — healthy
+    // cut levels vs level-0 clusters with an INF/absent parent (those never
+    // coarsen at range → sub-pixel triangle soup → quad-helper cost).
+    if (ps_r_fsinv_split > 0 && !s_metaCPU.empty()) {
+        static u32 s_lastCut = 0;
+        if (Device.dwTimeGlobal > s_lastCut + 3000) {
+            s_lastCut = Device.dwTimeGlobal;
+            const Fvector4 lp   = LodParams();
+            const float    ssa  = SsaCull();
+            const u32*     sbits = ClusterStream::HostBits();
+            u32 nAll = 0, nL0 = 0, nInf = 0, nPlain = 0;
+            u64 tAll = 0, tL0 = 0, tInf = 0, tPlain = 0;
+            for (u32 ei = 0; ei < (u32)s_metaCPU.size(); ++ei) {
+                const GpuMeshMeta& m = s_metaCPU[ei];
+                bool out = false;
+                for (int p = 0; p < 6 && !out; ++p)
+                    out = planes[p].x * m.sphere_P.x + planes[p].y * m.sphere_P.y
+                        + planes[p].z * m.sphere_P.z + planes[p].w < -m.sphere_R;
+                if (out) continue;
+                const bool plain = (m.flags & 2u) != 0u;
+                if (ssa > 0.f && plain) {
+                    const float dz = _max(lp.y, viewDir.dotproduct(Fvector{ m.sphere_P.x - camPos.x, m.sphere_P.y - camPos.y, m.sphere_P.z - camPos.z }) - m.sphere_R);
+                    if (m.sphere_R * ssa < dz) continue;
+                }
+                bool leaf = false;
+                if (sbits) {
+                    const u32 sb = (sbits[ei >> 4u] >> ((ei & 15u) * 2u)) & 3u;
+                    if (!(sb & 1u)) continue;
+                    leaf = (sb & 2u) != 0u;
+                }
+                const float dsd = _max(lp.y, viewDir.dotproduct(Fvector{ m.lodSelf.x - camPos.x, m.lodSelf.y - camPos.y, m.lodSelf.z - camPos.z }) - m.lodSelf.w);
+                const float dpd = _max(lp.y, viewDir.dotproduct(Fvector{ m.lodParent.x - camPos.x, m.lodParent.y - camPos.y, m.lodParent.z - camPos.z }) - m.lodParent.w);
+                const float sp = m.selfError * lp.x / dsd;
+                const float pp = _min(m.parentError, kErrInf) * lp.x / dpd;
+                if (!((sp <= 1.f || leaf) && pp > 1.f)) continue;
+                const u64 tris = m.index_count / 3;
+                ++nAll; tAll += tris;
+                if (plain)                         { ++nPlain; tPlain += tris; }
+                else if (m.parentError >= kErrInf) { ++nInf;   tInf   += tris; }
+                else if (m.selfError == 0.f)       { ++nL0;    tL0    += tris; }
+            }
+            Msg("[VK Cut] view cut: entries=%u tris=%.2fM | L0(healthy)=%u/%.2fM infParent=%u/%.2fM plain=%u/%.2fM | lodx=%.0f ssa=%.1f",
+                nAll, double(tAll) / 1e6, nL0, double(tL0) / 1e6, nInf, double(tInf) / 1e6,
+                nPlain, double(tPlain) / 1e6, lp.x, ps_r_ssa_px);
+        }
+    }
 
     // ---- Draw-command audit: snapshot THIS dispatch's output + inputs -------
     if (s_cmdAuditPtr && !s_cmdAuditPending && Device.dwTimeGlobal > s_cmdAuditLast + 3000) {
@@ -2225,7 +2289,7 @@ void CullColor(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& came
     pc.cameraPos.set(cameraPos.x, cameraPos.y, cameraPos.z, 0.f);
     pc.viewDir.set(Device.vCameraDirection.x, Device.vCameraDirection.y, Device.vCameraDirection.z, 0.f);
     pc.lodParams = LodParams();
-    pc.numGroups = nGroups; pc.unused0 = 0; pc.total = s_total;
+    pc.numGroups = nGroups; pc.ssaCull = SsaCull(); pc.total = s_total;
     vkCmdPushConstants(cmd, s_cullLayout2, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (s_total + 255) / 256, 1, 1);
 
@@ -2455,11 +2519,16 @@ void DrawShadow(VkCommandBuffer cmd, u32 target, const Fmatrix& lightVP, bool sk
     }
 }
 
-void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet, bool useOcclusion)
+void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet envSet, bool useOcclusion, bool atEqual, bool prepassZ, int fsFrame)
 {
     if (!Built()) return;
     const VkShaderStageFlags kStages = PipelineCache::GetPushStages();
     const u32 nGroups = (u32)s_groups.size();
+    // r_fsinv_split: terrain groups sort first in s_groups — query 1 brackets
+    // them, query 2 the rest (see vk_vrs.h).
+    const bool fsSplit = fsFrame >= 0;
+    bool fsInTerrain = true;
+    if (fsSplit) VK::VRS::SubStatsBegin(cmd, (u32)fsFrame, 1);
     // r_hzb_cull: draw the Hi-Z-culled set (CullColor must have run this frame).
     // Falls back to the frustum set if occlusion isn't ready/active.
     const bool occ = useOcclusion && s_occlReady;
@@ -2486,6 +2555,13 @@ void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet env
         const Group& grp = s_groups[g];
         WorldMaterial* mat = grp.mat;
 
+        // Terrain→mesh transition (r_fsinv_split): flip query 1 → 2 once.
+        if (fsSplit && fsInTerrain && !grp.terrain) {
+            VK::VRS::SubStatsEnd(cmd, (u32)fsFrame, 1);
+            VK::VRS::SubStatsBegin(cmd, (u32)fsFrame, 2);
+            fsInTerrain = false;
+        }
+
         VkPipeline       pipe;
         VkPipelineLayout layout;
         VkDescriptorSet  set;
@@ -2511,6 +2587,12 @@ void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet env
             k.depthTest = true; k.wmark = false; k.tess = false;
             // Uber-FS variant (Inc 1): POM bit per-material; frame bits stamped in Get().
             k.specMask = mat->tessellated ? (u8)PipelineCache::WS_POM : (u8)0;
+            // AT groups (r_at_equal): DrawDepth drew them into the prepass with the
+            // same aref discard → EQUAL + no write collapses their FS invocations
+            // to exactly the visible opaque texels. Opaque groups (r_z_prepass):
+            // LEQUAL + no write re-enables early-Z (FS discard + z-write = late-Z).
+            k.atEqual  = atEqual && mat->alphaRef >= 0.0f;
+            k.noZWrite = prepassZ;
             pipe = PipelineCache::Get(k); layout = PipelineCache::GetLayout(); set = mat->set;
         }
         if (pipe == VK_NULL_HANDLE || layout == VK_NULL_HANDLE) continue;
@@ -2543,6 +2625,15 @@ void DrawColor(VkCommandBuffer cmd, const Fmatrix& viewProj, VkDescriptorSet env
         const VkDeviceSize cntOff = (VkDeviceSize)g * sizeof(u32);
         vkCmdDrawIndexedIndirectCount(cmd, indirectBuf, cmdOff, countBuf, cntOff,
                                       grp.entryCount, sizeof(VkDrawIndexedIndirectCommand));
+    }
+    // Close the split queries — both must have begun+ended for the frame's
+    // result batch to be readable (all-terrain or empty group list included).
+    if (fsSplit) {
+        if (fsInTerrain) {
+            VK::VRS::SubStatsEnd(cmd, (u32)fsFrame, 1);
+            VK::VRS::SubStatsBegin(cmd, (u32)fsFrame, 2);
+        }
+        VK::VRS::SubStatsEnd(cmd, (u32)fsFrame, 2);
     }
 }
 

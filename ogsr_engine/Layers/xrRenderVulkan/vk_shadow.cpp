@@ -221,6 +221,8 @@ VkImage     GetGroundImage()  { return s_groundImage; }
 VkImageView GetGroundView()   { return s_groundView; }
 u32         RainSize()        { return kRainSize; }
 float       RainEyeY()        { return s_rainEyeY; }
+float       RainZNear()       { return kRainZNear; }
+float       RainZFar()        { return kRainZFar; }
 const Fmatrix& GetRainVP()    { return s_rainVP; }
 const Fmatrix& GetCascadeVP(u32 i) { return s_cascVP[i < kNumSunCascades ? i : 0]; }
 VkImage     GetCascadeImage(u32 i) { return (i < kNumSunCascades) ? s_cascImage[i] : VK_NULL_HANDLE; }

@@ -5,7 +5,7 @@
 // so the only input is the scene depth (statics + alpha-tested statics).
 // R4 reads view-space position+normal from the gbuffer; we reconstruct both
 // from depth: position via the frustum-ray basis (camDir + right·tanX·ndc.x +
-// top·tanY·ndc.y, zview = _43/(zndc−_33) — same scheme as sunshafts.frag),
+// top·tanY·ndc.y, zview = _43/(zndc−_33) — same scheme as light_cone.frag),
 // normal via 4-neighbour position differences (pick the neighbour closer in
 // depth on each axis so geometry edges don't smear the normal).
 //

@@ -354,8 +354,13 @@ private:
     Fvector4 m_MvWindAnimPrev{};
     bool     m_MvWindPrevValid = false;
 
-    // Per-detail-type loaded diffuse textures (one entry per `objects[]`).
+    // Per-detail-type loaded diffuse textures (one entry per `objects[]`) — these
+    // are REFERENCES and repeat: detail objects overwhelmingly share one level atlas
+    // (Pripyat: 29 objects, ONE `build_details.dds`). Ownership lives in the list
+    // below, which holds each distinct .dds once; loading per object cost 29 copies
+    // of the same image = 298 MB of the level's VRAM.
     xr_vector<VK::CVulkanTexture*> m_DetailTextures;
+    xr_vector<VK::CVulkanTexture*> m_DetailTexOwned;   // unique textures — the ones to free
     VkSampler                      m_DetailSampler = VK_NULL_HANDLE;
     VK::CVulkanTexture*            m_WaveTex       = nullptr;  // SSFX wind flow map (s_waves, wind_wave.dds)
 

@@ -85,6 +85,13 @@ void CTreeManager::ExtractFromVisual(::vkRender_Visual* vis, xr_vector<::vkFTree
     // MT_NORMAL / MT_PROGRESSIVE / MT_SKELETON_*: skip (not trees).
 }
 
+// Latches an out-of-VRAM upload (see UploadDeviceLocal) so Build() refuses to mark
+// itself built. Meta and transforms are NOT optional: every bin dispatch and every
+// page draw indexes them, so shipping a half-built manager only defers the crash by
+// a few frames instead of degrading. Big maps DO hit the ceiling — Pripyat loads
+// with ~5 GB of tree pools alone against a 7123 MB budget.
+static bool s_UploadFailed = false;
+
 // ============================================================================
 // Build — main entry point. Called from CRender::level_Load after Visuals[]
 // is populated.
@@ -93,6 +100,7 @@ void CTreeManager::Build()
 {
     VK::Vram::Scope _vram_scope("Trees");
     if (m_bBuilt) return;
+    s_UploadFailed = false;
 
     xr_vector<vkFTreeVisual*> trees;
     trees.reserve(2048);
@@ -278,6 +286,14 @@ void CTreeManager::Build()
     // ----- Upload + allocate.
     UploadMetadata(meta);
     UploadTransforms(xforms);
+    // Out of VRAM: stop here rather than build pipelines around buffers that do not
+    // exist. The level still loads — it just renders without trees, and the log says
+    // why. Previously this path dereferenced a null buffer and took the process down.
+    if (s_UploadFailed) {
+        Msg("!![VK Trees] DISABLED for this level: tree buffers did not fit in VRAM "
+            "(%u instances). Lower texture quality / r_bump 0, or free VRAM.", m_TotalCount);
+        return;
+    }
     BuildMeshlets(trees, meta);   // Phase A: VSM meshlet-cull clusters (r_vsm_meshlet)
     CreateIndirectBuffers();
     CreateTextureDescriptors(uniqueViews);
@@ -305,7 +321,14 @@ void CTreeManager::Build()
 // Upload helpers — staging via host-visible TRANSFER_SRC + one-shot copy.
 // Same pattern as CDetailManager::BakeHeightmap (host stage → cmd copy).
 // ============================================================================
-static void UploadDeviceLocal(CVulkanBuffer*& dst, const void* data, VkDeviceSize size,
+// Returns false when VRAM ran out. ⚠ EVERY caller must respect that: `Create` is
+// void and VK_CHECK only LOGS, so a failed allocation leaves VK_NULL_HANDLE behind
+// and the old code went on to vkCmdCopyBuffer with it — which is how an
+// out-of-memory condition became a c0000005 inside the driver instead of a message
+// (25-07: Pripyat crashed on load, `Vulkan error: -2` seven lines up in the log).
+// The level is at the VRAM ceiling on big maps; refusing the upload is survivable,
+// dereferencing a null buffer is not.
+static bool UploadDeviceLocal(CVulkanBuffer*& dst, const void* data, VkDeviceSize size,
                               VkBufferUsageFlags extraUsage)
 {
     dst = xr_new<CVulkanBuffer>();
@@ -315,36 +338,50 @@ static void UploadDeviceLocal(CVulkanBuffer*& dst, const void* data, VkDeviceSiz
     dst->Create(size,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extraUsage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+    if (dst->GetHandle() == VK_NULL_HANDLE) {
+        Msg("!![VK Trees] upload FAILED: no VRAM for a %llu KB device buffer",
+            (unsigned long long)(size >> 10));
+        return false;
+    }
 
     CVulkanBuffer staging;
     staging.Create(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
-    if (void* mapped = staging.Map())
-    {
-        memcpy(mapped, data, size);
-        staging.Flush();
+    void* mapped = (staging.GetHandle() != VK_NULL_HANDLE) ? staging.Map() : nullptr;
+    if (!mapped) {
+        Msg("!![VK Trees] upload FAILED: no staging for %llu KB (host/VRAM full)",
+            (unsigned long long)(size >> 10));
+        staging.Destroy();
+        return false;
     }
+    memcpy(mapped, data, size);
+    staging.Flush();
 
+    bool ok = false;
     VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
     if (cmd != VK_NULL_HANDLE)
     {
         VkBufferCopy cp{ 0, 0, size };
         vkCmdCopyBuffer(cmd, staging.GetHandle(), dst->GetHandle(), 1, &cp);
         VulkanHW.EndSingleTimeCommands(cmd);
+        ok = true;
     }
     staging.Destroy();
+    return ok;
 }
 
 void CTreeManager::UploadMetadata(const xr_vector<GpuTreeMeta>& meta)
 {
-    UploadDeviceLocal(m_TreeMetadataBuffer, meta.data(),
-                      meta.size() * sizeof(GpuTreeMeta), 0);
+    if (!UploadDeviceLocal(m_TreeMetadataBuffer, meta.data(),
+                           meta.size() * sizeof(GpuTreeMeta), 0))
+        s_UploadFailed = true;
     m_MetaCPU = meta;   // kept for the CPU-culled shadow caster path (RenderDepth)
 }
 
 void CTreeManager::UploadTransforms(const xr_vector<GpuTreeInstance>& xforms)
 {
-    UploadDeviceLocal(m_TreeTransformsBuffer, xforms.data(),
-                      xforms.size() * sizeof(GpuTreeInstance), 0);
+    if (!UploadDeviceLocal(m_TreeTransformsBuffer, xforms.data(),
+                           xforms.size() * sizeof(GpuTreeInstance), 0))
+        s_UploadFailed = true;
 }
 
 // ============================================================================

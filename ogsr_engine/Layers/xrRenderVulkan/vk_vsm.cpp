@@ -39,6 +39,9 @@ extern int   ps_r_vsm_hzb;   // shadow-HZB: cull casters fully behind cached occ
 extern float ps_r_vsm_base;       // clipmap level-0 extent (m) → finest texel = base/4096 (live, settings-bound)
 extern float ps_r_vsm_bias;       // receiver depth-compare bias, STATIC atlas (live)
 extern float ps_r_vsm_bias_dyn;   // receiver depth-compare bias, DYNAMIC atlas (live; tiny — no ground in it)
+extern float ps_r_vsm_bias_min;   // slope-scaled static bias: min slack (live; 0 = legacy constant ps_r_vsm_bias)
+extern float ps_r_vsm_raster_bias;   // atlas write-side raster depth bias, constant (D16 units; live)
+extern float ps_r_vsm_raster_slope;  // atlas write-side raster depth bias, slope factor (live)
 extern int   ps_r_vsm_grass_static;   // far-grass static-cache hybrid (L1/L2 rigid into dirty static pages)
 extern int   ps_r_vsm_temporal;   // TAA-for-shadows: clipmap jitter + reprojected history accumulate (live)
 extern float ps_r_vsm_ta_blend;       // history weight (EMA alpha) for the temporal resolve (live)
@@ -47,6 +50,11 @@ extern float ps_r_vsm_ta_clamp;        // (1) neighbourhood clamp: history bound
 extern float ps_r_vsm_ta_motion;       // (2) reprojected motion (px) at which history weight fades to the floor (live)
 extern float ps_r_vsm_ta_motion_floor; // (2) history weight at/after that motion (live)
 extern float ps_r_vsm_ta_blend_dlss;   // (3) history-weight scale when r_dlss on (DLSS also resolves the shadow → avoid double blur, live)
+extern int   ps_r_vsm_soft;            // SOFT SHADOWS (stochastic PCSS): filter taps, 0 = legacy 3x3 PCF (live)
+extern int   ps_r_vsm_soft_search;     // blocker-search taps (live)
+extern float ps_r_vsm_soft_angle;      // sun cone half-angle in DEGREES (0.265 = physical; higher = cinematic) (live)
+extern float ps_r_vsm_soft_range;      // max blocker search distance (m) — caps the widest penumbra (live)
+extern float ps_r_vsm_soft_clamp;      // temporal neighbourhood clamp used while soft is on (wider: it must pass stochastic noise) (live)
 extern int   ps_r_vsm_grass;      // cast near grass into the atlas (L0 only, GPU-driven, 1-frame stale) (live)
 extern int   ps_r_vsm_tree_wind;       // near/far wind hybrid (near trees re-raster into dyn atlas) (live)
 extern float ps_r_vsm_tree_wind_dist;  // near-set light-space radius (m) — the dominant dyn-tree cost knob (live)
@@ -442,7 +450,7 @@ struct MarkPush {
     u32     gazeOn;            // gaze refresh: count samples per page into pageHits (r_vsm_gaze)
 };
 
-// std140 — matches the Resolve UBO in vsm_resolve.comp.glsl (208 B).
+// std140 — matches the Resolve UBO in vsm_resolve.comp.glsl (240 B).
 struct ResolveParams {
     Fmatrix invViewProj;       // current clip -> world
     Fmatrix prevViewProj;      // world -> previous-frame clip (history reproject)
@@ -450,7 +458,9 @@ struct ResolveParams {
     float   curCamPos[4];      // xyz = this frame camera (stored as G for next frame); w = dyn-pixel EMA alpha (r_vsm_ta_blend_dyn)
     float   screen[4];         // xy = dims, zw = 1/dims
     float   params[4];         // x = alpha, y = reject tol, z = historyValid, w = dyn-gate
-    float   params2[4];        // x = clamp tol, y = motion ref px, z = motion-floor weight, w = unused
+    float   params2[4];        // x = clamp tol, y = motion ref px, z = motion-floor weight, w = static bias const
+    float   params3[4];        // SOFT: x = filter taps (0 = legacy 3x3 PCF), y = search taps, z = tan(sun half-angle), w = max blocker search dist (m)
+    float   params4[4];        // x = frame noise phase, yzw = reserved
 };
 
 void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
@@ -754,9 +764,18 @@ bool CreateClearPipeline()
     ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
     VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     cb.attachmentCount = 0;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    // DEPTH_BIAS is declared dynamic even though this pipeline biases nothing
+    // (depthBiasEnable stays FALSE). Binding a pipeline APPLIES every state it does
+    // NOT declare dynamic, so a clear pipeline carrying a static zero bias wipes the
+    // vkCmdSetDepthBias that beginAtlas issued three lines earlier — and every caster
+    // drawn after it rasterizes into the static atlas with NO write-side bias. That
+    // was the terrain shadow-acne banding (25-07): the receiver constant
+    // r_vsm_bias_min is sized on the assumption that this write bias exists, so
+    // losing it silently disables BOTH halves of the anti-acne scheme at once.
+    // Same class as the VRS dynamic-state loss ([[vulkan-vrs-saga]], VUID-07834).
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
     VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
+    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // D16 atlas (see CreateRenderResources)
     VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
@@ -1813,6 +1832,17 @@ void BeginFrame(const Fvector& camPos, VkExtent2D screen)
     EnsureMaskTargets(screen);   // screen-space mask (create/resize) — before EnvLight binds it
     s_curCamPos = camPos;
 
+    // Write-side raster bias changed (live A/B) → cached static pages hold depth
+    // rendered with the OLD bias — drop them so the flip is crisp, not a seconds-long
+    // round-robin mix of old and new page content.
+    {
+        static float s_lastRB = -1.f, s_lastRS = -1.f;
+        if (ps_r_vsm_raster_bias != s_lastRB || ps_r_vsm_raster_slope != s_lastRS) {
+            if (s_lastRB >= 0.f) InvalidateCache();
+            s_lastRB = ps_r_vsm_raster_bias; s_lastRS = ps_r_vsm_raster_slope;
+        }
+    }
+
     // ---- THROTTLE (r_vsm_throttle): cost-feedback LOD bias, the UE5 VSM throttle port.
     // Cost source = the profiler's World/VSMrender GPU zone (timestamps are collected
     // every frame regardless of r_profiler logging; 2-3 frames of fence latency is fine
@@ -2608,6 +2638,7 @@ VkImageView GetAtlasView() { return s_atlasView; }
 VkSampler   GetSampler()   { return s_atlasSampler; }
 VkImageView GetDynAtlasView()       { return s_dynView; }
 VkBuffer    GetDynPageTableHandle() { return s_dynPageTable ? s_dynPageTable->GetHandle() : VK_NULL_HANDLE; }
+VkBuffer    GetDynUsedHandle()      { return s_dynPageUsed ? s_dynPageUsed->GetHandle() : VK_NULL_HANDLE; }
 bool        AtlasReady()   { return s_atlasView != VK_NULL_HANDLE && s_dynView != VK_NULL_HANDLE && !s_atlasFirst && !s_dynFirst; }
 
 void RenderAtlas(VkCommandBuffer cmd)
@@ -2655,7 +2686,12 @@ void RenderAtlas(VkCommandBuffer cmd)
         vkCmdSetViewport(cmd, 0, 1, &vp);
         VkRect2D sc{ {0, 0}, { w, h } };
         vkCmdSetScissor(cmd, 0, 1, &sc);
-        vkCmdSetDepthBias(cmd, 1.5f, 0.f, 2.5f);
+        // Write-side raster bias (r_vsm_raster_bias/_slope, D16 units ≈ 3 cm each).
+        // Kept SMALL: every unit here is depth the sun can PUNCH THROUGH thin
+        // geometry before any receiver even gets a vote (the old 1.5/2.5 ≈ 5+ cm
+        // was most of a plank wall's thickness). Receiver acne is handled by the
+        // resolve's normal-offset + its own small bias, not by pushing casters deep.
+        vkCmdSetDepthBias(cmd, ps_r_vsm_raster_bias, 0.f, ps_r_vsm_raster_slope);
     };
     // Depth attachment → SHADER_READ, visible to COMPUTE (the resolve samples it) as well
     // as FRAGMENT (the auto-derived ImageBarrier only targets FRAGMENT — too narrow now).
@@ -2701,6 +2737,12 @@ void RenderAtlas(VkCommandBuffer cmd)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_clearPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_clearLayout, 0, 1, &s_clearSet, 0, nullptr);
     vkCmdDrawIndirect(cmd, s_drawClear->GetHandle(), 0, 1, sizeof(VkDrawIndirectCommand));
+    // Re-arm the write-side bias after the clear. Belt and braces: the clear pipeline
+    // now declares DEPTH_BIAS dynamic so it no longer clobbers it, but this pass mixes
+    // pipelines from three files (page/AT here, trees in vk_TreeManager_Render, grass
+    // below) and one of them regressing to a static bias would silently reopen the
+    // acne. Setting it here costs nothing and makes the guarantee local to the draws.
+    vkCmdSetDepthBias(cmd, ps_r_vsm_raster_bias, 0.f, ps_r_vsm_raster_slope);
     // Caster draws (only dirty pages, per the bin filter).
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_renderLayout, 0, 1, &s_renderSet[cur], 0, nullptr);
     VkPipeline lastPipe = VK_NULL_HANDLE;
@@ -2852,7 +2894,24 @@ void ResolveMask(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen,
     rp.params2[0] = ps_r_vsm_ta_clamp;                 // history clamp tol around current
     rp.params2[1] = ps_r_vsm_ta_motion;                // reproj motion (px) to reach the floor
     rp.params2[2] = ps_r_vsm_ta_motion_floor;          // history weight at/after that motion
-    rp.params2[3] = 0.f;
+    rp.params2[3] = ps_r_vsm_bias_min;                 // slope-scaled static bias: min slack (0 = legacy 0.6 m constant)
+    // SOFT SHADOWS (r_vsm_soft) — stochastic PCSS in place of the 3x3 PCF. The
+    // angle is authored in degrees because that is how the look is reasoned about
+    // (0.265 = the sun's true half-angle; larger = the cinematic penumbra).
+    const bool softOn = ps_r_vsm_soft >= 1;
+    rp.params3[0] = softOn ? (float)ps_r_vsm_soft : 0.f;
+    rp.params3[1] = (float)ps_r_vsm_soft_search;
+    rp.params3[2] = tanf(deg2rad(ps_r_vsm_soft_angle));
+    rp.params3[3] = ps_r_vsm_soft_range;
+    // Frame phase for the per-pixel disc rotation. Wrapped at 64: the hash only
+    // needs to walk a decorrelated cycle, and an unbounded counter would lose
+    // float precision long before the session ends.
+    rp.params4[0] = (float)(s_resolveCount & 63u);
+    // The neighbourhood clamp was tuned (0.24) against a DETERMINISTIC 3x3 PCF,
+    // where any big frame-to-frame deviation was a real shadow change. Stochastic
+    // taps deviate by ~1/sqrt(taps) on their own, so that clamp would pin the
+    // history to the noise and defeat the accumulation that denoises it.
+    if (softOn) rp.params2[0] = ps_r_vsm_soft_clamp;
     if (s_resolveUboPtr[cur]) memcpy(s_resolveUboPtr[cur], &rp, sizeof(rp));
 
     // ---- First use of each slot since (re)create: UNDEFINED → GENERAL (so both the

@@ -701,6 +701,17 @@ namespace {
     size_t s_castersVis       = 0;      // Visuals.size() at build
     bool   s_castersCompacted = false;  // pool compaction no-ops more Submits → rebuild once to harvest
 
+    // ⚠ TRAP, PAID FOR ONCE — read before sampling the FAR sun map anywhere new.
+    // Under VSM (and at night) its raster + combined copy are SKIPPED and the map
+    // stays CLEARED, which reads as "fully lit" at every world point. That is fine
+    // for the receivers (they read the VSM mask instead), but anything that samples
+    // this map DIRECTLY gets a unanimous "in the sun" answer. The sun-shafts pass
+    // did exactly that and painted warm additive rays through walls for months,
+    // immune to every fix applied on the shadow side — because it never sampled a
+    // shadow. That pass is gone (2026-07-24; god rays come from the froxel fog now),
+    // which is why the `s_sunFarValid` flag it consulted is gone with it. A future
+    // direct sampler must republish it: the condition is (!vsmActive && sunLit).
+
     // ---- RIGID dynamic sun casters -------------------------------------------------
     // Skinned_RenderShadow only ever draws SKELETONS: it walks s_uploads, which is built
     // by filtering g_DynamicVisuals through dynamic_cast<CKinematics*> with non-empty

@@ -158,6 +158,20 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
 // Specular reflection of the sky. N/V world-space (V = surface→eye, unit),
 // roughness in [0,1], F0 = base reflectance (0.04 dielectric). Returns 0 when
 // IBL is off / no probe yet (ibl_params.x). Strength = ibl_params.y.
+// The FRACTION of incoming light the same term reflects away — the diffuse must be
+// scaled by (1 - this). Physically obvious and easy to skip: a surface that mirrors
+// 10% of the sky does not also transmit that 10% into its albedo. We skipped it, so
+// turning IBL on ADDED energy to every lit pixel, and a physically correct reflection
+// ended up reading as "the whole frame got whiter" — which is exactly the bug this
+// pass fixes. Cheap: EnvBRDFApprox is the same maths iblSpecular already does.
+float iblSpecWeight(vec3 N, vec3 V, float roughness, vec3 F0)
+{
+    if (L.ibl_params.x < 0.004) return 0.0;
+    float NoV = clamp(dot(N, V), 0.0, 1.0);
+    vec3  ab  = EnvBRDFApprox(F0, roughness, NoV);
+    return clamp(dot(ab, vec3(1.0 / 3.0)) * L.ibl_params.y * L.ibl_params.x, 0.0, 1.0);
+}
+
 vec3 iblSpecular(vec3 N, vec3 V, float roughness, vec3 F0)
 {
     // ibl_params.x = enable × fade-in (0..1): a ~1 s ramp when the probe first

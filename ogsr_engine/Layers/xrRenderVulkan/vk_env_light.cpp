@@ -27,6 +27,8 @@
 #include "vk_terrain_cache.h"              // terrain composite cache (bindings 28/29 + tcache UBO params)
 #include "vk_pass_ssao.h"                  // GTAO result (binding 8, white fallback until ready)
 #include "vk_pipeline_cache.h"             // PipelineCache::SetFrameSpecMask (Inc 1 world uber-FS variant bits)
+
+extern int ps_r_txstream;                  // texture streaming master toggle — gates the WS_FEEDBACK cadence bit
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/IGame_Level.h"      // g_pGameLevel->name() — per-level terrain channel offsets
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_dir/sun_color/hemi/ambient)
@@ -66,6 +68,7 @@ extern int   ps_r_pom_debug;      // r_pom_debug — draw the POM AO×self-shado
 extern int   ps_r_rain_enable;    // r_rain — master rain on/off (forces wetness 0 when off)
 extern int   ps_r_ao_flat;        // r_ao_flat — debug: neutralize all ambient occlusion
 extern int   ps_r_shade_debug;    // r_shade_debug — lighting-component isolation views (world shaders)
+extern float ps_r_fog_dist;       // r_fog_dist — forward distance-fog range scale (0 = off)
 extern float ps_r_pom_ceil;       // r_pom_ceil — POM strength on down-facing surfaces (ceilings)
 extern float ps_r_pom_floor;      // r_pom_floor — POM strength on up-facing surfaces (floors)
 extern int   ps_r_pom_terrain;    // r_pom_terrain — terrain POM enable (experimental, default off)
@@ -87,6 +90,13 @@ extern int   ps_r_light_occ;      // r_light_occ — dynamic-light terrain/stati
 extern int   ps_r_puddle_sss;     // r_puddle_sss — SSS per-pixel puddles (default source)
 extern float ps_r_puddle_level;   // r_puddle_level — water rise level vs micro-height
 extern float ps_r_puddle_scale;   // r_puddle_scale — macro puddle-body size (procedural mask freq)
+extern float ps_r_puddle_geo;     // r_puddle_geo — puddles follow REAL ground dips (Surface Field concavity)
+extern float ps_r_wet_dist;       // r_wet_dist — range (m) wet shading survives to
+extern float ps_r_terrain_detail_dist; // r_terrain_detail_dist — range (m) terrain detail normal/AO/gloss survive to
+extern float ps_r_bolt_flash;     // r_bolt_flash — lightning lifts the hemisphere light instead of faking a sun
+extern float ps_r_bump;           // r_bump — static material normal-map strength
+extern int   ps_r_bump_debug;     // r_bump_debug — 1 world normal, 2 gloss
+extern float ps_r_gloss_scale;    // r_gloss_scale — material gloss -> IBL roughness
 extern int   ps_r_sf;             // r_sf — Surface Field master enable (consumers later)
 extern int   ps_r_sf_debug;       // r_sf_debug — Surface Field debug view (0..5)
 extern float ps_r_sf_eps;         // r_sf_eps — derive finite-difference epsilon (m)
@@ -109,6 +119,15 @@ extern float ps_r_grass_self_bias;    // r_grass_self_bias — grass dyn-atlas a
 extern int   ps_r_ibl;                // r_ibl — sky specular IBL master (prefiltered sky reflections + sun glint)
 extern float ps_r_ibl_spec;           // r_ibl_spec — specular IBL strength
 extern int   ps_r_ibl_debug;          // r_ibl_debug — show only the specular field
+extern int   ps_r_sky_sh_debug;       // r_sky_sh_debug — dump SH coefficients + the sun/ambient magnitudes
+extern int   ps_r_sky_proc;           // r_sky_proc — procedural Rayleigh+Mie sky
+extern float ps_r_sky_intensity;      // r_sky_intensity
+extern float ps_r_sky_turbidity;      // r_sky_turbidity
+extern float ps_r_sky_mie_g;          // r_sky_mie_g
+extern int   ps_r_sky_sun_from_atmo;  // r_sky_sun_from_atmo — derive sun_color from the model
+extern float ps_r_sky_sun_scale;      // r_sky_sun_scale — sun irradiance scale
+extern int   ps_r_sky_sh;             // r_sky_sh — diffuse sky irradiance via SH9 (0 = probe-mip fallback)
+extern float ps_r_sky_sh_ground;      // r_sky_sh_ground — below-horizon (ground bounce) weight in the projection
 
 namespace VK { namespace EnvLight {
 
@@ -213,6 +232,59 @@ namespace {
     // overall brightness.
     constexpr float kAmbientScale = 1.1f;   // sky-ambient strength knob (tune in-game)
     constexpr float kAmbientLod   = 0.0f;   // sky cubes are BC1/BC3 single-mip → mip 0 (no blur available)
+
+    // ── Sunlight colour from atmospheric extinction (r_sky_sun_from_atmo) ───────
+    // CPU mirror of SunTransmittance() in atmosphere.glsl — same constants, same
+    // march, so the directional sun agrees with the sky the model draws.
+    //
+    // This exists because the weather config CANNOT be trusted at the hours that
+    // matter most. Measured at a late sunset with the sun still up (elev +1.4°):
+    // sun_color = (0.009, 0.004, 0.002) — effectively black. X-Ray zeroes the sun
+    // near the horizon because the classic renderer had no twilight model, so dusk
+    // arrived with no directional light at all and the world went flat grey.
+    // Physics does know the answer: a low sun's beam crosses ~40x more air, Rayleigh
+    // strips its blue, and what survives is red and still bright enough to light a
+    // landscape. Deriving it here restores exactly that.
+    Fvector3 AtmoSunTransmittance(const Fvector3& toSun, float turbidity)
+    {
+        constexpr float kRp = 6371000.f, kRa = 6471000.f;
+        constexpr float kBetaR[3] = { 5.5e-6f, 13.0e-6f, 22.4e-6f };
+        constexpr float kBetaM = 21e-6f, kHR = 8000.f, kHM = 1200.f;
+
+        Fvector3 out; out.set(0.f, 0.f, 0.f);
+        const Fvector3 ro{ 0.f, kRp + 1.f, 0.f };
+
+        auto raySphere = [&](float r, float& t0, float& t1) -> bool {
+            const float b = ro.x * toSun.x + ro.y * toSun.y + ro.z * toSun.z;
+            const float c = ro.x * ro.x + ro.y * ro.y + ro.z * ro.z - r * r;
+            float d = b * b - c;
+            if (d < 0.f) return false;
+            d = _sqrt(d); t0 = -b - d; t1 = -b + d;
+            return true;
+        };
+
+        float a0, a1;
+        if (!raySphere(kRa, a0, a1) || a1 <= 0.f) return out;
+        // Below the geometric horizon the planet blocks the beam outright.
+        float g0, g1;
+        if (raySphere(kRp, g0, g1) && g1 > 0.f && g0 > 0.f) return out;
+
+        const int   kSteps = 16;
+        const float step = a1 / float(kSteps);
+        float t = step * 0.5f, odR = 0.f, odM = 0.f;
+        for (int i = 0; i < kSteps; ++i) {
+            const float qx = ro.x + toSun.x * t, qy = ro.y + toSun.y * t, qz = ro.z + toSun.z * t;
+            const float h = _max(_sqrt(qx * qx + qy * qy + qz * qz) - kRp, 0.f);
+            odR += expf(-h / kHR) * step;
+            odM += expf(-h / kHM) * step;
+            t   += step;
+        }
+        const float bm = kBetaM * _max(turbidity, 0.f) * 1.1f;
+        out.x = expf(-(kBetaR[0] * odR + bm * odM));
+        out.y = expf(-(kBetaR[1] * odR + bm * odM));
+        out.z = expf(-(kBetaR[2] * odR + bm * odM));
+        return out;
+    }
 }
 
 VkDescriptorSetLayout GetSetLayout() { return s_setLayout; }
@@ -634,6 +706,29 @@ const float* TerrainChOff()
     return s_chOff;
 }
 
+// ---- Visual sun direction: LATCHED for the duration of a thunderbolt ----------
+// CEffect_Thunderbolt overwrites CurrentEnv->sun_dir with the strike direction while
+// a bolt flashes (thunderbolt.cpp) — a 2000s trick that buys dramatic light for free.
+// The cost is that every consumer which draws something AT the sun draws a SECOND SUN
+// at the bolt's azimuth: the sky disc, the volumetric sun beam with god rays fanning
+// out of it. A clap fires several bolts, each at its own azimuth, and the volume's
+// temporal history (r_vol_ta, blend 0.92) keeps the previous beams alive for dozens of
+// frames — so you end up looking at two or three suns, each shooting light. Real
+// lightning is a huge, very distant AREA light: it lifts the whole sky and puts no
+// disc in it. So the direction is held to the last real sun here, and the flash is
+// spent as sky/ambient light in Update() instead.
+const Fvector& SunDirVisual()
+{
+    static Fvector s_dir{0.f, -1.f, 0.f};
+    if (g_pGamePersistent) {
+        auto& env = g_pGamePersistent->Environment();
+        if (const auto* E = env.CurrentEnv)
+            if (!env.IsThunderboltActive())
+                s_dir = E->sun_dir;
+    }
+    return s_dir;
+}
+
 void Update(u32 slot)
 {
     if (s_failed || !s_mapped) return;
@@ -649,18 +744,42 @@ void Update(u32 slot)
     ub.fog_params[0]=0.f; ub.fog_params[1]=1e6f; ub.fog_params[2]=1e6f; ub.fog_params[3]=0.f;
     if (g_pGamePersistent) {
         if (auto* E = g_pGamePersistent->Environment().CurrentEnv) {
-            ub.sun_dir[0]=E->sun_dir.x;  ub.sun_dir[1]=E->sun_dir.y;  ub.sun_dir[2]=E->sun_dir.z;
+            const Fvector& sunD = SunDirVisual();   // held steady through a bolt (no second sun)
+            ub.sun_dir[0]=sunD.x;  ub.sun_dir[1]=sunD.y;  ub.sun_dir[2]=sunD.z;
             ub.sun_color[0]=E->sun_color.x; ub.sun_color[1]=E->sun_color.y; ub.sun_color[2]=E->sun_color.z;
             ub.hemi_color[0]=E->hemi_color.x; ub.hemi_color[1]=E->hemi_color.y; ub.hemi_color[2]=E->hemi_color.z; ub.hemi_color[3]=E->hemi_color.w;
             ub.ambient[0]=E->ambient.x; ub.ambient[1]=E->ambient.y; ub.ambient[2]=E->ambient.z;
+            // LIGHTNING AS SKY LIGHT (r_bolt_flash). Holding the sun direction above
+            // would otherwise cost the flash entirely: the engine spends a bolt through
+            // sun_color, and with the sun back at its real place (below the horizon at
+            // night) that boost lands on nothing. A strike is an enormous distant area
+            // light, so it belongs in the HEMISPHERE term — the whole world brightens
+            // for an instant, no disc, no rays. fog_color/sky_color stay boosted by the
+            // engine, so the sky and the distance haze flash on their own.
+            const Fvector& flash = g_pGamePersistent->Environment().ThunderboltFlash();
+            if (ps_r_bolt_flash > 0.f && (flash.x + flash.y + flash.z) > 0.001f) {
+                ub.hemi_color[0] += flash.x * ps_r_bolt_flash;
+                ub.hemi_color[1] += flash.y * ps_r_bolt_flash;
+                ub.hemi_color[2] += flash.z * ps_r_bolt_flash;
+            }
 
             // Distance fog (R4 cl_fog_params/cl_fog_color binders + combine_1.ps):
             // fog_near/far are derived in CEnvDescriptorMixer (Environment_misc.cpp:
             // near = (1-density)*0.85*dist, far = 0.99*dist); fog_color is the env
             // colour the sky/horizon use, so the haze tints with time-of-day.
-            const float fn = E->fog_near, ff = E->fog_far;
-            const float r  = (ff > fn + 1e-3f) ? 1.f / (ff - fn) : 0.f;
-            ub.fog_params[0] = -fn * r; ub.fog_params[1] = fn; ub.fog_params[2] = ff; ub.fog_params[3] = r;
+            // r_fog_dist scales that distance (0 = OFF). This is the THIRD haze in the
+            // frame — froxel fog + Rayleigh/Mie atmosphere are the other two — and it
+            // was the only one with no control at all: purely distance-based, so it
+            // has no height profile and cannot be anchored to the ground. That is why
+            // it reads as "fog that follows me" and why no r_vol_*/r_atmo knob ever
+            // moved it. Needed as an A/B before judging the froxel layer, and as the
+            // seam where the three systems eventually get unified.
+            const float fogScale = ps_r_fog_dist;
+            const float fn = E->fog_near * fogScale, ff = E->fog_far * fogScale;
+            const float r  = (fogScale > 0.f && ff > fn + 1e-3f) ? 1.f / (ff - fn) : 0.f;
+            if (r > 0.f) {
+                ub.fog_params[0] = -fn * r; ub.fog_params[1] = fn; ub.fog_params[2] = ff; ub.fog_params[3] = r;
+            }   // else: keep the "no fog" defaults set above (0 / 1e6 / 1e6 / 0)
             ub.fog_color[0] = E->fog_color.x; ub.fog_color[1] = E->fog_color.y; ub.fog_color[2] = E->fog_color.z;
 
             // One-time dump of the real env magnitudes — to tune the shader balance.
@@ -688,6 +807,22 @@ void Update(u32 slot)
     ColorSpace::LinearizeRGB(ub.hemi_color);
     ColorSpace::LinearizeRGB(ub.ambient);
     ColorSpace::LinearizeRGB(ub.fog_color);
+
+    // Sun colour from the atmosphere model (r_sky_sun_from_atmo). Applied AFTER the
+    // linearisation block on purpose: transmittance is a physical, already-linear
+    // quantity, so pushing it through an sRGB decode would be a second, bogus
+    // conversion. The boost below still applies — it stays a user knob.
+    if (ps_r_sky_proc && ps_r_sky_sun_from_atmo) {
+        Fvector3 toSun; toSun.set(-ub.sun_dir[0], -ub.sun_dir[1], -ub.sun_dir[2]);
+        const float len = toSun.magnitude();
+        if (len > 1e-4f) {
+            toSun.div(len);
+            const Fvector3 tr = AtmoSunTransmittance(toSun, ps_r_sky_turbidity);
+            ub.sun_color[0] = tr.x * ps_r_sky_sun_scale;
+            ub.sun_color[1] = tr.y * ps_r_sky_sun_scale;
+            ub.sun_color[2] = tr.z * ps_r_sky_sun_scale;
+        }
+    }
 
     // LDR-era brightness hacks, centralized: the sun boost (was a ×1.25 literal
     // in five shaders) and the ambient floor (was +0.05 in four) apply ONCE
@@ -818,6 +953,20 @@ void Update(u32 slot)
     // sum, so a 1x1 uniform cube hands every surface of every object the same value —
     // flat, no matter how it is oriented. The Sky pass now runs as soon as the host
     // pushes a scene, which loads and transitions the real weather cubes, so take them.
+    // The weather's sky spin. It is part of the probe's identity (the probe is built
+    // in world space, so a rotated dome is a different probe) and it is also what the
+    // raw-cube last-resort path needs to undo. Same source the sky draw reads.
+    // ...and the weather tint the dome draw applies. Both come from the same
+    // descriptor the sky pass reads, so probe and dome cannot drift apart.
+    float skyRot = 0.f;
+    float skyTint[3] = { 1.f, 1.f, 1.f };
+    if (g_pGamePersistent)
+        if (auto* mixEnv = g_pGamePersistent->Environment().CurrentEnv) {
+            skyRot     = mixEnv->sky_rotation;
+            skyTint[0] = mixEnv->sky_color.x;
+            skyTint[1] = mixEnv->sky_color.y;
+            skyTint[2] = mixEnv->sky_color.z;
+        }
     {
         VkImageView v0 = VK_NULL_HANDLE, v1 = VK_NULL_HANDLE, samp = VK_NULL_HANDLE;
         VkSampler   skSamp = VK_NULL_HANDLE;
@@ -849,8 +998,21 @@ void Update(u32 slot)
             // path now — it unwraps the sky into world space and the SH9 projection
             // rides along in the same submit — so it must run whenever either
             // consumer is on, not just for r_ibl.
-            if (ps_r_ibl || ps_r_sky_sh)
-                IBL::Update(v0, v1, s_cubeSampler, w, skyRot, ps_r_sky_sh_ground);
+            if (ps_r_ibl || ps_r_sky_sh) {
+                IBL::SkyDesc sd;
+                sd.weight = w; sd.rotation = skyRot; sd.groundBounce = ps_r_sky_sh_ground;
+                sd.tint[0] = skyTint[0]; sd.tint[1] = skyTint[1]; sd.tint[2] = skyTint[2];
+                // Direction TO the sun, normalised (env sun_dir travels downward).
+                Fvector3 ts; ts.set(-ub.sun_dir[0], -ub.sun_dir[1], -ub.sun_dir[2]);
+                const float tl = ts.magnitude();
+                if (tl > 1e-4f) ts.div(tl); else ts.set(0.f, 1.f, 0.f);
+                sd.sunDir[0] = ts.x; sd.sunDir[1] = ts.y; sd.sunDir[2] = ts.z;
+                sd.proc      = (ps_r_sky_proc != 0);
+                sd.intensity = ps_r_sky_intensity;
+                sd.turbidity = ps_r_sky_turbidity;
+                sd.mieG      = ps_r_sky_mie_g;
+                IBL::Update(v0, v1, s_cubeSampler, sd);
+            }
             (void)samp;
         } else {
             static bool s_skyFail = false;
@@ -891,6 +1053,61 @@ void Update(u32 slot)
         ub.ibl_params[1] = ps_r_ibl_spec;                    // spec strength
         ub.ibl_params[2] = float(IBL::GetMaxMip());           // max roughness mip
         ub.ibl_params[3] = (iblReady && ps_r_ibl_debug) ? 1.f : 0.f;  // debug field view
+    }
+
+    // Diffuse sky irradiance, SH9 (binding 31 + sh_params). Swap the dummy for the
+    // real coefficient buffer once vk_ibl has projected it (lazy, per slot).
+    {
+        const bool shReady = ps_r_sky_sh && IBL::SHReady();
+        VkBuffer   shb     = shReady ? IBL::GetSHBuffer() : VK_NULL_HANDLE;
+        if (shb == VK_NULL_HANDLE) shb = s_dummyBuf.GetHandle();
+        if (shb != VK_NULL_HANDLE && shb != s_boundSH[slot]) {
+            VkDescriptorBufferInfo bi{ shb, 0, VK_WHOLE_SIZE };
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = s_set[slot]; w.dstBinding = 31; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
+            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            s_boundSH[slot] = shb;
+        }
+        // .x doubles as the strength knob AND the gate: 0 makes every receiver fall
+        // back to the prefiltered probe's top mip, which is the A/B for r_sky_sh.
+        // Its own ~1 s fade, NOT ibl_params.x: that one is gated on r_ibl, so sharing
+        // it would silently pin the diffuse to the fallback whenever specular IBL is
+        // switched off — exactly the configuration someone testing r_sky_sh alone
+        // would be in. The fade itself hides the ambient stepping when the first
+        // projection lands mid-load.
+        const bool shBound = shReady && (s_boundSH[slot] == IBL::GetSHBuffer());
+        static float s_shFade = 0.f;
+        const float dtS = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+        if (shBound) { s_shFade += dtS; if (s_shFade > 1.f) s_shFade = 1.f; }
+        else           s_shFade = 0.f;
+        ub.sh_params[0] = s_shFade;
+        ub.sh_params[1] = skyRot;                        // raw-cube fallback needs to undo the spin
+        ub.sh_params[2] = float(IBL::GetMaxMip());       // fallback diffuse LOD = roughest probe mip
+        ub.sh_params[3] = 0.f;
+
+        // Companion to the [VK SH] dump: the SH azimuth is only meaningful next to
+        // the sun's, and the DIRECTIONAL sky term is only meaningful next to the FLAT
+        // one it is added to (L.ambient). If flat >> directional, terrain reads as
+        // uniformly sky-lit no matter how good the SH is — the fix would then be the
+        // balance, not the irradiance. Throttled to ~2 s.
+        if (ps_r_sky_sh_debug) {
+            static float s_dbgT = 0.f;
+            s_dbgT += (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+            if (s_dbgT > 2.f) {
+                s_dbgT = 0.f;
+                const float sunAz = atan2f(-ub.sun_dir[2], -ub.sun_dir[0]) * 57.2957795f;   // to-sun = -sun_dir
+                Msg("[VK SH] sun: to-sun=(%.2f,%.2f,%.2f) azimuth=%.1f deg elev=%.1f deg | "
+                    "sun_color lum=%.4f | FLAT ambient=(%.4f,%.4f,%.4f) lum=%.4f | sky scale=%.2f | sh_fade=%.2f",
+                    -ub.sun_dir[0], -ub.sun_dir[1], -ub.sun_dir[2], sunAz,
+                    asinf(_max(_min(-ub.sun_dir[1], 1.f), -1.f)) * 57.2957795f,
+                    0.2126f * ub.sun_color[0] + 0.7152f * ub.sun_color[1] + 0.0722f * ub.sun_color[2],
+                    ub.ambient[0], ub.ambient[1], ub.ambient[2],
+                    0.2126f * ub.ambient[0] + 0.7152f * ub.ambient[1] + 0.0722f * ub.ambient[2],
+                    kAmbientScale, ub.sh_params[0]);
+            }
+        }
     }
 
     // [PARKED 2026-07-06 — r_sun_beam_ground default 0, so beam2.z stays 0 and the forward
@@ -1176,10 +1393,23 @@ void Update(u32 slot)
     ub.pom_params6[2] = ps_r_water_refract;             // bottom refraction strength
     ub.pom_params6[3] = ps_r_spec_occ;                 // bent-normal spec occlusion of wet reflections
     // SSS puddles (default source). Gate off when r_rain is off so dry weather clears.
-    ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? 1.f : 0.f;
+    // 2 = SSFX-STRICT shading (see wetness.glsl): passes the MODE through, not a
+    // flag, so the shader can tell "our tuned water body" from "the SSFX gloss patch".
+    ub.pom_params7[0] = (ps_r_puddle_sss && ps_r_rain_enable) ? (float)ps_r_puddle_sss : 0.f;
     ub.pom_params7[1] = ps_r_puddle_level;              // coverage (more/larger puddles)
     ub.pom_params7[2] = ps_r_mud_depth;                 // mud print POM carve depth (fraction of the height range)
     ub.pom_params7[3] = ps_r_puddle_scale;              // puddle-body size (procedural mask freq)
+    // Puddles in real ground dips. Deliberately NOT gated by r_sf: that cvar is a
+    // master switch for future Surface Field consumers, and hanging this on it would
+    // make the whole feature a silent no-op for anyone with r_sf 0. The curvature
+    // only needs the RAIN map, which is rendered whenever it rains or dries — i.e.
+    // exactly when puddles exist — so no extra pass and no extra dependency.
+    ub.puddle_geo[0] = ps_r_rain_enable ? clampr(ps_r_puddle_geo, 0.f, 1.f) : 0.f;
+    ub.puddle_geo[1] = ps_r_wet_dist;   // how far wet shading survives (m) — SSFX fades at 250..200
+    ub.puddle_geo[2] = ps_r_terrain_detail_dist;   // how far the terrain detail normal/AO/gloss survive (m)
+    ub.bump_params[0] = ps_r_bump;         // static material normal-map strength
+    ub.bump_params[1] = (float)ps_r_bump_debug;
+    ub.bump_params[2] = ps_r_gloss_scale;  // material gloss -> IBL roughness
     // Surface Field ("smart heightmap"): metre-scale derive read in-shader (Phase
     // 2.0). Consumers (snow/fog/water) come later; for now drives r_sf_debug.
     ub.sf_params[0] = ps_r_sf ? 1.f : 0.f;              // enable (reserved for consumers)
@@ -1341,10 +1571,19 @@ void Update(u32 slot)
         if (ub.sf_params[3]   > 0.f)    sm |= VK::PipelineCache::WS_SNOW;   // eased snow coverage
         if (ub.rain_params[1] > 0.f)    sm |= VK::PipelineCache::WS_WET;    // wetness (already rain-gated)
         if (ub.ibl_params[0]  > 0.004f) sm |= VK::PipelineCache::WS_IBL;    // r_ibl enable×fade (matches shader gate)
+        // ⚠ EVERY debug view in the world shaders sits behind SPEC_DEBUG, so a new one
+        // is DEAD CODE until its UBO field is listed HERE — the branch compiles out and
+        // the cvar looks broken rather than unimplemented. Add the field with the view.
         if (ub.ao_params[3]   > 0.5f || ub.rain_params[2]   < 0.f  || ub.pom_params5[3]   > 0.5f ||
             ub.pom_params3[0] > 0.5f || ub.pom_params3[1]   > 0.5f || ub.cluster_params[3] > 1.5f ||
             ub.sf_params[1]   > 0.5f || ub.pom_params4[3]   > 0.5f || ub.zoff_params[2]   > 0.5f ||
-            ub.ibl_params[3]  > 0.5f)   sm |= VK::PipelineCache::WS_DEBUG;
+            ub.ibl_params[3]  > 0.5f || ub.bump_params[1]   > 0.5f)   sm |= VK::PipelineCache::WS_DEBUG;
+        // Texture-streaming feedback master gate: off ⇒ the txfbReport atomic is
+        // DCE'd out of the world FS. The atomic's occluded-fragment cost (it is
+        // an FS side effect, which forbids automatic early-Z) is solved by the
+        // EARLY_ZTEST shader twin on the no-z-write statics pipelines — see
+        // EarlyTwin in vk_pipeline_cache.cpp — so feedback runs EVERY frame.
+        if (ps_r_txstream) sm |= VK::PipelineCache::WS_FEEDBACK;
         VK::PipelineCache::SetFrameSpecMask(sm);
     }
 

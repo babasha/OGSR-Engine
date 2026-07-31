@@ -199,6 +199,7 @@ void RenderQueue::Flush(FrameContext& ctx)
 
     u32 nDraw = 0, nPipeBind = 0, nMatBind = 0, nTailPush = 0, nVBBind = 0, nIBBind = 0;
     u32 nTessMat = 0, nTessDraw = 0;   // tessellation diag: opted-in mats / actually-tess draws
+    u32 nTerrain = 0, nWmark = 0, nEmis = 0, nAT = 0;   // draw-mix diag (r_fsinv_split)
 
     for (const DrawItem& it : m_Items)
     {
@@ -222,10 +223,15 @@ void RenderQueue::Flush(FrameContext& ctx)
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkDescriptorSet  set    = VK_NULL_HANDLE;
 
+        // Needed before pipeline selection (atEqual is statics-only) AND by the
+        // MVP push below: dynamic visuals carry their own world matrix.
+        const bool dynXform = 0 != memcmp(&it.xform, &Fidentity, sizeof(Fmatrix));
+
         const bool terrain = mat && mat->isTerrain
                           && mat->terrainSet != VK_NULL_HANDLE
                           && PipelineCache::GetTerrainPipeline() != VK_NULL_HANDLE;
         if (terrain) {
+            ++nTerrain;
             pipe   = PipelineCache::GetTerrainPipeline();
             layout = PipelineCache::GetTerrainLayout();
             set    = mat->terrainSet;
@@ -261,6 +267,17 @@ void RenderQueue::Flush(FrameContext& ctx)
                 ++nTessMat;
                 if (k.tess) ++nTessDraw;
             }
+            // Prepass-covered statics (armed by Pass_World for the static flush;
+            // the prepass depth is final for these items):
+            //  - r_at_equal: AT items → EQUAL + no write (kills layered AT).
+            //  - r_z_prepass: opaque items → LEQUAL, no write (re-enables
+            //    early-Z, which the FS's discard + z-write ON had disabled).
+            const bool prepassItem = !dynXform && !k.wmark && !k.emis && !k.tess;
+            k.atEqual  = m_ATEqual  && prepassItem && mat && mat->alphaRef >= 0.0f;
+            k.noZWrite = m_PrepassZ && prepassItem;
+            if (k.wmark) ++nWmark;
+            else if (k.emis) ++nEmis;
+            else if (mat && mat->alphaRef >= 0.0f) ++nAT;
             pipe   = PipelineCache::Get(k);
             layout = PipelineCache::GetLayout();
             set    = mat ? mat->set : VK_NULL_HANDLE;
@@ -295,8 +312,8 @@ void RenderQueue::Flush(FrameContext& ctx)
 
         // Per-item MVP (push-constant offset 0). Dynamic visuals carry their own
         // world matrix in it.xform; level statics submit identity, giving
-        // mvp == *viewProj. Push only when the xform changes.
-        const bool dynXform = 0 != memcmp(&it.xform, &Fidentity, sizeof(Fmatrix));
+        // mvp == *viewProj. Push only when the xform changes. (dynXform computed
+        // above, before pipeline selection.)
         if (ctx.viewProj && (!haveXform || 0 != memcmp(&it.xform, &lastXform, sizeof(Fmatrix)))) {
             Fmatrix mvp;
             mvp.mul(*ctx.viewProj, it.xform);   // = it.xform · viewProj (model->clip)
@@ -381,6 +398,19 @@ void RenderQueue::Flush(FrameContext& ctx)
         vkCmdDrawIndexed(cmd, indexCount, 1, firstIndex,
                          (s32)fv->m_mesh.vBase, 0);
         ++nDraw;
+    }
+
+    // Draw-mix attribution (r_fsinv_split): what the CPU flush actually consists
+    // of. Fires for BOTH the statics and the dynamics flush — tell them apart by
+    // items/atEq (statics flush arms atEq when r_at_equal is on).
+    extern int ps_r_fsinv_split;
+    if (ps_r_fsinv_split > 0) {
+        static u32 s_lastMix = 0;
+        if (Device.dwTimeGlobal > s_lastMix + 3000) {
+            s_lastMix = Device.dwTimeGlobal;
+            Msg("[VK Queue] mix: items=%zu draws=%u terrain=%u wmark=%u emis=%u at=%u atEq=%d",
+                m_Items.size(), nDraw, nTerrain, nWmark, nEmis, nAT, (int)m_ATEqual);
+        }
     }
 
     static bool s_diag_done = false;

@@ -1,5 +1,9 @@
 #version 450
-// xrRenderVulkan — sun shafts (god rays): fullscreen triangle, no vertex input.
+// xrRenderVulkan — SHARED fullscreen triangle (no vertex input, UV to location 0).
+// ⚠ Keeps its historic name: the sun-shafts pass it was written for is gone
+// (2026-07-24 — god rays are the froxel volumetrics' job now), but the light-cones
+// pass loads THIS module by name (vk_pass_lightcones.cpp). Do not delete with the
+// rest of the shafts files; rename only together with that Load() call.
 
 layout(location = 0) out vec2 vUV;
 

@@ -14,6 +14,8 @@
 #include "vk_texture.h"
 #include "HW_Vulkan.h"
 #include "vk_command_buffer.h"             // CommandManager.GetCurrentFrame() — in-flight slot
+#include "vk_clouds.h"                     // volumetric cloud noise volumes (bindings 5..7)
+#include "vk_buffer.h"                     // CVulkanBuffer — the params UBO
 #include "vk_pipeline_cache.h"             // PipelineCache::GetCacheObject() — shared disk-backed cache
 
 #include "../../xr_3da/device.h"           // Device.vCameraPosition
@@ -27,6 +29,35 @@
 extern int   ps_r_clouds;            // r_clouds — animated cloud layer on/off
 extern float ps_r_clouds_intensity;  // r_clouds_intensity — additive brightness multiplier
 extern float ps_r_clouds_speed;       // r_clouds_speed — UV scroll speed multiplier
+extern int   ps_r_sky_proc;           // r_sky_proc — procedural Rayleigh+Mie sky (0 = legacy cubemap)
+extern float ps_r_sky_intensity;      // r_sky_intensity — model units -> game exposure
+extern float ps_r_sky_turbidity;      // r_sky_turbidity — aerosol multiplier (Mie)
+extern float ps_r_sky_mie_g;          // r_sky_mie_g — Mie anisotropy (sun aureole tightness)
+// Volumetric clouds (r_clouds_vol) — see the block comment in vk_console_min.cpp.
+extern int   ps_r_clouds_vol;
+extern float ps_r_clouds_coverage;
+extern float ps_r_clouds_density;
+extern float ps_r_clouds_detail;
+extern float ps_r_clouds_bottom;
+extern float ps_r_clouds_top;
+extern float ps_r_clouds_shape_scale;
+extern float ps_r_clouds_detail_scale;
+extern float ps_r_clouds_weather_scale;
+extern float ps_r_clouds_wind_dir;
+extern float ps_r_clouds_wind_speed;
+extern float ps_r_clouds_phase_g;
+extern float ps_r_clouds_phase_g_back;
+extern float ps_r_clouds_extinction;
+extern float ps_r_clouds_powder;
+extern float ps_r_clouds_sun;
+extern float ps_r_clouds_ambient;
+extern int   ps_r_clouds_steps;
+extern float ps_r_clouds_max_dist;
+extern float ps_r_clouds_cirrus;
+extern float ps_r_clouds_cirrus_alt;
+extern float ps_r_clouds_cirrus_scale;
+extern int   ps_r_clouds_debug;
+extern int   ps_r_clouds_weather;
 
 namespace VK {
 
@@ -41,6 +72,14 @@ namespace {
     VkDescriptorSetLayout s_SetLayout      = VK_NULL_HANDLE;
     VkDescriptorPool      s_Pool           = VK_NULL_HANDLE;
     VkDescriptorSet       s_Set[kFramesInFlight] = {};  // one per in-flight slot (no in-place rewrite)
+    CVulkanBuffer         s_Ubo;                               // params block (binding 4), one slot per frame
+    u8*                   s_UboMapped      = nullptr;
+    VkDeviceSize          s_UboStride      = 0;
+    // Cloud coverage counters (binding 8, r_clouds_debug). Host-visible on purpose:
+    // it is written only while the debug cvar is on, and reading it straight off the
+    // mapping avoids a staging copy + fence for what is a once-a-second log line.
+    CVulkanBuffer         s_DbgBuf;
+    u32*                  s_DbgMapped      = nullptr;
     VkSampler             s_Sampler        = VK_NULL_HANDLE;  // CLAMP — cubemaps (bindings 0,1)
     VkSampler             s_CloudSampler   = VK_NULL_HANDLE;  // REPEAT — tiling clouds (bindings 2,3)
 
@@ -66,14 +105,19 @@ namespace {
     // Push must match shaders/sky.{vert,frag}.glsl exactly. Layout = 4×vec4
     // with manual packing (vec3 + scalar trailing). vec3+float push_constant
     // packing is implementation-defined, so we keep it explicit on both sides.
-    struct SkyPush
+    // Was a PUSH block. Push constants are guaranteed to only 128 bytes by the Vulkan
+    // spec and AMD exposes exactly that; adding the procedural-sky params had already
+    // taken this to 144, which would have failed on any AMD GPU and worked here only
+    // because the dev machine is NVIDIA (256). The cloud params made that a rout, so
+    // it is a UBO now. Layout must match sky_ubo.glsl.
+    struct SkyUBO
     {
         float camRightTan[3];  // 12 — vCameraRight * tan(fov/2) * aspect
         float skyRotation;     //  4
         float camUpTan[3];     // 12 — vCameraTop   * tan(fov/2)
         float blendWeight;     //  4
         float camForward[3];   // 12 — vCameraDirection (unit)
-        float _pad0;           //  4
+        float eyeAltitude;     //  4 — camera height (m), the cloud march origin
         float skyColor[3];     // 12
         float _pad1;           //  4
         float sunDir[3];       // 12 — sun TRAVEL dir (to-sun = -sunDir), for the sun disk
@@ -86,8 +130,25 @@ namespace {
         float cloudEnable;     //  4 — r_clouds (0/1)
         float cloudIntensity;  //  4 — r_clouds_intensity
         float _pad4;           //  4
+        // Procedural Rayleigh+Mie sky (r_sky_proc). When enabled the cube/tint/sun
+        // fields above are unused by the shader — radiance comes from the model.
+        float atmoEnable;      //  4
+        float atmoIntensity;   //  4 — r_sky_intensity
+        float atmoTurbidity;   //  4 — r_sky_turbidity
+        float atmoMieG;        //  4 — r_sky_mie_g
+        // ── Volumetric clouds (clouds.glsl reads these as CL.*) ──────────────
+        float bandBottom, bandTop, _bandPad0, _bandPad1;
+        float coverage, detailStrength, density, cloudDebug;
+        float shapeScale, detailScale, weatherScale, _scalePad;
+        float windX, windZ, windSpeed, _windPad;
+        float phaseG, phaseGBack, extinction, powder;
+        float sunStrength, ambStrength, _l2Pad0, _l2Pad1;
+        float marchSteps, _marchPad0, marchMaxDist, _marchPad1;
+        float cirrusAmount, cirrusAltitude, cirrusScale, _cirrusPad;
+        float atmo2Enable, atmo2Intensity, atmo2Turbidity, atmo2MieG;
+        float cloudTimeSec, _timePad0, _timePad1, _timePad2;
     };
-    static_assert(sizeof(SkyPush) == 128, "SkyPush mismatch with GLSL push block");
+    static_assert(sizeof(SkyUBO) == 144 + 16 * 10, "SkyUBO mismatch with sky_ubo.glsl");
 
     // Resolve sky_texture_name → "$game_textures$\<name>.dds".
     bool ResolveCubePath(const char* name, string_path& out)
@@ -212,6 +273,38 @@ namespace {
         vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
     }
 
+    // Bindings 4..7 never change once created: the params UBO slot for this frame
+    // index, and the three baked cloud noise fields. Written once at init.
+    void WriteStaticSet(u32 slot)
+    {
+        VkDescriptorBufferInfo bi{ s_Ubo.GetHandle(), s_UboStride * slot, sizeof(SkyUBO) };
+        VkDescriptorBufferInfo di{ s_DbgBuf.GetHandle(), 0, VK_WHOLE_SIZE };
+        VkDescriptorImageInfo  ii[3]{};
+        const VkImageView views[3] = { VK::Clouds::ShapeView(), VK::Clouds::DetailView(), VK::Clouds::WeatherView() };
+        VkSampler cs = VK::Clouds::Sampler();
+        VkWriteDescriptorSet w[5]{};
+
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = s_Set[slot]; w[0].dstBinding = 4; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
+
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = s_Set[slot]; w[1].dstBinding = 8; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &di;
+
+        u32 n = 2;
+        for (u32 i = 0; i < 3; ++i) {
+            if (views[i] == VK_NULL_HANDLE || cs == VK_NULL_HANDLE) continue;
+            ii[i].sampler = cs; ii[i].imageView = views[i];
+            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[n].dstSet = s_Set[slot]; w[n].dstBinding = 5 + i; w[n].descriptorCount = 1;
+            w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &ii[i];
+            ++n;
+        }
+        vkUpdateDescriptorSets(VulkanHW.m_Device, n, w, 0, nullptr);
+    }
+
     // Fetch [name0, name1] for the active weather interval. Empty strings
     // when the env subsystem hasn't populated yet.
     void GetCurrentSkyNames(const char** outName0, const char** outName1)
@@ -322,18 +415,23 @@ bool Init()
         return false;
     }
 
-    // Set 0: bindings 0+1 = sky cubemaps, 2+3 = cloud 2D textures. FS only.
+    // Set 0: 0+1 = sky cubemaps, 2+3 = legacy cloud 2D textures, 4 = the params UBO
+    // (VS+FS — the VS needs the camera basis), 5+6 = volumetric cloud noise volumes,
+    // 7 = cloud weather map.
     {
-        VkDescriptorSetLayoutBinding b[4]{};
-        for (int i = 0; i < 4; ++i) {
+        VkDescriptorSetLayoutBinding b[9]{};
+        for (int i = 0; i < 9; ++i) {
             b[i].binding         = i;
             b[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             b[i].descriptorCount = 1;
             b[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
         }
+        b[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        b[4].stageFlags     = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        b[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;   // cloud debug counters
         VkDescriptorSetLayoutCreateInfo lci{};
         lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        lci.bindingCount = 4;
+        lci.bindingCount = 9;
         lci.pBindings    = b;
         if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
             Msg("![VK Sky] CreateDescriptorSetLayout failed");
@@ -342,15 +440,19 @@ bool Init()
     }
 
     {
-        VkDescriptorPoolSize ps{};
-        ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ps.descriptorCount = 4 * kFramesInFlight;  // 4 bindings × FRAMES_IN_FLIGHT sets
+        VkDescriptorPoolSize ps[3]{};
+        ps[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ps[0].descriptorCount = 7 * kFramesInFlight;  // 7 image bindings × FRAMES_IN_FLIGHT
+        ps[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ps[1].descriptorCount = 1 * kFramesInFlight;  // the params UBO
+        ps[2].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        ps[2].descriptorCount = 1 * kFramesInFlight;  // cloud debug counters
 
         VkDescriptorPoolCreateInfo pci{};
         pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pci.maxSets       = kFramesInFlight;
-        pci.poolSizeCount = 1;
-        pci.pPoolSizes    = &ps;
+        pci.poolSizeCount = 3;
+        pci.pPoolSizes    = ps;
         if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_Pool) != VK_SUCCESS) {
             Msg("![VK Sky] CreateDescriptorPool failed");
             return false;
@@ -411,18 +513,37 @@ bool Init()
         WriteSet(s_Set[i], s_FallbackCube->GetView(), s_FallbackCube->GetView(),
                  s_FallbackTex2D->GetView(), s_FallbackTex2D->GetView());
 
-    // Pipeline layout — set 0 + push range, VS|FS (push struct is shared).
-    VkPushConstantRange pc{};
-    pc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    pc.offset     = 0;
-    pc.size       = sizeof(SkyPush);
+    // Params UBO: one aligned slot per in-flight frame, host-visible and persistently
+    // mapped (rewritten every frame, so device-local + staging would be pure overhead).
+    {
+        // Round to 256: the max minUniformBufferOffsetAlignment any desktop GPU asks
+        // for. Binding a slot at a misaligned offset is undefined behaviour — the same
+        // trap vk_env_light documents (it read garbage on alternate frames).
+        s_UboStride = (sizeof(SkyUBO) + 255) & ~VkDeviceSize(255);
+        s_Ubo.Create(s_UboStride * kFramesInFlight, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+        s_UboMapped = static_cast<u8*>(s_Ubo.Map());
+        if (!s_UboMapped) { Msg("![VK Sky] params UBO map failed"); return false; }
 
+        s_DbgBuf.Create(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+        s_DbgMapped = static_cast<u32*>(s_DbgBuf.Map());
+    }
+
+    // Volumetric cloud noise. The views must exist even if the bake failed — the FS
+    // declares sampler3D bindings and nothing else can legally fill them.
+    VK::Clouds::Init();
+
+    for (u32 i = 0; i < kFramesInFlight; ++i)
+        WriteStaticSet(i);
+
+    // Pipeline layout — set 0 only; the params block is a UBO now (see SkyUBO).
     VkPipelineLayoutCreateInfo plci{};
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount         = 1;
     plci.pSetLayouts            = &s_SetLayout;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pc;
+    plci.pushConstantRangeCount = 0;
+    plci.pPushConstantRanges    = nullptr;
     if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_PipelineLayout) != VK_SUCCESS) {
         Msg("![VK Sky] CreatePipelineLayout failed");
         return false;
@@ -545,6 +666,11 @@ void Destroy()
     if (s_PipelineLayout) { vkDestroyPipelineLayout(VulkanHW.m_Device, s_PipelineLayout, nullptr); s_PipelineLayout = VK_NULL_HANDLE; }
     if (s_Pool)           { vkDestroyDescriptorPool(VulkanHW.m_Device, s_Pool, nullptr);            s_Pool = VK_NULL_HANDLE; }
     if (s_Sampler)        { vkDestroySampler(VulkanHW.m_Device, s_Sampler, nullptr);                s_Sampler = VK_NULL_HANDLE; }
+    VK::Clouds::Destroy();
+    if (s_UboMapped)      { s_Ubo.Unmap(); s_UboMapped = nullptr; }
+    s_Ubo.Destroy();
+    if (s_DbgMapped)      { s_DbgBuf.Unmap(); s_DbgMapped = nullptr; }
+    s_DbgBuf.Destroy();
     if (s_CloudSampler)   { vkDestroySampler(VulkanHW.m_Device, s_CloudSampler, nullptr);           s_CloudSampler = VK_NULL_HANDLE; }
     if (s_SetLayout)      { vkDestroyDescriptorSetLayout(VulkanHW.m_Device, s_SetLayout, nullptr);  s_SetLayout = VK_NULL_HANDLE; }
     s_VS = VK_NULL_HANDLE;
@@ -567,6 +693,36 @@ void Pass_Sky(FrameContext& ctx)
     EnsureCurrentCubes(slot);
 
     VkCommandBuffer cmd = ctx.cmd;
+
+    // Cloud coverage counters: zero them BEFORE the pass (vkCmdFillBuffer is a
+    // transfer op and is illegal inside dynamic rendering), then read last frame's
+    // values off the mapping and log them. One frame of lag is irrelevant for a
+    // diagnostic and buys us no fence.
+    if (ps_r_clouds_debug && s_DbgBuf.GetHandle() != VK_NULL_HANDLE) {
+        if (s_DbgMapped) {
+            static float s_dbgT = 0.f;
+            s_dbgT += (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+            if (s_dbgT > 1.5f) {
+                s_dbgT = 0.f;
+                const u32 sky = s_DbgMapped[0], cld = s_DbgMapped[1];
+                const u32 mx  = s_DbgMapped[2], sum = s_DbgMapped[3];
+                Msg("[VK Clouds] coverage: %u/%u sky px have cloud (%.1f%%) | maxAlpha=%.3f meanAlpha=%.4f "
+                    "| cov=%.2f dens=%.2f band=%.0f..%.0f steps=%d",
+                    cld, sky, sky ? (100.0 * double(cld) / double(sky)) : 0.0,
+                    mx / 1000.f, sky ? (sum / 1000.f / float(sky)) : 0.f,
+                    ps_r_clouds_coverage, ps_r_clouds_density,
+                    ps_r_clouds_bottom, ps_r_clouds_top, ps_r_clouds_steps);
+            }
+        }
+        vkCmdFillBuffer(cmd, s_DbgBuf.GetHandle(), 0, 16, 0);
+        VkBufferMemoryBarrier bb{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = s_DbgBuf.GetHandle(); bb.offset = 0; bb.size = 16;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 1, &bb, 0, nullptr);
+    }
 
     VkRenderingAttachmentInfo cAtt{};
     cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -620,7 +776,7 @@ void Pass_Sky(FrameContext& ctx)
     rightScaled.mul(Device.vCameraRight, tanHalf / Device.fASPECT);
     upScaled   .mul(Device.vCameraTop,   tanHalf);
 
-    SkyPush push{};
+    SkyUBO push{};
     push.camRightTan[0] = rightScaled.x;
     push.camRightTan[1] = rightScaled.y;
     push.camRightTan[2] = rightScaled.z;
@@ -641,7 +797,7 @@ void Pass_Sky(FrameContext& ctx)
     // Sun disk defaults: pointing down, colour black (no disk) until env is up.
     push.sunDir[0] = 0.0f; push.sunDir[1] = -1.0f; push.sunDir[2] = 0.0f;
     push.sunColor[0] = push.sunColor[1] = push.sunColor[2] = 0.0f;
-    push._pad2 = push._pad3 = push._pad4 = 0.0f;
+    push.eyeAltitude = Device.vCameraPosition.y;
 
     // Cloud defaults: no clouds until env is up. Time = fTimeGlobal/10 (matches
     // R4 timers.z) scaled by r_clouds_speed; the shader multiplies by the
@@ -651,6 +807,51 @@ void Pass_Sky(FrameContext& ctx)
     push.cloudTime      = Device.fTimeGlobal * 0.1f * ps_r_clouds_speed;
     push.cloudEnable    = ps_r_clouds ? 1.0f : 0.0f;
     push.cloudIntensity = ps_r_clouds_intensity;
+    // Procedural sky (r_sky_proc): radiance from the atmosphere model rather than the
+    // authored cube + tint. See the cvar note in vk_console_min.cpp for why.
+    push.atmoEnable    = ps_r_sky_proc ? 1.0f : 0.0f;
+    push.atmoIntensity = ps_r_sky_intensity;
+    push.atmoTurbidity = ps_r_sky_turbidity;
+    push.atmoMieG      = ps_r_sky_mie_g;
+
+    // ── Volumetric clouds ────────────────────────────────────────────────────
+    // Coverage 0 is the OFF switch the shader tests, so gate it on both the cvar and
+    // the bake actually having produced volumes — otherwise a failed bake would march
+    // an all-zero field for nothing every frame.
+    const bool volClouds = (ps_r_clouds_vol != 0) && VK::Clouds::Ready();
+    push.coverage       = volClouds ? ps_r_clouds_coverage : 0.f;
+    push.bandBottom     = ps_r_clouds_bottom;
+    push.bandTop        = _max(ps_r_clouds_top, ps_r_clouds_bottom + 100.f);
+    push.detailStrength = ps_r_clouds_detail;
+    push.cloudDebug     = volClouds ? float(ps_r_clouds_debug) : 0.f;
+    push.density        = ps_r_clouds_density;
+    push.shapeScale     = ps_r_clouds_shape_scale;
+    push.detailScale    = ps_r_clouds_detail_scale;
+    push.weatherScale   = ps_r_clouds_weather_scale;
+    {
+        // Wind heading in degrees -> unit XZ. Shares the weather's cloud speed knob so
+        // the deck drifts with the same wind the rest of the sky uses.
+        const float wr = deg2rad(ps_r_clouds_wind_dir);
+        push.windX = cosf(wr); push.windZ = sinf(wr);
+    }
+    push.windSpeed      = ps_r_clouds_wind_speed;
+    push.phaseG         = ps_r_clouds_phase_g;
+    push.phaseGBack     = ps_r_clouds_phase_g_back;
+    push.extinction     = ps_r_clouds_extinction;
+    push.powder         = ps_r_clouds_powder;
+    push.sunStrength    = ps_r_clouds_sun;
+    push.ambStrength    = ps_r_clouds_ambient;
+    push.marchSteps     = float(ps_r_clouds_steps);
+    push.marchMaxDist   = ps_r_clouds_max_dist;
+    push.cirrusAmount   = ps_r_clouds_cirrus;
+    push.cirrusAltitude = ps_r_clouds_cirrus_alt;
+    push.cirrusScale    = ps_r_clouds_cirrus_scale;
+    // The cloud lighting reads the atmosphere params through its own mirror.
+    push.atmo2Enable    = push.atmoEnable;
+    push.atmo2Intensity = push.atmoIntensity;
+    push.atmo2Turbidity = push.atmoTurbidity;
+    push.atmo2MieG      = push.atmoMieG;
+    push.cloudTimeSec   = Device.fTimeGlobal;
     // Sun DISK direction/colour are LATCHED against sudden jumps: a thunderbolt
     // momentarily hijacks the env sun_dir/sun_color (the lightning flash is driven
     // as a directional light), which would teleport the disk. The real sun drifts
@@ -712,9 +913,35 @@ void Pass_Sky(FrameContext& ctx)
         }
     }
 
-    vkCmdPushConstants(cmd, s_PipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof(SkyPush), &push);
+    // Upload into this frame's UBO slot. WaitForFence(slot) in CRender::Begin already
+    // proved the GPU is done with it, so a plain memcpy is safe — same reasoning the
+    // cubemap rebind above relies on.
+    // ── Couple cloud COVERAGE to the weather (r_clouds_weather) ──────────────
+    // Runs here, after the env block above has filled cloudsWeight. Until now the
+    // deck's coverage came from a fixed cvar and knew nothing about the weather at
+    // all — so an hour the mod authored as solid overcast rendered as the same
+    // scattered puffs as a clear one. clouds_color.w IS the weather's cloud weight
+    // (R4 skips its cloud pass entirely when it is ~0), which makes it exactly the
+    // signal to drive coverage with.
+    if (volClouds && ps_r_clouds_weather) {
+        const float w = _min(_max(push.cloudsWeight, 0.f), 1.f);
+        // Below ~0.01 the weather means "clear" — honour that rather than leaving a
+        // residual deck the preset never asked for.
+        push.coverage = (w < 0.01f) ? 0.f
+                                    : _min(ps_r_clouds_coverage * (0.5f + 1.5f * w), 1.f);
+    }
+
+    if (ps_r_clouds_debug) {
+        static float s_covT = 0.f;
+        s_covT += (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
+        if (s_covT > 1.5f) {
+            s_covT = 0.f;
+            Msg("[VK Clouds] weather: clouds_color.w=%.3f -> effective coverage=%.3f (cvar %.2f, couple %d)",
+                push.cloudsWeight, push.coverage, ps_r_clouds_coverage, ps_r_clouds_weather);
+        }
+    }
+
+    if (s_UboMapped) memcpy(s_UboMapped + s_UboStride * slot, &push, sizeof(push));
 
     vkCmdDraw(cmd, 3, 1, 0, 0);
 

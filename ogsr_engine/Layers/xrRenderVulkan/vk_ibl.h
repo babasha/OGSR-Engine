@@ -37,8 +37,26 @@ bool        Ready();                // true once a prefiltered cube exists (has 
 // change detection like the cubes and the cross-fade do.
 // groundBounce scales the below-horizon hemisphere during the SH projection (the
 // sky cube's skirt is not sky radiance — see sky_sh_project.comp.glsl).
-void        Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, float weight,
-                   float skyRotation, float groundBounce);
+// Everything that defines WHAT SKY the probe represents. Every field gates the
+// refresh: if any of them moves, the probe is a different sky and must be rebuilt.
+// This arc's recurring bug was exactly a field missing from here — first the
+// half-cube remap, then sky_rotation, then sky_color — each time leaving the probe
+// describing a sky the player was not looking at.
+struct SkyDesc {
+    float weight       = 0.f;                  // weather cube cross-fade
+    float rotation     = 0.f;                  // sky_rotation (rad), as the dome draw uses
+    float groundBounce = 0.3f;                 // below-horizon weight in the SH projection
+    float tint[3]      = { 1.f, 1.f, 1.f };    // sky_color — the dome's ×1.7 tint
+    float sunDir[3]    = { 0.f, 1.f, 0.f };    // direction TO the sun (unit)
+    // Procedural Rayleigh+Mie sky (r_sky_proc). When on, the cubes/tint are bypassed
+    // and radiance comes from atmosphere.glsl — the same function the dome draws.
+    bool  proc         = false;
+    float intensity    = 22.f;
+    float turbidity    = 1.f;
+    float mieG         = 0.76f;
+};
+
+void        Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyDesc& sky);
 
 VkImageView GetSpecView();          // prefiltered specular cube (roughness mips); null until Ready
 VkSampler   GetSampler();           // trilinear clamp sampler (maxLod = mip count)

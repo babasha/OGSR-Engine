@@ -95,6 +95,12 @@ VkImage        GetGroundImage();
 VkImageView    GetGroundView();
 u32            RainSize();                    // 1024 (shared by rain + ground maps)
 float          RainEyeY();                    // ortho eye world-Y at the last redraw (height reconstruction)
+// Ortho depth range of that box. With the eye Y above, a sampled depth d becomes a
+// world height: y = RainEyeY() - RainZNear() - d * (RainZFar() - RainZNear()).
+// The froxel fog reconstructs MICRO relief from it (ruts/dips at 14.6 cm/texel,
+// five times finer than its own baked terrain field) — see r_vol_mist_micro.
+float          RainZNear();
+float          RainZFar();
 void           ComputeRainVP();               // straight-down ortho box at the camera
 const Fmatrix& GetRainVP();
 bool           RainSphereVisible(const Fvector& center, float radius);

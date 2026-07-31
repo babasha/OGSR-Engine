@@ -87,7 +87,20 @@ layout(set = 2, binding = 0) uniform Lighting {
     vec4 _pad_beam_params;
     vec4 _pad_beam2;
     vec4 spot_flash;       // z = DLSS texture mip-LOD bias (log2(render/display), 0 native)
+    // Tail pads up to sh_params — skinned samples none of these, but the shared UBO
+    // is only prefix-compatible, so every field before the one we DO read must be
+    // declared at its real offset.
+    vec4 _pad_zoff_params;
+    vec4 _pad_tcache_xform;
+    vec4 _pad_tcache_params;
+    vec4 _pad_ch_off;
+    vec4 _pad_tmask_params;
+    vec4 sh_params;        // Diffuse sky SH9: x=strength×ready, y=sky_rotation, z=probe max mip
 } L;
+// Diffuse sky irradiance coefficients — see sky_ambient.glsl.
+layout(std430, set = 2, binding = 31) readonly buffer SkySH {
+    vec4 c[9];
+} skySH;
 layout(set = 2, binding = 2) uniform sampler2D uSpotShadow;
 layout(set = 2, binding = 22) uniform sampler2D uSpotShadowGrass;   // spot+grass beam atlas
 layout(set = 2, binding = 3) uniform samplerCubeArray uPointShadow;
@@ -118,6 +131,15 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
     float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
     vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
     return F0 * ab.x + ab.y;
+}
+// Reflected FRACTION for the term below — the diffuse must lose it, or switching IBL
+// on is a pure energy gain on every lit pixel (see env_common.glsl::iblSpecWeight).
+float iblSpecWeight(vec3 N, vec3 V, float roughness, vec3 F0)
+{
+    if (L.ibl_params.x < 0.004) return 0.0;
+    float NoV = clamp(dot(N, V), 0.0, 1.0);
+    vec3  ab  = EnvBRDFApprox(F0, roughness, NoV);
+    return clamp(dot(ab, vec3(1.0 / 3.0)) * L.ibl_params.y * L.ibl_params.x, 0.0, 1.0);
 }
 vec3 iblSpecular(vec3 N, vec3 V, float roughness, vec3 F0)
 {
@@ -489,13 +511,17 @@ void main()
     // so a sky reflection is meaningless there — the earlier flat Fresnel rim just
     // painted a pale "waxy" edge on grazing hand/bolt surfaces. Body N/Vview are
     // world-space (correct), gated by ray-traced sky visibility (pc.hemi).
-    vec3 specIBL = vec3(0.0);
+    vec3  specIBL = vec3(0.0);
+    float specE   = 0.0;
     if (pc.hudMode < 0.5) {
         vec3 Vview = normalize(L.eye_pos.xyz - v_wpos);
         specIBL  = iblSpecular(N, Vview, 0.6, vec3(0.04)) * pc.hemi;
         specIBL += sun * sunSpec(N, Vview, normalize(-L.sun_dir.xyz), 0.6, vec3(0.04)) * max(ndl, 0.0);
+        specE    = iblSpecWeight(N, Vview, 0.6, vec3(0.04)) * pc.hemi;
     }
-    col += specIBL;
+    // Energy: what the gear mirrors away it does not also transmit. NPCs keep their
+    // sky glint — it just stops being free light added on top of full diffuse.
+    col = col * (1.0 - specE) + specIBL;
 
     // GLASS pane (kinematics furniture/doors/vehicle windows, NPC glasses) —
     // R4 model_env_lq.ps: colour = light × lerp(ENV REFLECTION, texture, a),
