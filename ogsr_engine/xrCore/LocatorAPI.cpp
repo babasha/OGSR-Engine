@@ -11,6 +11,8 @@
 #pragma warning(default : 4995)
 
 #include <filesystem>
+#include <atomic>   // r_open source counters (FS_OpenStats)
+
 
 namespace sqfs
 {
@@ -66,6 +68,14 @@ struct eq_fname_check
 
 XRCORE_API xr_vector<_open_file> g_open_files;
 
+// The registry below is shared, and r_open is now called from several threads at
+// once (the renderer's level texture prefetch). Its guard used to be a LOCAL
+// xrCriticalSection — a fresh object per call, so it locked nothing. Only reachable
+// under -file_activity, but a lock that is a no-op is worse than none: it reads as
+// protected.
+static xrCriticalSection g_open_files_lock;
+
+
 void _check_open_file(const shared_str& _fname)
 {
     xr_vector<_open_file>::iterator it = std::find_if(g_open_files.begin(), g_open_files.end(), eq_fname_check(_fname));
@@ -94,8 +104,7 @@ void setup_reader(IReader* _r, _open_file& _of) { _of._reader = _r; }
 template <typename T>
 void _register_open_file(T* _r, LPCSTR _fname)
 {
-    xrCriticalSection _lock;
-    _lock.Enter();
+    g_open_files_lock.Enter();
 
     shared_str f = _fname;
     _check_open_file(f);
@@ -104,20 +113,19 @@ void _register_open_file(T* _r, LPCSTR _fname)
     setup_reader(_r, _of);
     _of._used += 1;
 
-    _lock.Leave();
+    g_open_files_lock.Leave();
 }
 
 template <typename T>
 void _unregister_open_file(T* _r)
 {
-    xrCriticalSection _lock;
-    _lock.Enter();
+    g_open_files_lock.Enter();
 
     xr_vector<_open_file>::iterator it = std::find_if(g_open_files.begin(), g_open_files.end(), eq_pointer<T>(_r));
     VERIFY(it != g_open_files.end());
     _open_file& _of = *it;
     _of._reader = nullptr;
-    _lock.Leave();
+    g_open_files_lock.Leave();
 }
 
 XRCORE_API void _dump_open_files(int mode)
@@ -978,6 +986,31 @@ int CLocatorAPI::file_list(FS_FileSet& dest, LPCSTR path, u32 flags, LPCSTR mask
     return int(dest.size());
 }
 
+
+// ---------------------------------------------------------------------------
+// r_open source accounting — see FS_OpenStats in the header. Plain relaxed
+// atomics: the counters are read once per load phase, never in a decision.
+// ---------------------------------------------------------------------------
+namespace {
+std::atomic<u64> g_fsLooseN{0},  g_fsLooseB{0},  g_fsLooseUs{0};
+std::atomic<u64> g_fsPackedN{0}, g_fsPackedB{0}, g_fsPackedUs{0};
+std::atomic<u64> g_fsComprN{0},  g_fsComprB{0},  g_fsComprUs{0};
+}
+
+FS_OpenStats FS_GetOpenStats()
+{
+    FS_OpenStats s;
+    s.loose_n  = g_fsLooseN.load(std::memory_order_relaxed);
+    s.loose_b  = g_fsLooseB.load(std::memory_order_relaxed);
+    s.loose_us = g_fsLooseUs.load(std::memory_order_relaxed);
+    s.packed_n  = g_fsPackedN.load(std::memory_order_relaxed);
+    s.packed_b  = g_fsPackedB.load(std::memory_order_relaxed);
+    s.packed_us = g_fsPackedUs.load(std::memory_order_relaxed);
+    s.compr_n  = g_fsComprN.load(std::memory_order_relaxed);
+    s.compr_b  = g_fsComprB.load(std::memory_order_relaxed);
+    s.compr_us = g_fsComprUs.load(std::memory_order_relaxed);
+    return s;
+}
 void CLocatorAPI::file_from_cache_impl(IReader*& R, LPCSTR fname, const file& desc)
 {
     R = xr_new<CVirtualFileReader>(fname);
@@ -986,7 +1019,7 @@ void CLocatorAPI::file_from_cache_impl(IReader*& R, LPCSTR fname, const file& de
 void CLocatorAPI::file_from_cache_impl(CStreamReader*& R, LPCSTR fname, const file& desc)
 {
     CFileStreamReader* r = xr_new<CFileStreamReader>();
-    r->construct(fname, BIG_FILE_READER_WINDOW_SIZE);
+    r->construct(fname, FS_StreamWindowSize());
     R = r;
 }
 
@@ -1057,16 +1090,39 @@ T* CLocatorAPI::r_open_impl(LPCSTR path, LPCSTR _fname)
 
     T* R = nullptr;
 
-    // OK, analyse
+    // OK, analyse. The open is TIMED and attributed to its source: level loads
+    // spend seconds in here and a compressed archive entry (whole-file LZO on the
+    // calling thread) costs orders of magnitude more than a mapped one — the split
+    // is what tells "parallelize the reads" from "there is nothing to parallelize".
+    CTimer _tOpen;
+    _tOpen.Start();
     if (VFS_STANDARD_FILE == desc->vfs)
     {
         LPCSTR actual_name = desc->real_file_path.empty() ? fname : desc->real_file_path.c_str();
         file_from_cache(R, actual_name, *desc);
+        const u64 us = (u64)(_tOpen.GetElapsed_ms_total() * 1000.f);
+        g_fsLooseN.fetch_add(1, std::memory_order_relaxed);
+        g_fsLooseB.fetch_add(desc->size_real, std::memory_order_relaxed);
+        g_fsLooseUs.fetch_add(us, std::memory_order_relaxed);
     }
     else
     {
         file_from_archive(R, fname, *desc);
+        const u64 us = (u64)(_tOpen.GetElapsed_ms_total() * 1000.f);
+        // .db: stored entries hand back a mapped view, compressed ones allocate and
+        // decompress. (SQFS archives report size_compressed == size_real and land in
+        // "packed" — that container decompresses inside its own reader.)
+        if (desc->size_real == desc->size_compressed) {
+            g_fsPackedN.fetch_add(1, std::memory_order_relaxed);
+            g_fsPackedB.fetch_add(desc->size_real, std::memory_order_relaxed);
+            g_fsPackedUs.fetch_add(us, std::memory_order_relaxed);
+        } else {
+            g_fsComprN.fetch_add(1, std::memory_order_relaxed);
+            g_fsComprB.fetch_add(desc->size_real, std::memory_order_relaxed);
+            g_fsComprUs.fetch_add(us, std::memory_order_relaxed);
+        }
     }
+
 
     if (m_Flags.test(flDumpFileActivity))
     {

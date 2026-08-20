@@ -35,9 +35,30 @@
 #include "vk_pass_context.h"   // VK::FrameContext
 
 class vkRender_Visual;
+class vkFVisual;
 namespace VK { class RenderQueue; struct WorldMaterial; }   // WorldMaterial: vk_world_material.h
 
 namespace VK { namespace WorldGPU {
+
+// ============================================================================
+//  Shared leaf index (load-time only)
+// ============================================================================
+// Every load-time pass that needs the level's static leaves used to walk
+// RImplementation.Visuals itself, recursing MT_HIERRARHY/MT_LOD and deduping
+// on its own. Measured on pripyat_full (449 864 visuals, 18-08): WorldGPU
+// extract 327 ms + CompactPools collect 679 + TerrainMask collect 504 +
+// ShadowGPU casters — well over a second of a 19.5 s load spent walking the
+// SAME tree four times. This walks it ONCE and hands the result to all of
+// them; each keeps its own filter, which is where they actually differ.
+//
+// Order is the old recursive one (roots in Visuals[] order, children in
+// declaration order, first occurrence wins) — TerrainMask draws its regions in
+// list order, so preserving it keeps that bake bit-identical.
+// Built on first call, valid for this level; ReleaseLeafVisuals() drops it at
+// the end of the render load phase (dynamic spawns add visuals after that, so
+// nothing may read a stale list later).
+const xr_vector<vkFVisual*>& LeafVisuals();
+void ReleaseLeafVisuals();
 
 // One cullable ENTRY: either a whole mesh (material fragment) or one cluster
 // of its LOD DAG (r_cluster). Shared with vk_cluster_stream (page assembly /
@@ -116,8 +137,13 @@ bool OcclusionReady();
 // count region (cmds2/counts2) drawn only by DrawColor(useOcclusion=true). The
 // depth prepass keeps the full frustum set (Cull), so the pyramid is complete and
 // this never over-culls. MUST run OUTSIDE a render pass, AFTER the HZB build.
+// `hzbGen` = CDetailManager::HZBGeneration() — the descriptor for the pyramid is
+// (re)written only when it changes, because s_set2 is ONE set shared by all frames
+// in flight and rewriting it every frame updates a set an executing command buffer
+// still references. A raw handle comparison is not enough: after Destroy+Create the
+// driver can hand back the same VkImageView value.
 void CullColor(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& cameraPos,
-               VkImageView hzbView, VkSampler hzbSampler);
+               VkImageView hzbView, VkSampler hzbSampler, u32 hzbGen);
 
 // Depth prepass: indirect depth-only draw of the culled statics (solid + AT
 // variants), reusing the shared depth pipelines. INSIDE the prepass BeginRendering.

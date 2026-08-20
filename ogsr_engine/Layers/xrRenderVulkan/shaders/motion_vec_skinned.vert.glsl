@@ -6,13 +6,17 @@
 // its TRUE motion (camera + skeletal animation + the body moving through the
 // world), not just camera reprojection.
 //
-// Skins the vertex TWICE: with THIS frame's bones (curBase) and the PREVIOUS
+// Skins the vertex TWICE: with THIS frame's bones (baseBone) and the PREVIOUS
 // frame's bones (prevBase) — both regions live simultaneously in the shared bone
 // SSBO (kMaxBones × FRAMES_IN_FLIGHT; last frame's slot isn't overwritten this
 // frame). Bones are pre-multiplied to world space (see skinned.vert), so S*pos is
 // world; we project cur with curVP and prev with prevVP. The fragment turns the
-// two clip positions into screen-space motion. Skinning decode is identical to
-// skinned.vert (keep them in sync).
+// two clip positions into screen-space motion.
+//
+// The skinning decode comes from skin_matrix.glsl — the SAME include the colour,
+// caster and VSM passes use. It used to be a private copy here, which is how a pass
+// silently falls behind the shared one; skinMatrixAt(bb) exists precisely so this
+// pass can pick the pose base instead of forking the decode.
 
 layout(location = 0) in vec4 a_Position;
 layout(location = 1) in vec4 a_Normal;       // a = boneIdx(1W) / w0(2W+)
@@ -29,47 +33,21 @@ layout(push_constant) uniform PC {
     mat4 curVP;     // 0   this frame's view-proj, UNJITTERED (jitter-free MV)
     mat4 prevVP;    // 64  previous frame's view-proj, UNJITTERED
     uint skinMode;  // 128 1=1W,2=2W,3=3W,4=4W
-    uint curBase;   // 132 this frame's first bone slot
-    uint prevBase;  // 136 previous frame's first bone slot (== curBase if the skeleton is new)
+    uint baseBone;  // 132 this frame's first bone slot (skin_matrix.glsl contract name)
+    uint prevBase;  // 136 previous frame's first bone slot (== baseBone if the skeleton is new)
     uint boneCount; // 140 bone count (index clamp)
     vec2 jitter;    // 144 this frame's sub-pixel jitter (D3D-NDC) re-applied to gl_Position
 } pc;
 
 layout(std430, set = 0, binding = 0) readonly buffer Bones { mat4 bones[]; };
 
-uint dN(float a) { return uint(round(a * 255.0)); }
-uint dF(float v) { return uint(round(abs(v)));    }
-uint clampB(uint i) { return (pc.boneCount == 0u) ? 0u : min(i, pc.boneCount - 1u); }
-
-// World-space skinning matrix for this vertex, rooted at bone-slot base `bb`.
-mat4 skinMat(uint bb)
-{
-    uint mode = pc.skinMode & 15u;
-    if (mode == 1u) {
-        return bones[bb + clampB(dN(a_Normal.a))];
-    } else if (mode == 2u) {
-        float w0 = a_Normal.a;
-        return bones[bb + clampB(dF(a_TexCoordExt.z))] * (1.0 - w0)
-             + bones[bb + clampB(dF(a_TexCoordExt.w))] * w0;
-    } else if (mode == 3u) {
-        float w0 = a_Normal.a, w1 = a_Tangent.a;
-        return bones[bb + clampB(dF(a_TexCoordExt.z))] * w0
-             + bones[bb + clampB(dF(a_TexCoordExt.w))] * w1
-             + bones[bb + clampB(dN(a_Binormal.a))]    * (1.0 - w0 - w1);
-    } else {
-        float w0 = a_Normal.a, w1 = a_Tangent.a, w2 = a_Binormal.a;
-        return bones[bb + clampB(dN(a_BoneIndices.r))] * w0
-             + bones[bb + clampB(dN(a_BoneIndices.g))] * w1
-             + bones[bb + clampB(dN(a_BoneIndices.b))] * w2
-             + bones[bb + clampB(dN(a_BoneIndices.a))] * (1.0 - w0 - w1 - w2);
-    }
-}
+#include "skin_matrix.glsl"   // dN/dF/clampB + skinMatrix()/skinMatrixAt() — shared by all skinned passes
 
 void main()
 {
     vec3 pos = a_Position.xyz;
-    vec4 wpCur  = skinMat(pc.curBase)  * vec4(pos, 1.0);   // world pos, this frame's pose
-    vec4 wpPrev = skinMat(pc.prevBase) * vec4(pos, 1.0);   // world pos, previous pose
+    vec4 wpCur  = skinMatrix()               * vec4(pos, 1.0);   // world pos, this frame's pose
+    vec4 wpPrev = skinMatrixAt(pc.prevBase)  * vec4(pos, 1.0);   // world pos, previous pose
     vCurClip  = pc.curVP  * wpCur;    // unjittered → clean MV in the fragment
     vPrevClip = pc.prevVP * wpPrev;
     vUV         = a_TexCoordExt.xy;

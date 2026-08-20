@@ -5,6 +5,10 @@
 #include "light_ubo.glsl"          // DynLight + Lighting UBO (set 1 b0) + samplers (set 1 b1..13)
 #include "foliage_shadow.glsl"     // foliageLightShadow — grass receives spot/point pool shadows
 #include "surface_class.glsl"      // SC_* classification + snow (grass)
+#include "shore_wet.glsl"
+#include "ao_common.glsl"       // coloredAO (shared with env_common.glsl)          // shoreWetness — reeds standing in water
+#include "common_math.glsl"     // EnvBRDFApprox — pure, shared with world/tree
+#include "ao_sampled.glsl"      // gtaoVis / ssilBoost — after light_ubo.glsl (uAO/uIL/L)
 
 // xrRenderVulkan - detail (grass) fragment shader. set 0/binding 0 = per-type
 // diffuse (alpha-cutoff 0.5, punch-out). set 1 = the shared EnvLight, now via
@@ -24,28 +28,7 @@ float rainVisGrass(vec3 wp)
 
 // GTAO at this pixel - grass isn't in the prepass, so this is the AO of the GROUND
 // behind the blade (grass in a dark corner sits in the same ambient as the dirt).
-float gtaoVis()
-{
-    float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
-    return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);
-}
-
-// Colored AO - see world_lmap.frag (R4 tints occlusion toward the blade's albedo).
-vec3 coloredAO(float ao, vec3 albedo)
-{
-    vec3 a =  2.0404 * albedo - 0.3324;
-    vec3 b = -4.7951 * albedo + 0.6417;
-    vec3 c =  2.7552 * albedo + 0.6903;
-    return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
-}
-
-// SSIL ambient boost - see env_common.glsl (SSFX hdiffuse *= IL). 0/no-op where
-// there's no bounce or r_ssil is off; uIL is binding 21 (light_ubo.glsl).
-vec3 ssilBoost()
-{
-    vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
-    return vec3(1.0) + il / (1.0 + il);
-}
+// gtaoVis / ssilBoost come from ao_sampled.glsl (they read light_ubo's uAO/uIL/L).
 
 // Sky ambient (grass samples straight up — no real normal, same light as the
 // terrain beneath it) now comes from the shared header, so grass gets the SH9
@@ -54,20 +37,13 @@ vec3 ssilBoost()
 
 // Sky specular sheen for grass (r_ibl). Blades have no normal → up-reflected blurry
 // sky, gated by baked openness + WET (dry grass ≈ matte; the payoff is wet grass
-// glistening). Karis EnvBRDFApprox (local copy). `openness` = vColor.r baked hemi.
-vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
-{
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
-    const vec4 c1 = vec4( 1.0,  0.0425,  1.040, -0.040);
-    vec4  r    = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
-    vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
-    return F0 * ab.x + ab.y;
-}
+// glistening). Karis EnvBRDFApprox → common_math.glsl. `openness` = vColor.r baked hemi.
 vec3 grassSkySheen(vec3 wp, float openness)
 {
     if (L.ibl_params.x < 0.004) return vec3(0.0);
-    float wetF = clamp(L.rain_params.y, 0.0, 1.0) * rainVisGrass(wp);
+    // Rain OR standing water. Reeds grow out of a river and were bone dry to the
+    // waterline, because every wet surface in this renderer was wet from the sky.
+    float wetF = max(clamp(L.rain_params.y, 0.0, 1.0) * rainVisGrass(wp), shoreWet(wp));
     if (wetF < 0.02 && openness < 0.01) return vec3(0.0);
     const vec3 up = vec3(0.0, 1.0, 0.0);
     vec3  V   = normalize(L.eye_pos.xyz - wp);
@@ -80,44 +56,7 @@ vec3 grassSkySheen(vec3 wp, float openness)
          * (L.ibl_params.x * L.ibl_params.y * openness * (0.05 + 0.95 * wetF));
 }
 
-// Foliage variant: billboards have no meaningful normal -> attenuation-only.
-vec3 dynLightsFoliage(vec3 wp)
-{
-    vec3 acc = vec3(0.0);
-    int n = int(L.counts.x + 0.5);
-    for (int i = 0; i < n; ++i) {
-        vec3  dv = L.lights[i].pos.xyz - wp;
-        float r  = L.lights[i].pos.w;
-        float d2 = dot(dv, dv);
-        if (d2 >= r * r) continue;
-        float d   = sqrt(max(d2, 1e-6));
-        // Narrow beams: windowed falloff (far half still lights) — light_shade.glsl.
-        float att;
-        if (L.lights[i].color.w > 0.5 && L.lights[i].dir.w > 0.87) {
-            att = 1.0 - (d2 / (r * r));
-            att *= att;
-        } else {
-            att = 1.0 - d / r;
-            att *= att;
-        }
-        if (L.lights[i].color.w > 0.5) {
-            // Narrow beams: full inside the cone + spill to 2x the angle — see
-            // light_shade.glsl (axis-peaked ramp left beam-lit grass dark).
-            float ca = dot(-dv / d, L.lights[i].dir.xyz);
-            float ci = L.lights[i].dir.w;
-            if (ci > 0.87) {
-                float co = 2.0 * ci * ci - 1.0;
-                att *= clamp((ca - co) / max(ci - co, 1e-3), 0.0, 1.0);
-            } else
-                att *= clamp((ca - ci) / max(1.0 - ci, 1e-3), 0.0, 1.0);
-        }
-        // Dynamic shadow (spot tile / point cube) — NPC/props around a campfire
-        // or under a lamp now cast onto the grass, not just the terrain.
-        att *= foliageLightShadow(i, wp);
-        acc += L.lights[i].color.rgb * (att * 0.7);
-    }
-    return acc;
-}
+// dynLightsFoliage → foliage_shadow.glsl (shared with the other foliage pass).
 
 layout(push_constant) uniform DetailConstants {
     mat4 mViewProj;
@@ -280,6 +219,22 @@ void main()
     // Sky specular sheen (r_ibl) — additive, after the wet darken (reflected sky, not absorbed).
     vec3 sheen = grassSkySheen(vWPos, vColor.r);
     col += sheen;
+
+    // SOAKED IS DARK. The sheen alone does not read as wet — it is a grazing-angle
+    // highlight, and a reed standing in a river is read by TONE first. Applied
+    // after the lighting so it darkens the lit result, which is what water in the
+    // blade does: it fills the surface pores and stops them scattering back.
+    float sw = shoreWet(vWPos);
+    if (shoreWetDebug()) { outColor = vec4(sw, sw * 0.3, 0.0, 1.0); return; }   // red = wet
+    // Wet vegetation is markedly darker than dry — more so than soil, because a
+    // film of water on a blade kills the diffuse scatter that makes it look pale.
+    col *= 1.0 - 0.65 * sw;
+    // ...and then the foam the surge left ON it. Grass at a waterline is where the
+    // scum line actually catches, so leaving this to the terrain alone would put the
+    // foam under the very blades it hangs off. Lightening the LIT colour rather than
+    // an albedo, because that is where this shader's wetness already works.
+    float sf = shoreFoam(vWPos);
+    if (sf > 0.003) col = mix(col, vec3(0.80, 0.81, 0.78) * (0.35 + 0.65 * vColor.r), sf * 0.8);
 
     // Distance fog (R4).
     float fog = clamp(length(vWPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);

@@ -6,6 +6,8 @@
 // form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
+#include "vk_rendering.h"     // VK::RenderingBuilder
 #include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_pass_particles.h"
 #include "vk_color_space.h"   // ColorSpace::LinearizeRGB — smoke media albedo
@@ -22,7 +24,7 @@
 #include "vk_swapchain.h"
 #include "vk_scene_color.h"       // HDR scene target format
 #include "vk_command_buffer.h"    // CommandManager.GetCurrentFrame() / FRAMES_IN_FLIGHT
-#include "vk_pipeline_cache.h"    // PipelineCache::GetCacheObject()
+#include "vk_gfx_pipeline.h"      // VK::GfxPipelineBuilder
 #include "vk_barriers.h"          // ImageBarrier — distort RT layout flips
 #include "HW_Vulkan.h"
 
@@ -147,71 +149,17 @@ namespace {
         if (!s_GlassFS) s_GlassFS = g_ShaderManager->Load("glass_distort.frag.spv");
         if (!s_GlassVS || !s_GlassFS) return VK_NULL_HANDLE;
 
-        VkVertexInputBindingDescription bind{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription attrs[2] = {
-            { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 },
-            { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset },
-        };
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs;
-
-        VkPipelineShaderStageCreateInfo st[2]{};
-        st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = s_GlassVS; st[0].pName = "main";
-        st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = s_GlassFS; st[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_FALSE;   // occluded panes must not warp
-        ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        ba.blendEnable         = VK_TRUE;                       // same as the haze sprites
-        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        ba.colorBlendOp        = VK_BLEND_OP_ADD;
-        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        VkFormat colorFormat = kDistortFormat;
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFormat;
-        prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext = &prci;
-        pi.stageCount = 2;                 pi.pStages             = st;
-        pi.pVertexInputState = &vi;        pi.pInputAssemblyState = &ia;
-        pi.pViewportState = &vp;           pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms;        pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState = &cb;         pi.pDynamicState       = &dynState;
-        pi.layout = s_GlassDistortLayout;
-
-        VkPipeline h = VK_NULL_HANDLE;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h) != VK_SUCCESS) {
-            Msg("![VK Particles] glass-distort pipeline failed (tcOffset=%u)", tcOffset);
-            return VK_NULL_HANDLE;
-        }
-        return h;
+        // Depth-tested but never written — occluded panes must not warp. Blend is
+        // the same straight alpha the haze sprites use.
+        return VK::GfxPipelineBuilder(s_GlassDistortLayout)
+            .Vert(s_GlassVS).Frag(s_GlassFS)
+            .Binding(0, 32)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+            .Depth(true, false)
+            .Color(kDistortFormat).BlendAlpha()
+            .DepthTarget(Swapchain.m_DepthFormat)
+            .Build("Particles glass-distort tcOffset=%u", tcOffset);
     }
 
     // Re-draw the glass panes into the (already begun) distortion pass.
@@ -312,57 +260,6 @@ namespace {
     VkPipeline BuildPipeline(EParticleBlendMode mode, bool distortTarget = false,
                              VkShaderModule fsOverride = VK_NULL_HANDLE)
     {
-        VkVertexInputBindingDescription bind{};
-        bind.binding   = 0;
-        bind.stride    = kVtxStride;
-        bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-        VkVertexInputAttributeDescription attrs[3]{};
-        attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0  };   // pos
-        attrs[1] = { 1, 0, VK_FORMAT_B8G8R8A8_UNORM,   12 };   // D3DCOLOR → logical RGBA
-        attrs[2] = { 2, 0, VK_FORMAT_R32G32_SFLOAT,    16 };   // uv
-
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount   = 1;
-        vi.pVertexBindingDescriptions      = &bind;
-        vi.vertexAttributeDescriptionCount = 3;
-        vi.pVertexAttributeDescriptions    = attrs;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = s_VS; stages[0].pName = "main";
-        stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = fsOverride ? fsOverride : s_FS; stages[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1;
-        vp.scissorCount  = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;     // billboards are double-sided
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;          // occluded by world geometry
-        ds.depthWriteEnable = VK_FALSE;         // transparent — don't write depth
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
         VkBlendFactor src, dst;
         if (distortTarget) { src = VK_BLEND_FACTOR_SRC_ALPHA; dst = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; }
         else               BlendFactors(mode, src, dst);
@@ -377,46 +274,18 @@ namespace {
         ba.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1;
-        cb.pAttachments    = &ba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2;
-        dynState.pDynamicStates    = dyn;
-
-        VkFormat colorFormat = distortTarget ? kDistortFormat : VK::SceneColor::Format();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &colorFormat;
-        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext               = &prci;
-        pi.stageCount          = 2;
-        pi.pStages             = stages;
-        pi.pVertexInputState   = &vi;
-        pi.pInputAssemblyState = &ia;
-        pi.pViewportState      = &vp;
-        pi.pRasterizationState = &rs;
-        pi.pMultisampleState   = &ms;
-        pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState    = &cb;
-        pi.pDynamicState       = &dynState;
-        pi.layout              = s_Layout;
-
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(),
-                                      1, &pi, nullptr, &pipe) != VK_SUCCESS) {
-            Msg("![VK Particles] pipeline create failed (blend=%d)", (int)mode);
-            return VK_NULL_HANDLE;
-        }
-        return pipe;
+        // Billboards are double-sided (cull NONE, the builder default), occluded by
+        // world geometry but transparent, so they test depth and never write it.
+        return VK::GfxPipelineBuilder(s_Layout)
+            .Vert(s_VS).Frag(fsOverride ? fsOverride : s_FS)
+            .Binding(0, kVtxStride)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)    // pos
+            .Attr(1, 0, VK_FORMAT_B8G8R8A8_UNORM,   12)   // D3DCOLOR → logical RGBA
+            .Attr(2, 0, VK_FORMAT_R32G32_SFLOAT,    16)   // uv
+            .Depth(true, false)
+            .ColorBlend(distortTarget ? kDistortFormat : VK::SceneColor::Format(), ba)
+            .DepthTarget(Swapchain.m_DepthFormat)
+            .Build("Particles blend=%d distort=%d", (int)mode, (int)distortTarget);
     }
 
     // (Re)point set 1 at Vol's scatter volume. Vol::Init runs before ParticlePass_Init
@@ -430,18 +299,7 @@ namespace {
         VkImageView view = Vol::GetScatterView();
         VkSampler   samp = Vol::GetSampler();
         if (!view || !samp || s_VolSet == VK_NULL_HANDLE) return;
-        VkDescriptorImageInfo ii{};
-        ii.sampler     = samp;
-        ii.imageView   = view;
-        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = s_VolSet;
-        w.dstBinding      = 0;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo      = &ii;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(s_VolSet).ImageSampler(0, view, samp).Flush();
         s_VolBoundGen = gen;
     }
 }
@@ -460,37 +318,17 @@ bool ParticlePass_Init()
 
     // Set 0: binding 0 = sprite (combined image sampler, FS).
     {
-        VkDescriptorSetLayoutBinding b{};
-        b.binding         = 0;
-        b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b.descriptorCount = 1;
-        b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutCreateInfo lci{};
-        lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        lci.bindingCount = 1;
-        lci.pBindings    = &b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
-            Msg("![VK Particles] CreateDescriptorSetLayout failed");
-            return false;
-        }
+        s_SetLayout = VK::MakeSetLayout({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },
+                                        VK_SHADER_STAGE_FRAGMENT_BIT, "Particles.Sprite");
+        if (s_SetLayout == VK_NULL_HANDLE) return false;
     }
 
     // Set 1: binding 0 = froxel scatter volume (combined image sampler, FS) — the
     // Stage-0 light probe. Always part of the layout; bound for every particle draw.
     {
-        VkDescriptorSetLayoutBinding b{};
-        b.binding         = 0;
-        b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b.descriptorCount = 1;
-        b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutCreateInfo lci{};
-        lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        lci.bindingCount = 1;
-        lci.pBindings    = &b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_VolSetLayout) != VK_SUCCESS) {
-            Msg("![VK Particles] vol set layout create failed");
-            return false;
-        }
+        s_VolSetLayout = VK::MakeSetLayout({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },
+                                           VK_SHADER_STAGE_FRAGMENT_BIT, "Particles.Vol");
+        if (s_VolSetLayout == VK_NULL_HANDLE) return false;
     }
 
     // Pool — one set per unique sprite texture (~256 generous) + 1 for the vol set.
@@ -746,18 +584,7 @@ VkDescriptorSet GetTextureSet(const char* texture_name)
         return VK_NULL_HANDLE;
     }
 
-    VkDescriptorImageInfo ii{};
-    ii.sampler     = s_Sampler;
-    ii.imageView   = entry.tex->GetView();
-    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet w{};
-    w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w.dstSet          = entry.set;
-    w.dstBinding      = 0;
-    w.descriptorCount = 1;
-    w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo      = &ii;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+    VK::DescriptorWriter(entry.set).ImageSampler(0, entry.tex->GetView(), s_Sampler).Flush();
 
     VkDescriptorSet set = entry.set;
     s_TexCache.emplace(std::move(key), entry);
@@ -912,7 +739,8 @@ void Pass_Particles(FrameContext& ctx)
     // and only on alpha-blended smoke — see drawList. The basis is built from the
     // scene camera even for the HUD phase (which pushes strength 0, so it's unused).
     EnsureVolSet();
-    const float smokeStrength = (Vol::Ready() && Vol::Wanted()) ? ps_r_vol_smoke : 0.0f;
+    const float smokeStrength = (Vol::Ready() && Vol::Wanted() && Vol::ProbeAvailableToGraphics())
+                              ? ps_r_vol_smoke : 0.0f;
 
     ParticlePush push{};
     {
@@ -978,29 +806,13 @@ void Pass_Particles(FrameContext& ctx)
 
     // ---- Phases 1+2: scene colour + world depth, no depth write -------------
     if (!s_world.empty() || !s_hud.empty()) {
-        VkRenderingAttachmentInfo cAtt{};
-        cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        cAtt.imageView   = ctx.colorView;
-        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+        VK::RenderingBuilder(ctx.extent)
+            .Color(ctx.colorView)
+            .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+            .Begin(cmd);
 
-        VkRenderingAttachmentInfo dAtt{};
-        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        dAtt.imageView   = ctx.depthView;
-        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-
-        VkRenderingInfo ri{};
-        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent    = ctx.extent;
-        ri.layerCount           = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments    = &cAtt;
-        ri.pDepthAttachment     = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-
+        // Kept explicit (not BeginFlipped): the HUD pass below re-submits this
+        // same viewport with a compressed depth range.
         VkViewport vp{};
         vp.x = 0.0f; vp.y = (float)ctx.extent.height;
         vp.width = (float)ctx.extent.width; vp.height = -(float)ctx.extent.height;
@@ -1038,37 +850,12 @@ void Pass_Particles(FrameContext& ctx)
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         s_DistortFirst = false;
 
-        VkRenderingAttachmentInfo cAtt{};
-        cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        cAtt.imageView   = s_DistortView;
-        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;       // neutral = no offset
-        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-        cAtt.clearValue.color = { { 0.5f, 0.5f, 0.5f, 0.0f } };
-
-        // World depth (LOAD, no write): haze behind walls must not bleed through.
-        VkRenderingAttachmentInfo dAtt{};
-        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        dAtt.imageView   = ctx.depthView;
-        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-
-        VkRenderingInfo ri{};
-        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent    = ctx.extent;
-        ri.layerCount           = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments    = &cAtt;
-        ri.pDepthAttachment     = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-
-        VkViewport vp{};
-        vp.x = 0.0f; vp.y = (float)ctx.extent.height;
-        vp.width = (float)ctx.extent.width; vp.height = -(float)ctx.extent.height;
-        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        vkCmdSetScissor(cmd, 0, 1, &sc);
+        // CLEAR to neutral (= no offset); world depth LOADed for the test only,
+        // so haze behind walls does not bleed through.
+        VK::RenderingBuilder(ctx.extent)
+            .ColorClear(s_DistortView, VkClearColorValue{ { 0.5f, 0.5f, 0.5f, 0.0f } })
+            .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+            .BeginFlipped(cmd);
 
         if (!s_distort.empty() && ctx.viewProj) {
             // distort writes UV offsets, not colour — no probe → strength 0.

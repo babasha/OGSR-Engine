@@ -6,6 +6,11 @@
 #include "light_ubo.glsl"          // DynLight + Lighting UBO (set 2 b0) + samplers (set 2 b1..13)
 #include "foliage_shadow.glsl"     // foliageLightShadow — foliage receives spot/point pool shadows
 #include "surface_class.glsl"      // SC_* classification + snow (foliage)
+#include "shore_wet.glsl"
+#include "ao_common.glsl"       // coloredAO (shared with env_common.glsl)          // shoreWetness — trunks and snags lying in water
+#include "common_math.glsl"     // EnvBRDFApprox — pure, shared with world/grass
+#include "ao_sampled.glsl"      // gtaoVisK / ssilBoost — after light_ubo.glsl (uAO/uIL/L)
+#include "shadow_math.glsl"     // cascTap — set-agnostic bilinear PCF tap
 
 // xrRenderVulkan - tree forward fragment shader. set 1/binding 0 = per-group
 // diffuse; trees are alpha-tested (punch-out leaves). set 2 = the shared per-frame
@@ -15,40 +20,9 @@
 layout(set = 1, binding = 0) uniform sampler2D uDiffuse;
 
 // GTAO - trees ARE in the prepass depth, so crowns/trunks get their own AO. HALF
-// the strength exponent (alpha-tested leaf depth is noisy at half-res).
-float gtaoVis()
-{
-    float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
-    return pow(clamp(ao, 0.0, 1.0), L.ao_params.z * 0.5);
-}
-
-// Colored AO - see world_lmap.frag (R4 tints foliage occlusion by its albedo).
-vec3 coloredAO(float ao, vec3 albedo)
-{
-    vec3 a =  2.0404 * albedo - 0.3324;
-    vec3 b = -4.7951 * albedo + 0.6417;
-    vec3 c =  2.7552 * albedo + 0.6903;
-    return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
-}
-
-// SSIL ambient boost - see env_common.glsl (SSFX hdiffuse *= IL). 0/no-op where
-// there's no bounce or r_ssil is off; uIL is binding 21 (light_ubo.glsl).
-vec3 ssilBoost()
-{
-    vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
-    return vec3(1.0) + il / (1.0 + il);
-}
-
-// Bilinear-gather cascade tap - same as world_lmap's cascTap.
-float cascTap(sampler2D smap, vec2 uv, float ref)
-{
-    vec2 sz = vec2(textureSize(smap, 0));
-    vec2 t  = uv * sz - 0.5;
-    vec2 f  = fract(t);
-    vec4 d  = textureGather(smap, (floor(t) + 1.0) / sz, 0);
-    vec4 c  = step(vec4(ref), d);
-    return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
-}
+// the strength exponent (alpha-tested leaf depth is noisy at half-res) — that is
+// the gtaoVisK(0.5) at the shading site below. gtaoVisK/ssilBoost live in
+// ao_sampled.glsl, cascTap in shadow_math.glsl (both included above).
 
 // One cascade lookup; -1.0 when outside (1% UV inset). Single tap - foliage.
 float cascSample1(sampler2D smap, mat4 vp, vec3 wp, float bias_)
@@ -70,24 +44,19 @@ float cascSample1(sampler2D smap, mat4 vp, vec3 wp, float bias_)
 // Sky specular sheen for the canopy (r_ibl). Leaves have no normal, so a real
 // reflection is meaningless — instead give the crown a soft view-dependent sky
 // sheen (up-reflected, high roughness = blurry), gated by per-tree sky openness
-// (vLight.x) and boosted when wet. Karis EnvBRDFApprox (local copy of env_common).
-vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
-{
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
-    const vec4 c1 = vec4( 1.0,  0.0425,  1.040, -0.040);
-    vec4  r    = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
-    vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
-    return F0 * ab.x + ab.y;
-}
-vec3 canopySkySheen(vec3 wp, float openness)
+// (vLight.x) and boosted when wet. Karis EnvBRDFApprox → common_math.glsl.
+// ⚠wetF is passed IN, not looked up here. This function used to call shoreWet(wp)
+// itself while main() called it again eight lines later — two independent lookups
+// of the same answer at the same position, and shoreWet is up to five texture taps
+// (one level-water + four hand-filtered tile taps). On a fill-bound pass that is
+// the cheapest kind of waste there is: pure duplication, no picture attached.
+vec3 canopySkySheen(vec3 wp, float openness, float wetF)
 {
     if (L.ibl_params.x < 0.004) return vec3(0.0);
     const vec3 up = vec3(0.0, 1.0, 0.0);
     vec3  V   = normalize(L.eye_pos.xyz - wp);
     float NoV = clamp(dot(up, V), 0.0, 1.0);
     vec3  R   = reflect(-V, up);
-    float wetF  = clamp(L.rain_params.y, 0.0, 1.0);
     float rough = mix(0.7, 0.5, wetF);
     vec3  pref  = textureLod(uSkySpec, R, rough * L.ibl_params.z).rgb;
     // Subtle when dry, glistens when wet; × canopy openness so inner/shaded leaves stay matte.
@@ -95,50 +64,27 @@ vec3 canopySkySheen(vec3 wp, float openness)
          * (L.ibl_params.x * L.ibl_params.y * openness * (0.12 + 0.88 * wetF));
 }
 
-// Foliage variant: leaves have no per-pixel normal -> attenuation-only.
-vec3 dynLightsFoliage(vec3 wp)
-{
-    vec3 acc = vec3(0.0);
-    int n = int(L.counts.x + 0.5);
-    for (int i = 0; i < n; ++i) {
-        vec3  dv = L.lights[i].pos.xyz - wp;
-        float r  = L.lights[i].pos.w;
-        float d2 = dot(dv, dv);
-        if (d2 >= r * r) continue;
-        float d   = sqrt(max(d2, 1e-6));
-        // Narrow beams: windowed falloff (far half still lights) — light_shade.glsl.
-        float att;
-        if (L.lights[i].color.w > 0.5 && L.lights[i].dir.w > 0.87) {
-            att = 1.0 - (d2 / (r * r));
-            att *= att;
-        } else {
-            att = 1.0 - d / r;
-            att *= att;
-        }
-        if (L.lights[i].color.w > 0.5) {
-            // Narrow beams: full inside the cone + spill to 2x the angle — see
-            // light_shade.glsl (axis-peaked ramp left beam-lit foliage dark).
-            float ca = dot(-dv / d, L.lights[i].dir.xyz);
-            float ci = L.lights[i].dir.w;
-            if (ci > 0.87) {
-                float co = 2.0 * ci * ci - 1.0;
-                att *= clamp((ca - co) / max(ci - co, 1e-3), 0.0, 1.0);
-            } else
-                att *= clamp((ca - ci) / max(1.0 - ci, 1e-3), 0.0, 1.0);
-        }
-        // Dynamic shadow (spot tile / point cube) — see detail.frag.
-        att *= foliageLightShadow(i, wp);
-        acc += L.lights[i].color.rgb * (att * 0.7);
-    }
-    return acc;
-}
+// dynLightsFoliage → foliage_shadow.glsl (shared with the other foliage pass).
 
+// Prefix of VK::TreeGfxPush / tree_gfx_push.glsl — offsets must match that block.
 layout(push_constant) uniform PC {
     mat4  mViewProj;
     float uvScale;
     float alphaRef;
     float statsOn;    // 1 = mark the visible-tree bitset (r_profiler diagnostics)
+    float shadeDist;  // r_tree_shade_dist — metres past which the subtle terms are dropped (0 = never)
 } pc;
+
+// DISTANCE TIER for the subtle per-pixel terms — see r_tree_shade_dist in
+// vk_console_min.cpp for why the FRAGMENT shader is the lever on this pass.
+// Returns 1 near, fading to 0 over the last quarter of the band. The fade matters:
+// a hard radius draws a ring through the forest that slides with the camera,
+// whereas a fade only ever removes a term that was already almost gone.
+float shadeTier(float dist)
+{
+    if (pc.shadeDist <= 0.0) return 1.0;                       // r_tree_shade_dist 0 = tier disabled
+    return 1.0 - smoothstep(pc.shadeDist * 0.75, pc.shadeDist, dist);
+}
 
 layout(location = 0) in vec2 vUV;
 layout(location = 1) in vec3 vLight;
@@ -209,16 +155,40 @@ void main()
         sunPart *= sunSh;
     }
 
+    // ---- Distance tier ----
+    // camDist is needed by the fog below anyway, so the tier costs one compare.
+    // `near` is a UNIFORM branch across a distant crown (every fragment of one tree
+    // is at roughly one distance), so the skipped work is genuinely skipped rather
+    // than executed under a mask by half the warp.
+    float camDist = distance(vWPos, L.eye_pos.xyz);
+    float tier    = shadeTier(camDist);
+    bool  near_   = tier > 0.0031;   // below ~1/320 the term cannot move an 8-bit channel
+
+    // Soaked is DARK — see detail.frag. Wet bark is markedly darker than dry, and
+    // for a trunk lying in the water that boundary IS the effect. ONE lookup now,
+    // shared with the sheen below; the debug view forces it at any range so
+    // r_wtr_wet still shows the map rather than the tier.
+    float sw = (near_ || shoreWetDebug()) ? shoreWet(vWPos) : 0.0;
+    if (shoreWetDebug()) { outColor = vec4(sw, sw * 0.3, 0.0, 1.0); return; }   // red = wet
+    sw *= tier;
+
     // Ambient = sky-cube light x per-tree openness (vLight.x). x0.75 keeps the old
     // grass:tree ambient ratio. L.ambient = real env ambient (carries r_ambient_floor).
+    // SSIL is a screen-space BOUNCE, i.e. a multiplier that trends to 1 — so the
+    // tier fades it toward 1, not toward 0.
+    vec3 ssil    = near_ ? mix(vec3(1.0), ssilBoost(), tier) : vec3(1.0);
     vec3 ambient = (skyAmbientUp() * (vLight.x * L.sky_params.y * 0.75) + L.ambient.rgb)
-                 * coloredAO(gtaoVis(), diff.rgb) * ssilBoost();   // + SSIL bounce (ambient only)
+                 * coloredAO(gtaoVisK(0.5), diff.rgb) * ssil;
 
-    vec3 sheen = canopySkySheen(vWPos, vLight.x);   // sky specular sheen (r_ibl)
-    vec3 col = diff.rgb * (ambient + sunPart + dynLightsFoliage(vWPos)) + sheen;
+    // Rain OR standing water — a fallen trunk lying in a river is soaked where it lies.
+    float wetF  = max(clamp(L.rain_params.y, 0.0, 1.0), sw);
+    vec3  sheen = near_ ? canopySkySheen(vWPos, vLight.x, wetF) * tier : vec3(0.0);   // sky specular sheen (r_ibl)
+    vec3  dynl  = near_ ? dynLightsFoliage(vWPos) * tier : vec3(0.0);                 // point/spot walk + 1-tap shadows
+    vec3  col   = diff.rgb * (ambient + sunPart + dynl) + sheen;
+    col *= 1.0 - 0.65 * sw;
 
     // Distance fog (R4).
-    float fog = clamp(length(vWPos - L.eye_pos.xyz) * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
+    float fog = clamp(camDist * L.fog_params.w + L.fog_params.x, 0.0, 1.0);
     col = mix(col, L.fog_color.rgb, fog);
 
     if (L.ibl_params.w > 0.5) { outColor = vec4(sheen, 1.0); return; }   // r_ibl_debug

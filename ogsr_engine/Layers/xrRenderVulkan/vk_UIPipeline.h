@@ -29,6 +29,11 @@ namespace VulkanUI
     void EndUIPass();
     void BeginUIPassInternal();
     void ReplayDeferredUI();
+    // Prints the next <lines> UI-pass transitions (`ui_pass_trace 200`). Every
+    // early-out in BeginUIPassInternal looks the same from outside -- "no UI this
+    // frame" -- and one of them used to end in a driver fault, so the state
+    // machine needs to be able to say which one it took.
+    void TraceUIPass(u32 lines);
 
     // Per-frame ring rotation: selects this in-flight slot's vertex-buffer
     // region and resets the write offset. MUST be called from CRender::Begin
@@ -46,6 +51,14 @@ namespace VulkanUI
     extern u32             s_VBBase;           // byte base of this frame-slot's region
     extern VkDescriptorSet s_WhiteTextureSet;
     extern bool            s_bUIPassActive;
+    // ⚠⚠Has the scene of THIS frame been recorded yet? UI drawn before it must
+    // not open a render pass, because the scene would then record its barriers,
+    // its query resets and its own vkCmdBeginRendering INSIDE that pass -- and
+    // the frame dies a few commands later. Cleared per frame, raised at the end
+    // of CRender::Render. Until it is up, every UI draw takes the deferred queue
+    // and is replayed by CRender::End, on top of the finished image, which is
+    // both safe and where UI belongs anyway. See the note in CRender::Render.
+    extern bool            s_SceneDone;
     extern VkPipeline      s_Pipeline;          // TRIANGLE_LIST
     extern VkPipeline      s_PipelineLineList;   // LINE_LIST  (crosshair)
     extern VkPipeline      s_PipelineLineStrip;  // LINE_STRIP (UIWindow borders)

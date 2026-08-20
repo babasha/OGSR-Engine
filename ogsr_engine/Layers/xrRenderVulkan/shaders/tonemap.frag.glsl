@@ -22,50 +22,20 @@ layout(set = 0, binding = 1) uniform sampler2D uBloom;   // blurred bright-pass 
 layout(set = 0, binding = 2) uniform sampler2D uDistort; // particle heat-haze offsets (rg, neutral 0.5)
 layout(set = 0, binding = 3) uniform sampler2D uDepth;   // scene depth (SSR puddles)
 layout(set = 0, binding = 4) uniform sampler3D uVolume;  // integrated volumetrics (rgb=in-scatter, a=transmittance)
-layout(set = 0, binding = 5) uniform sampler2D uIL;      // SSIL — half-res one-bounce indirect light (HDR, pre-exposure)
+layout(set = 0, binding = 5) uniform sampler2D uILScene;      // SSIL — half-res one-bounce indirect light (HDR, pre-exposure)
 layout(set = 0, binding = 6) uniform sampler2D uResolved;// RESOLVED base colour at DISPLAY res (DLSS output when upscaling, else == uHDR mip0)
 
 // Shared per-frame environment set (same UBO/set the world shaders read at
 // set 1) — the SSR puddles need the rain mask/VP, the wetness factor and the
 // camera frustum terms. Layout MUST match vk_env_light.h LightUBO.
-struct DynLight {
-    vec4 pos;
-    vec4 color;
-    vec4 dir;
-};
-layout(set = 1, binding = 0) uniform Lighting {
-    vec4 sun_dir;
-    vec4 sun_color;
-    vec4 hemi_color;
-    vec4 ambient;
-    mat4 sun_vp;
-    vec4 counts;
-    DynLight lights[16];
-    mat4 spot_vp;
-    vec4 shadow_params;
-    mat4 sun_near_vp;
-    mat4 sun_c1_vp;
-    vec4 fog_color;
-    vec4 fog_params;
-    vec4 eye_pos;
-    vec4 sky_params;     // w = ripple clock
-    vec4 ao_params;
-    mat4 rain_vp;        // straight-down ortho VP for the rain occlusion map
-    vec4 rain_params;    // x=rain density, y=wetness, z=darken (<0 = debug), w=refl scale
-    mat4 scene_vp;       // this frame's view-proj (world - clip)
-    vec4 cam_dir;        // xyz = camera forward, w = proj _33
-    vec4 cam_rightT;     // xyz = right x tan(fovX/2), w = proj _43
-    vec4 cam_topT;       // xyz = top x tan(fovY/2)
-    vec4 pom_params;     // (declared for layout — unused here)
-    vec4 pom_params2;
-    vec4 pom_params3;
-    vec4 pom_params4;
-    vec4 pom_params5;
-    vec4 pom_params6;    // x=water-sim enable, y=murk extinction (/m), z=refraction scale
-    vec4 pom_params7;    // SSS puddles: x=enable, y=level, z=micro, w=macro scale
-} L;
-layout(set = 1, binding = 9)  uniform sampler2D uRainMap; // top-down rain occlusion
-layout(set = 1, binding = 11) uniform sampler2D uWater;   // water depth (flow sim, metres)
+// Shared per-frame environment set (the SAME UBO + samplers the world shaders
+// read at set 1 — vk_pass_tonemap binds EnvLight::GetSetLayout() there). The SSR
+// puddles need the rain mask/VP, the wetness factor and the camera frustum terms.
+//
+// This used to be a hand-copied 29-field PREFIX of that UBO. A prefix only stays
+// correct while every new field is appended at the TAIL; one insertion in the
+// middle of light_ubo.glsl would have shifted everything here with no diagnostic.
+#include "light_ubo.glsl"     // Lighting UBO (set 1 b0) + the set-1 samplers
 layout(set = 1, binding = 14) uniform sampler2D uVsmMask; // VSM screen mask (B = dyn-atlas occlusion, r_vsm_debug_dyn overlay)
 
 layout(push_constant) uniform PC {
@@ -392,7 +362,7 @@ void main()
     // term, SSFX-style — see light_ubo.glsl), not here. The tonemap only offers a
     // visualization of the raw bounce buffer the receivers consume.
     if (pc.p5.y > 0.5) {
-        vec3 il = textureLod(uIL, uv, 0.0).rgb;
+        vec3 il = textureLod(uILScene, uv, 0.0).rgb;
         il = il / (1.0 + il);   // SSFX compression → [0,1) so HDR bounce stays visible
         outColor = vec4(pow(clamp(il, 0.0, 1.0), vec3(pc.p2.z)), 1.0);
         return;

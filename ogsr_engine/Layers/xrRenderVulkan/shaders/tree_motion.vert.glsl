@@ -10,14 +10,7 @@
 layout(location = 0) in vec3 aPos;   // local-space position
 layout(location = 1) in vec2 aUV;    // SHORT2 SSCALED raw int16 → float
 
-struct TreeInstance {
-    mat4  xform;        // 64 B per-instance world transform
-    float c_scale_hemi;
-    float c_bias_hemi;
-    uint  _p0;          // wind class (2=foliage, 1=trunk, 0=rigid)
-    uint  _p1;
-};
-layout(set = 0, binding = 0, std430) readonly buffer XformBuf { TreeInstance inst[]; };
+#include "tree_instance.glsl"   // TreeInstance + XformBuf (set 0 b0) — matches VK::GpuTreeInstance
 
 layout(push_constant) uniform PC {
     mat4  curVP;              // 0    this frame's view-proj, UNJITTERED (jitter-free MV)
@@ -40,16 +33,8 @@ layout(location = 0) out vec4 vCurClip;
 layout(location = 1) out vec4 vPrevClip;
 layout(location = 2) out vec2 vUV;
 
-// World-space wind displacement — mirrors tree.vert exactly (phase = baseY).
-vec3 windDisp(vec3 wp, float H, float tc_y, uint cls, float baseY,
-              vec4 wparams, vec4 wsetup, vec4 wanim)
-{
-    float r    = -wparams.x + 1.57079;
-    vec2  wdir = vec2(cos(r), sin(r));
-    float spd  = max(wsetup.w, clamp(wparams.y * 0.001, 0.0, 1.0));
-    return ssfxTreeWind(cls, wp, H, tc_y, wdir, spd, baseY,
-                        wanim.xyz, wsetup.x, wsetup.y, wsetup.z, wanim.w, wparams.w);
-}
+// windDisp -> ssfxTreeWindWorld in ssfx_tree_wind.glsl (shared with every tree pass;
+// the motion pass calls it TWICE, once per frame's wind params, for the velocity).
 
 void main()
 {
@@ -62,10 +47,10 @@ void main()
     uint  cls   = t._p0;
 
     // Current pose — exactly tree.vert's displacement → depth bit-matches.
-    vec3 curWorld  = base + windDisp(base, H, tc_y, cls, baseY,
+    vec3 curWorld  = base + ssfxTreeWindWorld(base, H, tc_y, cls, baseY,
                                      pc.wind_params, pc.wsetup_trees, pc.wind_anim);
     // Previous pose — last frame's wind params + drift (the sway delta).
-    vec3 prevWorld = base + windDisp(base, H, tc_y, cls, baseY,
+    vec3 prevWorld = base + ssfxTreeWindWorld(base, H, tc_y, cls, baseY,
                                      pc.wind_params_prev, pc.wsetup_trees_prev, pc.wind_anim_prev);
 
     vCurClip    = pc.curVP  * vec4(curWorld,  1.0);   // unjittered → clean MV

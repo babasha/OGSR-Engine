@@ -57,6 +57,16 @@ u8   GetFrameSpecMask();
 // work remains (keep calling); false when the queue is drained.
 bool PrewarmWeatherVariants(u32 budget);
 
+// Is the weather prewarm still owed work? True before the first call has snapshotted
+// the list (nothing has started yet) and while the queue holds keys. The precache
+// countdown asks this: those frames exist to spread these compiles, so once the
+// queue is dry there is nothing left for them to warm.
+bool PrewarmPending();
+
+// Move the pipelines the prewarm worker finished into the live cache. Render
+// thread only, once a frame -- Get() reads the map this writes.
+void PrewarmDrain();
+
 struct Key
 {
     u32             stride       = 0;       // vertex stride in bytes (32 / 36 / 40 / 44)

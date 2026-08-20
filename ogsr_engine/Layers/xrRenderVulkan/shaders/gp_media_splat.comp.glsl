@@ -47,16 +47,7 @@ layout(push_constant) uniform Push {
     vec4 params;     // x = pool capacity (bounds guard), y = density scale, z = max footprint (cells)
 } pc;
 
-void depositCell(ivec3 c, ivec3 dim, float dens, vec3 col)
-{
-    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, dim))) return;
-    uint cell = (uint(c.z) * uint(dim.y) + uint(c.y)) * uint(dim.x) + uint(c.x);
-    float sc = pc.dims.w;
-    atomicAdd(accum[cell * 4u + 0u], uint(dens * sc));
-    atomicAdd(accum[cell * 4u + 1u], uint(dens * col.r * sc));
-    atomicAdd(accum[cell * 4u + 2u], uint(dens * col.g * sc));
-    atomicAdd(accum[cell * 4u + 3u], uint(dens * col.b * sc));
-}
+#include "splat_common.glsl"   // depositCell + splatFootprint — shared with vol_splat
 
 void main()
 {
@@ -101,23 +92,12 @@ void main()
     vec3  col = max(col4.rgb, vec3(0.0));
 
     vec3  fc = vec3(uv.x * float(dim.x), uv.y * float(dim.y), w * float(dim.z));
-    ivec3 ci = ivec3(floor(fc));
 
+    // Same footprint rule as vol_splat — only the radius source differs (a GPU
+    // particle has a billboard size, not a stored world radius).
     float radius    = (p.size.x + p.size.y) * 0.25;   // avg billboard half-extent
     float cellWorld = 2.0 * length(pc.camRightT.xyz) * viewZ / float(dim.x);
     int   fr = min(int(radius / max(cellWorld, 1e-3)), int(pc.params.z));
 
-    if (fr <= 0) {
-        depositCell(clamp(ci, ivec3(0), dim - 1), dim, dens, col);
-    } else {
-        float sig2 = max(float(fr) * float(fr) * 0.5, 0.25);
-        for (int dz = -fr; dz <= fr; ++dz)
-        for (int dy = -fr; dy <= fr; ++dy)
-        for (int dx = -fr; dx <= fr; ++dx) {
-            ivec3 c   = ci + ivec3(dx, dy, dz);
-            vec3  off = (vec3(c) + 0.5) - fc;
-            float wgt = exp(-dot(off, off) / sig2);
-            if (wgt > 0.02) depositCell(c, dim, dens * wgt, col);
-        }
-    }
+    splatFootprint(fc, dim, fr, dens, col);
 }

@@ -19,6 +19,10 @@
 #include "vk_terrain_cache.h"   // TerrainCache capture (composite ground cache)
 #include "vk_buffer.h"          // CVulkanBuffer
 #include "vk_pipeline_cache.h"  // PipelineCache pipelines/layouts
+#include "vk_compute_util.h"    // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"    // VK::GfxPipelineBuilder
+#include "vk_descriptors.h"     // VK::DescriptorWriter
+#include "vk_parallel.h"        // VK::ParallelChunks — per-mesh resolves run on the idle cores
 #include "vk_env_light.h"       // EnvLight::GetCurrentSet (set 1, terrain snow-depth)
 #include "vk_vrs.h"             // SubStats* — r_fsinv_split terrain/mesh attribution
 #include "vk_scene_color.h"     // HDR scene target format (cluster debug overlay)
@@ -31,12 +35,16 @@
 #include "../../../3rd_party/Src/meshoptimizer/demo/clusterlod.h"    // clodBuild — Nanite-style DAG (impl in vk_meshopt.cpp)
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>   // LeafVisuals: dedup for the XROS_LEAFWALK_FULL cross-check
+#include <cstdlib>         // std::getenv — XROS_LEAFWALK_FULL
 #include <atomic>
 #include <thread>
 
 extern int ps_r_cluster;        // cluster-granularity cull (Phase 1 of cluster-LOD) — read at Build
 extern int ps_r_cluster_tris;   // min triangles before a mesh is split into clusters
 extern int ps_r_cluster_merge;  // Phase 2.5: merge touching solid fragments into one component DAG — read at Build
+extern int ps_r_cluster_cache;  // 0 = ignore the on-disk DAG cache and always rebake (repro aid)
+
 extern float ps_r_cluster_lod;  // DAG-cut px error threshold (Phase 2) — live, read per frame
 extern float ps_r_vsm_cluster_lod;   // Phase 3 shadow LOD quality k (error budget in target texels) — live
 extern float ps_r_cluster_fade; // crossfade band as a fraction of the threshold (0 = hard cut) — live
@@ -146,6 +154,11 @@ CVulkanBuffer* s_count2    = nullptr;  // numGroups u32 (occlusion set)
 VkDescriptorSetLayout s_setL2  = VK_NULL_HANDLE;
 VkDescriptorPool      s_pool2  = VK_NULL_HANDLE;
 VkDescriptorSet       s_set2   = VK_NULL_HANDLE;
+// What binding 3 (the Hi-Z pyramid) currently holds — s_set2 is single while
+// several frames are in flight, so CullColor rewrites it only when this changes.
+VkImageView s_hzbBoundView    = VK_NULL_HANDLE;
+VkSampler   s_hzbBoundSampler = VK_NULL_HANDLE;
+u32         s_hzbBoundGen     = 0xFFFFFFFFu;
 VkPipelineLayout      s_cullLayout2 = VK_NULL_HANDLE;
 VkPipeline            s_cullPipe2   = VK_NULL_HANDLE;
 
@@ -246,20 +259,91 @@ void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
     vkCmdPipelineBarrier(cmd, ss, ds, 0, 1, &b, 0, nullptr, 0, nullptr);
 }
 
-// Recursively partition ALL renderable STATIC world-mesh leaves into:
+// The level's leaf visuals, walked ONCE for every load-time consumer — see
+// LeafVisuals() in the header for why. `s_leaves` is first-seen ordered and
+// deduped; the recursion below is the only place that touches the tree.
+xr_vector<vkFVisual*> s_leaves;
+bool                  s_leavesReady = false;
+
+void CollectLeaves(vkRender_Visual* rv, std::unordered_set<void*>& seen)
+{
+    if (!rv) return;
+
+    // Type-dispatch instead of dynamic_cast. vkVisual_Create is the single place
+    // that maps MT_* to a class, and the mapping is exact — so RTTI here was
+    // ~700k __RTDynamicCast calls answering a question the Type field already
+    // answers. The default arm keeps RTTI for anything outside that mapping.
+    vkFVisual* fv = nullptr;
+    switch (rv->Type) {
+    case MT_HIERRARHY:
+    case MT_LOD:
+        // vkFHierrarhyVisual and vkFLOD (derived) — the only container classes.
+        // Their children are getVisual() REFERENCES into Visuals[], so the same
+        // leaf arrives both directly and through its container: hence the
+        // seen-set, which every one of the old separate walks kept for itself.
+        for (auto* child : static_cast<vkFHierrarhyVisual*>(rv)->children)
+            CollectLeaves(child, seen);
+        return;
+    case MT_NORMAL:
+    case MT_PROGRESSIVE:
+    case MT_TREE_ST:
+    case MT_TREE_PM:
+        fv = static_cast<vkFVisual*>(rv);   // vkFVisual / vkFProgressive / vkFTreeVisual_*
+        break;
+    default:
+        // Skeletons, particles, the dummy: no level seen so far puts them in
+        // Visuals[] (the MT_* tally accounts for every entry), but ask rather
+        // than assume — this arm is cold by construction.
+        fv = dynamic_cast<vkFVisual*>(rv);
+        break;
+    }
+    if (!fv) return;
+    if (!seen.insert(fv).second) return;
+    s_leaves.push_back(fv);
+}
+
+// Partition the renderable STATIC world-mesh leaves into:
 //   gpuOut — opaque/AT meshes the GPU forward path can draw (have a material set +
 //            diffuse, not wmark/tess) → compute-culled + indirect-drawn.
 //   cpuOut — everything else still renderable (wmark decals, tessellated, no diffuse
 //            / no material) → drawn by the CPU RenderQueue (Flush handles them).
 // gpuOut ∪ cpuOut = exactly what the old full CPU walk drew (deduped), so nothing
-// is lost. Descends MT_HIERRARHY/MT_LOD (getVisual references; deduped by caller).
+// is lost. Called per entry of LeafVisuals() (which did the recursion + dedup).
 // Trees/skeletons/particles are other passes → skipped entirely.
-void ExtractMeshes(vkRender_Visual* rv, xr_vector<vkFVisual*>& gpuOut, xr_vector<vkFVisual*>& cpuOut)
+u32 s_cpuWhyNoMat = 0, s_cpuWhyWmark = 0, s_cpuWhyWater = 0, s_cpuWhyTess = 0, s_cpuWhyNoView = 0;
+
+// Input validation for clodBuild — the one call in the load that can turn bad
+// data into HEAP CORRUPTION rather than a wrong picture. meshopt's
+// buildTriangleAdjacency does `counts[indices[i]]++` over an array sized by
+// vertex_count, with the bounds check compiled out in release: a single index
+// past the end writes into somebody else's allocation, and the crash surfaces
+// later somewhere unrelated (a visual's vtable, in the case that started this).
+// Cheap next to a 27 s bake, and it names the mesh instead of leaving a dump.
+bool ValidateClodInput(const char* path, const clodMesh& cm, size_t attrFloats, size_t lockBytes,
+                       const char* who)
 {
-    if (!rv) return;
-    const u32 t = rv->Type;
+    const char* bad = nullptr;
+    if (cm.vertex_count == 0)                     bad = "vertex_count == 0";
+    else if (cm.index_count == 0)                 bad = "index_count == 0";
+    else if (cm.index_count % 3)                  bad = "index_count not a multiple of 3";
+    else if (attrFloats < (size_t)cm.vertex_count * 7) bad = "attribute array shorter than vertex_count";
+    else if (lockBytes  < (size_t)cm.vertex_count)     bad = "vertex_lock shorter than vertex_count";
+    if (!bad) {
+        for (size_t i = 0; i < cm.index_count; ++i)
+            if (cm.indices[i] >= cm.vertex_count) { bad = "index >= vertex_count"; break; }
+    }
+    if (!bad) return true;
+    Msg("!![VK Cluster] %s unit REJECTED (%s): verts=%u idx=%u attrs=%u lock=%u %s",
+        path, bad, (u32)cm.vertex_count, (u32)cm.index_count, (u32)attrFloats, (u32)lockBytes,
+        who ? who : "");
+    return false;
+}
+
+void ExtractMeshes(vkFVisual* fv, xr_vector<vkFVisual*>& gpuOut, xr_vector<vkFVisual*>& cpuOut)
+
+{
+    const u32 t = fv->Type;
     if (t == MT_NORMAL || t == MT_PROGRESSIVE) {
-        auto* fv = static_cast<vkFVisual*>(rv);
         if (!fv->m_mesh.IsValid() || !fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) return;  // not renderable
         WorldMaterial* mat = fv->m_pWorldMaterial;
         // `tessellated` = the material HAS a height texture (every bump-mapped
@@ -270,18 +354,26 @@ void ExtractMeshes(vkRender_Visual* rv, xr_vector<vkFVisual*>& gpuOut, xr_vector
         // of the building geometry (and the cluster-LOD coverage with it).
         // Flipping r_tess later only takes effect on statics after level reload.
         const bool tessActive = PipelineCache::TessAvailable() && ps_r_tess > 0.5f;
-        const bool gpuOk = mat && !mat->isWmark && !(mat->tessellated && tessActive)
+        // isWmark already covers water (it shares the marker), but state it
+        // explicitly: water has its OWN pipeline and shader in Pass_Water, and a
+        // silent fallthrough here would draw it a second time as opaque geometry.
+        const bool gpuOk = mat && !mat->isWmark && !mat->isWater && !(mat->tessellated && tessActive)
                         && (mat->view != VK_NULL_HANDLE || mat->isTerrain);
         if (gpuOk) gpuOut.push_back(fv);
-        else       cpuOut.push_back(fv);
-        return;
+        else {
+            // Which clause rejected it. The set is NOT stable across loads of the
+            // same level (see the cluster-cache superset note) — these counters are
+            // what name the drifting clause instead of leaving it to guesswork.
+            if (!mat)                              ++s_cpuWhyNoMat;
+            else if (mat->isWater)                 ++s_cpuWhyWater;
+            else if (mat->isWmark)                 ++s_cpuWhyWmark;
+            else if (mat->tessellated && tessActive) ++s_cpuWhyTess;
+            else                                   ++s_cpuWhyNoView;
+            cpuOut.push_back(fv);
+        }
+
     }
-    if (t == MT_HIERRARHY || t == MT_LOD) {
-        auto* hv = dynamic_cast<vkFHierrarhyVisual*>(rv);
-        if (!hv) return;
-        for (auto* child : hv->children)
-            ExtractMeshes(child, gpuOut, cpuOut);
-    }
+    // Other leaf types (trees, skeletons, particles) belong to other passes.
 }
 
 // ============================================================================
@@ -306,7 +398,8 @@ bool ReadbackBuffer(VkBuffer src, VkDeviceSize size, xr_vector<u8>& out)
 {
     if (src == VK_NULL_HANDLE || size == 0) return false;
     CVulkanBuffer stg;
-    stg.Create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    stg.Create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+               false, false, /*hostRead*/ true);   // cached: this mapping is READ
     VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
     if (cmd == VK_NULL_HANDLE) { stg.Destroy(); return false; }
     VkBufferCopy cp{ 0, 0, size };
@@ -425,7 +518,19 @@ bool LoadClusterCache(const xr_vector<vkFVisual*>& eligMeshes,
         if (h.magic != kClusterCacheMagic) { missWhy = "bad magic"; break; }
         if (h.params != ClusterParamsHash()) { missWhy = "params/version changed"; break; }
         if (h.stamp != stamp) { missWhy = "level.geom stamp changed"; break; }
-        if (h.meshCount != (u32)eligMeshes.size()) { missWhy = "mesh count differs"; break; }
+        // SUPERSET is a hit, not a miss. The eligible set is not a property of the
+        // level alone: WorldMaterial flags (isWmark/isWater/glass/emissive) are
+        // upgraded in place and the material cache outlives a level change, so
+        // re-entering a level classifies a handful of meshes differently than the
+        // first visit did — measured: 84 of 100896 move from the GPU set to the CPU
+        // set, every time. Records are matched by KEY below and duplicates are
+        // already legal, so a cache holding MORE meshes than we ask for serves all
+        // of them correctly; the per-key loop is what actually proves the hit.
+        // Insisting on equality here meant a 27 s rebake on every repeat load, and
+        // that rebake then SAVED the smaller set — poisoning the cache for the next
+        // fresh process, which then rebaked too.
+        if (h.meshCount < (u32)eligMeshes.size()) { missWhy = "cache has fewer meshes than the level needs"; break; }
+
 
         // Records carry inline entry lists (variable length) — read sequentially.
         struct Rec { CacheMeshRec r; xr_vector<u32> entries; };
@@ -595,7 +700,8 @@ void BuildClusters(const xr_vector<vkFVisual*>& meshes,
     if (eligMeshes.empty()) return;
 
     // Disk cache: on a hit the whole readback + clodBuild is skipped.
-    if (LoadClusterCache(eligMeshes, outMeta, outIdx16, outIdx32, outRanges)) {
+    if (ps_r_cluster_cache && LoadClusterCache(eligMeshes, outMeta, outIdx16, outIdx32, outRanges)) {
+
         Msg("[VK Cluster] DAG loaded from cache: %u meshes, %u entries", (u32)outRanges.size(), (u32)outMeta.size());
         return;
     }
@@ -831,7 +937,8 @@ void BuildClusters(const xr_vector<vkFVisual*>& meshes,
     if (units.empty()) {   // nothing clusterable — save the (empty) result so reloads skip the readback
         s_pageDir.clear();
         s_pageDir.push_back({ ClusterStream::kPagePinned, 0, 0, 0, 0 });   // identity page only
-        SaveClusterCache(eligMeshes, outMeta, outIdx16, outIdx32, outVbBlob, outRanges, s_pageDir);
+        if (ps_r_cluster_cache)
+            SaveClusterCache(eligMeshes, outMeta, outIdx16, outIdx32, outVbBlob, outRanges, s_pageDir);
         return;
     }
 
@@ -998,7 +1105,12 @@ void BuildClusters(const xr_vector<vkFVisual*>& meshes,
                 cm.attribute_count         = 3;
                 cm.attribute_protect_mask  = (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6);   // both UV sets
 
+                if (!ValidateClodInput("per-mesh", cm, attrs.size(), vlock.size(),
+                                       e.fv->dbg_name.c_str() ? e.fv->dbg_name.c_str() : "?"))
+                    continue;
+
                 const u32    metaFirst = (u32)out.meta.size();
+
                 const size_t idxFirst  = out.idx16.size();
                 u32 sim = 0, stall = 0;
                 clodBuild(cfg, cm, [&](clodGroup g, const clodCluster* cs, size_t n) -> int {
@@ -1105,7 +1217,15 @@ void BuildClusters(const xr_vector<vkFVisual*>& meshes,
             cm.attribute_count          = 3;
             cm.attribute_protect_mask   = 0;   // protect bits self-computed above (intra-mesh only)
 
+            {
+                string64 who;
+                xr_sprintf(who, "component of %u meshes", nMembers);
+                if (!ValidateClodInput("component", cm, attrs.size(), vlock.size(), who))
+                    continue;
+            }
+
             const u32    metaFirst = (u32)out.meta.size();
+
             const size_t idxFirst  = out.idx32.size();
             xr_vector<xr_vector<u32>> memberEntries(nMembers);
             u32 clustersEmitted = 0;
@@ -1298,7 +1418,10 @@ void BuildClusters(const xr_vector<vkFVisual*>& meshes,
         ClusterStream::AssemblePages(outMeta, entryIb32, entryMesh, meshInfo, sources,
                                      outIdx16, outIdx32, outVbBlob, s_pageDir);
     }
-    SaveClusterCache(eligMeshes, outMeta, outIdx16, outIdx32, outVbBlob, outRanges, s_pageDir);
+    // r_cluster_cache 0 is a REPRO switch, not a policy: it must not also overwrite the
+    // on-disk cache with whatever this particular load happened to classify.
+    if (ps_r_cluster_cache)
+        SaveClusterCache(eligMeshes, outMeta, outIdx16, outIdx32, outVbBlob, outRanges, s_pageDir);
 }
 
 
@@ -1311,52 +1434,28 @@ bool CreateCullPipeline()
     // 0 meta, 1 cmds, 2 counts, 3 groupBase, + Stage B: 4 stream bits,
     // 5 page slot bases, 6 page requests (feedback), 7 touched-page bitset.
     constexpr u32 kB = 8;
-    VkDescriptorSetLayoutBinding b[kB]{};
-    for (u32 i = 0; i < kB; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = kB; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL) != VK_SUCCESS) return false;
-
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kB };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) return false;
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                1, s_setL, s_pool, &s_set,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "WorldGPU.Cull"))
+        return false;
     VK::Prof::NameSet(s_set, "WorldGPU.Set");   // TEMP diag: VUID hunt
 
-    VkDescriptorBufferInfo bi[kB] = {
-        { s_meta->GetHandle(),                  0, VK_WHOLE_SIZE },
-        { s_indirect->GetHandle(),              0, VK_WHOLE_SIZE },
-        { s_count->GetHandle(),                 0, VK_WHOLE_SIZE },
-        { s_groupBase->GetHandle(),             0, VK_WHOLE_SIZE },
-        { ClusterStream::BitsBuffer(),          0, VK_WHOLE_SIZE },
-        { ClusterStream::SlotBaseBuffer(),      0, VK_WHOLE_SIZE },
-        { ClusterStream::RequestBuffer(),       0, VK_WHOLE_SIZE },
-        { ClusterStream::TouchedBuffer(),       0, VK_WHOLE_SIZE },
+    const VkBuffer bufs[kB] = {
+        s_meta->GetHandle(),             s_indirect->GetHandle(),
+        s_count->GetHandle(),            s_groupBase->GetHandle(),
+        ClusterStream::BitsBuffer(),     ClusterStream::SlotBaseBuffer(),
+        ClusterStream::RequestBuffer(),  ClusterStream::TouchedBuffer(),
     };
-    VkWriteDescriptorSet w[kB]{};
-    for (u32 i = 0; i < kB; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set; w[i].dstBinding = i;
-        w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, kB, w, 0, nullptr);
+    VK::DescriptorWriter dw(s_set);
+    for (u32 i = 0; i < kB; ++i) dw.StorageBuffer(i, bufs[i]);
+    dw.Flush();
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_cullLayout) != VK_SUCCESS) return false;
+    s_cullLayout = VK::MakePipelineLayout({ s_setL }, sizeof(CullPush));
+    if (!s_cullLayout) return false;
 
-    VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module = cs; cp.stage.pName = "main";
-    cp.layout = s_cullLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &s_cullPipe) != VK_SUCCESS) return false;
-    return true;
+    s_cullPipe = VK::CreateComputePipeline(cs, s_cullLayout, "WorldGPU.Cull");
+    return s_cullPipe != VK_NULL_HANDLE;
 }
 
 // Shadow cull pipeline (world_cull_shadow.comp): 4 SSBOs — meta (0), the
@@ -1370,49 +1469,26 @@ bool CreateShadowCullPipeline()
     // 0 meta, 1 per-target indirect, 2 per-target counts, 3 groupBase,
     // + Stage B: 4 stream bits, 5 page slot bases (no requests — main view asks).
     constexpr u32 kB3 = 6;
-    VkDescriptorSetLayoutBinding b[kB3]{};
-    for (u32 i = 0; i < kB3; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = kB3; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL3) != VK_SUCCESS) return false;
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                1, s_setL3, s_pool3, &s_set3,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "WorldGPU.CullShadow"))
+        return false;
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kB3 };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool3) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool3; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setL3;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set3) != VK_SUCCESS) return false;
-
-    VkDescriptorBufferInfo bi[kB3] = {
-        { s_meta->GetHandle(),             0, VK_WHOLE_SIZE },
-        { s_indirectSh->GetHandle(),       0, VK_WHOLE_SIZE },
-        { s_countSh->GetHandle(),          0, VK_WHOLE_SIZE },
-        { s_groupBase->GetHandle(),        0, VK_WHOLE_SIZE },
-        { ClusterStream::BitsBuffer(),     0, VK_WHOLE_SIZE },
-        { ClusterStream::SlotBaseBuffer(), 0, VK_WHOLE_SIZE },
+    const VkBuffer bufs[kB3] = {
+        s_meta->GetHandle(),         s_indirectSh->GetHandle(),
+        s_countSh->GetHandle(),      s_groupBase->GetHandle(),
+        ClusterStream::BitsBuffer(), ClusterStream::SlotBaseBuffer(),
     };
-    VkWriteDescriptorSet w[kB3]{};
-    for (u32 i = 0; i < kB3; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set3; w[i].dstBinding = i;
-        w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, kB3, w, 0, nullptr);
+    VK::DescriptorWriter dw(s_set3);
+    for (u32 i = 0; i < kB3; ++i) dw.StorageBuffer(i, bufs[i]);
+    dw.Flush();
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullShadowPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL3; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_cullLayout3) != VK_SUCCESS) return false;
+    s_cullLayout3 = VK::MakePipelineLayout({ s_setL3 }, sizeof(CullShadowPush));
+    if (!s_cullLayout3) return false;
 
-    VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module = cs; cp.stage.pName = "main";
-    cp.layout = s_cullLayout3;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &s_cullPipe3) != VK_SUCCESS) return false;
-    return true;
+    s_cullPipe3 = VK::CreateComputePipeline(cs, s_cullLayout3, "WorldGPU.CullShadow");
+    return s_cullPipe3 != VK_NULL_HANDLE;
 }
 
 // Hi-Z occlusion cull pipeline (world_cull_hzb.comp). 4 bindings: meta (0),
@@ -1428,57 +1504,93 @@ bool CreateCullColorPipeline()
 
     // 0 meta, 1 cmds2, 2 count2, 3 HZB (per-frame), 4 groupBase,
     // + Stage B: 5 stream bits, 6 page slot bases.
-    constexpr u32 kB2 = 7;
-    VkDescriptorSetLayoutBinding b[kB2]{};
-    for (u32 i = 0; i < kB2; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   // HZB
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = kB2; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL2) != VK_SUCCESS) return false;
-
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kB2 - 1 }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool2) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool2; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setL2;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set2) != VK_SUCCESS) return false;
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO,
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,   // 3 = HZB
+                                  kSSBO, kSSBO, kSSBO },
+                                1, s_setL2, s_pool2, &s_set2,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "WorldGPU.CullColor"))
+        return false;
     VK::Prof::NameSet(s_set2, "WorldGPU.Set2");   // TEMP diag: VUID hunt
+    // Fresh set → binding 3 is unwritten. Invalidate the cache so the first
+    // CullColor writes it (a level reload lands here with stale statics).
+    s_hzbBoundView = VK_NULL_HANDLE; s_hzbBoundSampler = VK_NULL_HANDLE; s_hzbBoundGen = 0xFFFFFFFFu;
 
-    const u32 dstBind[6] = { 0, 1, 2, 4, 5, 6 };   // 3 = HZB, written per-frame
-    VkDescriptorBufferInfo bi[6] = {
-        { s_meta->GetHandle(),             0, VK_WHOLE_SIZE },
-        { s_indirect2->GetHandle(),        0, VK_WHOLE_SIZE },
-        { s_count2->GetHandle(),           0, VK_WHOLE_SIZE },
-        { s_groupBase->GetHandle(),        0, VK_WHOLE_SIZE },
-        { ClusterStream::BitsBuffer(),     0, VK_WHOLE_SIZE },
-        { ClusterStream::SlotBaseBuffer(), 0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet w[6]{};
-    for (u32 i = 0; i < 6; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set2;
-        w[i].dstBinding = dstBind[i];
-        w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);   // binding 3 (HZB) written per-frame
+    // binding 3 = HZB, written on change (see CullColor)
+    VK::DescriptorWriter(s_set2)
+        .StorageBuffer(0, s_meta->GetHandle())
+        .StorageBuffer(1, s_indirect2->GetHandle())
+        .StorageBuffer(2, s_count2->GetHandle())
+        .StorageBuffer(4, s_groupBase->GetHandle())
+        .StorageBuffer(5, ClusterStream::BitsBuffer())
+        .StorageBuffer(6, ClusterStream::SlotBaseBuffer())
+        .Flush();
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CullColorPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL2; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_cullLayout2) != VK_SUCCESS) return false;
+    s_cullLayout2 = VK::MakePipelineLayout({ s_setL2 }, sizeof(CullColorPush));
+    if (!s_cullLayout2) return false;
 
-    VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cp.stage.module = cs; cp.stage.pName = "main";
-    cp.layout = s_cullLayout2;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cp, nullptr, &s_cullPipe2) != VK_SUCCESS) return false;
-    return true;
+    s_cullPipe2 = VK::CreateComputePipeline(cs, s_cullLayout2, "WorldGPU.CullColor");
+    return s_cullPipe2 != VK_NULL_HANDLE;
 }
 
 } // anonymous namespace
+
+const xr_vector<vkFVisual*>& LeafVisuals()
+{
+    if (s_leavesReady) return s_leaves;
+    s_leavesReady = true;
+
+    CTimer t; t.Start();
+    s_leaves.clear();
+    s_leaves.reserve(RImplementation.Visuals.size());
+
+    // FLAT pass, no recursion and no dedup set. A container's children are
+    // getVisual(id) results — i.e. ELEMENTS OF Visuals[] — so every leaf a
+    // recursion could reach is already a top-level entry, and Visuals[] holds each
+    // object once. That makes the recursive walk a much more expensive way to
+    // compute the same set: on pripyat_full both produce exactly 295 773 leaves
+    // (= 95248 MT_NORMAL + 7054 MT_PROGRESSIVE + 87848 MT_TREE_ST + 105623
+    // MT_TREE_PM, which is every leaf-typed entry), and the flat pass avoids
+    // ~700k hash inserts plus the recursion itself.
+    // ⚠If a future level ever wraps a visual that is NOT in Visuals[], this would
+    // miss it — set XROS_LEAFWALK_FULL=1 to run the old recursive walk instead and
+    // compare the two counts in the log.
+    static const bool s_full = [] {
+        const char* e = std::getenv("XROS_LEAFWALK_FULL");
+        return e && e[0] && e[0] != '0';
+    }();
+
+    if (s_full) {
+        std::unordered_set<void*> seen;
+        seen.reserve(RImplementation.Visuals.size() * 2);
+        for (IRenderVisual* iv : RImplementation.Visuals)
+            CollectLeaves(static_cast<vkRender_Visual*>(iv), seen);
+    } else {
+        for (IRenderVisual* iv : RImplementation.Visuals) {
+            auto* rv = static_cast<vkRender_Visual*>(iv);
+            if (!rv) continue;
+            switch (rv->Type) {
+            case MT_NORMAL: case MT_PROGRESSIVE: case MT_TREE_ST: case MT_TREE_PM:
+                s_leaves.push_back(static_cast<vkFVisual*>(rv));
+                break;
+            default: break;   // containers (recursed into nothing new) and non-mesh types
+            }
+        }
+    }
+
+    Msg("[load step]   LeafVisuals: %u roots -> %u unique leaves in %.0f ms (%s; shared by Build/CompactPools/ShadowGPU/TerrainMask)",
+        (u32)RImplementation.Visuals.size(), (u32)s_leaves.size(), t.GetElapsed_ms_total(),
+        s_full ? "recursive walk, XROS_LEAFWALK_FULL" : "flat pass");
+    return s_leaves;
+}
+
+void ReleaseLeafVisuals()
+{
+    // 450k pointers = ~3.6 MB, and it must not survive into the spawn phase:
+    // dynamic objects register their own visuals after this point.
+    xr_vector<vkFVisual*>().swap(s_leaves);
+    s_leavesReady = false;
+}
 
 void Build()
 {
@@ -1489,10 +1601,23 @@ void Build()
     s_compactRefs.clear();
     s_poolsCompacted = false;
 
+    // Sub-timers (`[load step]`, one line at the end). Build measured 1248 ms of a
+    // 19.5 s load as ONE bucket; three of the blocks below are pure diagnostics, so
+    // the split has to exist before anything here is called expensive.
+    CTimer _b; _b.Start();
+    float msExtract = 0, msPools = 0, msSort = 0, msSwi = 0, msGroup = 0,
+          msValid = 0, msCut = 0, msMetaCopy = 0, msState = 0, msBufs = 0;
+
     xr_vector<vkFVisual*> meshes; meshes.reserve(16384);
     xr_vector<vkFVisual*> cpu;    cpu.reserve(8192);
-    for (IRenderVisual* iv : RImplementation.Visuals)
-        ExtractMeshes(static_cast<vkRender_Visual*>(iv), meshes, cpu);
+    s_cpuWhyNoMat = s_cpuWhyWmark = s_cpuWhyWater = s_cpuWhyTess = s_cpuWhyNoView = 0;
+    for (vkFVisual* fv : LeafVisuals())
+        ExtractMeshes(fv, meshes, cpu);
+    Msg("[VK WorldGPU] cpu-set reasons: no-material=%u water=%u wmark=%u tess=%u no-view=%u",
+        s_cpuWhyNoMat, s_cpuWhyWater, s_cpuWhyWmark, s_cpuWhyTess, s_cpuWhyNoView);
+
+    // LeafVisuals() is already deduped; the sorts stay because s_meshSet/InSet
+    // need pointer order (unique() is now a no-op that costs one pass).
     std::sort(meshes.begin(), meshes.end());
     meshes.erase(std::unique(meshes.begin(), meshes.end()), meshes.end());
     // CPU (non-GPU) static leaves — pre-built + deduped so the per-frame path walks
@@ -1506,6 +1631,7 @@ void Build()
     // Pointer-sorted membership set (meshes is currently sorted by pointer +
     // deduped) for InSet() — the CPU queue excludes these to avoid double-draw.
     s_meshSet.assign(meshes.begin(), meshes.end());
+    msExtract = _b.GetElapsed_ms_total();
 
     // Cluster split (r_cluster): build the per-cluster meta pool + shared
     // cluster IBs BEFORE grouping — clustered meshes bind s_clusterIB (u16,
@@ -1528,6 +1654,7 @@ void Build()
     // page pools — pinned pages install here; the rest streams by GPU feedback
     // (or everything, when r_clpage 0 / no cache file = pre-streaming parity).
     // Slice 2: repacked cluster vertices live in the ClusterStream vertex pool.
+    _b.Start();
     if (!ClusterStream::CreatePools(s_pageDir, s_cachePath, s_blobOff16, s_blobOff32, s_blobOffVb,
                                     &clusterIdx16, &clusterIdx32, &clusterVbBlob)) {
         Msg("![VK Cluster] page pools failed — clusters disabled (plain meshes only)");
@@ -1543,19 +1670,32 @@ void Build()
             clustered.clear();
         }
     }
-    auto effectiveIB = [&](vkFVisual* a) -> VkBuffer {
-        auto it = clustered.find(a);
-        if (it == clustered.end()) return a->m_mesh.p_rm_Indices->GetHandle();
-        return it->second.ib32 ? ClusterStream::PoolIB32() : ClusterStream::PoolIB16();
+    msPools = _b.GetElapsed_ms_total();
+
+    // Every mesh asks `clustered` (an xr_map = red-black tree over 50k meshes)
+    // the same question up to seven times: twice for the sort key, once per
+    // effectiveVB/IB in the grouping walk, once more in appendEntries. Resolve
+    // it ONCE per mesh, on the idle cores (find is read-only), and carry the
+    // answer alongside the mesh from here on.
+    xr_vector<const MeshEntries*> clOf(meshes.size(), nullptr);
+    ParallelChunks((int)meshes.size(), [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+            auto it = clustered.find(meshes[i]);
+            clOf[i] = (it == clustered.end()) ? nullptr : &it->second;
+        }
+    });
+
+    auto effectiveIB = [&](const MeshEntries* cl, vkFVisual* a) -> VkBuffer {
+        if (!cl) return a->m_mesh.p_rm_Indices->GetHandle();
+        return cl->ib32 ? ClusterStream::PoolIB32() : ClusterStream::PoolIB16();
     };
     // Slice 2: a clustered mesh whose entries were vertex-repacked (its first
     // entry's page carries a VB payload — the flag is uniform per mesh by
     // construction) draws from the ClusterStream vertex pool; everything else
     // keeps its original pool VB. Same layout/stride — only the binding moves.
-    auto effectiveVB = [&](vkFVisual* a) -> VkBuffer {
-        auto it = clustered.find(a);
-        if (it != clustered.end() && !it->second.entries.empty()) {
-            const u32 pg = clusterMeta[it->second.entries[0]]._pad1;
+    auto effectiveVB = [&](const MeshEntries* cl, vkFVisual* a) -> VkBuffer {
+        if (cl && !cl->entries.empty()) {
+            const u32 pg = clusterMeta[cl->entries[0]]._pad1;
             if (pg < (u32)s_pageDir.size() && (s_pageDir[pg].flags & ClusterStream::kPageHasVB)
                 && ClusterStream::PoolVB() != VK_NULL_HANDLE)
                 return ClusterStream::PoolVB();
@@ -1567,16 +1707,40 @@ void Build()
     // tcOffset, effective vb, effective ib) so a run shares pipeline + descriptor
     // set + buffer binds. Clustered meshes separate naturally (their ib/vb =
     // the ClusterStream pools).
-    auto key = [&](vkFVisual* a) {
-        return std::make_tuple(a->m_pWorldMaterial->isTerrain ? 0 : 1,
-                               (const void*)a->m_pWorldMaterial,
-                               a->m_mesh.vStride, a->m_mesh.tcOffset,
-                               (const void*)effectiveVB(a),
-                               (const void*)effectiveIB(a));
+    // Keys are MATERIALIZED first, then sorted. effectiveVB/effectiveIB each do an
+    // xr_map (= std::map) lookup, and computing the key inside the comparator meant
+    // ~4 tree lookups per comparison — measured 280 ms of the 18-08 load. Now it is
+    // two lookups per mesh, total. The visual* is the last key component so the
+    // order is total (ties used to resolve arbitrarily, which decided WHICH terrain
+    // mesh seed() hands to the TerrainCache probe — now that pick is reproducible).
+    _b.Start();
+    struct SortKey {
+        u32 terrain, stride, tcOffset;
+        const void *mat, *vb, *ib;
+        vkFVisual*  fv;
+        const MeshEntries* cl;   // rides along so the grouping walk keeps it
+        bool operator<(const SortKey& o) const {
+            return std::tie(  terrain,   mat,   stride,   tcOffset,   vb,   ib,   fv)
+                 < std::tie(o.terrain, o.mat, o.stride, o.tcOffset, o.vb, o.ib, o.fv);
+        }
     };
-    std::sort(meshes.begin(), meshes.end(), [&](vkFVisual* a, vkFVisual* b) { return key(a) < key(b); });
+    xr_vector<SortKey> order; order.resize(meshes.size());
+    ParallelChunks((int)meshes.size(), [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+            vkFVisual* a = meshes[i];
+            order[i] = { a->m_pWorldMaterial->isTerrain ? 0u : 1u,
+                         a->m_mesh.vStride, a->m_mesh.tcOffset,
+                         (const void*)a->m_pWorldMaterial,
+                         (const void*)effectiveVB(clOf[i], a), (const void*)effectiveIB(clOf[i], a),
+                         a, clOf[i] };
+        }
+    });
+    std::sort(order.begin(), order.end());
+    for (size_t i = 0; i < order.size(); ++i) { meshes[i] = order[i].fv; clOf[i] = order[i].cl; }
+    msSort = _b.GetElapsed_ms_total();
 
     const u32 nMeshes = (u32)meshes.size();
+    _b.Start();
 
     // DIAG (one-shot): SWI LOD-level distribution of the GPU-set progressive meshes.
     // Tells us if there are INTERMEDIATE LODs (sw_count>2) to grade through (smooth,
@@ -1607,6 +1771,7 @@ void Build()
             Msg("[VK WorldGPU] SWI-LOD: no progressive meshes in the GPU set");
         }
     }
+    msSwi = _b.GetElapsed_ms_total();
 
     // Grouping walk: one pass over the sorted meshes builds the groups AND the
     // meta array in entry order — an entry is either the whole mesh (drawn slice
@@ -1615,23 +1780,22 @@ void Build()
     xr_vector<GpuMeshMeta> meta;
     meta.reserve(nMeshes + clusterMeta.size());
 
-    auto appendEntries = [&](vkFVisual* fv) {
+    auto appendEntries = [&](vkFVisual* fv, const MeshEntries* cl) {
         // Hard-cut flag: alpha-tested materials draw the prepass through the AT
         // pipeline, which has no dither — their transitions stay instant. Set
         // here (not at cluster build) so the disk cache stays material-agnostic.
         const u32 flags = (fv->m_pWorldMaterial->alphaRef >= 0.f) ? 1u : 0u;
-        auto it = clustered.find(fv);
         // Pool-compaction bookkeeping: remember this mesh's meta run + how its
         // entries reference the original pools (CompactPools patches by these).
         CompactRef ref{};
         ref.fv        = fv;
         ref.metaFirst = (u32)meta.size();
-        ref.clustered = (it != clustered.end()) ? 1 : 0;
-        ref.ib32      = (ref.clustered && it->second.ib32) ? 1 : 0;
-        ref.repacked  = (ref.clustered && effectiveVB(fv) == ClusterStream::PoolVB()
+        ref.clustered = cl ? 1 : 0;
+        ref.ib32      = (cl && cl->ib32) ? 1 : 0;
+        ref.repacked  = (cl && effectiveVB(cl, fv) == ClusterStream::PoolVB()
                          && ClusterStream::PoolVB() != VK_NULL_HANDLE) ? 1 : 0;
-        if (it != clustered.end()) {
-            for (u32 ei : it->second.entries) {
+        if (cl) {
+            for (u32 ei : cl->entries) {
                 GpuMeshMeta e = clusterMeta[ei];
                 e.flags = flags;
                 meta.push_back(e);
@@ -1658,6 +1822,7 @@ void Build()
         s_compactRefs.push_back(ref);
     };
 
+    _b.Start();
     s_groups.clear();
     Group cur{};
     auto seed = [&](u32 i) {
@@ -1666,11 +1831,11 @@ void Build()
         cur.terrain  = fv->m_pWorldMaterial->isTerrain;
         cur.stride   = fv->m_mesh.vStride;
         cur.tcOffset = fv->m_mesh.tcOffset;
-        cur.vb       = effectiveVB(fv);
-        cur.ib       = effectiveIB(fv);
-        auto itc = clustered.find(fv);
-        cur.iType    = itc == clustered.end() ? fv->m_mesh.iType
-                     : (itc->second.ib32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+        const MeshEntries* cl = clOf[i];
+        cur.vb       = effectiveVB(cl, fv);
+        cur.ib       = effectiveIB(cl, fv);
+        cur.iType    = !cl ? fv->m_mesh.iType
+                     : (cl->ib32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
         cur.meshCount   = 1;
         cur.entryOffset = (u32)meta.size();
         cur.entryCount  = 0;   // finalized when the group closes
@@ -1685,16 +1850,16 @@ void Build()
                                         fv->m_mesh.vBase, cur.stride, cur.tcOffset);
         }
     };
-    seed(0); appendEntries(meshes[0]);
+    seed(0); appendEntries(meshes[0], clOf[0]);
     for (u32 i = 1; i < nMeshes; ++i) {
         vkFVisual* fv = meshes[i];
         const bool same = fv->m_pWorldMaterial == cur.mat
             && fv->m_mesh.vStride == cur.stride && fv->m_mesh.tcOffset == cur.tcOffset
-            && effectiveVB(fv) == cur.vb
-            && effectiveIB(fv) == cur.ib;
+            && effectiveVB(clOf[i], fv) == cur.vb
+            && effectiveIB(clOf[i], fv) == cur.ib;
         if (same) cur.meshCount++;
         else { cur.entryCount = (u32)meta.size() - cur.entryOffset; s_groups.push_back(cur); seed(i); }
-        appendEntries(fv);
+        appendEntries(fv, clOf[i]);
     }
     cur.entryCount = (u32)meta.size() - cur.entryOffset;
     s_groups.push_back(cur);
@@ -1704,6 +1869,8 @@ void Build()
     for (u32 g = 0; g < nGroups; ++g)
         for (u32 e = s_groups[g].entryOffset; e < s_groups[g].entryOffset + s_groups[g].entryCount; ++e)
             meta[e].group = g;
+    msGroup = _b.GetElapsed_ms_total();
+    _b.Start();
 
     {   // Slice-2 VB-BINDING VALIDATOR (bisected bug: occasional white stretched
         // polygons / missing walls). The cull adds the page VB base to first_vertex
@@ -1746,8 +1913,20 @@ void Build()
             s_total, nGroups, poolVB != VK_NULL_HANDLE ? "yes" : "no", nMis, nFv);
         if (nMis || nFv) Msg("![VK ClVB] ^^ THIS is the white-polygon / missing-wall bug");
     }
+    msValid = _b.GetElapsed_ms_total();
+    _b.Start();
 
-    {   // LOD-cut data sanity: parentError histogram (meters) + parent sphere radii.
+    // LOD-cut sanity + the cut invariant: two full passes over 830k entries that
+    // READ meta and nothing else. BuildState below also only reads it, so the
+    // diagnostic rides along on its own thread and is joined afterwards — it
+    // costs wall time only if it outlives the state build. Msg() stays on this
+    // thread: the worker fills the counters, the print happens after the join.
+    u32 dgInf = 0, dgH100 = 0, dgH10 = 0, dgH1 = 0, dgH01 = 0, dgSm = 0, dgLevel0 = 0, dgHoles = 0;
+    float dgRmax = 0.f; double dgRsum = 0.0;
+    float msCutThread = 0.f;
+    std::thread cutDiagThread([&] {
+        CTimer _d; _d.Start();
+        {   // LOD-cut data sanity: parentError histogram (meters) + parent sphere radii.
         // An entry can only ever be REPLACED by its parent if parentError is finite
         // and the camera can get beyond the parent sphere (dist - r > 0).
         u32 hInf = 0, h100 = 0, h10 = 0, h1 = 0, h01 = 0, hSm = 0, level0 = 0;
@@ -1762,9 +1941,8 @@ void Build()
             else                               ++hSm;
             if (m.parentError < kErrInf) { rMax = _max(rMax, m.lodParent.w); rSum += m.lodParent.w; }
         }
-        const u32 fin = s_total - hInf;
-        Msg("[VK Cluster] cut diag: %u entries (%u level-0) | parentError: INF=%u >100m=%u 10-100=%u 1-10=%u 0.1-1=%u <0.1=%u | parent sphere r avg=%.1f max=%.1f",
-            s_total, level0, hInf, h100, h10, h1, h01, hSm, fin ? rSum / fin : 0.0, rMax);
+        dgInf = hInf; dgH100 = h100; dgH10 = h10; dgH1 = h1; dgH01 = h01; dgSm = hSm;
+        dgLevel0 = level0; dgRmax = rMax; dgRsum = rSum;
 
         // Cut COMPLEMENTARITY invariant (Nanite: "parents are all dependent"): a
         // child hides exactly when its (lodParent, parentError) projects small,
@@ -1782,32 +1960,62 @@ void Build()
                 mix(*(const u32*)&err);
                 return h;
             };
-            xr_set<u64> selfKeys;
+            // Sorted vector, not xr_set: this runs over EVERY cull entry (830k on
+            // pripyat_full) and a red-black tree spent ~40 ms of load doing it. Same
+            // membership test, same result  one sort plus binary searches.
+            xr_vector<u64> selfKeys;
+            selfKeys.reserve(meta.size());
             for (const GpuMeshMeta& m : meta)
-                if (m.selfError > 0.f) selfKeys.insert(key(m.lodSelf, m.selfError));
+                if (m.selfError > 0.f) selfKeys.push_back(key(m.lodSelf, m.selfError));
+            std::sort(selfKeys.begin(), selfKeys.end());
+            selfKeys.erase(std::unique(selfKeys.begin(), selfKeys.end()), selfKeys.end());
             u32 holes = 0;
             for (const GpuMeshMeta& m : meta)
-                if (m.parentError < kErrInf && selfKeys.find(key(m.lodParent, m.parentError)) == selfKeys.end()) ++holes;
-            if (holes)
-                // Legal source: a group fully pruned to nothing (lone-shell units
-                // dissolve into nothing by design) — expect a SMALL, stable count.
-                // A jump after a builder/cache change = bitwise mismatch = popping
-                // holes at the swap distance; bisect the change.
-                Msg("[VK Cluster] cut invariant: %u/%u entries dissolve to nothing (no parent-level entry)", holes, s_total);
+                if (m.parentError < kErrInf
+                    && !std::binary_search(selfKeys.begin(), selfKeys.end(), key(m.lodParent, m.parentError))) ++holes;
+            dgHoles = holes;
         }
-    }
+        }
+        msCutThread = _d.GetElapsed_ms_total();
+    });
 
+    msCut = _b.GetElapsed_ms_total();   // the fork itself; the wait is measured at the join
+    _b.Start();
     s_metaCPU = meta;   // host copy: the stats tick simulates the cut CPU-side (diag)
+    msMetaCopy = _b.GetElapsed_ms_total();
+    _b.Start();
 
     // Stage B state (phase 2): group/liveness tables + residency bits + feedback
     // buffers over the FINAL entry array. The cull shaders bind these — failure
     // means the new cull pipelines can't run, so the whole GPU path steps aside
     // (CPU queue draws everything, like a cull-pipeline failure).
-    if (!ClusterStream::BuildState(meta)) {
+    const bool stateOk = ClusterStream::BuildState(meta);
+    msState = _b.GetElapsed_ms_total();
+
+    // Join BEFORE anything can return: the worker reads `meta`, a local.
+    _b.Start();
+    cutDiagThread.join();
+    msCut += _b.GetElapsed_ms_total();
+    {
+        const u32 fin = s_total - dgInf;
+        Msg("[VK Cluster] cut diag: %u entries (%u level-0) | parentError: INF=%u >100m=%u 10-100=%u 1-10=%u 0.1-1=%u <0.1=%u | parent sphere r avg=%.1f max=%.1f",
+            s_total, dgLevel0, dgInf, dgH100, dgH10, dgH1, dgH01, dgSm,
+            fin ? dgRsum / fin : 0.0, dgRmax);
+        if (dgHoles)
+            // Legal source: a group fully pruned to nothing (lone-shell units
+            // dissolve into nothing by design) — expect a SMALL, stable count.
+            // A jump after a builder/cache change = bitwise mismatch = popping
+            // holes at the swap distance; bisect the change.
+            Msg("[VK Cluster] cut invariant: %u/%u entries dissolve to nothing (no parent-level entry)", dgHoles, s_total);
+    }
+
+    if (!stateOk) {
         Msg("![VK WorldGPU] cluster-stream state failed — GPU world path disabled");
         s_groups.clear();
         return;
     }
+
+    _b.Start();
 
     // meta SSBO (device-local)
     s_meta = xr_new<CVulkanBuffer>();
@@ -1895,8 +2103,12 @@ void Build()
                 (unsigned long long)(bci.size >> 20));
     }
 
+    msBufs = _b.GetElapsed_ms_total();
     Msg("[VK WorldGPU] built: %u GPU meshes -> %u cull entries, %u groups | cpu-set=%u (non-GPU static leaves) | occlusion=%d",
         nMeshes, s_total, nGroups, (u32)s_cpuMeshes.size(), s_occlReady ? 1 : 0);
+    Msg("[load step]   WorldGPU::Build: extract %.0f | clusters %llu | pools %.0f | sort %.0f | swiDiag %.0f | group %.0f | vbDiag %.0f | cutDiagWait %.0f (thread %.0f) | metaCopy %.0f | state %.0f | bufs+pipes %.0f ms",
+        msExtract, (unsigned long long)clusterMs, msPools, msSort, msSwi, msGroup,
+        msValid, msCut, msCutThread, msMetaCopy, msState, msBufs);
     if (!clustered.empty()) {
         u32 mergedMeshes = 0;
         for (const auto& kv : clustered) if (kv.second.ib32) ++mergedMeshes;
@@ -2208,7 +2420,7 @@ void Cull(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& camPos, c
 bool OcclusionReady() { return s_occlReady; }
 
 void CullColor(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& cameraPos,
-               VkImageView hzbView, VkSampler hzbSampler)
+               VkImageView hzbView, VkSampler hzbSampler, u32 hzbGen)
 {
     if (!Built() || !s_occlReady) return;
     if (hzbView == VK_NULL_HANDLE || hzbSampler == VK_NULL_HANDLE) return;
@@ -2263,14 +2475,23 @@ void CullColor(VkCommandBuffer cmd, const Fmatrix& viewProj, const Fvector& came
     }
 
     // Point binding 3 at this frame's HZB (view/sampler can change on resize).
-    VkDescriptorImageInfo hi{};
-    hi.sampler     = hzbSampler;
-    hi.imageView   = hzbView;
-    hi.imageLayout = VK_IMAGE_LAYOUT_GENERAL;   // HZB lives in GENERAL (see CreateHZB)
-    VkWriteDescriptorSet hw{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    hw.dstSet = s_set2; hw.dstBinding = 3; hw.descriptorCount = 1;
-    hw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; hw.pImageInfo = &hi;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &hw, 0, nullptr);
+    // HZB lives in GENERAL (see CreateHZB).
+    // ⚠ ONLY ON CHANGE. s_set2 is a SINGLE descriptor set while VK_FRAMES_IN_FLIGHT
+    // frames are in flight: rewriting it every frame updates a set that command
+    // buffers still executing on the GPU reference — UB, and the source of the
+    // live-descriptor validation errors (VUID-vkUpdateDescriptorSets-None-03047,
+    // dstBinding 3) that were being written off as another subsystem's noise. The
+    // tree cull's binding-4 write documents the same trap. Keyed on the GENERATION
+    // as well as the handle: Destroy+Create can return the same VkImageView value,
+    // and a handle-only check would then keep a descriptor bound to a dead object.
+    if (hzbView != s_hzbBoundView || hzbSampler != s_hzbBoundSampler || hzbGen != s_hzbBoundGen) {
+        VK::DescriptorWriter(s_set2)
+            .ImageSampler(3, hzbView, hzbSampler, VK_IMAGE_LAYOUT_GENERAL)
+            .Flush();
+        s_hzbBoundView    = hzbView;
+        s_hzbBoundSampler = hzbSampler;
+        s_hzbBoundGen     = hzbGen;
+    }
 
     // WAR-guard vs the previous frame's indirect reads of cmds2/count2
     // (TRANSFER src stage: the cmd-audit copy also reads them).
@@ -2655,77 +2876,33 @@ VkPipeline GetDebugPipeline(u32 stride, bool line)
 
     if (s_dbgLayout == VK_NULL_HANDLE) {
         // Set 0 = meta SSBO (VS reads parentError for the mode-4 health view).
-        VkDescriptorSetLayoutBinding db{};
-        db.binding = 0; db.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        db.descriptorCount = 1; db.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-        VkDescriptorSetLayoutCreateInfo dlci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        dlci.bindingCount = 1; dlci.pBindings = &db;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &dlci, nullptr, &s_dbgSetL) != VK_SUCCESS) { s_dbgFailed = true; return VK_NULL_HANDLE; }
-        VkDescriptorPoolSize dps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
-        VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &dps;
-        if (vkCreateDescriptorPool(VulkanHW.m_Device, &dpci, nullptr, &s_dbgPool) != VK_SUCCESS) { s_dbgFailed = true; return VK_NULL_HANDLE; }
-        VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dsai.descriptorPool = s_dbgPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &s_dbgSetL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dsai, &s_dbgSet) != VK_SUCCESS) { s_dbgFailed = true; return VK_NULL_HANDLE; }
-        VkDescriptorBufferInfo dbi{ s_meta->GetHandle(), 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet dw{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        dw.dstSet = s_dbgSet; dw.dstBinding = 0; dw.descriptorCount = 1;
-        dw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; dw.pBufferInfo = &dbi;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &dw, 0, nullptr);
+        if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER }, 1,
+                                    s_dbgSetL, s_dbgPool, &s_dbgSet,
+                                    VK_SHADER_STAGE_VERTEX_BIT, "Cluster.Debug")) {
+            s_dbgFailed = true; return VK_NULL_HANDLE;
+        }
+        VK::DescriptorWriter(s_dbgSet).StorageBuffer(0, s_meta->GetHandle()).Flush();
 
         // mvp (64) + tint vec4 (16): tint.a 1 = mode 3 path color, 2 = mode 4 health.
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Fmatrix) + sizeof(Fvector4) };
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &s_dbgSetL;
-        plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_dbgLayout) != VK_SUCCESS) { s_dbgFailed = true; return VK_NULL_HANDLE; }
+        s_dbgLayout = VK::MakePipelineLayout({ s_dbgSetL }, sizeof(Fmatrix) + sizeof(Fvector4),
+                                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+        if (s_dbgLayout == VK_NULL_HANDLE) { s_dbgFailed = true; return VK_NULL_HANDLE; }
     }
 
-    VkPipelineShaderStageCreateInfo ss[2]{};
-    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-    VkVertexInputBindingDescription vibd{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription via{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };   // position only
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &via;
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = line ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_FALSE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 1; cb.pAttachments = &ba;
-    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-    VkFormat colorFmt = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_dbgLayout;
+    VK::GfxPipelineBuilder b(s_dbgLayout);
+    b.Vert(vs).Frag(fs)
+     .Binding(0, stride)
+     .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)   // position only
+     .Polygon(line ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL)
+     .Depth(true, false)
+     .Color(VK::SceneColor::Format())
+     .DepthTarget(Swapchain.m_DepthFormat);
     // Bound inside the world-color pass (SRI may be attached) — needs the create
     // flag; no dynamic FSR state, so the overlay stays full-rate (static 1x1).
     if (VulkanHW.m_bVRSSupported)
-        pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
-    VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &pipe) != VK_SUCCESS) {
-        Msg("![VK Cluster] debug pipeline create failed (stride=%u line=%d)", stride, line ? 1 : 0);
-        s_dbgFailed = true; return VK_NULL_HANDLE;
-    }
+        b.CreateFlags(VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
+    VkPipeline pipe = b.Build("Cluster debug stride=%u line=%d", stride, line ? 1 : 0);
+    if (pipe == VK_NULL_HANDLE) { s_dbgFailed = true; return VK_NULL_HANDLE; }
     s_dbgPipes.emplace(key, pipe);
     return pipe;
 }
@@ -2800,6 +2977,11 @@ void CompactPools()
 
     VK::Vram::Scope _vram_scope("Geom/Pools");
 
+    // Sub-timers (`[load step]`): 817 ms of a 19.5 s load, split unknown between the
+    // 450k-visual walk, the interval bookkeeping and the actual GPU pool rebuild.
+    CTimer _c; _c.Start();
+    float msPrep = 0, msCollect = 0, msKeep = 0, msMerge = 0, msCopy = 0, msPatch = 0;
+
     // ---- Pool lookup: CVulkanBuffer* -> pool table slot --------------------
     struct Pool {
         CVulkanBuffer* buf = nullptr;
@@ -2827,21 +3009,38 @@ void CompactPools()
     addPools(RImplementation.nIB, false);
     if (pools.empty()) return;
 
+    // 938 pools x ~300k pool-backed visuals, and the three passes below ask
+    // "which pool is this buffer?" six times per visual. As an xr_map that is a
+    // red-black tree walk each time; as a sorted array it is the same ten
+    // comparisons inside 15 KB that never leaves L2.
+    constexpr u32 kNoPool = 0xFFFFFFFFu;
+    xr_vector<std::pair<CVulkanBuffer*, u32>> poolIdx;
+    poolIdx.reserve(poolOf.size());
+    for (const auto& kv : poolOf) poolIdx.emplace_back(kv.first, kv.second);   // xr_map: already ordered
+    auto poolFind = [&](CVulkanBuffer* b) -> u32 {
+        auto it = std::lower_bound(poolIdx.begin(), poolIdx.end(), b,
+            [](const std::pair<CVulkanBuffer*, u32>& e, CVulkanBuffer* k) { return e.first < k; });
+        return (it != poolIdx.end() && it->first == b) ? it->second : kNoPool;
+    };
+
     // ---- Freed predicate ----------------------------------------------------
     // A mesh's pool slices can go iff every GPU path draws it from the
     // ClusterStream pools (clustered + vertex-repacked) and no always-CPU path
     // needs it: alpha-tested casters draw on the CPU cutout path in every
     // shadow target, and the terrain slice feeds the TerrainCache probe copy.
-    xr_map<vkFVisual*, const CompactRef*> refOf;
-    for (const CompactRef& r : refs) refOf[r.fv] = &r;
-    auto isFreed = [&](vkFVisual* fv) -> bool {
-        auto it = refOf.find(fv);
-        if (it == refOf.end()) return false;
-        const CompactRef& r = *it->second;
-        if (!r.clustered || !r.repacked) return false;
-        WorldMaterial* m = fv->m_pWorldMaterial;
-        if (!m || m->alphaRef >= 0.f || m->isTerrain) return false;
-        return true;
+    // Same story as poolIdx: one sorted (visual -> ref) array instead of a
+    // 50k-node tree that the keep and patch passes each query per visual. The
+    // grouping walk emits exactly one ref per mesh, so there are no duplicate
+    // keys to disambiguate.
+    constexpr u32 kNoRef = 0xFFFFFFFFu;
+    xr_vector<std::pair<vkFVisual*, u32>> refIdx;
+    refIdx.reserve(refs.size());
+    for (u32 i = 0; i < (u32)refs.size(); ++i) refIdx.emplace_back(refs[i].fv, i);
+    std::sort(refIdx.begin(), refIdx.end());
+    auto refFind = [&](vkFVisual* fv) -> u32 {
+        auto it = std::lower_bound(refIdx.begin(), refIdx.end(), fv,
+            [](const std::pair<vkFVisual*, u32>& e, vkFVisual* k) { return e.first < k; });
+        return (it != refIdx.end() && it->first == fv) ? it->second : kNoRef;
     };
 
     // u32 pool-global component pages address their pool VB by ABSOLUTE vertex
@@ -2849,31 +3048,43 @@ void CompactPools()
     // don't reference the pool at all, so only the raw-u32 combination bails.)
     for (const CompactRef& r : refs)
         if (r.clustered && r.ib32 && !r.repacked && r.fv->m_mesh.p_rm_Vertices) {
-            auto it = poolOf.find(r.fv->m_mesh.p_rm_Vertices);
-            if (it != poolOf.end()) pools[it->second].bail = true;
+            const u32 pi = poolFind(r.fv->m_mesh.p_rm_Vertices);
+            if (pi != kNoPool) pools[pi].bail = true;
         }
 
-    // ---- Collect every pool-backed visual (recurse hierarchies/LODs) -------
+    msPrep = _c.GetElapsed_ms_total();
+    _c.Start();
+
+    // ---- Every pool-backed visual (shared walk; this pass only filters) -----
     xr_vector<vkFVisual*> all;
     all.reserve(RImplementation.Visuals.size());
-    xr_vector<vkRender_Visual*> stack;
-    for (IRenderVisual* iv : RImplementation.Visuals)
-        if (iv) stack.push_back(static_cast<vkRender_Visual*>(iv));
-    while (!stack.empty()) {
-        vkRender_Visual* rv = stack.back(); stack.pop_back();
-        if (rv->Type == MT_HIERRARHY || rv->Type == MT_LOD) {
-            if (auto* hv = dynamic_cast<vkFHierrarhyVisual*>(rv))
-                for (auto* c : hv->children) if (c) stack.push_back(c);
-            continue;
-        }
-        auto* fv = dynamic_cast<vkFVisual*>(rv);
-        if (!fv || !fv->m_mesh.IsValid()) continue;
-        if (poolOf.find(fv->m_mesh.p_rm_Vertices) == poolOf.end()
-         && poolOf.find(fv->m_mesh.p_rm_Indices)  == poolOf.end()) continue;   // owns its buffers
+    for (vkFVisual* fv : LeafVisuals()) {
+        if (!fv->m_mesh.IsValid()) continue;
+        if (poolFind(fv->m_mesh.p_rm_Vertices) == kNoPool
+         && poolFind(fv->m_mesh.p_rm_Indices)  == kNoPool) continue;   // owns its buffers
         all.push_back(fv);
     }
-    std::sort(all.begin(), all.end());
-    all.erase(std::unique(all.begin(), all.end()), all.end());
+    // No sort/unique any more: the shared walk deduped, and `all`'s order is not
+    // observable here — the keep intervals it feeds get sorted below, and the
+    // patch loop treats each mesh independently.
+    //
+    // Resolve each visual's ref ONCE, on the idle cores, instead of three times
+    // serially (keep: freed-test + attribution, patch: freed-test).
+    xr_vector<u32> refFor(all.size(), kNoRef);
+    ParallelChunks((int)all.size(), [&](int lo, int hi) {
+        for (int k = lo; k < hi; ++k) refFor[k] = refFind(all[k]);
+    });
+    auto isFreedAt = [&](size_t k) -> bool {
+        const u32 ri = refFor[k];
+        if (ri == kNoRef) return false;
+        const CompactRef& r = refs[ri];
+        if (!r.clustered || !r.repacked) return false;
+        WorldMaterial* m = all[k]->m_pWorldMaterial;
+        if (!m || m->alphaRef >= 0.f || m->isTerrain) return false;
+        return true;
+    };
+    msCollect = _c.GetElapsed_ms_total();
+    _c.Start();
 
     // ---- Keep intervals + why-kept accounting (VB bytes) --------------------
     u64 accFreed = 0, accAT = 0, accTerrain = 0, accRaw = 0, accPlainGpu = 0, accCpu = 0;
@@ -2890,29 +3101,33 @@ void CompactPools()
         }
         return end;
     };
-    for (vkFVisual* fv : all) {
+    for (size_t k = 0; k < all.size(); ++k) {
+        vkFVisual* fv = all[k];
         const VK_Render_Mesh& m = fv->m_mesh;
         const u64 vbBytes = (u64)m.vCount * m.vStride;
-        if (isFreed(fv)) { accFreed += vbBytes; continue; }
-        auto itV = poolOf.find(m.p_rm_Vertices);
-        if (itV != poolOf.end() && m.vCount) {
-            Pool& p = pools[itV->second];
+        if (isFreedAt(k)) { accFreed += vbBytes; continue; }
+        const u32 pV = poolFind(m.p_rm_Vertices);
+        if (pV != kNoPool && m.vCount) {
+            Pool& p = pools[pV];
             p.keep.emplace_back((u64)m.vBase * m.vStride, ((u64)m.vBase + m.vCount) * m.vStride);
         }
-        auto itI = poolOf.find(m.p_rm_Indices);
-        if (itI != poolOf.end() && m.iCount) {
-            Pool& p = pools[itI->second];
+        const u32 pI = poolFind(m.p_rm_Indices);
+        if (pI != kNoPool && m.iCount) {
+            Pool& p = pools[pI];
             p.keep.emplace_back((u64)m.iBase * ibSize(m), ibEnd(fv) * ibSize(m));
         }
         // Attribution (diagnostic): why does this mesh keep its VB slice?
-        auto itR = refOf.find(fv);
+        const u32 ri = refFor[k];
         WorldMaterial* mat = fv->m_pWorldMaterial;
-        if      (itR == refOf.end())              accCpu     += vbBytes;   // CPU leaf / tree / non-GPU-set
+        if      (ri == kNoRef)                    accCpu     += vbBytes;   // CPU leaf / tree / non-GPU-set
         else if (mat && mat->isTerrain)           accTerrain += vbBytes;
         else if (mat && mat->alphaRef >= 0.f)     accAT      += vbBytes;
-        else if (itR->second->clustered)          accRaw     += vbBytes;   // clustered but not repacked
+        else if (refs[ri].clustered)              accRaw     += vbBytes;   // clustered but not repacked
         else                                      accPlainGpu+= vbBytes;   // plain identity mesh
     }
+
+    msKeep = _c.GetElapsed_ms_total();
+    _c.Start();
 
     // ---- Merge intervals, decide per buffer, build remap tables -------------
     u64 oldVbTotal = 0, newVbTotal = 0, oldIbTotal = 0, newIbTotal = 0;
@@ -2957,6 +3172,66 @@ void CompactPools()
         return p.newOff[lo] + (oldByte - p.keep[lo].first);
     };
 
+    msMerge = _c.GetElapsed_ms_total();
+    _c.Start();
+
+    // ---- Patch visuals (m_mesh offsets; freed ones become empty) ------------
+    // Runs on a worker DURING the pool copy below: it rewrites CPU-side offsets
+    // (m_mesh, s_metaCPU) and touches no Vulkan object, while the copy is a queue
+    // round trip the loader would otherwise sit out. The handle swap and the
+    // group/meta patch that depend on it stay on this thread, after the join.
+    //
+    // new vBase - old vBase per REF (raw-u16 cluster meta patch). A vector
+    // indexed by ref, not a map keyed by visual: only refs are ever asked, and
+    // "no entry" and "delta 0" mean the same thing to the consumer below.
+    xr_vector<s64> refVbDelta(refs.size(), 0);
+    float msPatchThread = 0.f;
+    auto patchCpu = [&] {
+        CTimer _pt; _pt.Start();
+        for (size_t k = 0; k < all.size(); ++k) {
+            vkFVisual* fv = all[k];
+            VK_Render_Mesh& m = fv->m_mesh;
+            if (isFreedAt(k)) {
+                // Every CPU path gates on IsValid() (vCount>0) / draws iCount — this
+                // makes any submit of the mesh a clean no-op. GPU paths draw it from
+                // the ClusterStream pools via the meta, which never reads m_mesh.
+                m.vCount = 0; m.iCount = 0; m.dwPrimitives = 0;
+                continue;
+            }
+            const u32 pV = poolFind(m.p_rm_Vertices);
+            if (pV != kNoPool && pools[pV].compact && m.vCount) {
+                const Pool& p = pools[pV];
+                const u32 nb = (u32)(remap(p, (u64)m.vBase * m.vStride) / m.vStride);
+                if (nb != m.vBase && refFor[k] != kNoRef)
+                    refVbDelta[refFor[k]] = (s64)nb - (s64)m.vBase;
+                m.vBase = nb;
+            }
+            const u32 pI = poolFind(m.p_rm_Indices);
+            if (pI != kNoPool && pools[pI].compact && m.iCount) {
+                const Pool& p = pools[pI];
+                m.iBase = (u32)(remap(p, (u64)m.iBase * ibSize(m)) / ibSize(m));
+            }
+        }
+        // Identity metas take their mesh offsets straight from the patched m_mesh,
+        // so this half belongs with the loop above, not after the join.
+        for (u32 ri = 0; ri < (u32)refs.size(); ++ri) {
+            const CompactRef& r = refs[ri];
+            if (r.metaFirst + r.metaCount > (u32)s_metaCPU.size()) continue;
+            if (!r.clustered) {
+                GpuMeshMeta& m = s_metaCPU[r.metaFirst];
+                m.first_vertex = r.fv->m_mesh.vBase;
+                DrawnSlice(r.fv, m.ib_first, m.index_count);
+            } else if (!r.repacked && !r.ib32) {
+                const s64 d = refVbDelta[ri];
+                if (!d) continue;
+                for (u32 e = r.metaFirst; e < r.metaFirst + r.metaCount; ++e)
+                    s_metaCPU[e].first_vertex = (u32)((s64)s_metaCPU[e].first_vertex + d);
+            }
+        }
+        msPatchThread = _pt.GetElapsed_ms_total();
+    };
+    std::thread patchThread;
+
     // ---- Rebuild the compacted buffers (one submit, waits on completion) ----
     xr_vector<CVulkanBuffer> fresh(pools.size());
     {
@@ -2977,8 +3252,19 @@ void CompactPools()
             vkCmdCopyBuffer(cmd, p.buf->GetHandle(), fresh[i].GetHandle(),
                             (u32)regions.size(), regions.data());
         }
+        // The mesh/meta patch below is pure CPU (offsets in m_mesh and s_metaCPU,
+        // no Vulkan object touched) and does not depend on the copy having run —
+        // only the HANDLE swap does. So it rides the queue round trip instead of
+        // waiting its turn behind it.
+        patchThread = std::thread(patchCpu);
         VulkanHW.EndSingleTimeCommands(cmd);   // waits — old buffers are idle after this
     }
+
+    msCopy = _c.GetElapsed_ms_total();
+    _c.Start();
+
+    // The offsets the group patch and the meta upload read must be final by now.
+    if (patchThread.joinable()) patchThread.join();
 
     // ---- Swap in place + raw-handle map -------------------------------------
     xr_map<VkBuffer, VkBuffer> handleMap;
@@ -2990,51 +3276,12 @@ void CompactPools()
         handleMap[p.oldHandle] = p.buf->GetHandle();
     }
 
-    // ---- Patch visuals (m_mesh offsets; freed ones become empty) ------------
-    xr_map<vkFVisual*, s64> vbDelta;   // new vBase - old vBase (raw-u16 cluster meta patch)
-    for (vkFVisual* fv : all) {
-        VK_Render_Mesh& m = fv->m_mesh;
-        if (isFreed(fv)) {
-            // Every CPU path gates on IsValid() (vCount>0) / draws iCount — this
-            // makes any submit of the mesh a clean no-op. GPU paths draw it from
-            // the ClusterStream pools via the meta, which never reads m_mesh.
-            m.vCount = 0; m.iCount = 0; m.dwPrimitives = 0;
-            continue;
-        }
-        auto itV = poolOf.find(m.p_rm_Vertices);
-        if (itV != poolOf.end() && pools[itV->second].compact && m.vCount) {
-            const Pool& p = pools[itV->second];
-            const u32 nb = (u32)(remap(p, (u64)m.vBase * m.vStride) / m.vStride);
-            if (nb != m.vBase) vbDelta[fv] = (s64)nb - (s64)m.vBase;
-            m.vBase = nb;
-        }
-        auto itI = poolOf.find(m.p_rm_Indices);
-        if (itI != poolOf.end() && pools[itI->second].compact && m.iCount) {
-            const Pool& p = pools[itI->second];
-            m.iBase = (u32)(remap(p, (u64)m.iBase * ibSize(m)) / ibSize(m));
-        }
-    }
-
     // ---- Patch the GPU-set state --------------------------------------------
-    // Groups snapshot raw pool handles; identity metas hold pool-global offsets;
-    // raw-u16 cluster metas hold pool-global first_vertex (their page indices
-    // are mesh-local). Repacked metas are page-local — untouched.
+    // Groups snapshot raw pool handles — this half needs the swap above, so it
+    // is the only patch left on this thread.
     for (Group& g : s_groups) {
         auto it = handleMap.find(g.vb); if (it != handleMap.end()) g.vb = it->second;
         it = handleMap.find(g.ib);      if (it != handleMap.end()) g.ib = it->second;
-    }
-    for (const CompactRef& r : refs) {
-        if (r.metaFirst + r.metaCount > (u32)s_metaCPU.size()) continue;
-        if (!r.clustered) {
-            GpuMeshMeta& m = s_metaCPU[r.metaFirst];
-            m.first_vertex = r.fv->m_mesh.vBase;
-            DrawnSlice(r.fv, m.ib_first, m.index_count);
-        } else if (!r.repacked && !r.ib32) {
-            auto it = vbDelta.find(r.fv);
-            if (it == vbDelta.end()) continue;
-            for (u32 e = r.metaFirst; e < r.metaFirst + r.metaCount; ++e)
-                s_metaCPU[e].first_vertex = (u32)((s64)s_metaCPU[e].first_vertex + it->second);
-        }
     }
     if (s_meta) s_meta->Upload(s_metaCPU.data(), sizeof(GpuMeshMeta) * s_metaCPU.size());
     ++s_buildStamp;   // derived tables (VSM candidates) refresh from the patched meta
@@ -3055,6 +3302,10 @@ void CompactPools()
     }
 
     s_poolsCompacted = true;
+    msPatch = _c.GetElapsed_ms_total();
+    Msg("[load step]   WorldGPU::CompactPools: prep %.0f | collect %.0f (%u visuals -> %u pool-backed) | keep %.0f | merge %.0f | gpuCopy %.0f (patch %.0f rides along) | swap+meta %.0f ms",
+        msPrep, msCollect, (u32)RImplementation.Visuals.size(), (u32)all.size(),
+        msKeep, msMerge, msCopy, msPatchThread, msPatch);
     const double MB = 1.0 / (1024.0 * 1024.0);
     Msg("[VK PoolCompact] VB %.1f -> %.1f MB, IB %.1f -> %.1f MB (%u compacted, %u skipped, %u bailed of %u pools)",
         oldVbTotal * MB, newVbTotal * MB, oldIbTotal * MB, newIbTotal * MB,
@@ -3097,6 +3348,7 @@ void Destroy()
     s_cmdAuditPending = false; s_cmdAuditHasOccl = false; s_cmdAuditFrame = 0; s_cmdAuditLast = 0;
     s_cmdAuditBits.clear(); s_cmdAuditSlotBase.clear();
     s_groups.clear(); s_meshSet.clear(); s_cpuMeshes.clear(); s_metaCPU.clear(); s_total = 0; s_nGroups = 0;
+    ReleaseLeafVisuals();   // also covers an unload that never reached the loader's release
     s_compactRefs.clear(); s_poolsCompacted = false;
     s_set = VK_NULL_HANDLE; s_set2 = VK_NULL_HANDLE; s_set3 = VK_NULL_HANDLE;
     s_occlReady = false; s_shadowReady = false; s_built = false;

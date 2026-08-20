@@ -10,6 +10,7 @@
 #include "vk_env_light.h"
 #include "vk_color_space.h"                 // ColorSpace::Linearize* — sRGB→linear on upload (r_linear_color)
 #include "vk_buffer.h"                     // CVulkanBuffer
+#include "vk_descriptors.h"                // VK::DescriptorWriter / TDescriptorWriter
 #include "vk_command_buffer.h"             // CVulkanCommandManager::FRAMES_IN_FLIGHT
 #include "vk_shadow.h"                     // ShadowMap (binding 1 = shadow map, sun_vp)
 #include "vk_pass_shadow.h"                // SpotShadow_TileOfLight — spot-pool tile per light
@@ -17,6 +18,8 @@
 #include "vk_clustered.h"                  // Clustered forward (bindings 17-19: lights, grid, indices)
 #include "vk_profiler.h"                    // VK::Prof::NameSet — TEMP VUID-hunt instrumentation
 #include "vk_water_sim.h"                  // WaterSim (binding 11 = water depth)
+#include "vk_water_ripple.h"               // WaterRipple (binding 32 = shore wetness)
+#include "vk_pass_water.h"                 // Water_LevelMap* (binding 33 = level water height)
 #include "vk_deform.h"                     // Deform (binding 20 = snow deform press field)
 #include "vk_pass_skinned.h"               // Skinned_CollectFeet (snow footprint deformation)
 #include "vk_texture.h"                    // CVulkanTexture (fallback ambient cube)
@@ -97,6 +100,13 @@ extern float ps_r_bolt_flash;     // r_bolt_flash — lightning lifts the hemisp
 extern float ps_r_bump;           // r_bump — static material normal-map strength
 extern int   ps_r_bump_debug;     // r_bump_debug — 1 world normal, 2 gloss
 extern float ps_r_gloss_scale;    // r_gloss_scale — material gloss -> IBL roughness
+extern int   ps_r_wtr;            // water master
+extern int   ps_r_wtr_sim;        // ripple sim master (the wetness tile rides on it)
+extern float ps_r_wtr_wet;        // shore wetness strength (0 = off)
+extern float ps_r_wtr_wet_lift;   // capillary rise above the line the water touched
+extern float ps_r_wtr_wet_dry;    // seconds from soaked to dry — also the foam clock
+extern float ps_r_wtr_foam_land;  // foam the backwash leaves on bared ground
+extern float ps_r_wtr_foam_life;  // ...and how many seconds it lasts
 extern int   ps_r_sf;             // r_sf — Surface Field master enable (consumers later)
 extern int   ps_r_sf_debug;       // r_sf_debug — Surface Field debug view (0..5)
 extern float ps_r_sf_eps;         // r_sf_eps — derive finite-difference epsilon (m)
@@ -190,6 +200,10 @@ namespace {
     VkImageView           s_boundFlow[kFramesInFlight]  = {};
     // Ground-height map (binding 13, SSS puddle real-dip placement): lazy-bind.
     VkImageView           s_boundGround[kFramesInFlight] = {};
+    // Shore wetness (binding 32, vk_water_ripple): same lazy-bind tracking.
+    VkImageView           s_boundShoreWet[kFramesInFlight] = {};
+    // Level water height map (binding 33, vk_pass_water): built once, then static.
+    VkImageView           s_boundWaterLvl[kFramesInFlight] = {};
     // Snow deform press field (binding 20, vk_deform): white fallback until the
     // first Deform dispatch creates it (lazy, like water).
     VkImageView           s_boundDeform[kFramesInFlight] = {};
@@ -306,7 +320,7 @@ bool Init()
     // water-sim (r_water_sim, off by default); the SSS puddle path doesn't use them
     // but they stay bound (harmless) so the sim can be switched on without relayout.
     // All FRAGMENT.
-    VkDescriptorSetLayoutBinding b[32]{};
+    VkDescriptorSetLayoutBinding b[34]{};
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     // Also visible to VS/TES: snow geometric displacement reads sf_params.w (coverage).
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
@@ -385,16 +399,32 @@ bool Init()
     // + deform field (20) to place + displace its dense grid -> need VERTEX visibility.
     b[9].stageFlags  |= VK_SHADER_STAGE_VERTEX_BIT;
     b[13].stageFlags |= VK_SHADER_STAGE_VERTEX_BIT;
+    // The water TESE samples the RAIN map too (9): wind waves need sky, so the
+    // stage that DISPLACES the surface has to know about a roof for the same
+    // reason the stage that shades it does — otherwise the two disagree about
+    // where the wave is (see water_common.glsl, waterShelter).
+    b[9].stageFlags  |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     VkDescriptorSetLayoutCreateInfo slci{};
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 32; slci.pBindings = b;
+    // SHORE WETNESS (binding 32, vk_water_ripple): RG16F on the ripple tile —
+    // .r = how high the water has wetted this column, .g = how wet it still is.
+    // Lets the WORLD shading know about the water, which nothing here previously
+    // did: every wet surface in the renderer was wet because of RAIN.
+    b[32].binding = 32; b[32].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[32].descriptorCount = 1;
+    b[32].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // LEVEL WATER MAP (binding 33): the whole level's water height, built once.
+    // Binding 32 is the LOCAL, decaying record of contact; this is the standing
+    // fact of where water is. Wetness needs both — one dries, the other does not.
+    b[33].binding = 33; b[33].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[33].descriptorCount = 1;
+    b[33].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    slci.bindingCount = 34; slci.pBindings = b;
     if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
         Msg("![VK EnvLight] set layout create failed"); s_failed = true; return false;
     }
 
     VkDescriptorPoolSize ps[3]{
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kFramesInFlight * 2 },    // LightUBO + VSM clipmap UBO
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 24 },   // 13 shadow/sky/ao + VSM mask + deform + SSIL + spot beam + VSM static/dyn atlases (grass) + IBL spec cube + froxel volume
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight * 26 },   // 13 shadow/sky/ao + VSM mask + deform + SSIL + spot beam + VSM static/dyn atlases (grass) + IBL spec cube + froxel volume + shore wetness
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kFramesInFlight * 7 },    // VSM static+dyn page tables + 3 cluster SSBOs + tex-stream feedback + sky SH9
     };
     VkDescriptorPoolCreateInfo pci{};
@@ -471,7 +501,6 @@ bool Init()
     const VkImageView fbBlack = s_fallbackBlack->GetView();
 
     for (u32 i = 0; i < kFramesInFlight; ++i) {
-        VkDescriptorBufferInfo bi{ s_ubo.GetHandle(), kSlotStride * i, sizeof(LightUBO) };
         VkDescriptorImageInfo  si[5]{};
         si[0].sampler = ShadowMap::GetSampler(); si[0].imageView = ShadowMap::GetView();           // 1: far sun
         si[1].sampler = ShadowMap::GetSampler(); si[1].imageView = ShadowMap::GetSpotView();       // 2: spot
@@ -511,159 +540,74 @@ bool Init()
         VkDescriptorImageInfo ckI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         s_boundCookie[i] = fbWhite;
 
-        // Binding 11: water depth (sim) — white fallback until WaterSim runs;
-        // Update() swaps in the real water buffer once it exists.
-        VkDescriptorImageInfo wtI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        s_boundWater[i] = fbWhite;
-        // Binding 12: water velocity — white fallback until WaterSim runs.
-        VkDescriptorImageInfo flI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        s_boundFlow[i] = fbWhite;
-        // Binding 13: clean ground-height map — white fallback until rendered;
-        // Update() swaps in ShadowMap::GetGroundView once it exists.
-        VkDescriptorImageInfo gdI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        s_boundGround[i] = fbWhite;
-        // Binding 20: snow deform press field — white fallback until vk_deform runs;
-        // Update() swaps in Deform::GetView once it exists (gated by deform_tex.x so
-        // the white fallback is never actually sampled before then).
-        VkDescriptorImageInfo dfI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        s_boundDeform[i] = fbWhite;
-        // Binding 26: sky specular IBL cube — grey cube fallback until vk_ibl has a
-        // probe; Update() swaps in IBL::GetSpecView() (gated by ibl_params.x anyway).
-        VkDescriptorImageInfo iblI{ s_cubeSampler, fbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        s_boundIBL[i] = fbView;
+        // The white/black/grey fallbacks below all keep a binding DEFINED before the
+        // subsystem that owns it has produced anything. Every one of them is gated in
+        // the shader by its own params lane, so the fallback is never actually read —
+        // but an unwritten descriptor is undefined behaviour even for a shader that
+        // never samples it (VUID-08114).
+        const VkDescriptorImageInfo white{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        s_boundWater[i]    = fbWhite;   // 11: water depth (sim)
+        s_boundFlow[i]     = fbWhite;   // 12: water velocity
+        s_boundGround[i]   = fbWhite;   // 13: clean ground-height map
+        s_boundShoreWet[i] = fbWhite;   // 32: shore wetness (ripple tile)
+        s_boundWaterLvl[i] = fbWhite;   // 33: level water height
+        s_boundDeform[i]   = fbWhite;   // 20: snow deform press field
+        s_boundIBL[i]      = fbView;    // 26: sky specular IBL cube (grey cube)
+        s_boundTCacheH[i]  = fbWhite;   // 28/29: terrain composite cache
+        s_boundTCacheW[i]  = fbWhite;
+        const VkDescriptorBufferInfo dummy{ s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
 
-        // Clustered forward (bindings 17/18/19): valid SSBO placeholder until the
-        // vk_clustered module inits; Update() swaps in the real buffers (gated by
-        // cluster_params.w so the dummy is never actually read).
-        VkDescriptorBufferInfo clI[3]{
-            { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
-            { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
-            { s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE },
-        };
-
-        VkWriteDescriptorSet w[32]{};
-        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[0].dstSet = s_set[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
+        // Sized by the template argument and checked on every append — the older
+        // hand-counted array silently overflowed when bindings 32/33 were added
+        // (the validator saw "dstBinding 31, dstArrayElement 32758" and the process
+        // died during init with nothing in the log). 34 bindings, room to grow.
+        VK::TDescriptorWriter<40> dw(s_set[i]);
+        dw.UniformBuffer(0, s_ubo.GetHandle(), sizeof(LightUBO), kSlotStride * i);
 
         // Shadow maps (sun/spot/point/cascades) — ShadowMap::Init ran above, views exist.
-        u32 count = 1;
-        for (u32 m = 0; m < 5; ++m) {
-            if (si[m].imageView == VK_NULL_HANDLE || si[m].sampler == VK_NULL_HANDLE) continue;
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = 1 + m; w[count].descriptorCount = 1;
-            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &si[m];
-            ++count;
-        }
-        for (u32 c = 0; c < 2; ++c) {
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = 6 + c; w[count].descriptorCount = 1;
-            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &cube[c];
-            ++count;
-        }
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 8; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &aoI;
-        ++count;
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 21; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &ilI;
-        ++count;
-        if (rainI.imageView != VK_NULL_HANDLE && rainI.sampler != VK_NULL_HANDLE) {
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = 9; w[count].descriptorCount = 1;
-            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &rainI;
-            ++count;
-        }
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 10; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &ckI;
-        ++count;
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 11; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &wtI;
-        ++count;
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 12; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &flI;
-        ++count;
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 13; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &gdI;
-        ++count;
-        if (beamI.imageView != VK_NULL_HANDLE) {
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = 22; w[count].descriptorCount = 1;
-            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &beamI;
-            ++count;
-        }
-        for (u32 k = 0; k < 3; ++k) {
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = 17 + k; w[count].descriptorCount = 1;
-            w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &clI[k];
-            ++count;
-        }
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 20; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &dfI;
-        ++count;
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 26; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &iblI;
-        ++count;
-        // VSM receiver bindings 14/15/16 + 23/24/25 — fallback (white image / dummy
-        // buffer) so they are DEFINED from Init, before the first EnvLight::Update
-        // writes the real VSM data. Without this, a draw that binds this set before the
-        // first Update reads an unwritten binding 14 (uVsmMask) → VUID-08114. Update()
-        // overwrites all six each frame.
-        VkDescriptorImageInfo  vsmFbImg{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorBufferInfo vsmFbBuf{ s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
-        const struct { u32 binding; VkDescriptorType type; bool img; } vsmFb[6] = {
-            { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, true  },
-            { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         false },
-            { 16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         false },
-            { 23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, true  },
-            { 24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, true  },
-            { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         false },
-        };
-        for (const auto& f : vsmFb) {
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = f.binding; w[count].descriptorCount = 1;
-            w[count].descriptorType = f.type;
-            if (f.img) w[count].pImageInfo = &vsmFbImg; else w[count].pBufferInfo = &vsmFbBuf;
-            ++count;
-        }
-        // Terrain composite cache (28/29) — white fallback until the first bake;
-        // Update() swaps in TerrainCache views (gated by tcache_params.x anyway).
-        VkDescriptorImageInfo tcI{ s_cubeSampler, fbWhite, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        s_boundTCacheH[i] = fbWhite; s_boundTCacheW[i] = fbWhite;
-        for (u32 tb = 28; tb <= 29; ++tb) {
-            w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[count].dstSet = s_set[i]; w[count].dstBinding = tb; w[count].descriptorCount = 1;
-            w[count].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[count].pImageInfo = &tcI;
-            ++count;
-        }
+        for (u32 m = 0; m < 5; ++m)
+            if (si[m].imageView != VK_NULL_HANDLE && si[m].sampler != VK_NULL_HANDLE)
+                dw.Image(1 + m, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, si[m]);
+        for (u32 c = 0; c < 2; ++c)
+            dw.Image(6 + c, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, cube[c]);   // sky ambient cubes
+        dw.Image(8,  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, aoI);              // GTAO
+        dw.Image(21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ilI);              // SSIL
+        if (rainI.imageView != VK_NULL_HANDLE && rainI.sampler != VK_NULL_HANDLE)
+            dw.Image(9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, rainI);         // rain occlusion
+        dw.Image(10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ckI);              // spot cookie
+        dw.Image(11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // water depth
+          .Image(12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // water velocity
+          .Image(13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // ground height
+          .Image(32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // shore wetness
+          .Image(33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // level water map
+          .Image(20, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // snow deform
+          .Image(28, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)             // terrain cache H
+          .Image(29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white);            // terrain cache W
+        if (beamI.imageView != VK_NULL_HANDLE)
+            dw.Image(22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, beamI);        // spot BEAM map
+        // Clustered forward (17/18/19): valid SSBO placeholder until vk_clustered
+        // inits; Update() swaps in the real buffers (gated by cluster_params.w).
+        for (u32 k = 0; k < 3; ++k)
+            dw.Buffer(17 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dummy);
+        dw.ImageSampler(26, fbView, s_cubeSampler);                                // sky specular IBL
+        // VSM receiver bindings 14/15/16 + 23/24/25 — defined here, overwritten by
+        // every EnvLight::Update once the real VSM data exists.
+        dw.Image (14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)
+          .Buffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         dummy)
+          .Buffer(16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         dummy)
+          .Image (23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)
+          .Image (24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, white)
+          .Buffer(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         dummy);
         // Texture-streaming GPU feedback SSBO (binding 30). The streamer creates it
         // on this first call; on failure the dummy keeps the binding defined (world
         // FS skips the write for streamID >= kFeedbackSlots, and no real slots are
         // ever handed out when the buffer doesn't exist).
         VkBuffer fbStream = VK::TextureStreamer::Instance().GetFeedbackBuffer();
-        VkDescriptorBufferInfo fbStreamI{ fbStream != VK_NULL_HANDLE ? fbStream : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 30; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &fbStreamI;
-        ++count;
-        // Sky SH9 (binding 31): dummy for now — IBL::Init() runs AFTER this block, so
-        // the real buffer does not exist yet. Update() swaps it in lazily per slot
-        // (same pattern as the IBL cube at binding 26). The binding must be defined
-        // here regardless: an unwritten descriptor is undefined behaviour even for a
-        // shader that never reads it.
-        VkDescriptorBufferInfo shI{ s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
-        w[count].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[count].dstSet = s_set[i]; w[count].dstBinding = 31; w[count].descriptorCount = 1;
-        w[count].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[count].pBufferInfo = &shI;
-        ++count;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, count, w, 0, nullptr);
+        dw.StorageBuffer(30, fbStream != VK_NULL_HANDLE ? fbStream : s_dummyBuf.GetHandle());
+        // Sky SH9 (31): dummy for now — IBL::Init() runs AFTER this block, so the real
+        // buffer does not exist yet. Update() swaps it in lazily per slot.
+        dw.Buffer(31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dummy);
+        dw.Flush();
     }
 
     // Sky specular IBL prefilter module (owns the RGBA16F reflection cube at
@@ -729,7 +673,7 @@ const Fvector& SunDirVisual()
     return s_dir;
 }
 
-void Update(u32 slot)
+void Update(u32 slot, VkCommandBuffer cmd)
 {
     if (s_failed || !s_mapped) return;
     if (slot >= kFramesInFlight) slot = 0;
@@ -922,12 +866,7 @@ void Update(u32 slot)
         VkImageView want = cookie ? cookie
                                   : (s_fallbackWhite ? s_fallbackWhite->GetView() : VK_NULL_HANDLE);
         if (want != VK_NULL_HANDLE && want != s_boundCookie[slot]) {
-            VkDescriptorImageInfo ii{ s_cubeSampler, want, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet wck{};
-            wck.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            wck.dstSet = s_set[slot]; wck.dstBinding = 10; wck.descriptorCount = 1;
-            wck.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wck.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &wck, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(10, want, s_cubeSampler).Flush();
             s_boundCookie[slot] = want;
         }
     }
@@ -974,17 +913,10 @@ void Update(u32 slot)
         if (SkyPass::AcquireAmbientCubes(v0, v1, skSamp, w)) {
             skyWeight = w;
             if (v0 && v1 && (v0 != s_boundCube0[slot] || v1 != s_boundCube1[slot])) {
-                VkDescriptorImageInfo cube[2]{};
-                cube[0].sampler = s_cubeSampler; cube[0].imageView = v0;
-                cube[1].sampler = s_cubeSampler; cube[1].imageView = v1;
-                cube[0].imageLayout = cube[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                VkWriteDescriptorSet w2[2]{};
-                for (u32 c = 0; c < 2; ++c) {
-                    w2[c].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    w2[c].dstSet = s_set[slot]; w2[c].dstBinding = 6 + c; w2[c].descriptorCount = 1;
-                    w2[c].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w2[c].pImageInfo = &cube[c];
-                }
-                vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w2, 0, nullptr);
+                VK::DescriptorWriter(s_set[slot])
+                    .ImageSampler(6, v0, s_cubeSampler)
+                    .ImageSampler(7, v1, s_cubeSampler)
+                    .Flush();
                 s_boundCube0[slot] = v0; s_boundCube1[slot] = v1;
                 static bool s_skyDiag = false;
                 if (!s_skyDiag) { s_skyDiag = true;
@@ -993,11 +925,12 @@ void Update(u32 slot)
                 }
             }
             // Sky specular IBL: refresh the prefiltered reflection cube from the SAME
-            // weather cubes (no-op unless they/the cross-fade/the spin changed;
-            // fence-waited immediate submit). The prefilter also drives the DIFFUSE
-            // path now — it unwraps the sky into world space and the SH9 projection
-            // rides along in the same submit — so it must run whenever either
-            // consumer is on, not just for r_ibl.
+            // weather cubes (no-op unless they/the cross-fade/the spin changed). The
+            // prefilter also drives the DIFFUSE path — it unwraps the sky into world
+            // space and the SH9 projection rides along — so it must run whenever either
+            // consumer is on, not just for r_ibl. ⚠That means r_sky_sh (default ON)
+            // pays for the whole prefilter even at r_ibl 0; the cost is now a few
+            // recorded dispatches, but it used to be a blocking submit — see vk_ibl.h.
             if (ps_r_ibl || ps_r_sky_sh) {
                 IBL::SkyDesc sd;
                 sd.weight = w; sd.rotation = skyRot; sd.groundBounce = ps_r_sky_sh_ground;
@@ -1011,7 +944,7 @@ void Update(u32 slot)
                 sd.intensity = ps_r_sky_intensity;
                 sd.turbidity = ps_r_sky_turbidity;
                 sd.mieG      = ps_r_sky_mie_g;
-                IBL::Update(v0, v1, s_cubeSampler, sd);
+                IBL::Update(cmd, v0, v1, s_cubeSampler, sd);
             }
             (void)samp;
         } else {
@@ -1035,12 +968,7 @@ void Update(u32 slot)
                                   : (s_fallbackCube ? s_fallbackCube->GetView() : VK_NULL_HANDLE);
         VkSampler   is = iblReady ? IBL::GetSampler() : s_cubeSampler;
         if (iv != VK_NULL_HANDLE && iv != s_boundIBL[slot]) {
-            VkDescriptorImageInfo ii{ is, iv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 26; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(26, iv, is).Flush();
             s_boundIBL[slot] = iv;
         }
         // Fade-in (~1 s) when the probe first becomes ready → hides the reflection
@@ -1062,12 +990,7 @@ void Update(u32 slot)
         VkBuffer   shb     = shReady ? IBL::GetSHBuffer() : VK_NULL_HANDLE;
         if (shb == VK_NULL_HANDLE) shb = s_dummyBuf.GetHandle();
         if (shb != VK_NULL_HANDLE && shb != s_boundSH[slot]) {
-            VkDescriptorBufferInfo bi{ shb, 0, VK_WHOLE_SIZE };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 31; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).StorageBuffer(31, shb).Flush();
             s_boundSH[slot] = shb;
         }
         // .x doubles as the strength knob AND the gate: 0 makes every receiver fall
@@ -1122,26 +1045,17 @@ void Update(u32 slot)
     {
         VkImageView vv = Vol::GetIntegratedView();
         if (vv != VK_NULL_HANDLE && vv != s_boundVol3D[slot]) {
-            VkDescriptorImageInfo ii{ Vol::GetSampler(), vv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 27; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(27, vv, Vol::GetSampler()).Flush();
             s_boundVol3D[slot] = vv;
         }
         // Terrain composite cache (28/29): swap in the baked views once they exist.
         VkImageView th = TerrainCache::HeightView(), tw = TerrainCache::WeightsView();
         if (th != VK_NULL_HANDLE && tw != VK_NULL_HANDLE
             && (th != s_boundTCacheH[slot] || tw != s_boundTCacheW[slot])) {
-            VkDescriptorImageInfo hi{ TerrainCache::Sampler(), th, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkDescriptorImageInfo wi{ TerrainCache::Sampler(), tw, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet tws[2]{};
-            tws[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            tws[0].dstSet = s_set[slot]; tws[0].dstBinding = 28; tws[0].descriptorCount = 1;
-            tws[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; tws[0].pImageInfo = &hi;
-            tws[1] = tws[0]; tws[1].dstBinding = 29; tws[1].pImageInfo = &wi;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 2, tws, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot])
+                .ImageSampler(28, th, TerrainCache::Sampler())
+                .ImageSampler(29, tw, TerrainCache::Sampler())
+                .Flush();
             s_boundTCacheH[slot] = th; s_boundTCacheW[slot] = tw;
         }
         // tcache UBO params: duv->cacheUV transform + live flag. Live only once
@@ -1188,12 +1102,7 @@ void Update(u32 slot)
             aoSamp = s_cubeSampler;
         }
         if (ao != VK_NULL_HANDLE && ao != s_boundAO[slot]) {
-            VkDescriptorImageInfo ii{ aoSamp, ao, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 8; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(8, ao, aoSamp).Flush();
             s_boundAO[slot] = ao;
         }
         // Debug: confirm which image binding 8 actually holds (real AO vs the
@@ -1222,12 +1131,7 @@ void Update(u32 slot)
             ilSp = s_cubeSampler;
         }
         if (il != VK_NULL_HANDLE && il != s_boundIL[slot]) {
-            VkDescriptorImageInfo ii{ ilSp, il, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 21; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(21, il, ilSp).Flush();
             s_boundIL[slot] = il;
         }
     }
@@ -1238,23 +1142,38 @@ void Update(u32 slot)
         VkImageView wv = WaterSim::GetStateView();
         VkSampler   ws = WaterSim::GetSampler();
         if (wv != VK_NULL_HANDLE && ws != VK_NULL_HANDLE && wv != s_boundWater[slot]) {
-            VkDescriptorImageInfo ii{ ws, wv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 11; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(11, wv, ws).Flush();
             s_boundWater[slot] = wv;
         }
         VkImageView fv = WaterSim::GetVelView();
         if (fv != VK_NULL_HANDLE && ws != VK_NULL_HANDLE && fv != s_boundFlow[slot]) {
-            VkDescriptorImageInfo ii{ ws, fv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 12; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(12, fv, ws).Flush();
             s_boundFlow[slot] = fv;
+        }
+        // Binding 32: shore wetness from the ripple tile. Lazy, same as the rest —
+        // the image only exists once WaterRipple::Init has run, which needs water
+        // on the level at all.
+        {
+            VkImageView sw = VK::WaterRipple::WetView();
+            // ⚠ POINT, not the ripple module's LINEAR sampler. Both of these maps
+            // store a world HEIGHT with a huge negative sentinel for "dry", and
+            // interpolating that against a real height yields nonsense across every
+            // shoreline — a two-texel dead band that on the 2 m/texel level map is
+            // FOUR METRES of terrain the wetness refuses to touch. That is the
+            // straight-edged wedge of unpainted ground along the water.
+            VkSampler   ss = VK::WaterRipple::GetPointSampler();
+            if (sw != VK_NULL_HANDLE && ss != VK_NULL_HANDLE && sw != s_boundShoreWet[slot]) {
+                VK::DescriptorWriter(s_set[slot])
+                    .ImageSampler(32, sw, ss, VK_IMAGE_LAYOUT_GENERAL).Flush();
+                s_boundShoreWet[slot] = sw;
+            }
+            // Binding 33: the level water map. Built once by Pass_Water, so this
+            // rebinds a single time and then never again.
+            VkImageView lw = VK::Water_LevelMapView();
+            if (lw != VK_NULL_HANDLE && ss != VK_NULL_HANDLE && lw != s_boundWaterLvl[slot]) {
+                VK::DescriptorWriter(s_set[slot]).ImageSampler(33, lw, ss).Flush();
+                s_boundWaterLvl[slot] = lw;
+            }
         }
         // Binding 13: clean ground-height map (no trees) for SSS real-dip puddle
         // placement. Same depth image / sampler as the rain map; rendered in
@@ -1262,12 +1181,7 @@ void Update(u32 slot)
         VkImageView gv = ShadowMap::GetGroundView();
         VkSampler   gs = ShadowMap::GetSampler();
         if (gv != VK_NULL_HANDLE && gs != VK_NULL_HANDLE && gv != s_boundGround[slot]) {
-            VkDescriptorImageInfo ii{ gs, gv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 13; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(13, gv, gs).Flush();
             s_boundGround[slot] = gv;
             { static bool s_gbl = false; if (!s_gbl) { s_gbl = true;
                 Msg("[VK Puddle] ground map bound to EnvLight binding 13 (slot %u)", slot); } }
@@ -1277,12 +1191,7 @@ void Update(u32 slot)
         VkImageView dv = Deform::GetView();
         VkSampler   ds = Deform::GetSampler();
         if (dv != VK_NULL_HANDLE && ds != VK_NULL_HANDLE && dv != s_boundDeform[slot]) {
-            VkDescriptorImageInfo ii{ ds, dv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_set[slot]; w.dstBinding = 20; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+            VK::DescriptorWriter(s_set[slot]).ImageSampler(20, dv, ds).Flush();
             s_boundDeform[slot] = dv;
         }
     }
@@ -1410,6 +1319,56 @@ void Update(u32 slot)
     ub.bump_params[0] = ps_r_bump;         // static material normal-map strength
     ub.bump_params[1] = (float)ps_r_bump_debug;
     ub.bump_params[2] = ps_r_gloss_scale;  // material gloss -> IBL roughness
+    // Shore wetness tile. Gated on Ready(): before the first dispatch the binding
+    // still holds the white fallback, and a strength of 0 is what keeps that from
+    // reading as a flooded world.
+    {
+        const bool on = ps_r_wtr && ps_r_wtr_sim && _abs(ps_r_wtr_wet) > 0.f && VK::WaterRipple::Ready();
+        ub.shorewet[0] = on ? VK::WaterRipple::OriginX() : 0.f;
+        ub.shorewet[1] = on ? VK::WaterRipple::OriginZ() : 0.f;
+        ub.shorewet[2] = on ? 1.f / _max(VK::WaterRipple::SizeMetres(), 0.001f) : 0.f;
+        ub.shorewet[3] = on ? ps_r_wtr_wet : 0.f;
+        // The OTHER end of the chain. `on` is an AND of four things and any one of
+        // them silently zeroes the feature; the shader then reads 0 and there is
+        // nothing to see, which looks exactly like "the effect is too weak".
+        // The level map: a standing fact, so it is bound whenever it exists —
+        // independent of `on`, of the ripple tile, and of where the player is.
+        const bool lvlOn = ps_r_wtr && _abs(ps_r_wtr_wet) > 0.f && VK::Water_LevelMapReady();
+        ub.waterlvl[0] = lvlOn ? VK::Water_LevelMapOriginX() : 0.f;
+        ub.waterlvl[1] = lvlOn ? VK::Water_LevelMapOriginZ() : 0.f;
+        // z doubles as the enable (0 = off); w is the LIFT, and it is now ZERO on
+        // purpose. This half states one thing — ground under the still surface has
+        // water standing on it — and a lift turns that into a CONTOUR BAND: at
+        // 35 cm on a 1:10 beach, three and a half metres of sand painted wet from
+        // the moment the shore comes into view, never drying, with no wave near it.
+        // The strip above the line belongs to the tile now, which measures it by
+        // contact against the wave that is actually drawn. r_wtr_wet_lift kept its
+        // name and moved there, as the capillary rise above the touch line.
+        ub.waterlvl[2] = lvlOn ? 1.f / _max(VK::Water_LevelMapSize(), 0.001f) : 0.f;
+        ub.waterlvl[3] = 0.f;
+        // SWASH FOAM. The exponent is the whole trick: the wetness map decays to 1%
+        // over r_wtr_wet_dry seconds, so raising it to (dry / life) reads a `life`-
+        // second clock out of the same number and no third channel is needed.
+        ub.shorefoam[0] = on ? _max(ps_r_wtr_foam_land, 0.f) : 0.f;
+        ub.shorefoam[1] = _max(ps_r_wtr_wet_dry, 0.5f) / _max(ps_r_wtr_foam_life, 0.15f);
+        ub.shorefoam[2] = Device.fTimeGlobal;
+        ub.shorefoam[3] = 0.f;
+        static float s_swLog = 0.f;
+        if (Device.fTimeGlobal - s_swLog > 3.f) {
+            s_swLog = Device.fTimeGlobal;
+            Msg("[VK Wet] shorewet: on=%d (wtr=%d sim=%d knob=%.2f ready=%d) tile origin(%.0f,%.0f) 1/size=%.4f str=%.2f",
+                (int)on, ps_r_wtr, ps_r_wtr_sim, ps_r_wtr_wet, (int)VK::WaterRipple::Ready(),
+                ub.shorewet[0], ub.shorewet[1], ub.shorewet[2], ub.shorewet[3]);
+            // The LEVEL map, separately — it is the half that is supposed to make
+            // wetness independent of where the player is, and it has never been
+            // reported. `cam uv` says outright whether the player is inside it.
+            const float u = (ub.waterlvl[2] > 0.f) ? (Device.vCameraPosition.x - ub.waterlvl[0]) * ub.waterlvl[2] : -1.f;
+            const float v = (ub.waterlvl[2] > 0.f) ? (Device.vCameraPosition.z - ub.waterlvl[1]) * ub.waterlvl[2] : -1.f;
+            Msg("[VK Wet] levelmap: on=%d ready=%d origin(%.0f,%.0f) 1/size=%.5f | cam uv=(%.3f, %.3f) %s",
+                (int)lvlOn, (int)VK::Water_LevelMapReady(), ub.waterlvl[0], ub.waterlvl[1], ub.waterlvl[2],
+                u, v, (u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f) ? "INSIDE" : "OUTSIDE <-- map does not cover the player");
+        }
+    }
     // Surface Field ("smart heightmap"): metre-scale derive read in-shader (Phase
     // 2.0). Consumers (snow/fog/water) come later; for now drives r_sf_debug.
     ub.sf_params[0] = ps_r_sf ? 1.f : 0.f;              // enable (reserved for consumers)
@@ -1569,7 +1528,19 @@ void Update(u32 slot)
     {
         u8 sm = 0;
         if (ub.sf_params[3]   > 0.f)    sm |= VK::PipelineCache::WS_SNOW;   // eased snow coverage
-        if (ub.rain_params[1] > 0.f)    sm |= VK::PipelineCache::WS_WET;    // wetness (already rain-gated)
+        // Wetness. TWO sources now, and the second one is why this line is not just
+        // `rain_params[1] > 0` any more: shore wetness happens in perfectly dry
+        // weather — a river wets its bank at noon in July. Left rain-only, the lean
+        // variant compiles applyWetness out entirely and the feature is DEAD CODE
+        // that looks like a knob turned down. Exactly the trap the note below this
+        // block warns about, walked into from the wet side instead of the debug one.
+        // ⚠ _abs: the debug views pass shorewet.w NEGATIVE, and a plain `> 0` test
+        // dropped WS_WET for exactly those runs — compiling the wetness path, and
+        // with it the debug branch, out of the world shaders. Grass and foliage
+        // kept painting (no spec constant of their own), so the screenshot read
+        // "terrain has no wetness" when it actually read "terrain has no shader".
+        if (ub.rain_params[1] > 0.f || _abs(ub.shorewet[3]) > 0.f)
+            sm |= VK::PipelineCache::WS_WET;
         if (ub.ibl_params[0]  > 0.004f) sm |= VK::PipelineCache::WS_IBL;    // r_ibl enable×fade (matches shader gate)
         // ⚠ EVERY debug view in the world shaders sits behind SPEC_DEBUG, so a new one
         // is DEAD CODE until its UBO field is listed HERE — the branch compiles out and
@@ -1623,18 +1594,14 @@ void Update(u32 slot)
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         const VkBuffer pdBuf = VK::VSM::GetDynPageTableHandle();
         VkDescriptorBufferInfo pdI{ pdBuf ? pdBuf : s_dummyBuf.GetHandle(), 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet wv[6]{};
-        for (u32 k = 0; k < 6; ++k) { wv[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wv[k].dstSet = s_set[slot]; wv[k].dstBinding = 14 + k; wv[k].descriptorCount = 1; }
-        wv[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[0].pImageInfo  = &atI;
-        wv[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         wv[1].pBufferInfo = &ptI;
-        wv[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         wv[2].pBufferInfo = &vuI;
-        wv[3].dstBinding = 23;
-        wv[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[3].pImageInfo  = &asI;
-        wv[4].dstBinding = 24;
-        wv[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wv[4].pImageInfo  = &adI;
-        wv[5].dstBinding = 25;
-        wv[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         wv[5].pBufferInfo = &pdI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 6, wv, 0, nullptr);
+        VK::DescriptorWriter(s_set[slot])
+            .Image (14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, atI)
+            .Buffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         ptI)
+            .Buffer(16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         vuI)
+            .Image (23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, asI)
+            .Image (24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, adI)
+            .Buffer(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         pdI)
+            .Flush();
     }
 
     // Clustered forward SSBOs (bindings 17/18/19): swap the dummy for the real
@@ -1642,18 +1609,12 @@ void Update(u32 slot)
     // stable; the light buffer binds to THIS slot's region). Fence-safe (Begin
     // waited this slot's fence). Receivers gate on cluster_params.w regardless.
     if ((ps_r_clustered || ps_r_clustered_debug) && Clustered::Ready() && !s_boundCluster[slot]) {
-        VkDescriptorBufferInfo cb[3] = {
-            { Clustered::GetLightsHandle(slot), Clustered::GetLightsOffset(slot), Clustered::GetLightsRange() },
-            { Clustered::GetGridHandle(),    0, VK_WHOLE_SIZE },
-            { Clustered::GetIndicesHandle(), 0, VK_WHOLE_SIZE },
-        };
-        VkWriteDescriptorSet wc[3]{};
-        for (u32 k = 0; k < 3; ++k) {
-            wc[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wc[k].dstSet = s_set[slot];
-            wc[k].dstBinding = 17 + k; wc[k].descriptorCount = 1;
-            wc[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wc[k].pBufferInfo = &cb[k];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 3, wc, 0, nullptr);
+        VK::DescriptorWriter(s_set[slot])
+            .StorageBuffer(17, Clustered::GetLightsHandle(slot), Clustered::GetLightsRange(),
+                                                                 Clustered::GetLightsOffset(slot))
+            .StorageBuffer(18, Clustered::GetGridHandle())
+            .StorageBuffer(19, Clustered::GetIndicesHandle())
+            .Flush();
         s_boundCluster[slot] = true;
     }
 
@@ -1678,7 +1639,7 @@ void Destroy()
     s_dummyBuf.Destroy();
     s_mapped = nullptr;
     s_current = VK_NULL_HANDLE;
-    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundIL[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundDeform[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; s_boundIBL[i] = VK_NULL_HANDLE; s_boundSH[i] = VK_NULL_HANDLE; }
+    for (u32 i = 0; i < kFramesInFlight; ++i) { s_set[i] = VK_NULL_HANDLE; s_boundCube0[i] = VK_NULL_HANDLE; s_boundCube1[i] = VK_NULL_HANDLE; s_boundAO[i] = VK_NULL_HANDLE; s_boundIL[i] = VK_NULL_HANDLE; s_boundCookie[i] = VK_NULL_HANDLE; s_boundWater[i] = VK_NULL_HANDLE; s_boundFlow[i] = VK_NULL_HANDLE; s_boundGround[i] = VK_NULL_HANDLE; s_boundShoreWet[i] = VK_NULL_HANDLE; s_boundWaterLvl[i] = VK_NULL_HANDLE; s_boundDeform[i] = VK_NULL_HANDLE; s_boundCluster[i] = false; s_boundIBL[i] = VK_NULL_HANDLE; s_boundSH[i] = VK_NULL_HANDLE; }
     s_inited = false; s_failed = false;
 }
 

@@ -10,6 +10,7 @@
 #include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_pass_bloom.h"
 #include "vk_scene_color.h"
+#include "vk_descriptors.h" // VK::DescriptorWriter
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
@@ -85,16 +86,8 @@ namespace {
             if (s_view[i] == VK_NULL_HANDLE) return false;
         }
         // Blur sets point at the (new) ping-pong views.
-        auto writeSet = [&](VkDescriptorSet set, VkImageView view) {
-            VkDescriptorImageInfo ii{ s_Sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = set; w.dstBinding = 0; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
-        };
-        writeSet(s_SetA, s_view[0]);
-        writeSet(s_SetB, s_view[1]);
+        VK::DescriptorWriter(s_SetA).ImageSampler(0, s_view[0], s_Sampler).Flush();
+        VK::DescriptorWriter(s_SetB).ImageSampler(0, s_view[1], s_Sampler).Flush();
         ++s_generation;
         Msg("[VK Bloom] RTs ready (%ux%u, gen %u)", want.width, want.height, s_generation);
         return true;
@@ -131,33 +124,13 @@ bool Init()
         Msg("![VK Bloom] shader load failed"); return false;
     }
 
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo lci{};
-    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 1; lci.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
-        Msg("![VK Bloom] set layout failed"); return false;
-    }
-
     const u32 nSets = kMaxImages + 2;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_Pool) != VK_SUCCESS) {
-        Msg("![VK Bloom] pool failed"); return false;
-    }
     {
-        VkDescriptorSetLayout layouts[kMaxImages + 2];
-        for (u32 i = 0; i < nSets; ++i) layouts[i] = s_SetLayout;
         VkDescriptorSet sets[kMaxImages + 2]{};
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = s_Pool; dai.descriptorSetCount = nSets; dai.pSetLayouts = layouts;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, sets) != VK_SUCCESS) {
-            Msg("![VK Bloom] alloc sets failed"); return false;
+        if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER }, nSets,
+                                    s_SetLayout, s_Pool, sets,
+                                    VK_SHADER_STAGE_FRAGMENT_BIT, "Bloom")) {
+            return false;
         }
         for (u32 i = 0; i < kMaxImages; ++i) s_SetScene[i] = sets[i];
         s_SetA = sets[kMaxImages];
@@ -213,14 +186,9 @@ void Execute(VkCommandBuffer cmd, u32 imageIndex, VkExtent2D sceneExtent, u32 sc
 
     // (Re)bind the scene sample views when SceneColor was recreated.
     if (sceneGen != s_boundSceneGen) {
-        for (u32 i = 0; i < SceneColor::Count() && i < kMaxImages; ++i) {
-            VkDescriptorImageInfo ii{ s_Sampler, SceneColor::GetSampleView(i), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = s_SetScene[i]; w.dstBinding = 0; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
-        }
+        for (u32 i = 0; i < SceneColor::Count() && i < kMaxImages; ++i)
+            VK::DescriptorWriter(s_SetScene[i])
+                .ImageSampler(0, SceneColor::GetSampleView(i), s_Sampler).Flush();
         s_boundSceneGen = sceneGen;
     }
 

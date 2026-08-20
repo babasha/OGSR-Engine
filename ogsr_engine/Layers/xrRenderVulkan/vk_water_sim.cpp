@@ -6,9 +6,11 @@
 // form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
+#include "vk_descriptors.h"       // VK::DescriptorWriter
 #include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_water_sim.h"
 #include "vk_image.h"      // VK::CreateImage2D / CreateImageView
+#include "vk_barriers.h"   // VK::ImageBarrier (explicit stage/access overload)
 #include "vk_compute_util.h" // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_shadow.h"          // rain ortho VP / views / size / sampler (the grid)
 #include "vk_shaders.h"         // g_ShaderManager
@@ -48,19 +50,6 @@ namespace {
         float   p2[4];   // damping, dt, maxVel, 0
     };
 
-    void barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout oldL, VkImageLayout newL,
-                 VkPipelineStageFlags srcS, VkPipelineStageFlags dstS, VkAccessFlags srcA, VkAccessFlags dstA)
-    {
-        VkImageMemoryBarrier b{};
-        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout = oldL; b.newLayout = newL;
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = img;
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
-        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
-    }
-
     bool createImage(VkFormat fmt, VkImageUsageFlags usage, Buf& out)
     {
         if (!VK::CreateImage2D(fmt, { s_size, s_size }, usage, out.img, out.alloc, "WaterSim"))
@@ -78,20 +67,23 @@ namespace {
     // compute write (GENERAL) -> copy to state -> back to working layouts.
     void copyBack(VkCommandBuffer cmd, Buf& scr, Buf& state)
     {
-        barrier(cmd, scr.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        barrier(cmd, state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VK::ImageBarrier(cmd, scr.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VK::ImageBarrier(cmd, state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         VkImageCopy cp{};
         cp.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         cp.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         cp.extent = { s_size, s_size, 1 };
         vkCmdCopyImage(cmd, scr.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        barrier(cmd, state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        barrier(cmd, scr.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        VK::ImageBarrier(cmd, state.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+        VK::ImageBarrier(cmd, scr.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
     }
 }
 
@@ -130,28 +122,13 @@ bool Init()
 
     if (!g_ShaderManager) { Msg("![VK Water] g_ShaderManager null"); s_failed = true; return false; }
 
-    VkDescriptorSetLayoutBinding b[6]{};
-    for (int i = 0; i < 6; ++i) { b[i].binding = (u32)i; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    b[0].descriptorType = b[1].descriptorType = b[2].descriptorType = b[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b[4].descriptorType = b[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    VkDescriptorSetLayoutCreateInfo slci{};
-    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 6; slci.pBindings = b;
-    vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout);
-
-    VkDescriptorPoolSize ps[2]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 4;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = 2;
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool);
-
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setLayout;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) {
-        Msg("![VK Water] descriptor alloc failed"); s_failed = true; return false;
+    // 0..3 = sampled inputs, 4/5 = storage outputs.
+    constexpr auto kTex = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    constexpr auto kImg = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (!VK::MakeDescriptorSets({ kTex, kTex, kTex, kTex, kImg, kImg }, 1,
+                                s_setLayout, s_pool, &s_set,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "Water.Sim")) {
+        s_failed = true; return false;
     }
 
     const VkImageLayout RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -163,13 +140,11 @@ bool Init()
         { VK_NULL_HANDLE, s_depthScr.view, VK_IMAGE_LAYOUT_GENERAL }, // 4 out depth
         { VK_NULL_HANDLE, s_velScr.view,   VK_IMAGE_LAYOUT_GENERAL }, // 5 out velocity
     };
-    VkWriteDescriptorSet w[6]{};
-    for (int i = 0; i < 6; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set; w[i].dstBinding = (u32)i; w[i].descriptorCount = 1;
-        w[i].descriptorType = (i < 4) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[i].pImageInfo = &ii[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+    VK::DescriptorWriter w(s_set);
+    for (u32 i = 0; i < 6; ++i)
+        w.Image(i, (i < 4) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ii[i]);
+    w.Flush();
 
     s_pipeLayout = VK::MakePipelineLayout({ s_setLayout }, sizeof(PushConstants));
 
@@ -190,11 +165,13 @@ void Dispatch(VkCommandBuffer cmd, float rainDensity01)
 
     if (s_first) {
         for (Buf* st : { &s_depth, &s_vel })
-            barrier(cmd, st->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT);
+            VK::ImageBarrier(cmd, st->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
         for (Buf* sc : { &s_depthScr, &s_velScr })
-            barrier(cmd, sc->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+            VK::ImageBarrier(cmd, sc->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
     }
 
     const Fmatrix& curVP = ShadowMap::GetRainVP();

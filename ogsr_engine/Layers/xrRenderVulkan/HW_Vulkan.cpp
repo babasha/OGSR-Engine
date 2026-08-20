@@ -16,6 +16,11 @@
 #include <vector>
 #include <set>
 
+// Streamline is only needed by the SL/FG routes — Step 0 below reads these to decide
+// whether to bring the interposer up at all (vk_console_min.cpp owns them).
+extern int ps_r_dlss_sl;
+extern int ps_r_dlss_fg;
+
 // Use VK namespace globals
 using VK::g_VulkanGeometry;
 using VK::g_VulkanLighting;
@@ -142,6 +147,11 @@ bool CVulkanHW::CreateLogicalDevice()
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
     features13.maintenance4 = VK_TRUE;
+    // Our fragment shaders compile `discard` to OpDemoteToHelperInvocation (glslc does
+    // this by default for SPIR-V 1.6), so the modules DECLARE the capability while the
+    // device never enabled it — 68 × VUID-VkShaderModuleCreateInfo-pCode-08740 per run,
+    // one per module. Core 1.3 and universal on anything that reaches this renderer.
+    features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -203,6 +213,18 @@ bool CVulkanHW::CreateLogicalDevice()
             deviceFeatures.features.tessellationShader = VK_TRUE;
         else
             Msg("[Vulkan] tessellationShader not supported — world tessellation disabled");
+
+        // independentBlend: per-attachment blend state on an MRT pipeline. The water
+        // mask pass needs it — its two targets share the MAX blend but differ in
+        // colorWriteMask (R only vs RGBA, vk_pass_water.cpp), and WITHOUT this feature
+        // the spec requires every pAttachments element to be identical. The pipeline
+        // was being created anyway (VUID-...-pAttachments-00605, caught 16-08), i.e.
+        // the write masks were only working by driver grace.
+        if (supportedBase.independentBlend == VK_TRUE)
+            deviceFeatures.features.independentBlend = VK_TRUE;
+        else
+            Msg("![Vulkan] independentBlend NOT supported — MRT passes with per-attachment "
+                "write masks (water mask) are out of spec on this GPU");
     }
 
     // Build final extension list: required + optional NGX extensions if available
@@ -614,8 +636,26 @@ bool CVulkanHW::CreateDevice(HWND hWnd)
     // Step 0: NVIDIA Streamline — MUST init before ANY Vulkan call (the linked
     // sl.interposer proxies vkCreateInstance/Device so SL can hook DLSS/Reflex/FG).
     // Non-fatal: if slInit fails, SL stays off and the raw-NGX DLSS path is used.
+    //
+    // ⚠ONLY brought up when something actually needs it (r_dlss_sl / r_dlss_fg).
+    // Streamline is a prerequisite for those two routes and for NOTHING else — the
+    // default DLSS path is raw NGX. Initialising it unconditionally left its
+    // interposer hooking vkCmd* for a plugin set that, on this machine, does not
+    // even come up (logs 16-08: "failed to load NGXCore: 126", "no matching adapter
+    // found", "Hook sl.common:Vulkan:CmdBindPipeline is NOT supported", plus a 3 s
+    // adapter-probe wait at startup and ~380 log lines a run).
+    //
+    // Reading the cvars HERE is safe: x_ray.cpp executes user.ltx before the render
+    // device is created (verified in the startup log — user.ltx at 17:37:10.42,
+    // "Initializing Vulkan renderer" at 17:37:10.53). The flip side is that enabling
+    // SL needs a RESTART, which CRender::Render reports if r_dlss_sl is set mid-run.
+    // `-force_sl` forces it on for a run; `-no_sl` (inside Init) still hard-disables.
     // ========================================================================
-    VK::SL::Init();
+    if (ps_r_dlss_sl || ps_r_dlss_fg || strstr(Core.Params, "-force_sl"))
+        VK::SL::Init();
+    else
+        Msg("[VK SL] not requested (r_dlss_sl 0, r_dlss_fg 0) — Streamline NOT initialised; "
+            "DLSS runs on the raw-NGX path. Set r_dlss_sl 1 in user.ltx and restart for the SL/FG route.");
 
     // ========================================================================
     // Step 1: Create Vulkan instance

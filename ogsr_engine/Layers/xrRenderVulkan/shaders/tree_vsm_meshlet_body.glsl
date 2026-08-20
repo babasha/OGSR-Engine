@@ -12,27 +12,21 @@
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUV;    // SHORT2 SSCALED
 
-struct TreeInstance { mat4 xform; float c_scale_hemi; float c_bias_hemi; uint _p0; uint _p1; };
-layout(set = 0, binding = 0, std430) readonly buffer XformBuf { TreeInstance inst[]; };
+#include "tree_instance.glsl"   // TreeInstance + XformBuf (set 0 b0) — matches VK::GpuTreeInstance
 
 layout(set = 2, binding = 0) readonly buffer PageList { uvec4 pageList[]; };
-// set=2 binding=1 (casterPages) is declared by the pipeline layout but UNUSED here — the
-// meshlet path carries the slot in gl_InstanceIndex instead.
-layout(set = 2, binding = 2) uniform VsmParams {
-    mat4 view;
-    vec4 level[VSM_LEVELS];
-    vec4 zparams;
-} vsm;
+#define VSM_PARAMS_SET     2
+#define VSM_PARAMS_BINDING 2
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 
-layout(push_constant) uniform PC {
-    float uvScale; float alphaRef; uint cap; uint pad;
-    vec4  wind_params;   // wind (dyn wrapper only): all 0 when off -> no displacement
-    vec4  wsetup_trees;
-    vec4  wind_anim;
-} pc;
+#include "tree_vsm_push.glsl"   // VSM caster push — shared by the four caster bodies
 
 layout(location = 0) out vec2 vUV;
 out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[4]; };
+
+#define VSM_ROUTE_WP       wp
+#define VSM_ROUTE_ATLAS_W  TV_ATLAS_W
+#define VSM_ROUTE_ATLAS_H  TV_ATLAS_H
 
 void main()
 {
@@ -51,35 +45,10 @@ void main()
     {
         float baseY = X[3].y;
         float H     = wp.y - baseY;
-        float r     = -pc.wind_params.x + 1.57079;
-        vec2  wdir  = vec2(cos(r), sin(r));
-        float spd   = max(pc.wsetup_trees.w, clamp(pc.wind_params.y * 0.001, 0.0, 1.0));
-        wp += ssfxTreeWind(inst[treeIdx]._p0, wp, H, vUV.y, wdir, spd, baseY,
-                           pc.wind_anim.xyz, pc.wsetup_trees.x, pc.wsetup_trees.y,
-                           pc.wsetup_trees.z, pc.wind_anim.w, pc.wind_params.w);
+        wp += ssfxTreeWindWorld(wp, H, vUV.y, inst[treeIdx]._p0, baseY,
+                                pc.wind_params, pc.wsetup_trees, pc.wind_anim);
     }
 
-    uvec4 pg   = pageList[slot];
-    int   L    = int(pg.x);
-    ivec2 page = ivec2(pg.yz);
-    vec3  lp   = (vsm.view * vec4(wp, 1.0)).xyz;
-    vec2  origin = vsm.level[L].xy;
-    float pw     = vsm.level[L].z / float(VSM_PAGES_AXIS);
-    vec2  pmin   = origin + vec2(page) * pw;
-    vec2  pmax   = pmin + vec2(pw);
-    vec2  nxy    = (lp.xy - pmin) / pw * 2.0 - 1.0;
-    float nz     = (lp.z - vsm.zparams.x) * vsm.zparams.y;
-
-    gl_ClipDistance[0] = lp.x - pmin.x;
-    gl_ClipDistance[1] = pmax.x - lp.x;
-    gl_ClipDistance[2] = lp.y - pmin.y;
-    gl_ClipDistance[3] = pmax.y - lp.y;
-
-    uint  ax = slot % uint(TV_ATLAS_W);
-    uint  ay = slot / uint(TV_ATLAS_W);
-    float hX = 1.0 / float(TV_ATLAS_W);
-    float hY = 1.0 / float(TV_ATLAS_H);
-    float cx = (float(ax) + 0.5) * 2.0 * hX - 1.0;
-    float cy = (float(ay) + 0.5) * 2.0 * hY - 1.0;
-    gl_Position = vec4(cx + nxy.x * hX, cy + nxy.y * hY, nz, 1.0);
+    // Page routing (clip planes + atlas sub-rect) — shared by all VSM casters.
+#include "vsm_page_route.glsl"
 }

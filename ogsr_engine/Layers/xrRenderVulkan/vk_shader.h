@@ -24,7 +24,6 @@
 //
 // ============================================================================
 
-#include "vk_pipeline.h"
 #include "vk_material.h"
 
 namespace VK
@@ -64,9 +63,6 @@ public:
     // lightmap at descriptor binding 2 instead of the 1×1 white fallback.
     shared_str m_TexLmap;
 
-    // Pipeline configuration
-    VK::PipelineConfig m_PipelineConfig;
-
     // Material reference (created on first use)
     VK::CMaterial* m_Material;
 
@@ -77,6 +73,7 @@ public:
     bool m_bWmark;        // Wallmark shader (decals)
     bool m_bAlphaRef;     // Alpha-reference shader (discard in fragment shader)
     bool m_bGlass;        // Translucent glass (engine "glass" shader / trans shader on a glas\/wnd texture) — must BLEND, not alpha-test
+    bool m_bWater;        // Level water body (`effects\water*`) — its own late blended pass (vk_pass_water)
 
 public:
     CVulkanShader();
@@ -88,9 +85,6 @@ public:
 
     // Material access (lazy creation)
     VK::CMaterial* GetMaterial();
-
-    // Pipeline access
-    VkPipeline GetPipeline();
 
     // Helpers
     bool IsValid() const { return m_Name.size() > 0; }

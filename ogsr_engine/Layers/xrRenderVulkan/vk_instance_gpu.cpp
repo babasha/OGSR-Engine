@@ -10,6 +10,7 @@
 // per-instance transform SSBO + firstInstance indexing).
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_instance_gpu.h"
 #include "CRender_Vulkan.h"     // RImplementation
 #include "vk_Visual.h"          // vkFVisual, vkFHierrarhyVisual, m_mesh
@@ -18,6 +19,7 @@
 #include "vk_pipeline_cache.h"  // world pipelines (Key::instanced) + push offsets
 #include "vk_cull.h"            // VK::ExtractFrustumPlanes (camera frustum → cull planes)
 #include "vk_compute_util.h"    // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"    // VK::GfxPipelineBuilder
 #include "vk_shaders.h"         // g_ShaderManager
 #include "vk_pass_world.h"      // g_DynamicVisuals, DynVisual
 #include "vk_pass_skinned.h"    // Skinned_HandlesVisual
@@ -125,7 +127,7 @@ void Flatten(vkRender_Visual* rv, const Fmatrix& xf, xr_vector<RawInst>& out, bo
         // of meshes, so leaving it on the CPU queue costs nothing; an instanced
         // terrain variant would need an INSTANCED world_terrain.vert first.
         if (mat && (mat->isWmark || mat->isGlass || mat->isEmisAdd || mat->isLitBlend
-                    || mat->isTerrain)) {
+                    || mat->isWater || mat->isTerrain)) {
             excluded = true;
             return;
         }
@@ -169,33 +171,21 @@ bool CreateCullPipeline()
     VkShaderModule cs = g_ShaderManager->Load("instance_cull.comp.spv");
     if (!cs) { Msg("![VK InstanceGPU] instance_cull.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[5]{};
-    for (u32 i = 0; i < 5; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 5; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_cullSetL) != VK_SUCCESS) return false;
-
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    s_cullSetL = VK::MakeSetLayout({ kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                   VK_SHADER_STAGE_COMPUTE_BIT, "InstanceGPU.Cull");
     // Draw side: set 0 = the same transform SSBO, read by the VERTEX stage.
-    VkDescriptorSetLayoutBinding db{};
-    db.binding = 0; db.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    db.descriptorCount = 1; db.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo dlci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dlci.bindingCount = 1; dlci.pBindings = &db;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &dlci, nullptr, &s_drawSetL) != VK_SUCCESS) return false;
+    s_drawSetL = VK::MakeSetLayout({ kSSBO }, VK_SHADER_STAGE_VERTEX_BIT, "InstanceGPU.Draw");
+    if (!s_cullSetL || !s_drawSetL) return false;
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 };
+    // One pool for both sets: 5 SSBOs for the cull set + 1 for the draw set.
+    VkDescriptorPoolSize ps{ kSSBO, 6 };
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets = 2; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
 
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_cullSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_cullSet) != VK_SUCCESS) return false;
-    dai.pSetLayouts = &s_drawSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_drawSet) != VK_SUCCESS) return false;
+    if (!VK::AllocSets(s_pool, s_cullSetL, 1, &s_cullSet, "InstanceGPU.Cull")) return false;
+    if (!VK::AllocSets(s_pool, s_drawSetL, 1, &s_drawSet, "InstanceGPU.Draw")) return false;
 
     s_cullLayout = VK::MakePipelineLayout({ s_cullSetL }, sizeof(CullPush));
     if (s_cullLayout == VK_NULL_HANDLE) return false;
@@ -228,62 +218,16 @@ VkPipeline GetDrawPipeline(u32 stride)
         return VK_NULL_HANDLE;
     }
 
-    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &attr;
-
-    VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    stage.stage = VK_SHADER_STAGE_VERTEX_BIT; stage.module = vs; stage.pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode    = VK_CULL_MODE_NONE;
-    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth   = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp  = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 0;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount  = 0;
-    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;   // matches the shadow map
-
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci;
-    pi.stageCount = 1;   pi.pStages             = &stage;
-    pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
-    pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
-    pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
-    pi.layout = s_drawLayout;
-
-    VkPipeline h = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &h) != VK_SUCCESS) {
-        Msg("![VK InstanceGPU] instanced depth pipeline failed, stride=%u", stride);
-        h = VK_NULL_HANDLE;
-    } else {
+    VkPipeline h = VK::GfxPipelineBuilder(s_drawLayout)
+        .Vert(vs)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D32_SFLOAT)   // matches the shadow map
+        .Build("InstanceGPU instanced depth stride=%u", stride);
+    if (h != VK_NULL_HANDLE)
         Msg("[VK InstanceGPU] instanced depth pipeline stride=%u", stride);
-    }
     s_drawPipes.emplace(stride, h);
     return h;
 }
@@ -398,21 +342,15 @@ void Rebuild()
     s_xform->Upload(s_xformCPU.data(), (VkDeviceSize)s_total * sizeof(Fmatrix));
     s_xformDirty = false;
 
-    VkDescriptorBufferInfo bi[5] = {
-        { s_meta->GetHandle(),      0, VK_WHOLE_SIZE },
-        { s_xform->GetHandle(),     0, VK_WHOLE_SIZE },
-        { s_indirect->GetHandle(),  0, VK_WHOLE_SIZE },
-        { s_count->GetHandle(),     0, VK_WHOLE_SIZE },
-        { s_groupBase->GetHandle(), 0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet w[6]{};
-    for (u32 i = 0; i < 5; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_cullSet; w[i].dstBinding = i;
-        w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-    }
-    w[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[5].dstSet = s_drawSet; w[5].dstBinding = 0;
-    w[5].descriptorCount = 1; w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[5].pBufferInfo = &bi[1];
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+    VK::DescriptorWriter(s_cullSet)
+        .StorageBuffer(0, s_meta->GetHandle())
+        .StorageBuffer(1, s_xform->GetHandle())
+        .StorageBuffer(2, s_indirect->GetHandle())
+        .StorageBuffer(3, s_count->GetHandle())
+        .StorageBuffer(4, s_groupBase->GetHandle())
+        .Flush();
+    // The draw set only needs the transforms (the VS pulls its instance row from them).
+    VK::DescriptorWriter(s_drawSet).StorageBuffer(0, s_xform->GetHandle()).Flush();
 
     u32 atGroups = 0, atInstances = 0;
     for (const Group& g : s_groups) if (g.alphaTested) { ++atGroups; atInstances += g.entryCount; }

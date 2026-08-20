@@ -71,17 +71,9 @@ u32            CascadeSize(u32 i);
 VkImage        GetCascadeStaticImage(u32 i);
 VkImageView    GetCascadeStaticView(u32 i);
 
-// ---- Volumetric fog sun-shadow (r_vol_shadow): a dedicated low-res sun depth
-// rendered EVERY frame (no cache) so the FOG's sun occlusion updates CONTINUOUSLY.
-// The cascade/VSM caches refresh in ~1 s steps on a moving sun → the fog shafts
-// tremble / the field fog pulses; a per-frame map removes the step at the source.
-// Low-res → cheap even per-frame AND naturally soft (good for fog). Anchor-snapped
-// like the cascades so per-frame rendering itself doesn't shimmer.
-VkImage        GetFogShadowImage();
-VkImageView    GetFogShadowView();
-u32            FogShadowSize();
-void           ComputeFogShadowVP(const Fvector& sunDir);   // fresh every frame
-const Fmatrix& GetFogShadowVP();
+// (The dedicated volumetric-fog sun-shadow map lived here — REMOVED 12-08-2026 as
+// dead code behind r_vol_shadow 0. It existed to stop fog shafts trembling on a
+// moving sun, but that was the temporal reprojection, fixed in vol_inject.)
 
 // ---- Rain occlusion map (R4 rt_smap_rain analogue): one top-down ortho
 // depth render of the statics around the camera. Receivers sample it to mask

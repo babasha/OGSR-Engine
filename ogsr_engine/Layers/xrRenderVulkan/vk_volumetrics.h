@@ -67,9 +67,48 @@ bool Wanted();      // r_vol != 0
 // Enables froxel depth rejection (r_vol_depth_reject): fog behind the geometry of its
 // own view column gets no in-scatter (kills the through-wall glow the trilinear volume
 // fetch smears onto walls). Pass VK_NULL_HANDLE to disable (editor path).
+// `onComputeQueue`: `cmd` belongs to the dedicated COMPUTE queue (async compute).
+// Graphics pipeline stages are ILLEGAL there, so the pass's boundary barriers — the
+// ones handing the volumes to the tonemap / particle pass — drop their FRAGMENT
+// stage and let the timeline semaphore carry that dependency instead, which is what
+// a cross-queue handoff is expressed with. Everything in between is compute/transfer
+// already. Pass VK_NULL_HANDLE for sceneDepthPrev in that mode: the scene depth is
+// being rewritten by this frame's prepass on the other queue.
 void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
              const SmokeParticle* smoke, u32 smokeCount,
-             VkImageView sceneDepthPrev = VK_NULL_HANDLE);
+             VkImageView sceneDepthPrev = VK_NULL_HANDLE,
+             bool onComputeQueue = false);
+
+// GRAPHICS-queue call, recorded right after Pass_SunShadow. Under async compute
+// (r_async) the inject records onto the COMPUTE queue, where sampling the live sun
+// cascades would race against the graphics queue rewriting them for the same frame —
+// and nothing stores last frame's cascade to read instead. This blits a downscaled
+// (1024²) snapshot of the cascades + rain map into one of two ping-ponged sets; the
+// NEXT frame's inject samples the set written here. No-op when r_async is off or the
+// device has no dedicated compute family — then the inject samples the live maps.
+void SnapshotShadows(VkCommandBuffer cmd);
+
+// May the GRAPHICS queue sample the LOCAL scatter volume this frame (the Stage-0
+// smoke light probe)? False under async compute: the inject writes that volume on
+// the compute queue while the particle pass — which lives in the scene segment and
+// deliberately does NOT wait on compute — would be reading it. Returning false costs
+// the smoke its volumetric probe under r_async and nothing else; the fix that gives
+// it back is ping-ponging the scatter volume so the graphics queue reads the
+// previous frame's copy. The integrated volume needs no such gate: its only consumer
+// is the tonemap, which sits in the post segment and already waits on the timeline.
+bool ProbeAvailableToGraphics();
+
+// May the inject record onto the COMPUTE queue this frame? Only once a COMPLETED
+// shadow snapshot exists for it to sample (see SnapshotShadows). False on the first
+// frames after a level load or after r_async is switched on — there the pass stays on
+// the graphics queue, where reading the live cascades is safe.
+bool AsyncInjectReady();
+
+// GRAPHICS-queue prerequisites of Execute: the one-shot terrain-height bake (a real
+// render pass) and the grass-canopy upload. Call with the frame's GRAPHICS command
+// buffer BEFORE Execute — under async Execute records onto the compute queue, where
+// a render pass is fatal. Both early-out once baked.
+void RecordGraphicsBakes(VkCommandBuffer gfxCmd);
 
 // Composite inputs for the tonemap fold: the integrated volume (rgb = in-scatter,
 // a = transmittance) + a linear/clamp sampler. The view exists from Init on (the

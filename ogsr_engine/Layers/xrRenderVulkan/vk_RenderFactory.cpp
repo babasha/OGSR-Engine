@@ -17,6 +17,7 @@
 // is in _parked/vk_RenderFactory.cpp.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_RenderFactory.h"
 #include "vk_RenderDeviceRender.h"
 #include "vk_ui_shader.h"
@@ -170,18 +171,9 @@ private:
             slot.descSet = VK_NULL_HANDLE;
             return false;
         }
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView   = slot.texture.GetView();
-        imageInfo.sampler     = slot.texture.GetSampler();
-        VkWriteDescriptorSet write{};
-        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet          = slot.descSet;
-        write.dstBinding      = 0;
-        write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.descriptorCount = 1;
-        write.pImageInfo      = &imageInfo;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &write, 0, nullptr);
+        VK::DescriptorWriter(slot.descSet)
+            .ImageSampler(0, slot.texture.GetView(), slot.texture.GetSampler())
+            .Flush();
         return true;
     }
 

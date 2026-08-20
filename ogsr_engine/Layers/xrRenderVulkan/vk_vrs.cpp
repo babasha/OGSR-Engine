@@ -8,6 +8,7 @@
 // Variable Rate Shading — depth-driven SRI built by compute. See vk_vrs.h.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_vrs.h"
 #include "HW_Vulkan.h"
 #include "vk_image.h"      // VK::CreateImage / CreateImageView
@@ -84,26 +85,12 @@ bool CreatePipeline()
     VkShaderModule cs = g_ShaderManager->Load("vrs_build.comp.spv");
     if (!cs) { Msg("![VK VRS] vrs_build.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[3]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 3; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL) != VK_SUCCESS) return false;
-
-    VkDescriptorPoolSize ps[3] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, N },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          N },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         N },
-    };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout layouts[N]; for (u32 i = 0; i < N; ++i) layouts[i] = s_setL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = N; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_set) != VK_SUCCESS) return false;
+    // 0 = depth (in), 1 = VRS image (out), 2 = stats.
+    if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+                                N, s_setL, s_pool, s_set, VK_SHADER_STAGE_COMPUTE_BIT, "VRS.Build"))
+        return false;
 
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -202,17 +189,11 @@ void BuildFromDepth(VkCommandBuffer cmd, u32 frameIndex, VkImageView depthView, 
     }
 
     // descriptor: depth (read) + this slot's SRI (write) + histogram SSBO
-    VkDescriptorImageInfo di{ s_depthSampler, depthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo si{ VK_NULL_HANDLE, s_view[cur], VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorBufferInfo hi{ s_hist[cur].GetHandle(), 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w[3]{};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = s_set[cur]; w[0].dstBinding = 0;
-    w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &di;
-    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = s_set[cur]; w[1].dstBinding = 1;
-    w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &si;
-    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = s_set[cur]; w[2].dstBinding = 2;
-    w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &hi;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+    VK::DescriptorWriter(s_set[cur])
+        .ImageSampler (0, depthView, s_depthSampler)
+        .StorageImage (1, s_view[cur])
+        .StorageBuffer(2, s_hist[cur].GetHandle())
+        .Flush();
 
     auto imgBarrier = [&](VkImageLayout oldL, VkImageLayout newL, VkAccessFlags srcA, VkAccessFlags dstA,
                           VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {

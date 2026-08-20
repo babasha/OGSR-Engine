@@ -18,12 +18,15 @@
 // pttLIT — supported too in case the engine asks for lit primitives.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_core.h"
 #include "vk_UIPipeline.h"
 #include "vk_ui_shader.h"
 #include "vk_swapchain.h"
 #include "../../Include/xrRender/UIRender.h"
 #include "../xrRender/FVF.h"   // FVF::TL, FVF::LIT
+#include "vk_texture.h"        // CVulkanTexture::CreateFromData -- dynamic textures
+#include "HW_Vulkan.h"         // VulkanHW.m_Device
 #include <set>
 
 // Tracks the last UI shader passed to SetShader so vkUISequenceVideoItem
@@ -31,6 +34,15 @@
 IVkUIShader* g_pLastVkUIShader = nullptr;
 
 namespace {
+
+// A texture the caller handed us as pixels. See the note on DynTextureCreate in
+// Include/xrRender/UIRender.h: an atlas a font engine just rasterised has no
+// file behind it, so the name-based shader path cannot carry it.
+struct VkDynTexture
+{
+    VK::CVulkanTexture tex;
+    VkDescriptorSet    set = VK_NULL_HANDLE;
+};
 
 class vkUIRender final : public IUIRender
 {
@@ -49,6 +61,71 @@ class vkUIRender final : public IUIRender
 public:
     void CreateUIGeom() override  { /* VulkanUI::Create() done at engine init */ }
     void DestroyUIGeom() override { /* VulkanUI::Destroy() at engine teardown */ }
+
+    void* DynTextureCreate(const void* rgba, u32 w, u32 h) override
+    {
+        if (!rgba || !w || !h)
+            return nullptr;
+
+        auto* dt = xr_new<VkDynTexture>();
+        // ⚠⚠The last argument is the TOTAL SIZE IN BYTES, not bytes per pixel.
+        // It was 4, so exactly one pixel was ever uploaded and the rest of the
+        // image kept whatever VRAM happened to hold -- a font atlas came out as
+        // multicoloured noise that reads as broken hardware. The 1x1 white
+        // texture below survived only because 1*1*4 IS 4.
+        dt->tex.CreateFromData(rgba, w, h, VK_FORMAT_R8G8B8A8_UNORM, VkDeviceSize(w) * VkDeviceSize(h) * 4);
+        if (dt->tex.GetView() == VK_NULL_HANDLE)
+        {
+            xr_delete(dt);
+            Msg("![VK-UI] DynTextureCreate: %ux%u upload failed", w, h);
+            return nullptr;
+        }
+
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = VulkanUI::s_DescriptorPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &VulkanUI::s_DescriptorSetLayout;
+        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &ai, &dt->set) != VK_SUCCESS)
+        {
+            // The pool is a fixed 256 sets shared with every menu texture. Worth
+            // saying out loud rather than drawing an untextured rectangle and
+            // leaving somebody to wonder why the font went blank.
+            Msg("![VK-UI] DynTextureCreate: descriptor pool exhausted (256 sets)");
+            xr_delete(dt);
+            return nullptr;
+        }
+
+        VK::DescriptorWriter(dt->set)
+            .ImageSampler(0, dt->tex.GetView(), dt->tex.GetSampler())
+            .Flush();
+
+        return dt;
+    }
+
+    void DynTextureDestroy(void* handle) override
+    {
+        auto* dt = static_cast<VkDynTexture*>(handle);
+        if (!dt)
+            return;
+        // ⚠The GPU may still be reading this in a frame that has not retired.
+        // The UI has no per-resource fence, so wait the device out -- destruction
+        // happens at document teardown, not per frame, so the stall is not on any
+        // hot path.
+        vkDeviceWaitIdle(VulkanHW.m_Device);
+        if (dt->set != VK_NULL_HANDLE)
+            vkFreeDescriptorSets(VulkanHW.m_Device, VulkanUI::s_DescriptorPool, 1, &dt->set);
+        dt->tex.Destroy();
+        xr_delete(dt);
+    }
+
+    void SetDynTexture(void* handle) override
+    {
+        m_pCurrentShader = nullptr;
+        g_pLastVkUIShader = nullptr;
+        auto* dt = static_cast<VkDynTexture*>(handle);
+        m_CurrentTextureSet = dt ? dt->set : VulkanUI::s_WhiteTextureSet;
+    }
 
     void SetShader(IUIShader& shader) override
     {
@@ -74,7 +151,10 @@ public:
     void SetScissor(Irect* rect) override
     {
         VkCommandBuffer cmd = g_VkUI_FrameCmd;
-        if (!cmd) {
+        // ⚠Same gate as the draw path: a scissor set immediately would apply to
+        // the SCENE's commands when the UI runs before it, and the matching draw
+        // is going to be queued anyway. Keep the pair together.
+        if (!cmd || !VulkanUI::s_SceneDone) {
             // Deferred: queue scissor change for replay.
             if (VulkanUI::s_DeferredCmdCount < VulkanUI::MAX_DEFERRED_CMDS) {
                 auto& dcmd = VulkanUI::s_DeferredCmds[VulkanUI::s_DeferredCmdCount++];
@@ -179,7 +259,12 @@ public:
         if (m_PrimitiveType == IUIRender::ptLineList  && VulkanUI::s_PipelineLineList)  pipe = VulkanUI::s_PipelineLineList;
         else if (m_PrimitiveType == IUIRender::ptLineStrip && VulkanUI::s_PipelineLineStrip) pipe = VulkanUI::s_PipelineLineStrip;
 
-        if (!cmd) {
+        // ⚠⚠"No command buffer" was NOT the only reason to defer, and the missing
+        // half was a crash: a UI draw issued BEFORE this frame's scene (the cursor
+        // sits at seqRender priority 1, the main menu at 5 -- and the menu is what
+        // renders the world) opened a render pass that the scene then recorded
+        // into. See VulkanUI::s_SceneDone and the note at the end of CRender::Render.
+        if (!cmd || !VulkanUI::s_SceneDone) {
             // Deferred path: vertex data already in mapped buffer; queue draw.
             if (VulkanUI::s_DeferredCmdCount < VulkanUI::MAX_DEFERRED_CMDS) {
                 auto& dcmd = VulkanUI::s_DeferredCmds[VulkanUI::s_DeferredCmdCount++];
@@ -198,6 +283,14 @@ public:
         // Immediate path.
         VulkanUI::FlushVertexBuffer();
         if (!VulkanUI::s_bUIPassActive) VulkanUI::BeginUIPassInternal();
+        // ⚠⚠The pass can REFUSE to open (BeginUIPassInternal has four early-outs)
+        // and drawing anyway is not a missing quad, it is a fault: the validation
+        // layer calls it "vkCmdDraw(): must be issued inside an active render
+        // pass", and the frame dies a few commands later. 18-08.
+        if (!VulkanUI::s_bUIPassActive) {
+            m_pWriteTL = nullptr; m_pWriteLIT = nullptr; m_VertCount = 0;
+            return;
+        }
         if (VulkanUI::s_Pipeline == VK_NULL_HANDLE) return;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);

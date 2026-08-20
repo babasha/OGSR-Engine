@@ -1,5 +1,10 @@
 #include "stdafx.h"
 #include "stream_reader.h"
+#include "LocatorAPI.h"     // FS_StreamStats / FS_StreamWindowSize live with the other FS accounting
+#include <atomic>
+#include <cstdlib>          // getenv — XROS_FS_WINDOW_MB
+
+
 
 void CMapStreamReader::construct(const HANDLE& file_mapping_handle, const size_t& start_offset, const size_t& file_size, const size_t& archive_size, const size_t& window_size)
 {
@@ -14,9 +19,56 @@ void CMapStreamReader::construct(const HANDLE& file_mapping_handle, const size_t
 
 void CMapStreamReader::destroy() { unmap(); }
 
+// ---------------------------------------------------------------------------
+// Sliding-window accounting. level.geom is 1.96 GB read through a 1 MB window,
+// i.e. ~1900 MapViewOfFile/UnmapViewOfFile pairs and ~478k page faults, all on
+// the loading thread — measured 1869 MB at 755 MB/s. Two very different causes
+// (window churn vs. faulting the pages in) hide behind that one number, so count
+// them apart before changing the window size or prefaulting anything.
+// ---------------------------------------------------------------------------
+namespace {
+std::atomic<u64> g_srMaps{0}, g_srMapUs{0}, g_srCopyBytes{0}, g_srCopyUs{0};
+}
+
+FS_StreamStats FS_GetStreamStats()
+{
+    FS_StreamStats s;
+    s.maps       = g_srMaps.load(std::memory_order_relaxed);
+    s.map_us     = g_srMapUs.load(std::memory_order_relaxed);
+    s.copy_bytes = g_srCopyBytes.load(std::memory_order_relaxed);
+    s.copy_us    = g_srCopyUs.load(std::memory_order_relaxed);
+    return s;
+}
+
+// Window size for every sliding-window reader. Overridable so the "is it the
+// window churn?" question can be answered by a run, not by an argument.
+size_t FS_StreamWindowSize()
+{
+    static size_t s_win = [] {
+        size_t mb = 1;
+        if (const char* e = std::getenv("XROS_FS_WINDOW_MB")) {
+            const int v = atoi(e);
+            if (v > 0 && v <= 512) mb = (size_t)v;
+        }
+        return mb * 1024 * 1024;
+    }();
+    return s_win;
+}
+
 void CMapStreamReader::map(const size_t& new_offset)
 {
+    CTimer _tMap;
+    _tMap.Start();
+    struct _mapScope {
+        CTimer& t;
+        ~_mapScope() {
+            g_srMaps.fetch_add(1, std::memory_order_relaxed);
+            g_srMapUs.fetch_add((u64)(t.GetElapsed_ms_total() * 1000.f), std::memory_order_relaxed);
+        }
+    } _ms{ _tMap };
+
     VERIFY(new_offset <= m_file_size);
+
     m_current_offset_from_start = new_offset;
 
     const size_t granularity = FS.dwAllocGranularity;
@@ -66,8 +118,20 @@ void CMapStreamReader::advance(std::ptrdiff_t offset)
 
 void CMapStreamReader::r(void* _buffer, size_t buffer_size)
 {
+    CTimer _tCopy;
+    _tCopy.Start();
+    const size_t _copyReq = buffer_size;
+    struct _copyScope {
+        CTimer& t; const size_t& n;
+        ~_copyScope() {
+            g_srCopyBytes.fetch_add((u64)n, std::memory_order_relaxed);
+            g_srCopyUs.fetch_add((u64)(t.GetElapsed_ms_total() * 1000.f), std::memory_order_relaxed);
+        }
+    } _cs{ _tCopy, _copyReq };
+
     VERIFY(m_current_pointer >= m_start_pointer);
     VERIFY(size_t(m_current_pointer - m_start_pointer) <= m_current_window_size);
+
 
     int offset_inside_window = int(m_current_pointer - m_start_pointer);
     if (offset_inside_window + buffer_size < m_current_window_size)

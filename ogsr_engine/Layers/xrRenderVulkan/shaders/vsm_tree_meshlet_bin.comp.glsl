@@ -23,7 +23,9 @@ struct Meshlet    { vec3 center; float radius; uint first_index, index_count, p0
 struct Range      { uint base, count; };
 
 layout(set = 0, binding =  0) readonly buffer Meta        { TreeMeta meta[]; };
-layout(set = 0, binding =  1) uniform VsmParams { mat4 view; vec4 level[VSM_LEVELS]; vec4 zparams; } vsm;
+#define VSM_PARAMS_SET     0
+#define VSM_PARAMS_BINDING 1
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 layout(set = 0, binding =  2) readonly buffer Xform       { TreeInst inst[]; };
 layout(set = 0, binding =  3) readonly buffer Meshlets    { Meshlet meshlets[]; };
 layout(set = 0, binding =  4) readonly buffer TreeRange   { Range treeRange[]; };

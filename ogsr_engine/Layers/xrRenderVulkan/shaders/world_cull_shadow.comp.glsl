@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // GPU-driven SHADOW culling of the cluster-LOD world set (Phase 3). One
 // invocation per cullable ENTRY (mesh or cluster of its LOD DAG — same meta
 // SSBO as world_cull.comp) — sphere vs the sun target's 6 ortho planes →
@@ -19,14 +20,8 @@
 // the legacy split: AT casters stay on the CPU FlushDepth cutout path.
 layout(local_size_x = 256) in;
 
-struct Meta {   // = world_cull.comp Meta (80 B)
-    vec4 sphere;        // cull sphere
-    vec4 lodSelf;       // unused here (ortho test is distance-free)
-    vec4 lodParent;     // unused here
-    uint indexCount; uint ibFirst; uint firstVertex; uint group;
-    float selfError; float parentError; uint flags; uint _p1;
-};
-struct Cmd  { uint indexCount; uint instanceCount; uint firstIndex; int vertexOffset; uint firstInstance; };
+#include "cluster_meta.glsl"   // struct Meta — matches VK::WorldGPU::GpuMeshMeta
+#include "draw_cmd.glsl"       // struct Cmd — matches VkDrawIndexedIndirectCommand
 
 layout(set = 0, binding = 0) readonly buffer Metas  { Meta metas[]; };
 layout(set = 0, binding = 1)          buffer Cmds   { Cmd  cmds[];  };   // TGT_COUNT × total, exact prefix regions per target

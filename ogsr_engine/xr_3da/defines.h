@@ -26,7 +26,13 @@ ENGINE_API extern BOOL bDebug;
 // psDeviceFlags
 enum
 {
-    //rsFullscreen = (1ul << 0ul),
+    // ⭐Alive again, 18-08. It was commented out because the DX path had stopped
+    // asking (R4 just runs borderless over the whole monitor) — and the Vulkan
+    // path inherited that, which is why `vid_mode` in the options screen wrote a
+    // number nobody read: the window was always the monitor. With a real flag the
+    // two settings mean what they say — fullscreen = the monitor, windowed = the
+    // resolution the player picked. See vk_RenderDeviceRender::apply_window_mode.
+    rsFullscreen = (1ul << 0ul),
     rsClearBB = (1ul << 1ul),
     rsVSync = (1ul << 2ul),
     //rsWireframe = (1ul << 3ul),

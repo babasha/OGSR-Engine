@@ -12,6 +12,19 @@ public:
     virtual void advance(std::ptrdiff_t offset) = 0;
     virtual void r(void* buffer, size_t buffer_size) = 0;
     virtual CStreamReader* open_chunk(u32 chunk_id) = 0;
+
+    // The bytes the caller can consume IN PLACE, without r() copying them out
+    // first: a pointer into the mapped window and how much is left in it before
+    // a remap. A reader that does not map (archive entries) answers {null, 0}
+    // and the caller keeps using r().
+    // Absolute offset, in the underlying file or archive, of the next byte this
+    // reader will hand out -- or size_t(-1) when it cannot say. Lets a caller that
+    // holds ANOTHER view of the same file stage out of that one instead (the
+    // geometry loader does: a fresh window mapping costs a fault per 4 KB).
+    virtual size_t abs_pos() const { return size_t(-1); }
+
+    virtual const u8* window_pointer() const { return nullptr; }
+    virtual size_t window_avail() const { return 0; }
 };
 
 template <>
@@ -65,6 +78,10 @@ public:
     void advance(std::ptrdiff_t offset) override;
     void r(void* buffer, size_t buffer_size) override;
     CStreamReader* open_chunk(u32 chunk_id) override;
+
+    size_t abs_pos() const override { return m_start_offset + m_current_offset_from_start + size_t(m_current_pointer - m_start_pointer); }
+    const u8* window_pointer() const override { return m_current_pointer; }
+    size_t window_avail() const override { return size_t(m_current_window_size - (m_current_pointer - m_start_pointer)); }
 };
 
 #include "stream_reader_inline.h"

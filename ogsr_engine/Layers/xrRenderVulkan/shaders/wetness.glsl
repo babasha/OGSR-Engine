@@ -18,6 +18,8 @@
 // before wetness.glsl in all three, which is what surface_field actually needs.
 #include "surface_field.glsl"
 
+#include "shore_wet.glsl"   // shoreWetness() — wet by CONTACT, not by rain
+
 // lmap/vlit puddle coverage: STATIC geometry (concrete slabs, asphalt platforms,
 // floors) — everything that is not splat terrain. This path had none of what the
 // terrain path grew: no height fill, no real dips, no border hardness, just a soft
@@ -172,17 +174,53 @@ vec3 applyWetnessCore(inout vec3 albedo, vec3 wp, vec3 N, float wetK, float pud,
     return sky * (puddleK * specOcc) + L.sun_color.rgb * (glint * 3.0) + vec3(foam) + crestCol;
 }
 
+// FOAM the surge left behind, on ground the sheet has just drained off.
+//
+// Kept OUTSIDE applyWetnessCore on purpose: foam is the opposite material to
+// everything that function models. Soaked ground is dark and glossy; a bubble raft
+// is pale and dead matte. Fed through the core it would come out as a shiny white
+// smear — so it lightens the albedo (in place, before the caller shades it) and
+// returns a small ambient lift of its own.
+//
+// Only UP-facing surfaces: foam settles, it does not cling to a wall.
+//
+// Nothing is ADDED to the light — the albedo is lightened in place and the
+// caller's own diffuse shading lights it. Foam on a shore at dusk is grey, and a
+// self-lit white patch would be the one thing that gives away that it is painted.
+void applyShoreFoam(inout vec3 albedo, vec3 wp, vec3 N)
+{
+    float f = shoreFoam(wp) * smoothstep(0.15, 0.55, N.y);
+    if (f <= 0.003) return;
+    albedo = mix(albedo, vec3(0.82, 0.83, 0.80), f * 0.85);
+}
+
 // world_lmap / world_vlit: down-facing kill in wetK, pud from puddleCoverage.
 vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask, vec3 bentN, float ao)
 {
-    float wet = L.rain_params.y;
-    if (wet < 0.005) return vec3(0.0);
+    float wet   = L.rain_params.y;
+    float shore = shoreWet(wp);
+    if (wet < 0.005 && shore < 0.005) return vec3(0.0);
     wet *= rainVis(wp);
     float upness = clamp(N.y, 0.0, 1.0);
     // Kill wetness on DOWN-facing surfaces (ceilings/overhang undersides).
     float wetK = wet * mix(0.35, 1.0, upness) * smoothstep(-0.15, 0.05, N.y);
+    // Water contact does NOT get the down-facing kill: the underside of a jetty
+    // or a slab lying half in a river is soaked, and rain is the only reason that
+    // rule existed. It also does not create puddles — a wet wall is not a pool.
+    wetK = max(wetK, shore);
+    // Same debug view as detail/tree, so one screenshot compares all three paths:
+    // if the ground reads red and the reeds do not, the fault is in THEIR shader,
+    // not in the map both of them sample.
+    if (shoreWetDebug()) { albedo = vec3(shore, shore * 0.3, 0.0); return vec3(0.0); }
+    // SOAKED IS DARK. The core keeps off-puddle darkening at 5% on purpose —
+    // rain-damp asphalt reads by GLOSS, and darkening it fully made the whole
+    // world muddy. Water contact is a different state: ground that a river has
+    // been standing on is wet THROUGH, and tone is the cue people actually read.
+    albedo *= 1.0 - 0.55 * shore;
     float pud  = puddleCoverage(wp, N, wet, upness);
-    return applyWetnessCore(albedo, wp, N, wetK, pud, sunMask, bentN, ao);
+    vec3  lit  = applyWetnessCore(albedo, wp, N, wetK, pud, sunMask, bentN, ao);
+    applyShoreFoam(albedo, wp, N);
+    return lit;
 }
 
 // world_terrain: pud arrives from the caller's per-pixel sssPuddle. Terrain's
@@ -190,13 +228,21 @@ vec3 applyWetness(inout vec3 albedo, vec3 wp, vec3 N, float sunMask, vec3 bentN,
 // the pre-refactor terrain applyWetness exactly.
 vec3 applyWetnessTerrain(inout vec3 albedo, vec3 wp, vec3 N, float pudIn, float sunMask, vec3 bentN, float ao)
 {
-    float wet = L.rain_params.y;
-    if (wet < 0.005) return vec3(0.0);
+    float wet   = L.rain_params.y;
+    float shore = shoreWet(wp);
+    if (wet < 0.005 && shore < 0.005) return vec3(0.0);
     wet *= rainVis(wp);
     float upness = clamp(N.y, 0.0, 1.0);
-    float wetK = wet * mix(0.35, 1.0, upness);
+    float wetK = max(wet * mix(0.35, 1.0, upness), shore);
+    // Same debug view as the lmap/vlit path — it was missing here, so TERRAIN
+    // never painted in r_wtr_wet -1/-2 and the one surface the complaint was
+    // actually about could not be read off the screenshot.
+    if (shoreWetDebug()) { albedo = vec3(shore, shore * 0.3, 0.0); return vec3(0.0); }
+    albedo *= 1.0 - 0.55 * shore;          // soaked is DARK — see applyWetness
     float pud  = clamp(pudIn, 0.0, 1.0) * upness;
-    return applyWetnessCore(albedo, wp, N, wetK, pud, sunMask, bentN, ao);
+    vec3  lit  = applyWetnessCore(albedo, wp, N, wetK, pud, sunMask, bentN, ao);
+    applyShoreFoam(albedo, wp, N);
+    return lit;
 }
 
 #endif // WETNESS_GLSL

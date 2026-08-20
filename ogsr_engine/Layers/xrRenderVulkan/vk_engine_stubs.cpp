@@ -79,20 +79,35 @@ bool RESET_SECTORS_HACK{};
 void Cleanup_R_occlusion() {}
 
 // ---------------------------------------------------------------------------
-// D3D11 debug-layer message dump. Called unconditionally from
+// Renderer debug-layer message dump. Called unconditionally from
 // xrCore/xrDebugNew.cpp on crash and from device.cpp::on_idle. Vulkan has its
 // own validation pipe (debug_utils messenger), so this stays empty here.
 // ---------------------------------------------------------------------------
-void LogD3D11DebugMessages() {}
+void LogRenderDebugMessages() {}
 
 // ---------------------------------------------------------------------------
-// ImGui DX11 backend hooks called unconditionally from xr_3da/device.cpp.
-// Forward-declared signature only — we don't pull in imgui.h or DX headers.
-// These get replaced with imgui_impl_vulkan once the Vulkan backend is wired.
+// ImGui backend hooks called unconditionally from xr_3da/device.cpp.
+// Forward-declared signature only — we don't pull in imgui.h here.
+// These get replaced with imgui_impl_vulkan once the Vulkan backend is wired;
+// meanwhile the editor overlay is drawn by VK::ImGuiVK::DrawOverlay.
 // ---------------------------------------------------------------------------
 struct ImDrawData;
-void ImGui_ImplDX11_NewFrame() {}
-void ImGui_ImplDX11_RenderDrawData(ImDrawData* /*draw_data*/) {}
+void ImGui_Backend_NewFrame() {}
+void ImGui_Backend_RenderDrawData(ImDrawData* /*draw_data*/) {}
+
+// ---------------------------------------------------------------------------
+// ⭐The same three hooks under their ORIGINAL names.
+//
+// This tree still ships the Direct3D renderer, and device.cpp / xrDebugNew.cpp
+// there call the hooks by their D3D11 names — those names are satisfied by
+// xrRenderDX10 in a DX build, and by nobody at all in a Vulkan build, which is
+// a link error rather than a missing feature. Defining both spellings costs
+// three empty functions and keeps this file identical to the one the renderer
+// is developed against, so the next sync is a copy rather than a merge.
+// ---------------------------------------------------------------------------
+void LogD3D11DebugMessages() { LogRenderDebugMessages(); }
+void ImGui_ImplDX11_NewFrame() { ImGui_Backend_NewFrame(); }
+void ImGui_ImplDX11_RenderDrawData(ImDrawData* draw_data) { ImGui_Backend_RenderDrawData(draw_data); }
 
 // ---------------------------------------------------------------------------
 // Material / lighting subsystems — stubs until vk_material.cpp / vk_lighting.cpp

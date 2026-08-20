@@ -41,6 +41,33 @@ int vsmToroidalSlot(int level, ivec2 absPage) {
     return level * VSM_PAGES_PER_LVL + sy * VSM_PAGES_AXIS + sx;
 }
 
+// Page range on ONE clipmap level covered by a caster's bounding sphere, in light
+// space `lp` with radius `R`. Declares lo/hi (unclamped, fractional — vsm_tree_bin's
+// acceptPage() weighs a page by them) and p0/p1 (the clamped page rect), and skips
+// the level when the sphere misses it entirely.
+//
+// Every binning pass computes exactly this — static meshes, clusters, skinned, trees
+// — and they MUST agree: two passes that disagree on which pages a caster touches put
+// its shadow on one page and not the neighbouring one, which reads as a shadow ending
+// at a straight line in mid-air. It was copy-pasted into all six loops.
+//
+// ⚠ A MACRO, not a function, and deliberately so. A function would have to signal
+// "skip this level" through a return value and hand back four out-parameters, which
+// (a) turns the caller's plain `continue` into a branch on a returned bool and
+// (b) reads the whole level vec4 instead of the .xy/.z the math actually uses — the
+// SPIR-V diff shows both as real changes (OpPhi/OpSelectionMerge/OpCompositeExtract).
+// Textual substitution keeps the emitted code bit-identical to the six copies, so
+// this refactor is provably free. USE INSIDE a `for (int L...)` loop over levels.
+#define VSM_PAGE_RANGE(L, lp, R, lo, hi, p0, p1)                                            \
+    vec2  origin = vsm.level[L].xy;                                                         \
+    float pw     = vsm.level[L].z / float(VSM_PAGES_AXIS);                                  \
+    vec2  lo = (lp - vec2(R) - origin) / pw;                                                \
+    vec2  hi = (lp + vec2(R) - origin) / pw;                                                \
+    if (hi.x < 0.0 || hi.y < 0.0 || lo.x >= float(VSM_PAGES_AXIS) || lo.y >= float(VSM_PAGES_AXIS)) \
+        continue;                                                                           \
+    ivec2 p0 = clamp(ivec2(floor(lo)), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));                \
+    ivec2 p1 = clamp(ivec2(floor(hi)), ivec2(0), ivec2(VSM_PAGES_AXIS - 1))
+
 // RECEIVER MASK (r_vsm_rmask, the UE5 VSM idea): per virtual page an 8×8 bitmask of
 // which 16×16-texel cells visible receivers actually sample (written by vsm_mark,
 // 2 u32 per page: .x = rows 0..3, .y = rows 4..7, bit = row*8+col). Dynamic-pass bins

@@ -8,6 +8,7 @@
 // Volumetric cloud noise bake — see vk_clouds.h.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_clouds.h"
 #include "vk_image.h"            // VK::CreateImage / CreateImageView
 #include "vk_compute_util.h"     // VK::MakePipelineLayout / CreateComputePipeline
@@ -75,23 +76,12 @@ namespace {
 
     VkDescriptorSetLayout MakeStorageSetLayout(VkDescriptorType type)
     {
-        VkDescriptorSetLayoutBinding b{};
-        b.binding = 0; b.descriptorType = type; b.descriptorCount = 1;
-        b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        VkDescriptorSetLayoutCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        ci.bindingCount = 1; ci.pBindings = &b;
-        VkDescriptorSetLayout l = VK_NULL_HANDLE;
-        vkCreateDescriptorSetLayout(VulkanHW.m_Device, &ci, nullptr, &l);
-        return l;
+        return VK::MakeSetLayout({ type }, VK_SHADER_STAGE_COMPUTE_BIT, "Clouds");
     }
 
     void WriteStorage(VkDescriptorSet set, VkImageView view)
     {
-        VkDescriptorImageInfo ii{ VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
-        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w.dstSet = set; w.dstBinding = 0; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w.pImageInfo = &ii;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(set).StorageImage(0, view).Flush();
     }
 }
 

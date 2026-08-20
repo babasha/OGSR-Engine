@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cmath>
@@ -24,6 +25,7 @@
 extern int ps_r_clpage;          // 0 = eager install-all (pre-streaming behavior), 1 = stream by budget
 extern int ps_r_clpage_budget;   // MB for the resident page pool (pinned pages always fit)
 extern int ps_r_profiler;
+extern int ps_r_clpage_map;      // pinned install uploads out of a mapping instead of fread
 extern int ps_r_cl_audit;        // heavyweight streaming forensics (white-polygon hunt) — read at level load
 
 namespace VK { namespace ClusterStream {
@@ -671,6 +673,9 @@ bool CreatePools(const xr_vector<PageRec>& pages,
                  const xr_vector<u8>* ramVb)
 {
     VK::Vram::Scope _vram_scope("Clusters");
+    CTimer _cp; _cp.Start();
+    float msAlloc = 0, msRead = 0, msUpload = 0;
+    u32   nPinnedInstalled = 0; u64 pinnedReadBytes = 0;
     Destroy();
     const u32 nPages = _max(1u, (u32)pages.size());
     s_pages.resize(nPages);
@@ -794,43 +799,164 @@ bool CreatePools(const xr_vector<PageRec>& pages,
                 (unsigned long long)tryWant);
         }
         // Install pinned pages now (level load — Upload staging is fine).
+        // Sub-timers: CreatePools measured 835 ms of the 18-08 load, and this loop
+        // does ~2 payload reads + 2 Uploads per PINNED page (768 of them on
+        // pripyat_full) — split read from upload before touching either.
+        msAlloc = _cp.GetElapsed_ms_total();
+        _cp.Start();
         s_slotBaseHost.assign((size_t)2 * nPages, 0u);
         u32 next[3] = { 0, 0, 0 };
-        xr_vector<u8> tmp, tmpVb;
+
+        // The install used to walk pinned pages one by one, reading each page's IB
+        // payload and then its VB payload — that is THREE regions of the cache file
+        // (IB16 blob, IB32 blob, VB blob) interleaved page by page, ~1500 seeks for
+        // 768 pages. Measured 18-08: 664 ms for 336 MB, about 500 MB/s on an NVMe
+        // that reads sequentially at 2+ GB/s. So: plan first (no IO), then run the
+        // reads in FILE order, so each blob is scanned once, forward, and the OS
+        // readahead applies. Slots are still handed out in page order — the
+        // residency layout is exactly what it was.
+        struct PinRead { u64 off; u32 page, sel, size, slot; };   // sel 0/1 = IB blob, kSelVB = VB blob
+        xr_vector<PinRead> plan;
+        plan.reserve((size_t)(pinnedCount[0] + pinnedCount[1]) * 2);
         for (u32 p = 1; p < nPages; ++p) {
             PageState& ps = s_pages[p];
             if (!(ps.flags & kPagePinned) || !ps.byteSize) { if (!ps.byteSize && (ps.flags & kPagePinned)) ps.resident = 1; continue; }
             const u32 t = PageType(ps);
             ps.slot = next[t]++;
-            tmp.resize(ps.byteSize);
-            bool ok = false;
-            if (haveRam) {
-                const u8* src = t ? (const u8*)ramIdx32->data() : (const u8*)ramIdx16->data();
-                memcpy(tmp.data(), src + ps.byteOff, ps.byteSize); ok = true;
-            } else if (s_ioFile) {
-                ok = _fseeki64(s_ioFile, (long long)(s_blobOff[t] + ps.byteOff), SEEK_SET) == 0
-                  && fread(tmp.data(), 1, tmp.size(), s_ioFile) == tmp.size();
-            }
-            if (!ok) { Msg("![VK ClPage] pinned page %u read failed — cluster path disabled", p); Destroy(); return false; }
-            s_pool[t]->Upload(tmp.data(), tmp.size(), (VkDeviceSize)ps.slot * kPageBytes);
-            if (ps_r_cl_audit) ps.hashIb = HashBytes(tmp.data(), ps.byteSize);
+            plan.push_back({ s_blobOff[t] + ps.byteOff, p, t, ps.byteSize, ps.slot });
             const u32 vbB = (s_vbPool && ps.vbByteSize) ? ps.vbByteSize : 0;
             if (vbB) {
                 ps.vbSlot = next[kSelVB]++;
-                tmpVb.resize(vbB);
-                ok = false;
-                if (haveRam) { memcpy(tmpVb.data(), ramVb->data() + ps.vbByteOff, vbB); ok = true; }
-                else if (s_ioFile)
-                    ok = _fseeki64(s_ioFile, (long long)(s_blobOffVb + ps.vbByteOff), SEEK_SET) == 0
-                      && fread(tmpVb.data(), 1, tmpVb.size(), s_ioFile) == tmpVb.size();
-                if (!ok) { Msg("![VK ClPage] pinned page %u vb read failed — cluster path disabled", p); Destroy(); return false; }
-                s_vbPool->Upload(tmpVb.data(), tmpVb.size(), (VkDeviceSize)ps.vbSlot * kPageVbBytes);
-                if (ps_r_cl_audit) ps.hashVb = HashBytes(tmpVb.data(), vbB);
+                plan.push_back({ s_blobOffVb + ps.vbByteOff, p, kSelVB, vbB, ps.vbSlot });
                 s_slotBaseHost[2 * p + 1] = ps.vbSlot * kVbSlotVerts;
             }
-            if (ps_r_cl_audit) AuditPagePayload(p, t, tmp.data(), ps.byteSize, vbB ? tmpVb.data() : nullptr, vbB);
             ps.resident = 1;
             s_slotBaseHost[2 * p] = ps.slot * IdxPerSlot(t);
+            ++nPinnedInstalled;
+        }
+        std::sort(plan.begin(), plan.end(),
+                  [](const PinRead& a, const PinRead& b) { return a.off < b.off; });
+
+        // 336 MB out of a 2.2 GB file, and it used to arrive as fseek+fread into a
+        // scratch buffer -- a serial read on the loading thread, followed by a SECOND
+        // copy into the staging ring. Map the file instead and hand Upload the mapped
+        // bytes directly: one copy, and the page faults the read really consists of
+        // move onto workers -- which is where the geometry stage already learned to
+        // put them (a resident page still faults into a new view).
+        const u8* mapBase = nullptr;
+        HANDLE    mapFile = INVALID_HANDLE_VALUE;
+        HANDLE    mapObj  = nullptr;
+        if (!haveRam && ps_r_clpage_map && s_filePath[0]) {
+            mapFile = CreateFile(s_filePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
+            if (mapFile != INVALID_HANDLE_VALUE) {
+                mapObj = CreateFileMapping(mapFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+                if (mapObj) mapBase = (const u8*)MapViewOfFile(mapObj, FILE_MAP_READ, 0, 0, 0);
+            }
+            if (!mapBase) {
+                if (mapObj) CloseHandle(mapObj);
+                if (mapFile != INVALID_HANDLE_VALUE) CloseHandle(mapFile);
+                mapObj = nullptr;
+                mapFile = INVALID_HANDLE_VALUE;
+                Msg("![VK ClPage] page cache mapping failed - falling back to fread");
+            }
+        }
+        if (mapBase) {
+            CTimer _w;
+            _w.Start();
+            std::atomic<size_t> cursor{0};
+            std::atomic<u32>    sink{0};
+            xr_vector<std::thread> warm;
+            warm.reserve(16);
+            for (u32 w = 0; w < 16; ++w)
+                warm.emplace_back([&plan, mapBase, &cursor, &sink]() {
+                    u32 acc = 0;
+                    for (size_t i = cursor.fetch_add(1); i < plan.size(); i = cursor.fetch_add(1)) {
+                        const PinRead& pr = plan[i];
+                        const u8* p = mapBase + pr.off;
+                        for (u32 o = 0; o < pr.size; o += 4096) acc += p[o];
+                        if (pr.size) acc += p[pr.size - 1];
+                    }
+                    sink.fetch_add(acc, std::memory_order_relaxed);   // keep the loop
+                });
+            for (auto& t : warm) t.join();
+            msRead = _w.GetElapsed_ms_total();   // the faults ARE the read
+        }
+
+        xr_vector<u8> tmp;
+        for (const PinRead& r : plan) {
+            const u8* src = nullptr;
+            bool ok = false;
+            CTimer _s; _s.Start();
+            if (haveRam) {
+                const u8* ram = (r.sel == kSelVB) ? (const u8*)ramVb->data()
+                              : (r.sel ? (const u8*)ramIdx32->data() : (const u8*)ramIdx16->data());
+                const u64 base = (r.sel == kSelVB) ? s_blobOffVb : s_blobOff[r.sel];
+                src = ram + (r.off - base);
+                ok = true;
+            } else if (mapBase) {
+                src = mapBase + r.off;
+                ok = true;
+            } else if (s_ioFile) {
+                tmp.resize(r.size);
+                ok = _fseeki64(s_ioFile, (long long)r.off, SEEK_SET) == 0
+                  && fread(tmp.data(), 1, tmp.size(), s_ioFile) == tmp.size();
+                src = tmp.data();
+                msRead += _s.GetElapsed_ms_total();
+            }
+            pinnedReadBytes += r.size;
+            if (!ok) {
+                Msg("![VK ClPage] pinned page %u %s read failed — cluster path disabled",
+                    r.page, r.sel == kSelVB ? "vb" : "ib");
+                if (mapBase) { UnmapViewOfFile((void*)mapBase); CloseHandle(mapObj); CloseHandle(mapFile); }
+                Destroy(); return false;
+            }
+            _s.Start();
+            if (r.sel == kSelVB) s_vbPool->Upload(src, r.size, (VkDeviceSize)r.slot * kPageVbBytes);
+            else                 s_pool[r.sel]->Upload(src, r.size, (VkDeviceSize)r.slot * kPageBytes);
+            msUpload += _s.GetElapsed_ms_total();
+            if (ps_r_cl_audit) {
+                if (r.sel == kSelVB) s_pages[r.page].hashVb = HashBytes(src, r.size);
+                else                 s_pages[r.page].hashIb = HashBytes(src, r.size);
+            }
+        }
+        if (mapBase) {
+            // Streaming keeps using s_ioFile; this view existed only for the install.
+            // UnmapViewOfFile on a view with 336 MB resident tears down ~85k PTEs and
+            // measured 40 ms -- the whole saving, spent on release work the level is
+            // waiting for. Hand it to a detached thread: it owns nothing else.
+            std::thread([mapBase, mapObj, mapFile]() {
+                UnmapViewOfFile((void*)mapBase);
+                CloseHandle(mapObj);
+                CloseHandle(mapFile);
+            }).detach();
+            mapBase = nullptr;
+        }
+
+        if (ps_r_cl_audit) {
+            // AuditPagePayload validates a page's indices AGAINST its own vertex
+            // payload, so it needs both halves at once — which the file-ordered
+            // install deliberately no longer holds. Re-read the pair per page.
+            // r_cl_audit only: a debug run may pay for a second pass.
+            xr_vector<u8> ib, vb;
+            for (u32 p = 1; p < nPages; ++p) {
+                PageState& ps = s_pages[p];
+                if (!(ps.flags & kPagePinned) || !ps.byteSize) continue;
+                const u32 t = PageType(ps);
+                const u32 vbB = (s_vbPool && ps.vbByteSize) ? ps.vbByteSize : 0;
+                ib.resize(ps.byteSize);
+                vb.resize(vbB);
+                auto grab = [&](u64 off, void* dst, u32 size, const u8* ram, u64 ramBase) {
+                    if (!size) return true;
+                    if (haveRam) { memcpy(dst, ram + (off - ramBase), size); return true; }
+                    return s_ioFile && _fseeki64(s_ioFile, (long long)off, SEEK_SET) == 0
+                        && fread(dst, 1, size, s_ioFile) == size;
+                };
+                const u8* ramIb = t ? (const u8*)ramIdx32->data() : (const u8*)ramIdx16->data();
+                if (!grab(s_blobOff[t] + ps.byteOff, ib.data(), ps.byteSize, ramIb, s_blobOff[t])) continue;
+                if (vbB && !grab(s_blobOffVb + ps.vbByteOff, vb.data(), vbB, haveRam ? (const u8*)ramVb->data() : nullptr, s_blobOffVb)) continue;
+                AuditPagePayload(p, t, ib.data(), ps.byteSize, vbB ? vb.data() : nullptr, vbB);
+            }
         }
         s_pages[0].resident = 1;
         // ⭐ 0-byte pages have nothing to stream — but a NON-PINNED one could
@@ -861,6 +987,10 @@ bool CreatePools(const xr_vector<PageRec>& pages,
             (unsigned long long)(((u64)(s_slotCount[0] + s_slotCount[1]) * kPageBytes + (u64)s_slotCount[kSelVB] * kPageVbBytes) >> 20),
             pinnedCount[0], pinnedCount[1],
             nPages - 1, double(blobBytes[0] + blobBytes[1]) / (1024.0 * 1024.0), double(vbBlobBytes) / (1024.0 * 1024.0));
+        Msg("[load step]   ClusterStream::CreatePools: poolAlloc %.0f | pinned install %u pages: read %.0f + upload %.0f ms (%u MB, source=%s) | rest %.0f ms",
+            msAlloc, nPinnedInstalled, msRead, msUpload, (u32)(pinnedReadBytes >> 20),
+            haveRam ? "RAM" : (ps_r_clpage_map ? "mapped file, 16 warm threads" : "file"),
+            _cp.GetElapsed_ms_total() - msRead - msUpload);
     }
 
     // ---- Slice 2 vertex pool, EAGER mode (r_clpage 0) -------------------------
@@ -910,6 +1040,12 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
     if (s_total == 0 || s_pages.empty()) { Destroy(); return false; }
     const u32 nPages = (u32)s_pages.size();
 
+    // Sub-timers (`[load step]`): this is 80 ms of the post-visual budget on
+    // pripyat_full and it is five different walks over 830k entries — the split
+    // decides which one is worth attacking.
+    CTimer _s; _s.Start();
+    float msKeys = 0, msFill = 0, msPages = 0, msCycle = 0, msLive = 0, msBufs = 0;
+
     // ---- Tables from the FINAL meta (duplicated shared-slice entries included) ----
     s_entryPage.resize(s_total);
     s_entryMember.assign(s_total, kNone);
@@ -944,6 +1080,8 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
     u32 selfLoops = 0;
     for (u32 i = 0; i < s_total; ++i)
         if (s_entryChild[i] != kNone && s_entryChild[i] == s_entryMember[i]) { s_entryChild[i] = kNone; ++selfLoops; }
+    msKeys = _s.GetElapsed_ms_total();
+    _s.Start();
     for (u32 i = 0; i < s_total; ++i) {
         if (s_entryMember[i] != kNone) {
             GroupState& G = s_groups[s_entryMember[i]];
@@ -957,6 +1095,8 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
         std::sort(G.pages.begin(), G.pages.end());
         G.pages.erase(std::unique(G.pages.begin(), G.pages.end()), G.pages.end());
     }
+    msFill = _s.GetElapsed_ms_total();
+    _s.Start();
     for (u32 i = 0; i < s_total; ++i) {
         s_pages[s_entryPage[i]].entries.push_back(i);
         if (s_entryMember[i] != kNone) s_pages[s_entryPage[i]].groups.push_back(s_entryMember[i]);
@@ -966,6 +1106,8 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
         std::sort(g.begin(), g.end());
         g.erase(std::unique(g.begin(), g.end()), g.end());
     }
+    msPages = _s.GetElapsed_ms_total();
+    _s.Start();
 
     if (selfLoops)
         Msg("[VK ClPage] cut %u self-loop entries (degenerate clusterlod stall chains)", selfLoops);
@@ -1015,6 +1157,8 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
         if (orphanG)
             Msg("[VK ClPage] %u groups have NO refiner (stall chains / merged props) — direct demand covers them", orphanG);
     }
+    msCycle = _s.GetElapsed_ms_total();
+    _s.Start();
 
     // ---- Group liveness + bits (initial full evaluation) -------------------------
     for (u32 g = 0; g < (u32)s_groups.size(); ++g) {
@@ -1029,6 +1173,8 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
     for (u32 i = 0; i < s_total; ++i) UpdateEntryBits(i);   // entries outside any group too
     s_groupSeen.assign(s_groups.size(), 0u);                 // want-chase epoch array
     s_tickEpoch = 0;
+    msLive = _s.GetElapsed_ms_total();
+    _s.Start();
 
     // ---- GPU state buffers -------------------------------------------------------
     const u32 bitsWords = (u32)s_bitsHost.size();
@@ -1102,6 +1248,9 @@ bool BuildState(const xr_vector<GpuMeshMeta>& finalMeta)
 
     s_statInstalled = s_statEvicted = s_statStarved = s_statReqs = 0;
     s_active = true;
+    msBufs = _s.GetElapsed_ms_total();
+    Msg("[load step]   ClusterStream::BuildState: keys %.0f (%u entries -> %u groups) | groupFill %.0f | pageFill %.0f | cycleDiag %.0f | liveness %.0f | buffers %.0f ms",
+        msKeys, s_total, (u32)s_groups.size(), msFill, msPages, msCycle, msLive, msBufs);
     return true;
 }
 

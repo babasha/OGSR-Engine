@@ -1,9 +1,18 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-#define VSM_SET 2                 // env set is bound at set 2 for skinned
+// Skinned binds the SHARED EnvLight descriptor set (vk_env_light.h, the very same
+// VkDescriptorSetLayout the world uses) — only at set 2 instead of set 1, because
+// set 1 carries the leaf's WorldMaterial. So every shared header works verbatim
+// once the set index is pointed at 2; nothing here needs a private copy.
+#define ENV_SET     2
+#define VSM_SET     2
+#define CLUSTER_SET 2
+#include "light_ubo.glsl"         // DynLight + Lighting UBO (set 2 b0) + set-2 samplers
 #include "vsm_sample.glsl"        // vsmSunShadow — screen-space VSM mask (set 2, binding 14)
-#define CLUSTER_SET 2             // env set is bound at set 2 for skinned
 #include "cluster_lights.glsl"    // clustered forward (set 2 bindings 17-19, r_clustered)
+#include "shadow_common.glsl"     // spotShadowF/pointShadowF/cascTap/cascSample/sunShadow
+#include "env_common.glsl"        // gtaoVis*/coloredAO/ssilBoost/skyAmbient/ibl* (pulls sky_ambient)
+#include "light_shade.glsl"       // lightTerrainOcc/shadeDynLight/dynLights
 // skinned.frag - forward skinned shading with the diffuse texture.
 // The leaf's WorldMaterial descriptor set (base/detail/lmap) is bound as set 1;
 // we sample the base diffuse (binding 0) and light it with the REAL environment
@@ -28,361 +37,34 @@ layout(push_constant) uniform PC {
     float hemi;       // sky-ambient gate (ray-traced sky visibility, 0..1)
 } pc;
 
-// Per-frame environment lighting (CEnvDescriptorMixer, filled in Pass_Skinned).
-// sun_dir.xyz is X-Ray's direction the light TRAVELS (points downward, .y<0);
-// the direction toward the sun for N-L is therefore -sun_dir. .w fields unused.
-struct DynLight {
-    vec4 pos;     // xyz = world position, w = range
-    vec4 color;   // rgb = colour,         w = 1 spot / 0 point
-    vec4 dir;     // xyz = spot direction, w = cos(cone/2)
-};
-layout(set = 2, binding = 0) uniform Lighting {
-    vec4 sun_dir;     // xyz = travel dir (downward)
-    vec4 sun_color;   // rgb
-    vec4 hemi_color;  // rgb (w = R2 correction, unused here)
-    vec4 ambient;     // rgb
-    mat4 sun_vp;      // sun light view-proj (shadow lookup)
-    vec4 counts;      // x = dynamic light count
-    DynLight lights[16];
-    mat4 spot_vp;        // spot (flashlight) shadow view-proj
-    vec4 shadow_params;  // x = spot-shadowed light index (-1 none), y = point-shadowed index
-    mat4 sun_near_vp;    // sun cascade 0 view-proj (25 m, per-frame, R4 scheme)
-    mat4 sun_c1_vp;      // sun cascade 1 view-proj (60 m, per-frame)
-    vec4 fog_color;      // rgb haze colour (env)
-    vec4 fog_params;     // x=-near*r, y=near, z=far, w=r; fog = saturate(dist*w + x)
-    vec4 eye_pos;        // xyz camera world pos
-    vec4 sky_params;     // x=cube cross-fade weight, y=ambient scale, z=sample LOD
-    vec4 ao_params;      // x=1/screenW, y=1/screenH, z=AO strength (0=off)
-    // Tail of the shared LightUBO — declared so the clustered fields at the end
-    // are reachable (cam_dir for the view-space depth, cluster_params for the
-    // froxel lookup). Everything between is padding skinned doesn't sample.
-    mat4 _pad_rain_vp;
-    vec4 _pad_rain_params;
-    mat4 _pad_scene_vp;
-    vec4 cam_dir;          // xyz camera forward (unit) — clustered z-view
-    vec4 _pad_cam_rightT;
-    vec4 _pad_cam_topT;
-    vec4 _pad_pom_params;
-    vec4 _pad_pom_params2;
-    vec4 _pad_pom_params3;
-    vec4 _pad_pom_params4;
-    vec4 pom_params5;   // y = glass opacity ceiling (r_glass_opacity); rest unused here
-    vec4 _pad_pom_params6;
-    vec4 _pad_pom_params7;
-    vec4 cluster_params;   // x=sliceScale, y=sliceBias, z=near, w=enable (0/1/2 debug)
-    vec4 cluster_params2;  // x=gridX, y=gridY, z=gridZ, w=maxLightsPerCluster
-    // Tail pads up to the spot-pool block (see light_ubo.glsl for the layout).
-    vec4 _pad_light_occ;
-    vec4 _pad_sf_params;
-    vec4 _pad_deform_count;
-    vec4 _pad_deform_stamps[256];
-    mat4 _pad_deform_vp;
-    vec4 _pad_deform_tex;
-    vec4 spot_params;      // x = grass shadow strength on surfaces (r_spot_grass_shadow)
-    // Spot shadow POOL: per-light tile (+1, packed 4/vec4) + per-tile view·proj.
-    vec4 spot_assign[4];
-    mat4 spot_pool_vp[8];
-    vec4 point_assign[4];  // Point POOL: per-light cube-array index (+1, packed 4/vec4)
-    vec4 ibl_params;       // Sky specular IBL: x=enable×fade, y=strength, z=maxMip, w=debug
-    vec4 _pad_beam_params;
-    vec4 _pad_beam2;
-    vec4 spot_flash;       // z = DLSS texture mip-LOD bias (log2(render/display), 0 native)
-    // Tail pads up to sh_params — skinned samples none of these, but the shared UBO
-    // is only prefix-compatible, so every field before the one we DO read must be
-    // declared at its real offset.
-    vec4 _pad_zoff_params;
-    vec4 _pad_tcache_xform;
-    vec4 _pad_tcache_params;
-    vec4 _pad_ch_off;
-    vec4 _pad_tmask_params;
-    vec4 sh_params;        // Diffuse sky SH9: x=strength×ready, y=sky_rotation, z=probe max mip
-} L;
-// Diffuse sky irradiance coefficients — see sky_ambient.glsl.
-layout(std430, set = 2, binding = 31) readonly buffer SkySH {
-    vec4 c[9];
-} skySH;
-layout(set = 2, binding = 2) uniform sampler2D uSpotShadow;
-layout(set = 2, binding = 22) uniform sampler2D uSpotShadowGrass;   // spot+grass beam atlas
-layout(set = 2, binding = 3) uniform samplerCubeArray uPointShadow;
-layout(set = 2, binding = 4) uniform sampler2D uShadowNear;    // sun cascade 0 (~0.61 cm texels)
-layout(set = 2, binding = 5) uniform sampler2D uShadowC1;      // sun cascade 1 (~1.46 cm texels)
-layout(set = 2, binding = 6) uniform samplerCube uSky0;        // sky ambient cube 0 (weather A)
-layout(set = 2, binding = 7) uniform samplerCube uSky1;        // sky ambient cube 1 (weather B)
-layout(set = 2, binding = 10) uniform sampler2D uSpotCookie;   // flashlight beam texture (cookie)
-layout(set = 2, binding = 8) uniform sampler2D uAO;            // GTAO (half-res)
-layout(set = 2, binding = 21) uniform sampler2D uIL;          // SSIL one-bounce indirect light (half-res, r_ssil)
-layout(set = 2, binding = 26) uniform samplerCube uSkySpec;   // prefiltered sky specular IBL cube (r_ibl)
+// Per-frame environment lighting (CEnvDescriptorMixer, filled in Pass_Skinned)
+// now comes from light_ubo.glsl. sun_dir.xyz is X-Ray's direction the light
+// TRAVELS (points downward, .y<0); toward the sun for N·L is therefore -sun_dir.
+//
+// This file used to hand-mirror that UBO: 50 fields, 24 of them `_pad_*` whose
+// only job was to hold the offsets of the ~15 fields skinned actually reads. It
+// was in sync — but nothing enforced that. std140 offsets are positional, so a
+// field inserted anywhere in the middle of the real UBO silently shifts every
+// later field here, with no compile error and no validation warning: the shader
+// just reads a neighbouring vec4. One shared declaration cannot drift.
 
-// SSIL ambient boost - see light_ubo.glsl (SSFX hdiffuse *= IL). Multiplies the
-// ambient where AO does; 0/no-op where there's no bounce or r_ssil is off.
-vec3 ssilBoost()
-{
-    vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
-    return vec3(1.0) + il / (1.0 + il);
-}
-
-// Sky specular IBL (r_ibl) — local copies of env_common (skinned has its own UBO).
-// NPC gear/skin/helmet reflect the sky + catch a sun glint. Karis EnvBRDFApprox.
-vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
-{
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
-    const vec4 c1 = vec4( 1.0,  0.0425,  1.040, -0.040);
-    vec4  r    = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
-    vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
-    return F0 * ab.x + ab.y;
-}
-// Reflected FRACTION for the term below — the diffuse must lose it, or switching IBL
-// on is a pure energy gain on every lit pixel (see env_common.glsl::iblSpecWeight).
-float iblSpecWeight(vec3 N, vec3 V, float roughness, vec3 F0)
-{
-    if (L.ibl_params.x < 0.004) return 0.0;
-    float NoV = clamp(dot(N, V), 0.0, 1.0);
-    vec3  ab  = EnvBRDFApprox(F0, roughness, NoV);
-    return clamp(dot(ab, vec3(1.0 / 3.0)) * L.ibl_params.y * L.ibl_params.x, 0.0, 1.0);
-}
-vec3 iblSpecular(vec3 N, vec3 V, float roughness, vec3 F0)
-{
-    if (L.ibl_params.x < 0.004) return vec3(0.0);
-    float NoV  = clamp(dot(N, V), 0.0, 1.0);
-    vec3  R    = reflect(-V, N);
-    vec3  pref = textureLod(uSkySpec, R, clamp(roughness, 0.0, 1.0) * L.ibl_params.z).rgb;
-    return pref * EnvBRDFApprox(F0, roughness, NoV) * L.ibl_params.y * L.ibl_params.x;
-}
-vec3 sunSpec(vec3 N, vec3 V, vec3 Ld, float roughness, vec3 F0)
-{
-    if (L.ibl_params.x < 0.004) return vec3(0.0);
-    vec3  H   = normalize(V + Ld);
-    float NoH = clamp(dot(N, H), 0.0, 1.0);
-    float VoH = clamp(dot(V, H), 0.0, 1.0);
-    float a   = max(roughness * roughness, 0.002);
-    float d   = (NoH * NoH * (a * a - 1.0) + 1.0);
-    float D   = (a * a) / (3.14159265 * d * d);
-    vec3  F   = F0 + (1.0 - F0) * pow(1.0 - VoH, 5.0);
-    return vec3(D * 0.25) * F * L.ibl_params.x;
-}
-
-// GTAO visibility - see world_lmap.frag (occludes hemi+ambient only). NPCs are
-// IN the prepass depth (Skinned_RenderDepthPrepass), so this is real per-pixel
-// AO of the character itself + its contact with the surroundings.
-float gtaoVis()
+// GTAO visibility for SKINNED receivers. Deliberately NOT env_common.glsl's
+// gtaoVis(): NPCs use HALF the strength exponent. AO normals come from half-res
+// depth derivatives, which are noisy on small curvy skinned geometry (limbs,
+// folds) - full strength reads as dark "dirt" speckle on characters. They still
+// CAST full-strength AO onto the world.
+float gtaoVisSkinned()
 {
     float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
-    // HALF the strength exponent vs the world receivers: AO normals come from
-    // half-res depth derivatives, which are noisy on small curvy skinned
-    // geometry (limbs, folds) - full strength reads as dark "dirt" speckle on
-    // characters. They still CAST full-strength AO onto the world.
     return pow(clamp(ao, 0.0, 1.0), L.ao_params.z * 0.5);
 }
 
-// Colored AO - see world_lmap.frag (R4 compute_colored_ao port).
-vec3 coloredAO(float ao, vec3 albedo)
-{
-    vec3 a =  2.0404 * albedo - 0.3324;
-    vec3 b = -4.7951 * albedo + 0.6417;
-    vec3 c =  2.7552 * albedo + 0.6903;
-    return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
-}
 
-// Sky ambient — shared header (SH9 irradiance + fallbacks), see sky_ambient.glsl.
-#include "sky_ambient.glsl"
-
-// Spot/point shadow + dynamic lights - same model as world_lmap.frag
-// (shadow_common.glsl): the spot POOL atlas, per-light tile, LINEAR-depth
-// compare with a world epsilon.
-int spotTileOf(int gi)
-{
-    if (gi < 0 || gi >= 16) return -1;
-    return int(L.spot_assign[gi >> 2][gi & 3] + 0.5) - 1;
-}
-float spotLinZ(float zndc, float f)
-{
-    const float n = 0.5;   // ComputeSpotVPFor near plane
-    return n * f / max(f - zndc * (f - n), 1e-4);
-}
-float spotShadowF(vec3 wp, float range, int tile)
-{
-    vec4 c = L.spot_pool_vp[tile] * vec4(wp, 1.0);
-    if (c.w <= 0.0) return 1.0;
-    vec3 ndc = c.xyz / c.w;
-    vec2 uv = ndc.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float f    = max(range, 1.0);
-    float zRef = spotLinZ(ndc.z, f) - 0.08;
-    const vec2 kTileScale = vec2(0.25, 0.5);
-    vec2  texel = 1.0 / vec2(textureSize(uSpotShadow, 0));
-    vec2  tBase = vec2(float(tile & 3), float(tile >> 2)) * kTileScale;
-    vec2  tMin  = tBase + texel * 1.5;
-    vec2  tMax  = tBase + kTileScale - texel * 1.5;
-    vec2  auv   = tBase + uv * kTileScale;
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x)
-            sum += (zRef <= spotLinZ(texture(uSpotShadow, clamp(auv + vec2(x, y) * texel, tMin, tMax)).r, f)) ? 1.0 : 0.0;
-    return sum * (1.0 / 9.0);
-}
-
-int pointCubeOf(int gi)
-{
-    if (gi < 0 || gi >= 16) return -1;
-    return int(L.point_assign[gi >> 2][gi & 3] + 0.5) - 1;
-}
-float pointShadowF(vec3 wp, vec3 lp, float range, int cube)
-{
-    // LINEAR-depth compare, world epsilon (same fix as the spot pool) — the old
-    // 0.01 NDC bias grew to metres at the range edge and ate far NPC shadows.
-    // 3x3 PCF perpendicular to the lookup ray — magnified near-caster (grass)
-    // shadows read as hard 512-cube texel squares with 1 tap (see shadow_common).
-    vec3 d = wp - lp;
-    float z = max(max(abs(d.x), abs(d.y)), abs(d.z));
-    const float n = 0.1;                 // kPointNear
-    float f    = max(range, 1.0);
-    float zRef = z - 0.08;
-    vec3 up = (abs(d.y) > abs(d.x) && abs(d.y) > abs(d.z)) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
-    vec3 t1 = normalize(cross(up, d));
-    vec3 t2 = normalize(cross(d, t1));
-    float texel = 2.0 * z / float(textureSize(uPointShadow, 0).x);
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x) {
-            vec3 dd = d + (t1 * float(x) + t2 * float(y)) * texel;
-            float zMap = texture(uPointShadow, vec4(dd, float(cube))).r;
-            zMap = n * f / max(f - zMap * (f - n), 1e-4);
-            sum += (zRef <= zMap) ? 1.0 : 0.0;
-        }
-    return sum * (1.0 / 9.0);
-}
-
-// Shade ONE dynamic light — same model as world_lmap.frag (passed-in fields so
-// it serves both the UBO array fallback and the clustered SSBO). gi = global idx.
-vec3 shadeDynLight(vec4 lpos, vec4 lcol, vec4 ldir, vec3 wp, vec3 N, int gi, int sIdx, int pIdx)
-{
-    vec3  dv = lpos.xyz - wp;
-    float r  = lpos.w;
-    float d2 = dot(dv, dv);
-    if (d2 >= r * r) return vec3(0.0);
-    float d   = sqrt(max(d2, 1e-6));
-    vec3  ld  = dv / d;
-    // Narrow beams: windowed falloff (far half of the beam still lights) —
-    // see light_shade.glsl.
-    float att;
-    if (lcol.w > 0.5 && ldir.w > 0.87) {
-        att = 1.0 - (d2 / (r * r));
-        att *= att;
-    } else {
-        att = 1.0 - d / r;
-        att *= att;
-    }
-    if (lcol.w > 0.5) {
-        // Narrow beams: full inside the cone + spill to 2x the angle — see
-        // light_shade.glsl (the axis-peaked ramp left beam-lit ground/NPCs dark).
-        float ca = dot(-ld, ldir.xyz);
-        if (ldir.w > 0.87) {
-            float co = 2.0 * ldir.w * ldir.w - 1.0;
-            att *= clamp((ca - co) / max(ldir.w - co, 1e-3), 0.0, 1.0);
-        } else
-            att *= clamp((ca - ldir.w) / max(1.0 - ldir.w, 1e-3), 0.0, 1.0);
-    }
-    vec3 tint = lcol.rgb;
-    if (lcol.w > 0.5) {
-        // Spot POOL: every pooled spot samples its own atlas tile.
-        int tile = spotTileOf(gi);
-        if (tile >= 0) att *= spotShadowF(wp, r, tile);
-        if (gi == sIdx && L.shadow_params.z > 0.5) {
-            vec4 cc = L.spot_vp * vec4(wp, 1.0);
-            if (cc.w > 0.0) {
-                vec2 cuv = (cc.xy / cc.w) * 0.5 + 0.5;
-                cuv.y = 1.0 - cuv.y;
-                tint *= textureLod(uSpotCookie, clamp(cuv, 0.0, 1.0), 0.0).rgb;
-            }
-        }
-    }
-    else {
-        int cube = pointCubeOf(gi);
-        if (cube >= 0) att *= pointShadowF(wp, lpos.xyz, r, cube);
-    }
-    float ndl = dot(N, ld);
-    // Narrow-beam wrap diffuse — same as light_shade.glsl (grazing headlight
-    // beams painted no light pool at plain Lambert).
-    if (lcol.w > 0.5 && ldir.w > 0.87) ndl = (ndl + 0.4) * (1.0 / 1.4);
-    return tint * (att * max(ndl, 0.0));
-}
-
-// Clustered (r_clustered): only this froxel's lights from the SSBO; fallback:
-// the old per-fragment loop over the UBO's 16. See world_lmap.frag.
-vec3 dynLights(vec3 wp, vec3 N)
-{
-    int sIdx = int(L.shadow_params.x);
-    int pIdx = int(L.shadow_params.y);
-    vec3 acc = vec3(0.0);
-    if (L.cluster_params.w > 0.5) {
-        int ci  = clusterOfFragment(wp, L.eye_pos.xyz, L.cam_dir.xyz, gl_FragCoord.xy, L.ao_params.xy, L.cluster_params, L.cluster_params2);
-        int mxp = int(L.cluster_params2.w);
-        int cnt = int(clusterGrid[ci]);
-        for (int k = 0; k < cnt; ++k) {
-            int gi = int(clusterIndex[ci * mxp + k]);
-            acc += shadeDynLight(clusterLights[gi].pos, clusterLights[gi].color, clusterLights[gi].dir, wp, N, gi, sIdx, pIdx);
-        }
-    } else {
-        int n = int(L.counts.x + 0.5);
-        for (int i = 0; i < n; ++i)
-            acc += shadeDynLight(L.lights[i].pos, L.lights[i].color, L.lights[i].dir, wp, N, i, sIdx, pIdx);
-    }
-    return acc;
-}
-layout(set = 2, binding = 1) uniform sampler2D uShadow;   // sun shadow map (D32, manual compare)
-
-// Bilinear-weighted near-cascade PCF tap (textureGather) - see world_lmap.frag.
-float cascTap(sampler2D smap, vec2 uv, float ref)
-{
-    vec2 sz = vec2(textureSize(smap, 0));
-    vec2 t  = uv * sz - 0.5;
-    vec2 f  = fract(t);
-    vec4 d  = textureGather(smap, (floor(t) + 1.0) / sz, 0);
-    vec4 c  = step(vec4(ref), d);
-    return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
-}
-
-float cascSample(sampler2D smap, mat4 vp, vec3 wp, float bias_)
-{
-    vec3 n = (vp * vec4(wp, 1.0)).xyz;
-    vec2 uv = n.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99
-        || n.z <= 0.0 || n.z >= 1.0)
-        return -1.0;
-    float ref = n.z - bias_;
-    vec2  tx  = 1.0 / vec2(textureSize(smap, 0));
-    return 0.25 * (cascTap(smap, uv + vec2(-0.5, -0.5) * tx, ref)
-                 + cascTap(smap, uv + vec2( 0.5, -0.5) * tx, ref)
-                 + cascTap(smap, uv + vec2(-0.5,  0.5) * tx, ref)
-                 + cascTap(smap, uv + vec2( 0.5,  0.5) * tx, ref));
-}
-
-// Sun shadow lookup - same convention as the world shaders (world_lmap.frag).
-// NEAR cascade first: leaf-shaped dapples on NPCs standing under trees.
-float sunShadow(vec3 worldPos)
-{
-    float s = cascSample(uShadowNear, L.sun_near_vp, worldPos, 0.0004);
-    if (s >= 0.0) return s;
-    s = cascSample(uShadowC1, L.sun_c1_vp, worldPos, 0.0006);
-    if (s >= 0.0) return s;
-
-    vec4 c = L.sun_vp * vec4(worldPos, 1.0);
-    if (c.w <= 0.0) return 1.0;
-    vec3 ndc = c.xyz / c.w;
-    vec2 uv = ndc.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) return 1.0;
-    float ref   = ndc.z - 0.0015;
-    vec2  texel = 1.0 / vec2(textureSize(uShadow, 0));
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x)
-            sum += (ref <= texture(uShadow, uv + vec2(x, y) * texel).r) ? 1.0 : 0.0;
-    return sum * (1.0 / 9.0);
-}
+// spotTileOf/pointCubeOf (light_ubo.glsl), spotShadowF/pointShadowF/cascTap/
+// cascSample/sunShadow (shadow_common.glsl) and shadeDynLight/dynLights
+// (light_shade.glsl) used to be copied in here, because those headers name the
+// env descriptor set and skinned binds it at 2. ENV_SET settles that — and the
+// copies had ALREADY drifted from the originals: see the header comment above.
 
 void main()
 {
@@ -452,7 +134,7 @@ void main()
     // so a sky-cube sample in N is meaningless there).
     // GTAO gates ambient/hemi like the world shaders - never for the HUD
     // (hands would inherit the AO of whatever wall is behind them on screen).
-    vec3 occ = (pc.hudMode < 0.5) ? coloredAO(gtaoVis(), base.rgb) * ssilBoost() : vec3(1.0);   // HUD path = vec3(1) → no IL on hands
+    vec3 occ = (pc.hudMode < 0.5) ? coloredAO(gtaoVisSkinned(), base.rgb) * ssilBoost() : vec3(1.0);   // HUD path = vec3(1) → no IL on hands
     vec3 skyFill = (pc.hudMode < 0.5) ? skyAmbient(N) * (L.sky_params.y * 0.7 * pc.hemi)
                                       : vec3(0.0);   // HUD: light fully replaced below
     vec3 light = L.ambient.rgb * occ

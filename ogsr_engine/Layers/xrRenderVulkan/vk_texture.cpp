@@ -10,9 +10,33 @@
 #include "vk_texture_stream.h"
 #include "vk_buffer.h"
 #include "vk_command_buffer.h"
+#include "vk_parallel.h"       // VK::FarmRun — the persistent pool the BC4 repack splits over
+#include "vk_clk.h"            // VK::ClkToMs — rdtsc counters inside the repack
 #include "HW_Vulkan.h"
+#include <emmintrin.h>         // SSE2 gather (BC3 alpha half -> BC4)
 
 #include <utility>   // std::swap (SwapContents)
+#include <thread>              // TexPrefetch worker pool
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <unordered_set>
+#include <deque>                // deferred-close queue
+
+#include <string>
+#include <cctype>              // tolower — case-insensitive path keys
+
+// r_tex_prefetch / r_tex_prefetch_mb — see vk_console_min.cpp. Global scope on
+// purpose: a namespace-scope extern mangles differently and silently fails to bind.
+extern int ps_r_tex_prefetch;
+extern int ps_r_tex_prefetch_mb;
+extern int ps_r_tex_prefetch_lmaps_first;   // park the level's lightmaps before the diffuse bases
+extern int ps_r_tex_repack_threads;   // helpers for the BC3->BC4 gather (0 = caller alone)
+extern int ps_r_tex_repack_scratch;   // reuse one destination buffer per thread instead of malloc per texture
+extern int ps_r_tex_repack_verify;    // rebuild each gather the plain way and compare
+extern int ps_r_tex_materialize;      // 1 = prefetch workers build the texture, not just read the file
+extern int ps_r_tex_mat_threads;      // how many of them may be building at once (0 = all)
+
 
 // r_linear_color — 1 = load TexColorSpace::Color textures as _SRGB so the sampler
 // decodes to linear. Declared at GLOBAL scope on purpose: a namespace-scope extern
@@ -76,6 +100,15 @@ const u32 DDPF_LUMINANCE   = 0x20000;
 
 namespace VK
 {
+
+// Load-time counters live in TexLoadProf further down this file; Create/UploadData
+// run above it, so the three they feed are declared here. rdtsc, not CTimer: a
+// sampler create is a few microseconds and CTimer would truncate most of them to
+// zero (see vk_clk.h).
+namespace TexLoadProf {
+extern std::atomic<u64> s_createVramClk, s_createViewClk, s_createSampClk, s_uploadRegionsClk;
+extern std::atomic<u32> s_createDedicated;
+}
 
 // Constructor
 CVulkanTexture::CVulkanTexture()
@@ -168,12 +201,18 @@ void CVulkanTexture::Create(u32 width, u32 height, VkFormat format, u32 mipLevel
             if (w > 1) w >>= 1;
             if (h > 1) h >>= 1;
         }
-        if (approx >= (2ull << 20))
+        if (approx >= (2ull << 20)) {
             allocInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+            ++VK::TexLoadProf::s_createDedicated;
+        }
     }
 
-    VK_CHECK(VK::Vram::CreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
-                            &m_Image, &m_Allocation, nullptr));
+    {
+        const u64 _c0 = CPU::GetCLK();
+        VK_CHECK(VK::Vram::CreateImage(VulkanHW.m_Allocator, &imageInfo, &allocInfo,
+                                &m_Image, &m_Allocation, nullptr));
+        VK::TexLoadProf::s_createVramClk += CPU::GetCLK() - _c0;
+    }
 
     // VK_CHECK is non-fatal (logs only). If the allocation failed, m_Image is
     // VK_NULL_HANDLE — bail before CreateImageView/CreateSampler, which would
@@ -186,8 +225,8 @@ void CVulkanTexture::Create(u32 width, u32 height, VkFormat format, u32 mipLevel
     m_CurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     // Создаём view и sampler
-    CreateImageView();
-    CreateSampler();
+    { const u64 _c0 = CPU::GetCLK(); CreateImageView(); VK::TexLoadProf::s_createViewClk += CPU::GetCLK() - _c0; }
+    { const u64 _c0 = CPU::GetCLK(); CreateSampler();   VK::TexLoadProf::s_createSampClk += CPU::GetCLK() - _c0; }
 
     // Msg("[Vulkan] Texture created: %dx%d, format=%d, mips=%d", width, height, format, m_MipLevels);
 }
@@ -234,6 +273,7 @@ void CVulkanTexture::UploadData(const void* data, VkDeviceSize size)
     // relative to `data`; the async uploader rebases them into its staging ring.
     xr_vector<VkBufferImageCopy> regions;
     VkDeviceSize offset = 0;
+    const u64 _regions0 = CPU::GetCLK();
 
     for (u32 layer = 0; layer < m_ArrayLayers; layer++) {
         u32 currentWidth = m_Width;
@@ -277,6 +317,8 @@ void CVulkanTexture::UploadData(const void* data, VkDeviceSize size)
             if (currentHeight > 1) currentHeight /= 2;
         }
     }
+
+    VK::TexLoadProf::s_uploadRegionsClk += CPU::GetCLK() - _regions0;
 
     // Async upload on the dedicated transfer queue — no per-texture command pool, no
     // vkQueueWaitIdle, no per-upload staging buffer. Leaves the image in
@@ -471,6 +513,26 @@ void CVulkanTexture::Destroy()
 // Map a DXGI_FORMAT (from a DX10 extended DDS header) to the VkFormat we load it
 // as. The engine runs an UNORM pipeline (UNORM swapchain, no gamma hardware), so
 // sRGB DXGI variants are loaded as their UNORM equivalents — same convention the
+// Legacy (pre-DX10) FourCC -> VkFormat. Shared by the 2D loader and the cubemap
+// loader, which are otherwise separate implementations (the cubemap path never
+// calls loadDDSFromMemory) and each carried its own copy of this switch — so a
+// newly supported block format could land in one and not the other. Returns
+// VK_FORMAT_UNDEFINED for anything unhandled; the caller words its own message and
+// does its own cleanup, which is all the two sites ever actually differed in.
+//
+// DXT1 always maps to the RGBA (punch-through alpha) form: many X-Ray DDS files
+// omit DDPF_ALPHAPIXELS yet still use the 1-bit alpha, and D3D11 treats DXT1 as
+// alpha-capable regardless, so matching it keeps the two renderers in agreement.
+static VkFormat FourCCToVkFormat(u32 fourCC)
+{
+    switch (fourCC) {
+        case FOURCC_DXT1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case FOURCC_DXT3: return VK_FORMAT_BC2_UNORM_BLOCK;
+        case FOURCC_DXT5: return VK_FORMAT_BC3_UNORM_BLOCK;
+        default:          return VK_FORMAT_UNDEFINED;
+    }
+}
+
 // legacy BC1/2/3 path already uses. Returns VK_FORMAT_UNDEFINED for formats we
 // don't handle so the caller can bail with a clear message.
 static VkFormat DXGIFormatToVk(u32 dxgi)
@@ -583,27 +645,127 @@ static bool DetectLmapHemiChannel(const void* data, VkDeviceSize dataSize,
 // every 16 bytes) with no decoder, no encoder, no generation loss; the sampler
 // reads bit-identical values afterwards. What we drop is measured to be exactly
 // zero. Pripyat's 27 x 4096^2 hemi maps: 432 MB -> 216 MB.
-static void* TranscodeBC3AlphaToBC4(const void* src, u32 width, u32 height, u32 mipLevels,
-                                    VkDeviceSize& outSize)
+// Defined with the rest of the load table further down; used here, above it.
+namespace TexLoadProf { extern std::atomic<u64> s_repackAllocClk; extern std::atomic<u32> s_repackMismatch; }
+
+// Two blocks at a time: BC3 keeps the alpha half in bytes 0..7 of every 16, so
+// the gather is exactly _mm_unpacklo_epi64 of two consecutive blocks — 32 bytes
+// in, 16 out, no shuffle table and no branch. SSE2, so no CPU feature test.
+static void GatherAlphaBlocks(u8* d, const u8* s, u64 blocks)
 {
-    VkDeviceSize total = 0;
-    for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
-        total += (VkDeviceSize)((w + 3) / 4) * ((h + 3) / 4) * 8;
+    u64 b = 0;
+    for (; b + 2 <= blocks; b += 2, s += 32, d += 16) {
+        const __m128i b0 = _mm_loadu_si128((const __m128i*)(s +  0));
+        const __m128i b1 = _mm_loadu_si128((const __m128i*)(s + 16));
+        _mm_storeu_si128((__m128i*)d, _mm_unpacklo_epi64(b0, b1));
+    }
+    if (b < blocks) memcpy(d, s, 8);
+}
+
+static void* TranscodeBC3AlphaToBC4(const void* src, u32 width, u32 height, u32 mipLevels,
+                                    VkDeviceSize& outSize, bool& outOwned)
+{
+    outOwned = true;
+    // Mip table first: with it a destination byte range maps back to a source
+    // range without walking the chain, which is what lets the gather be split.
+    struct MipSpan { u64 srcOff, dstOff, blocks; };
+    MipSpan  mips[16];
+    u32      nMips = 0;
+    u64      srcOff = 0, dstOff = 0, totalBlocks = 0;
+    for (u32 w = width, h = height, i = 0; i < mipLevels && nMips < 16; ++i, ++nMips) {
+        const u64 blocks = (u64)((w + 3) / 4) * ((h + 3) / 4);
+        mips[nMips] = { srcOff, dstOff, blocks };
+        srcOff += blocks * 16;
+        dstOff += blocks * 8;
+        totalBlocks += blocks;
         if (w > 1) w >>= 1;
         if (h > 1) h >>= 1;
     }
-    u8* dst = (u8*)xr_malloc((size_t)total);
+    const VkDeviceSize total = (VkDeviceSize)dstOff;
+
+    // Split the allocation off the gather. Four helper threads moved this whole
+    // function by nothing at all, which means the ceiling is not cores -- and half
+    // a gigabyte of FRESH pages per load (a fault per 4 KB, on write) is the first
+    // suspect that a thread split cannot touch.
+    const u64 _cAlloc0 = CPU::GetCLK();
+    u8* dst = nullptr;
+    if (ps_r_tex_repack_scratch) {
+        // One buffer per thread, grown to the largest image and kept. 561 repacks a
+        // load allocate half a gigabyte between them and free it again immediately;
+        // reusing the pages means faulting them once instead of once per texture.
+        // The caller must not free it -- hence outOwned.
+        static thread_local u8*    s_scratch     = nullptr;
+        static thread_local size_t s_scratchSize = 0;
+        if (s_scratchSize < (size_t)total) {
+            if (s_scratch) xr_free(s_scratch);
+            s_scratch     = (u8*)xr_malloc((size_t)total);
+            s_scratchSize = s_scratch ? (size_t)total : 0;
+        }
+        dst      = s_scratch;
+        outOwned = false;
+    } else {
+        dst = (u8*)xr_malloc((size_t)total);
+    }
+    VK::TexLoadProf::s_repackAllocClk += CPU::GetCLK() - _cAlloc0;
     if (!dst) return nullptr;
 
     const u8* s = (const u8*)src;
-    u8*       d = dst;
-    for (u32 w = width, h = height, i = 0; i < mipLevels; ++i) {
-        const u64 blocks = (u64)((w + 3) / 4) * ((h + 3) / 4);
-        for (u64 b = 0; b < blocks; ++b, s += 16, d += 8)
-            memcpy(d, s, 8);   // BC3 alpha block == BC4 block, verbatim
-        if (w > 1) w >>= 1;
-        if (h > 1) h >>= 1;
+
+    // One thread reads 16 bytes and writes 8 for every block, and the 27 hemi maps
+    // of a level are 4096^2 each: 561 repacks measured 183 ms on the loading thread
+    // while fifteen cores sat idle. The pool is the persistent one (no threads
+    // created per texture), and the grain is chosen so a chunk is worth the claim.
+    constexpr u64 kGrainBlocks = 8192;   // 128 KB in, 64 KB out
+    u32 helpers = ps_r_tex_repack_threads < 0 ? 0 : (u32)ps_r_tex_repack_threads;
+    if (helpers > 15) helpers = 15;
+    // ...unless we ARE one of sixteen workers already (r_tex_materialize): the farm
+    // is shared and one caller at a time holds it, so recruiting from inside it turns
+    // a parallel phase back into a queue.
+    if (VK::TexPrefetch::t_TexWorker) helpers = 0;
+    const u32 chunks = (u32)((totalBlocks + kGrainBlocks - 1) / kGrainBlocks);
+
+    if (helpers == 0 || chunks <= 1) {
+        for (u32 i = 0; i < nMips; ++i)
+            GatherAlphaBlocks(dst + mips[i].dstOff, s + mips[i].srcOff, mips[i].blocks);
+        outSize = total;
+        return dst;
     }
+
+    VK::FarmRun(chunks, helpers, [&](u32 c) {
+        const u64 first = (u64)c * kGrainBlocks;
+        const u64 last  = _min(first + kGrainBlocks, totalBlocks);
+        // Which mip owns this range — at most 16 entries, so a scan per chunk.
+        u64 base = 0;
+        for (u32 i = 0; i < nMips; ++i) {
+            const u64 lo = _max(first, base), hi = _min(last, base + mips[i].blocks);
+            if (lo < hi)
+                GatherAlphaBlocks(dst + mips[i].dstOff + (lo - base) * 8,
+                                  s   + mips[i].srcOff + (lo - base) * 16, hi - lo);
+            base += mips[i].blocks;
+            if (base >= last) break;
+        }
+    });
+
+    // Guard (r_tex_repack_verify): the SIMD gather and the chunk split both changed
+    // WHICH bytes land where, and a wrong lightmap is not a crash — it is a level
+    // that looks slightly off. Rebuild the same buffer with the plain per-block copy
+    // this replaced and compare. Off by default; one run with it on is the proof.
+    if (ps_r_tex_repack_verify) {
+        if (u8* ref = (u8*)xr_malloc((size_t)total)) {
+            const u8* rs = s;
+            u8*       rd = ref;
+            for (u32 i = 0; i < nMips; ++i)
+                for (u64 b = 0; b < mips[i].blocks; ++b, rs += 16, rd += 8)
+                    memcpy(rd, rs, 8);
+            if (memcmp(ref, dst, (size_t)total) != 0) {
+                ++VK::TexLoadProf::s_repackMismatch;
+                Msg("![VK Repack] gather MISMATCH: %ux%u mips=%u (%llu blocks) — the SIMD/threaded path is wrong",
+                    width, height, mipLevels, (unsigned long long)totalBlocks);
+            }
+            xr_free(ref);
+        }
+    }
+
     outSize = total;
     return dst;
 }
@@ -613,19 +775,559 @@ static void* TranscodeBC3AlphaToBC4(const void* src, u32 width, u32 height, u32 
 // and BuildStreamImage (explicit mipSkip for a promote/demote). Does NOT register
 // with the streamer — the caller owns that. Returns ok=false on any failure with the
 // image left as it was (unbuilt) so callers can fall back to a default.
+// ---------------------------------------------------------------------------
+// Stage 1 profiling: texture loading owns 8.5 s of a 21 s pripyat_full load
+// (2028 material-cache misses x ~4.2 ms). Before choosing a fix, split ONE
+// texture load into its four costs - a mip cap only helps the ones downstream
+// of the read, because r_open materializes the whole file either way.
+// ---------------------------------------------------------------------------
+// (already inside `namespace VK` — opened at the top of this file)
+namespace TexLoadProf {
+
+// Sixteen prefetch workers write these as well as the loading thread
+// (r_tex_materialize), so every counter is an atomic -- and rdtsc rather than
+// CTimer, which truncates a sub-microsecond sample to zero (see vk_clk.h).
+std::atomic<u64> s_totalClk{0}, s_openClk{0}, s_repackClk{0}, s_createClk{0}, s_uploadClk{0};
+// The four costs above left a third of the total unaccounted for (893 vs 522 ms on
+// pripyat_full). The two that were never timed: parsing the header out of the blob,
+// and CLOSING the file -- which for an archived texture frees the whole decompressed
+// image and for a loose one unmaps it.
+std::atomic<u64> s_parseClk{0}, s_closeClk{0};
+std::atomic<u32> s_count{0}, s_repacked{0};
+std::atomic<u64> s_bytesRead{0}, s_bytesUploaded{0};
+// How much the repack actually moves. Without it "repack 183 ms" cannot be told
+// apart from "the gather is bandwidth-bound and already at the ceiling".
+std::atomic<u64> s_repackBytes{0};
+// And of that time, how much is the destination allocation rather than the copy,
+// plus how many of the repacked bytes the residency skip throws away right after.
+std::atomic<u64> s_repackAllocClk{0}, s_repackSkipBytes{0};
+// `create` and `upload` were single numbers; both are sums of parts that behave
+// differently under a fix (an image allocation is a driver call, a sampler is a
+// per-texture object nothing outside the UI ever binds, the region walk is pure CPU).
+std::atomic<u64> s_createVramClk{0}, s_createViewClk{0}, s_createSampClk{0}, s_uploadRegionsClk{0};
+std::atomic<u32> s_createDedicated{0};
+// Written from vk_vram_stats.cpp: the small-image probe that runs BEFORE every
+// non-dedicated allocation, and how many images it actually routed to a pool.
+std::atomic<u64> s_createProbeClk{0};
+std::atomic<u32> s_createSmall{0};
+std::atomic<u32> s_repackMismatch{0};   // r_tex_repack_verify: textures where the SIMD gather disagreed
+
+void Dump()
+{
+    const float k = VK::ClkToMs();
+    Msg("[load step]   texture load: %u files, %llu MB read -> %llu MB uploaded | total %.0f ms = open/read %.0f + parse %.0f + repack %.0f (%u tex, %llu MB in) + create %.0f + upload %.0f + close %.0f",
+        s_count.load(), (unsigned long long)(s_bytesRead.load() >> 20), (unsigned long long)(s_bytesUploaded.load() >> 20),
+        k * float(s_totalClk.load()), k * float(s_openClk.load()), k * float(s_parseClk.load()),
+        k * float(s_repackClk.load()), s_repacked.load(), (unsigned long long)(s_repackBytes.load() >> 20),
+        k * float(s_createClk.load()), k * float(s_uploadClk.load()), k * float(s_closeClk.load()));
+    Msg("[load step]     create split: image %.0f (%u dedicated, %u small-pool; probe %.0f ms of the image) | view %.0f | sampler %.0f ms | of the upload: regions %.0f ms",
+        k * float(s_createVramClk.load()), s_createDedicated.load(), s_createSmall.load(),
+        k * float(s_createProbeClk.load()),
+        k * float(s_createViewClk.load()), k * float(s_createSampClk.load()),
+        k * float(s_uploadRegionsClk.load()));
+    Msg("[load step]     repack split: xr_malloc %.0f ms of the %.0f | %llu MB gathered, %llu MB of it thrown away by the mip skip%s",
+        k * float(s_repackAllocClk.load()), k * float(s_repackClk.load()),
+        (unsigned long long)((s_repackBytes.load() / 2) >> 20), (unsigned long long)(s_repackSkipBytes.load() >> 20),
+        ps_r_tex_repack_verify ? (s_repackMismatch.load() ? " | VERIFY: MISMATCHES" : " | verify: byte-identical") : "");
+    s_totalClk = s_openClk = s_repackClk = s_createClk = s_uploadClk = s_parseClk = s_closeClk = 0;
+    s_count = s_repacked = 0;
+    s_bytesRead = s_bytesUploaded = s_repackBytes = s_repackSkipBytes = 0;
+    s_repackAllocClk = 0; s_repackMismatch = 0;
+    s_createVramClk = s_createViewClk = s_createSampClk = s_uploadRegionsClk = 0;
+    s_createDedicated = 0; s_createProbeClk = 0; s_createSmall = 0;
+}
+
+// Adds its lifetime to `acc` — used for whole-function totals with many returns.
+struct scope
+{
+    u64               t0;
+    std::atomic<u64>& acc;
+    explicit scope(std::atomic<u64>& a) : t0(CPU::GetCLK()), acc(a) {}
+    ~scope() { acc.fetch_add(CPU::GetCLK() - t0, std::memory_order_relaxed); }
+};
+
+}   // namespace TexLoadProf
+
+// ---------------------------------------------------------------------------
+// Level texture prefetch — see the contract in vk_texture.h.
+// ---------------------------------------------------------------------------
+namespace TexPrefetch {
+
+// Set once per worker thread in WorkerBody; read by the repack (and anything else
+// that must not assume it owns every core).
+thread_local bool t_TexWorker = false;
+
+namespace {
+
+std::mutex                                  s_mx;
+std::condition_variable                     s_cvSpace;      // workers wait for the walk to take bytes
+std::unordered_map<std::string, IReader*>   s_ready;        // key = lower-cased full path
+std::unordered_set<std::string>             s_produced;     // every key ever parked (see ParkOne)
+
+u64                                         s_parked = 0;   // bytes currently held
+u64                                         s_budget = 0;
+bool                                        s_running = false;
+
+xr_vector<shared_str>  s_names;
+xr_vector<TexJob>      s_direct;
+ExpandFn               s_expand = nullptr;
+LoadFn                 s_load   = nullptr;
+std::atomic<u32>       s_materialized{0};   // jobs a worker finished instead of parking
+std::atomic<bool>      s_matOn{false};      // r_tex_materialize 2: set when the walk starts
+std::mutex             s_matMx;
+std::condition_variable s_matCv;
+u32                    s_matBusy = 0;       // workers currently inside a build (r_tex_mat_threads)
+std::atomic<u32>       s_nextName{0}, s_nextDirect{0};
+xr_vector<std::thread> s_pool;
+
+// Stats (read once, in Stop)
+std::atomic<u32> s_opened{0}, s_hits{0}, s_misses{0}, s_dropped{0};
+std::atomic<u32> s_touchSink{0};   // consumes the page-touch loop so the optimiser keeps it
+
+std::atomic<u64> s_openedB{0}, s_hitB{0};
+float            s_wallMs = 0.f;
+float            s_joinMs = 0.f;   // time the walk spent waiting for the workers in Stop()
+u32              s_threads = 0;
+
+// Windows paths are case-insensitive and the two sides of this cache are built
+// by different code (FS.update_path here, the material cache there) — key on a
+// lower-cased copy so a case difference can never turn into a silent miss.
+std::string KeyOf(const char* p)
+{
+    std::string k(p);
+    for (char& c : k) c = (char)tolower((unsigned char)c);
+    return k;
+}
+
+// ---- Deferred close ----------------------------------------------------------
+// The destructor of a reader is not free: CTempReader frees the decompressed archive
+// blob, CVirtualFileReader unmaps the file and closes two handles. 2463 of those in a
+// row was the third-largest item in the texture phase and it is pure teardown — nothing
+// downstream waits on it. Hand it to a worker, with a byte cap so a slow drain cannot
+// hold more memory than the inline path would have.
+std::mutex              s_clMx;
+std::condition_variable s_clCv, s_clIdle;
+std::deque<IReader*>    s_clQ;
+xr_vector<std::thread>  s_clPool;
+u64                     s_clBytes = 0;      // bytes waiting to be freed
+u32                     s_clBusy  = 0;      // workers inside a close
+bool                    s_clStop  = false;
+constexpr u64           kCloseCapBytes = 192ull << 20;
+
+void CloseWorker()
+{
+    for (;;) {
+        IReader* F = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(s_clMx);
+            s_clCv.wait(lk, [] { return s_clStop || !s_clQ.empty(); });
+            if (s_clQ.empty()) { if (s_clStop) return; continue; }
+            F = s_clQ.front(); s_clQ.pop_front(); ++s_clBusy;
+        }
+        const u64 len = (u64)F->length();
+        FS.r_close(F);
+        {
+            std::lock_guard<std::mutex> lk(s_clMx);
+            s_clBytes -= _min(s_clBytes, len);
+            --s_clBusy;
+        }
+        s_clIdle.notify_all();
+    }
+}
+
+// Opens one file and parks it. Returns false when the prefetch is shutting down.
+bool ParkOne(const std::string& path)
+{
+    const std::string key = KeyOf(path.c_str());
+    {   // Produced once, ever. Materials share bump/detail maps heavily, and the
+        // walk's own caches mean a shared file is asked for exactly once — so a
+        // second park would never be claimed. Tracked apart from `s_ready`, which
+        // the walk empties as it goes.
+        std::lock_guard<std::mutex> lk(s_mx);
+        if (!s_produced.insert(key).second) return true;
+    }
+
+
+    IReader* F = FS.r_open(path.c_str());
+    if (!F) return true;                       // missing file: the walk resolves it the same way
+
+    const u64 len = (u64)F->length();
+
+    // MATERIALIZE it. A loose .dds comes back as a mapped VIEW: r_open is three
+    // syscalls and the actual disk read happens on first touch — which, before this,
+    // was the loader thread's staging copy, where it showed up as a mysteriously slow
+    // "memcpy" (2 GB/s on memory that benchmarks far faster). Archive entries are
+    // already materialized and this just warms them. One byte per 4 KB page is enough
+    // to fault the whole file in, and doing it HERE is the entire point of the
+    // prefetch: the read belongs on a worker, not on the thread the level waits for.
+    if (const void* base = F->pointer()) {
+        const u8* p = (const u8*)base;
+        u32 sink = 0;
+        for (size_t o = 0, n = (size_t)len; o < n; o += 4096) sink += p[o];
+        s_touchSink.fetch_add(sink, std::memory_order_relaxed);   // keep the loop
+    }
+
+    std::unique_lock<std::mutex> lk(s_mx);
+    // Back-pressure: hold the line until the walk has taken enough away. The
+    // budget is what keeps a 3.5 GB texture set from becoming 3.5 GB of RAM.
+    // ...or until the walk starts and this worker's job changes from parking bytes
+    // to building textures (r_tex_materialize 2): the budget must not hold it there.
+    s_cvSpace.wait(lk, [] { return !s_running || s_parked < s_budget
+                                   || s_matOn.load(std::memory_order_relaxed); });
+    if (!s_running) { lk.unlock(); FS.r_close(F); return false; }
+
+    s_ready.emplace(key, F);
+    s_parked += len;
+
+    s_opened.fetch_add(1, std::memory_order_relaxed);
+    s_openedB.fetch_add(len, std::memory_order_relaxed);
+    return true;
+}
+
+// Lead file: one whole-file mapping shared by every worker, handed out in chunks
+// by an atomic cursor so they sweep it front to back — the order its sequential
+// reader wants.
+//
+// It warms the file's SECTION, and for a while that was assumed to be all the
+// reader needed. It is not: a page resident in the cache still costs the reading
+// thread a fault to put into ITS view's page table, and the geometry loader maps
+// a fresh 1 MB window every megabyte. Measured with r_geom_prefault 1 — touching
+// the window's own pages first costs 465 ms and leaves a copy that then runs at
+// 13.7 GB/s instead of 5.9. So the loader stages out of THIS view instead (see
+// LeadView / rvk_loader), and the faults stay where they already were: spread
+// across sixteen workers, ahead of the read.
+HANDLE           s_leadFile = INVALID_HANDLE_VALUE;
+HANDLE           s_leadMap  = nullptr;
+const u8*        s_leadBase = nullptr;
+u64              s_leadSize = 0;
+string_path      s_leadPath = {};
+std::atomic<u64> s_leadNext{0};
+std::atomic<u64> s_leadDone{0};
+
+constexpr u64 kLeadChunk = 8u << 20;   // 8 MB: enough to keep an NVMe queue busy
+
+void OpenLead(const char* path)
+{
+    s_leadFile = CreateFile(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (s_leadFile == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(s_leadFile, &sz) || sz.QuadPart <= 0) { CloseHandle(s_leadFile); s_leadFile = INVALID_HANDLE_VALUE; return; }
+    s_leadSize = (u64)sz.QuadPart;
+    s_leadMap  = CreateFileMapping(s_leadFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!s_leadMap) { CloseHandle(s_leadFile); s_leadFile = INVALID_HANDLE_VALUE; s_leadSize = 0; return; }
+    s_leadBase = (const u8*)MapViewOfFile(s_leadMap, FILE_MAP_READ, 0, 0, 0);
+    if (!s_leadBase) { CloseHandle(s_leadMap); CloseHandle(s_leadFile); s_leadMap = nullptr; s_leadFile = INVALID_HANDLE_VALUE; s_leadSize = 0; return; }
+    xr_strcpy(s_leadPath, path);
+}
+
+// Teardown thread: unmapping the lead view and closing the readers nobody claimed
+// is pure release work that the level is waiting on for no reason. UnmapViewOfFile
+// on a 1.9 GB fully-resident view tears down ~460k PTEs, and 51 unclaimed readers
+// unmap and close two handles each — measured together as the tail of the visual
+// phase, AFTER the join that the "walk waited" number covers. Joined at the next
+// Start (and at the start of the next Stop), so it can never outlive the level.
+std::thread s_teardown;
+
+void JoinTeardown()
+{
+    if (s_teardown.joinable()) s_teardown.join();
+}
+
+void CloseLead()
+{
+    if (s_leadBase) UnmapViewOfFile((void*)s_leadBase);
+    if (s_leadMap)  CloseHandle(s_leadMap);
+    if (s_leadFile != INVALID_HANDLE_VALUE) CloseHandle(s_leadFile);
+    s_leadBase = nullptr; s_leadMap = nullptr; s_leadFile = INVALID_HANDLE_VALUE;
+    s_leadSize = 0; s_leadNext = 0; s_leadPath[0] = 0;
+}
+
+// One job. With r_tex_materialize the worker OWNS it end to end -- read, image,
+// upload, publish into the cache the walk will look in -- instead of parking the
+// bytes and leaving the other four fifths of the work on the thread the level is
+// waiting for. Returns false when the worker should stop.
+bool DoJob(const TexJob& job)
+{
+    // 1 = build from the first job; 2 = read and park until the walk starts, then
+    // build. The difference is which phase pays for the upload bus (see
+    // EnableMaterialize).
+    const bool build = (ps_r_tex_materialize == 1) ||
+                       (ps_r_tex_materialize >= 2 && s_matOn.load(std::memory_order_relaxed));
+    if (build && s_load) {
+        // Optional throttle: building ends in the upload ring, which is one mutex, and
+        // the copy that fills it wants cores of its own.
+        const u32 cap = (u32)_max(0, ps_r_tex_mat_threads);
+        if (cap) {
+            std::unique_lock<std::mutex> lk(s_matMx);
+            s_matCv.wait(lk, [cap] { return !s_running || s_matBusy < cap; });
+            ++s_matBusy;
+        }
+        s_load(job);
+        if (cap) {
+            { std::lock_guard<std::mutex> lk(s_matMx); --s_matBusy; }
+            s_matCv.notify_one();
+        }
+        s_materialized.fetch_add(1, std::memory_order_relaxed);
+        return s_running;
+    }
+    return ParkOne(job.path);
+}
+
+void WorkerBody()
+{
+    t_TexWorker = true;
+    for (u64 off = s_leadNext.fetch_add(kLeadChunk); s_leadBase && off < s_leadSize;
+         off = s_leadNext.fetch_add(kLeadChunk)) {
+        if (!s_running) return;
+        const u64 end = _min(off + kLeadChunk, s_leadSize);
+        u32 sink = 0;
+        for (u64 o = off; o < end; o += 4096) sink += s_leadBase[o];
+        s_touchSink.fetch_add(sink, std::memory_order_relaxed);
+        s_leadDone.fetch_add(end - off, std::memory_order_relaxed);
+    }
+
+    xr_vector<TexJob> jobs;
+
+    // Lightmaps FIRST (r_tex_prefetch_lmaps_first). They used to come last, and the
+    // consequence was measured: the walk asks for them in its first milliseconds
+    // (every lightmapped material needs one), the workers were still grinding
+    // through 2400 diffuse bases, so all 27 missed — 432 MB the loading thread then
+    // read itself, a page fault at a time, inside the BC3->BC4 gather. The workers
+    // parked them afterwards for nobody: "unclaimed 51 (441 MB)" was 27 lightmaps
+    // read twice. They are few, they are 16 MB each, and they are needed first.
+    if (ps_r_tex_prefetch_lmaps_first)
+        for (u32 i = s_nextDirect++; i < (u32)s_direct.size(); i = s_nextDirect++) {
+            if (!s_running) return;
+            if (!DoJob(s_direct[i])) return;
+        }
+
+    // Shader-table bases: each expands to that material's whole texture set,
+    // which is exactly the group the walk asks for in one go.
+    for (u32 i = s_nextName++; i < (u32)s_names.size(); i = s_nextName++) {
+        if (!s_running) return;
+        jobs.clear();
+        if (s_expand) s_expand(s_names[i].c_str(), jobs);
+        for (const TexJob& j : jobs)
+            if (!DoJob(j)) return;
+    }
+    for (u32 i = s_nextDirect++; i < (u32)s_direct.size(); i = s_nextDirect++) {
+        if (!s_running) return;
+        if (!DoJob(s_direct[i])) return;
+    }
+}
+
+CTimer s_wall;
+
+}   // anonymous namespace
+
+// The whole-file view of the lead file, for a caller that wants to read the same
+// file the workers are prefaulting. Its own mapping would fault per 4 KB on its
+// own thread; this one is being warmed by sixteen. Null unless `path` IS the lead.
+const u8* LeadView(const char* path, u64& size)
+{
+    size = 0;
+    if (!s_leadBase || !path || !path[0] || !s_leadPath[0]) return nullptr;
+    if (_stricmp(path, s_leadPath) != 0) return nullptr;
+    size = s_leadSize;
+    return s_leadBase;
+}
+
+void Start(xr_vector<shared_str>&& diffuseNames, xr_vector<TexJob>&& directJobs, ExpandFn expand,
+           LoadFn materialize, const char* leadFile)
+{
+    if (ps_r_tex_prefetch == 0) return;
+    if (s_running) Stop();
+    JoinTeardown();   // the previous level's unmap must be done before we map again
+    if (diffuseNames.empty() && directJobs.empty() && !leadFile) return;
+
+    if (leadFile && leadFile[0]) OpenLead(leadFile);
+
+
+    s_names  = std::move(diffuseNames);
+    s_direct = std::move(directJobs);
+    s_expand = expand;
+    s_load   = materialize;
+    s_materialized = 0;
+    s_matOn  = false;
+    s_nextName = 0;
+    s_nextDirect = 0;
+    s_opened = 0; s_hits = 0; s_misses = 0; s_dropped = 0;
+    s_openedB = 0; s_hitB = 0;
+    s_parked = 0;
+    s_budget = (u64)_max(64, ps_r_tex_prefetch_mb) << 20;
+    s_running = true;
+    s_wall.Start();
+
+    u32 nThr = std::thread::hardware_concurrency();
+    nThr = _min(_max(1u, nThr), 16u);
+    s_threads = nThr;
+    s_pool.reserve(nThr);
+    for (u32 w = 0; w < nThr; ++w)
+        s_pool.emplace_back([] { WorkerBody(); });
+
+    Msg("[VK TexPrefetch] started: lead %u MB + %u shader bases + %u direct files on %u threads, budget %u MB, mode=%s",
+        (u32)(s_leadSize >> 20), (u32)s_names.size(), (u32)s_direct.size(), nThr, (u32)(s_budget >> 20),
+        (ps_r_tex_materialize && s_load) ? "materialize" : "park");
+
+}
+
+void CloseAsync(IReader*& F)
+{
+    if (!F) return;
+    const u64 len = (u64)F->length();
+    {
+        std::lock_guard<std::mutex> lk(s_clMx);
+        if (s_clBytes + len <= kCloseCapBytes) {
+            if (s_clPool.empty()) {
+                s_clStop = false;
+                for (u32 i = 0; i < 2; ++i) s_clPool.emplace_back(CloseWorker);
+            }
+            s_clBytes += len;
+            s_clQ.push_back(F);
+            F = nullptr;
+        }
+    }
+    if (!F) { s_clCv.notify_one(); return; }
+    FS.r_close(F);   // over the cap: pay for it here, exactly as before
+}
+
+void CloseDrain()
+{
+    std::unique_lock<std::mutex> lk(s_clMx);
+    s_clIdle.wait(lk, [] { return s_clQ.empty() && s_clBusy == 0; });
+}
+
+IReader* Take(const char* fullPath)
+{
+    if (!fullPath || !fullPath[0]) return nullptr;
+    std::lock_guard<std::mutex> lk(s_mx);
+    if (s_ready.empty()) {
+        // Nothing parked: either the prefetch is off, or it is behind. Only count a
+        // miss while it is actually running, so unrelated (UI/model) loads don't
+        // pollute the hit rate -- and never for a worker, which parked nothing for
+        // itself and would report a 0% hit rate for a path with nothing to hit.
+        if (s_running && !t_TexWorker) s_misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    auto it = s_ready.find(KeyOf(fullPath));
+    if (it == s_ready.end()) {
+        if (s_running && !t_TexWorker) s_misses.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    IReader* F = it->second;
+    const u64 len = (u64)F->length();
+    s_ready.erase(it);
+    s_parked -= _min(s_parked, len);
+    s_hits.fetch_add(1, std::memory_order_relaxed);
+    s_hitB.fetch_add(len, std::memory_order_relaxed);
+    s_cvSpace.notify_one();
+    return F;
+}
+
+void EnableMaterialize()
+{
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        s_matOn.store(true, std::memory_order_relaxed);
+    }
+    // Workers blocked on the parking budget have to wake up: from here they consume
+    // what they parked instead of adding to it.
+    s_cvSpace.notify_all();
+}
+
+void Stop()
+{
+    CTimer _tJoin; _tJoin.Start();
+    JoinTeardown();   // a previous level's, if any — never two in flight
+    CloseDrain();   // deferred closes belong to THIS level, not the next one
+    if (!s_running && s_pool.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        s_running = false;
+    }
+    s_cvSpace.notify_all();
+    for (auto& th : s_pool) if (th.joinable()) th.join();
+    s_pool.clear();
+    s_wallMs = s_wall.GetElapsed_ms_total();
+    // How long the walk had to WAIT here: if the workers are still busy when the
+    // visuals are done, the phase is bound by the prefetch tail, not by the walk.
+    s_joinMs = _tJoin.GetElapsed_ms_total();
+
+    u64 leftB = 0;
+    xr_vector<IReader*> unclaimed;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        unclaimed.reserve(s_ready.size());
+        // Name them. 441 MB read, decompressed and never asked for is not a rounding
+        // error during the phase the whole load waits on -- but it is only worth
+        // attacking if the names say WHICH rule produced them.
+        u32 shown = 0;
+        for (auto& kv : s_ready)
+            if (shown++ < 64)
+                Msg("[VK TexPrefetch] unclaimed: '%s' (%u KB)", kv.first.c_str(), (u32)(kv.second->length() >> 10));
+        for (auto& kv : s_ready) { leftB += (u64)kv.second->length(); unclaimed.push_back(kv.second); }
+        s_dropped = (u32)s_ready.size();
+        s_ready.clear();
+        s_produced.clear();
+        s_parked = 0;
+    }
+    const u64 leadDone = s_leadDone.exchange(0);
+    const u64 leadSize = s_leadSize;
+    // Hand the release work to the teardown thread; the level does not wait for it.
+    s_teardown = std::thread([unclaimed = std::move(unclaimed)] {
+        for (IReader* F : unclaimed) FS.r_close(F);
+        CloseLead();
+    });
+    s_names.clear();
+    s_direct.clear();
+
+
+    if (leadSize)
+        Msg("[load step]   TexPrefetch lead: %llu of %llu MB prefaulted",
+            (unsigned long long)(leadDone >> 20), (unsigned long long)(leadSize >> 20));
+    const u32 hits = s_hits.load(), misses = s_misses.load();
+
+    Msg("[load step]   TexPrefetch: %u opened (%llu MB) on %u threads in %.0f ms wall (walk waited %.0f ms here) | walk hits %u / miss %u (%.0f%%) | unclaimed %u (%llu MB) | materialized %u",
+        s_opened.load(), (unsigned long long)(s_openedB.load() >> 20), s_threads, s_wallMs, s_joinMs,
+        hits, misses, (hits + misses) ? 100.0 * hits / double(hits + misses) : 0.0,
+        s_dropped.load(), (unsigned long long)(leftB >> 20), s_materialized.load());
+}
+
+}   // namespace TexPrefetch
+
 CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSToImage(const char* filename,
                                                             bool applyBCSwizzle, u32 mipSkip,
                                                             TexColorSpace colorSpace)
 {
-    IReader* F = FS.r_open(filename);
+    VK::TexLoadProf::scope _profAll(VK::TexLoadProf::s_totalClk);
+    ++VK::TexLoadProf::s_count;
+
+    const u64 _cOpen0 = CPU::GetCLK();
+    // Already opened by a prefetch worker? Then this costs a hash lookup instead of
+    // a whole-file LZO decompress. Ownership transfers — the r_close below is the
+    // same one either way (see VK::TexPrefetch).
+    IReader* F = VK::TexPrefetch::Take(filename);
+    if (!F) F = FS.r_open(filename);
     if (!F) {
         Msg("![Vulkan] Failed to open texture: %s", filename);
         return {};
     }
+
+    // Archived files are decompressed whole here — this is the read cost a mip
+    // cap can NOT reduce, so it is measured on its own.
+    const size_t _len = (size_t)F->length();
+    const void*  _ptr = F->pointer();
+    VK::TexLoadProf::s_openClk   += CPU::GetCLK() - _cOpen0;
+    VK::TexLoadProf::s_bytesRead += _len;
+
     // IReader is memory-backed (mapped or decompressed) — parse in place.
-    DDSLoadResult r = loadDDSFromMemory(filename, F->pointer(), (size_t)F->length(),
+    DDSLoadResult r = loadDDSFromMemory(filename, _ptr, _len,
                                         applyBCSwizzle, mipSkip, colorSpace);
-    FS.r_close(F);
+    {
+        VK::TexLoadProf::scope _profClose(VK::TexLoadProf::s_closeClk);
+        VK::TexPrefetch::CloseAsync(F);   // archived: frees the decompressed image; loose: unmaps it
+    }
     return r;
 }
 
@@ -634,6 +1336,10 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
                                                                 bool applyBCSwizzle, u32 mipSkip,
                                                                 TexColorSpace colorSpace)
 {
+    // Header parse + format pick + the truncation walk: cheap per texture, 2463 of
+    // them per load, and never on the books until now.
+    const u64 _cParse0 = CPU::GetCLK();
+
     const u8* cur = (const u8*)blob;
     size_t    rem = blob ? blobSize : 0;
     auto take = [&](void* dst, size_t n) -> bool {
@@ -680,22 +1386,10 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
             // only when the caller asked AND the format is a (BC) compressed one.
             m_bBCSwizzle = applyBCSwizzle && IsCompressedFormat(format);
         } else {
-            switch (header.ddspf.dwFourCC) {
-                case FOURCC_DXT1:
-                    // DXT1 always has 1-bit punch-through alpha in X-Ray engine.
-                    // Many DDS files omit DDPF_ALPHAPIXELS flag but still use alpha.
-                    // D3D11 always treats DXT1 as having alpha, so we do the same.
-                    format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-                    break;
-                case FOURCC_DXT3:
-                    format = VK_FORMAT_BC2_UNORM_BLOCK;
-                    break;
-                case FOURCC_DXT5:
-                    format = VK_FORMAT_BC3_UNORM_BLOCK;
-                    break;
-                default:
-                    Msg("![Vulkan] Unsupported FourCC: %X in %s", header.ddspf.dwFourCC, filename);
-                    return {};
+            format = FourCCToVkFormat(header.ddspf.dwFourCC);
+            if (format == VK_FORMAT_UNDEFINED) {
+                Msg("![Vulkan] Unsupported FourCC: %X in %s", header.ddspf.dwFourCC, filename);
+                return {};
             }
             // X-Ray UI atlases ship with BGR-ordered BC endpoints (yellow indicators
             // come out blue without R↔B swap). Level statics are stock BC1/3 with
@@ -834,11 +1528,15 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
         }
     }
 
+    VK::TexLoadProf::s_parseClk += CPU::GetCLK() - _cParse0;
+
     // Hemi lightmaps only: which channel carries the bake (see DetectLmapHemiChannel),
     // and repack to single-channel BC4 while we hold the blob. Done here — after the
     // truncation guard (so the source is known complete), before the residency plan
     // and CreateView, both of which must see the FINAL format.
+    bool repackedHere = false;
     {
+        VK::TexLoadProf::scope _profRepack(VK::TexLoadProf::s_repackClk);
         // A hemi lightmap qualifies only if the bake actually sits in alpha (measured);
         // a height map qualifies by construction — every sampler of it reads .a.
         double rgbMean = 0.0, aMean = 0.0;
@@ -850,7 +1548,9 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
         if (lmapInAlpha || heightOnly) {
             m_ChanFix = lmapInAlpha ? ChanFix::HemiFromAlpha : ChanFix::None;   // pre-repack fallbacks
             VkDeviceSize packedSize = 0;
-            if (void* packed = TranscodeBC3AlphaToBC4(data, width, height, mipLevels, packedSize)) {
+            bool packedOwned = true;
+            if (void* packed = TranscodeBC3AlphaToBC4(data, width, height, mipLevels, packedSize, packedOwned)) {
+                VK::TexLoadProf::s_repackBytes += dataSize;   // source bytes, before the swap below
                 if (ownsData) { void* old = const_cast<void*>(data); xr_free(old); }
                 Msg("[VK %s] '%s': %s -> repacked BC3->BC4, %.1f -> %.1f MB",
                     lmapInAlpha ? "Lmap" : "Height", filename,
@@ -858,7 +1558,9 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
                     dataSize / 1048576.0, packedSize / 1048576.0);
                 data      = packed;
                 dataSize  = packedSize;
-                ownsData  = true;
+                ownsData  = packedOwned;   // false when the gather wrote into the reused scratch
+                ++VK::TexLoadProf::s_repacked;
+                repackedHere = true;
                 format    = VK_FORMAT_BC4_UNORM_BLOCK;
                 // BC4 delivers the scalar in R; route it to wherever shaders look.
                 m_ChanFix = lmapInAlpha ? ChanFix::HemiFromRed : ChanFix::AlphaFromRed;
@@ -901,6 +1603,10 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
         for (u32 i = 0; i < skip; ++i) { if (width > 1) width >>= 1; if (height > 1) height >>= 1; }
         mipLevels -= skip;
     }
+    // Bytes the repack produced and the residency plan then dropped. The repack has
+    // to run first (the plan needs the FINAL format), but it does not have to gather
+    // mips nobody will upload -- if this number is large.
+    if (repackedHere) VK::TexLoadProf::s_repackSkipBytes += skipBytes;
 
     // Debug: log format for magnifier texture specifically
     if (strstr(filename, "magnifier")) {
@@ -909,7 +1615,10 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
     }
 
     // Create texture at the resident dimensions.
-    Create(width, height, format, mipLevels);
+    {
+        VK::TexLoadProf::scope _profCreate(VK::TexLoadProf::s_createClk);
+        Create(width, height, format, mipLevels);
+    }
     if (m_Image == VK_NULL_HANDLE) {   // allocation failed (OOM) — bail cleanly
         if (ownsData) { void* p = const_cast<void*>(data); xr_free(p); }
         return {};
@@ -919,7 +1628,11 @@ CVulkanTexture::DDSLoadResult CVulkanTexture::loadDDSFromMemory(const char* file
     if (m_Allocation) vmaSetAllocationName(VulkanHW.m_Allocator, m_Allocation, filename);
 
     // Upload from the first resident mip onward (offset past the skipped mips).
-    UploadData((const u8*)data + skipBytes, dataSize - skipBytes);
+    {
+        VK::TexLoadProf::scope _profUpload(VK::TexLoadProf::s_uploadClk);
+        UploadData((const u8*)data + skipBytes, dataSize - skipBytes);
+        VK::TexLoadProf::s_bytesUploaded += (dataSize - skipBytes);
+    }
     if (ownsData) { void* p = const_cast<void*>(data); xr_free(p); }
 
     DDSLoadResult res;
@@ -1050,20 +1763,11 @@ bool CVulkanTexture::LoadDDSCubemap(const char* filename, bool applyBCSwizzle,
     VkFormat format = VK_FORMAT_UNDEFINED;
 
     if (header.ddspf.dwFlags & DDPF_FOURCC) {
-        switch (header.ddspf.dwFourCC) {
-            case FOURCC_DXT1:
-                format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-                break;
-            case FOURCC_DXT3:
-                format = VK_FORMAT_BC2_UNORM_BLOCK;
-                break;
-            case FOURCC_DXT5:
-                format = VK_FORMAT_BC3_UNORM_BLOCK;
-                break;
-            default:
-                Msg("![Vulkan] Unsupported cubemap FourCC: %X in %s", header.ddspf.dwFourCC, filename);
-                FS.r_close(F);
-                return false;
+        format = FourCCToVkFormat(header.ddspf.dwFourCC);
+        if (format == VK_FORMAT_UNDEFINED) {
+            Msg("![Vulkan] Unsupported cubemap FourCC: %X in %s", header.ddspf.dwFourCC, filename);
+            FS.r_close(F);
+            return false;
         }
         // Same R↔B swizzle policy as 2D BC: caller decides.
         m_bBCSwizzle = applyBCSwizzle;

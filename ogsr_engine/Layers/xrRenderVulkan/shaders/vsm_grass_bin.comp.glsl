@@ -25,7 +25,9 @@ layout(local_size_x = 64) in;
 struct DetailInstance { vec4 row0, row1, row2, color; };   // 64 B (matches DetailInstance; translation = row*.w)
 layout(set = 0, binding = 0) readonly buffer Visible  { DetailInstance inst[]; };
 layout(set = 0, binding = 1) readonly buffer Indirect { uint indirect[]; };       // 5 u32 / type, instanceCount @ +1
-layout(set = 0, binding = 2) uniform VsmParams { mat4 view; vec4 level[VSM_LEVELS]; vec4 zparams; } vsm;
+#define VSM_PARAMS_SET     0
+#define VSM_PARAMS_BINDING 2
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 layout(set = 0, binding = 3) readonly buffer PageTable { uint pageTable[]; };      // DYN table (mode 0/2) or STATIC table (mode 1)
 layout(set = 0, binding = 4) writeonly buffer GrassPairs { uint pairs[]; };        // per-type arena: slot(13) << 19 | instLocal(19)
 layout(set = 0, binding = 5) buffer Stats     { uint stats[]; };                   // [0]=casting instances [1]=dropped [2]=dyn pairs [3]=static pairs [4]=candidates

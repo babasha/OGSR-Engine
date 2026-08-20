@@ -16,9 +16,11 @@
 // ±kHalf of the eye). See deform_stamp.comp.glsl.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
 #include "vk_deform.h"
 #include "vk_image.h"      // VK::CreateImage2D / CreateImageView
+#include "vk_barriers.h"   // VK::ImageBarrier (explicit stage/access overload)
 #include "vk_compute_util.h" // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_shaders.h"         // g_ShaderManager
 #include "vk_pipeline_cache.h"  // shared pipeline cache object
@@ -81,19 +83,6 @@ namespace {
     // skip the whole dispatch when the field is guaranteed empty (nobody stepped).
     float s_contentUntil = 0.f;   // Device.fTimeGlobal until which the field may hold visible prints
     bool  s_skipped      = false; // last Dispatch skipped GPU work -> resume uses a fresh window (prev is stale)
-
-    void barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout oldL, VkImageLayout newL,
-                 VkPipelineStageFlags srcS, VkPipelineStageFlags dstS, VkAccessFlags srcA, VkAccessFlags dstA)
-    {
-        VkImageMemoryBarrier b{};
-        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout = oldL; b.newLayout = newL;
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = img;
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
-        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
-    }
 
     bool createImage(VkImageUsageFlags usage, Buf& out)
     {
@@ -183,33 +172,21 @@ bool Init()
     slci.bindingCount = 3; slci.pBindings = b;
     vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout);
 
-    VkDescriptorPoolSize ps[3]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[0].descriptorCount = 1;   // field (in place)
-    ps[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; ps[1].descriptorCount = 1;
-    ps[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[2].descriptorCount = 1;   // rain
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool);
-
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setLayout;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) {
-        Msg("![VK Deform] descriptor alloc failed"); s_failed = true; return false;
+    // The layout above stays hand-rolled: its bindings are 0/2/3, not 0..N.
+    s_pool = VK::MakeDescriptorPool({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,             // field (in place)
+                                      VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                                      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },  // rain
+                                    1, "Deform.Stamp");
+    if (!s_pool || !VK::AllocSets(s_pool, s_setLayout, 1, &s_set, "Deform.Stamp")) {
+        s_failed = true; return false;
     }
 
-    VkDescriptorImageInfo fieldI{ VK_NULL_HANDLE, s_state.view, VK_IMAGE_LAYOUT_GENERAL };       // 0 field (storage, in place)
-    VkDescriptorImageInfo rainI{ ShadowMap::GetSampler(), ShadowMap::GetRainView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorBufferInfo sbI{ s_stampBuf, 0, sizeof(StampsUBO) };
-    VkWriteDescriptorSet w[3]{};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = s_set; w[0].dstBinding = 0; w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[0].pImageInfo = &fieldI;
-    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = s_set; w[1].dstBinding = 2; w[1].descriptorCount = 1;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; w[1].pBufferInfo = &sbI;
-    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = s_set; w[2].dstBinding = 3; w[2].descriptorCount = 1;
-    w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[2].pImageInfo = &rainI;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+    VK::DescriptorWriter(s_set)
+        .StorageImage(0, s_state.view)                          // field (storage, in place)
+        .Buffer      (2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                         { s_stampBuf, 0, sizeof(StampsUBO) })
+        .ImageSampler(3, ShadowMap::GetRainView(), ShadowMap::GetSampler())
+        .Flush();
 
     s_pipeLayout = VK::MakePipelineLayout({ s_setLayout }, sizeof(PushConstants));
 
@@ -253,16 +230,17 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
     // Bring it to GENERAL for the compute's in-place read-modify-write; first frame comes
     // from UNDEFINED. The consumer stages (terrain frag/tese/tesc, snow-mesh VS/FS) are the
     // src of the read->write hazard.
-    const VkPipelineStageFlags kConsumers =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
-        | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
+    const VkPipelineStageFlags2 kConsumers =
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+        | VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT;
     if (s_first) {
-        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        VK::ImageBarrier(cmd, s_state.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
     } else {
-        barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                kConsumers, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        VK::ImageBarrier(cmd, s_state.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                         kConsumers, VK_ACCESS_2_SHADER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
     }
 
     const float dt = (Device.fTimeDelta < 0.1f) ? Device.fTimeDelta : 0.1f;
@@ -321,9 +299,9 @@ void Dispatch(VkCommandBuffer cmd, const Stamp* stamps, u32 count)
     vkCmdDispatch(cmd, groups, groups, 1);
 
     // Back to SHADER_READ_ONLY for the consumers.
-    barrier(cmd, s_state.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kConsumers,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    VK::ImageBarrier(cmd, s_state.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                     kConsumers, VK_ACCESS_2_SHADER_READ_BIT);
 
     s_prevCamX = camX; s_prevCamZ = camZ; s_haveCam = true;
     s_first  = false;

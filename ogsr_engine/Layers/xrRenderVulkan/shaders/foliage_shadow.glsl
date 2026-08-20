@@ -69,4 +69,48 @@ vec4 foliagePointDebug(vec3 wp)
     return vec4(mix(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), shadow), 1.0);
 }
 
+// Dynamic point/spot accumulation for FOLIAGE. Attenuation-only (leaves and
+// blades carry no per-pixel normal, so there is no N-L term) + the 1-tap shadow
+// above. The opaque receivers use light_shade.glsl::dynLights instead; the beam
+// falloff/cone maths is kept in step with it deliberately.
+
+// Foliage variant: leaves have no per-pixel normal -> attenuation-only.
+vec3 dynLightsFoliage(vec3 wp)
+{
+    vec3 acc = vec3(0.0);
+    int n = int(L.counts.x + 0.5);
+    for (int i = 0; i < n; ++i) {
+        vec3  dv = L.lights[i].pos.xyz - wp;
+        float r  = L.lights[i].pos.w;
+        float d2 = dot(dv, dv);
+        if (d2 >= r * r) continue;
+        float d   = sqrt(max(d2, 1e-6));
+        // Narrow beams: windowed falloff (far half still lights) — light_shade.glsl.
+        float att;
+        if (L.lights[i].color.w > 0.5 && L.lights[i].dir.w > 0.87) {
+            att = 1.0 - (d2 / (r * r));
+            att *= att;
+        } else {
+            att = 1.0 - d / r;
+            att *= att;
+        }
+        if (L.lights[i].color.w > 0.5) {
+            // Narrow beams: full inside the cone + spill to 2x the angle — see
+            // light_shade.glsl (axis-peaked ramp left beam-lit foliage dark).
+            float ca = dot(-dv / d, L.lights[i].dir.xyz);
+            float ci = L.lights[i].dir.w;
+            if (ci > 0.87) {
+                float co = 2.0 * ci * ci - 1.0;
+                att *= clamp((ca - co) / max(ci - co, 1e-3), 0.0, 1.0);
+            } else
+                att *= clamp((ca - ci) / max(1.0 - ci, 1e-3), 0.0, 1.0);
+        }
+        // Dynamic shadow (spot tile / point cube): NPCs/props around a campfire or
+        // under a lamp cast onto the foliage, not just the terrain.
+        att *= foliageLightShadow(i, wp);
+        acc += L.lights[i].color.rgb * (att * 0.7);
+    }
+    return acc;
+}
+
 #endif // FOLIAGE_SHADOW_GLSL

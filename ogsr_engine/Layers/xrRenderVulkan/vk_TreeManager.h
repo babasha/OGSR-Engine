@@ -39,8 +39,9 @@ struct TreeGfxPush
     Fmatrix  mViewProj;    // 64 B  world → clip
     float    uvScale;      //  4 B  1/2048 (FTreeVisual_quant = 32768/16)
     float    alphaRef;     //  4 B  fragment alpha cutoff
-    float    _pad0;        //  4 B  (vec4 below needs 16-byte alignment → offset 80)
-    float    _pad1;        //  4 B
+    float    statsOn;      //  4 B  1 = tree.frag marks the visible-tree bitset (r_profiler)
+    float    shadeDist;    //  4 B  r_tree_shade_dist — metres past which tree.frag drops its subtle terms
+                           //       (vec4 below needs 16-byte alignment → offset 80, so these two are free anyway)
     Fvector4 vSunColor;    // 16 B  env sun colour (rgb); w unused
     Fvector4 vHemiColor;   // 16 B  env hemi colour (rgb); w unused
     Fvector4 wind_params;  // 16 B  SSFX (wind_direction, wind_velocity, _, _)
@@ -81,20 +82,34 @@ struct TreeFrustumUBO
     Fvector4 planes[6];  // 96 B
 };
 
-// Cull compute push constants (116 B). The frustum planes ride in push constants
+// Cull compute push constants (208 B). The frustum planes ride in push constants
 // (recorded per dispatch) instead of the racy single-buffered UBO. planes FIRST
-// (offset 0) keeps the trailing u32s 4-aligned and the total under the 128 B
-// guaranteed push limit. Mirrors tree_cull.comp's push_constant block.
+// (offset 0) keeps the trailing scalars 4-aligned. Mirrors tree_cull.comp's
+// push_constant block.
+// ⚠ eye_* are three SCALARS, not an Fvector/vec3: a vec3 in the shader's push
+// block aligns to 16 B, which would shift every following offset.
+// ⚠ 208 B EXCEEDS the 128 B guaranteed minimum — legal here because this renderer
+// already ships TreeMotionPush at 240 B, i.e. it targets the 256 B every desktop
+// GPU provides. CreateCullPipeline checks Caps.maxPushConstantsSize and refuses
+// to build rather than letting vkCreatePipelineLayout fail obscurely.
 struct TreeCullPush
 {
     Fvector4 planes[6];   // 96 B  view frustum (normalized; 0=L 1=R 2=B 3=T 4=N 5=F)
     u32      mesh_count;   //  4 B  trees in this group
-    u32      _unused;      //  4 B
+    float    cut_dist;     //  4 B  r_tree_dist: drop FLOD-backed trees past this (0 = off)
     u32      mesh_offset;  //  4 B  start index in the metadata buffer
     u32      output_base;  //  4 B  base index into the indirect command buffer
     u32      count_index;  //  4 B  index into the draw-count buffer (= group)
+    float    eye_x;        //  4 B  camera position — distance cut + HZB near face
+    float    eye_y;        //  4 B
+    float    eye_z;        //  4 B
+    Fmatrix  viewProj;     // 64 B  @128 (mat4 needs 16-B alignment — 128 is aligned)
+    u32      hzb_on;       //  4 B  1 = run the Hi-Z occlusion test
+    float    hzb_focal;    //  4 B  1/tan(fovY/2) — true screen footprint of the sphere
+    u32      _pad0;        //  4 B
+    u32      _pad1;        //  4 B
 };
-static_assert(sizeof(TreeCullPush) == 116, "TreeCullPush must be 116 B");
+static_assert(sizeof(TreeCullPush) == 208, "TreeCullPush must be 208 B");
 
 // ============================================================================
 // Per-instance data uploaded to GPU. The vertex shader reads
@@ -124,8 +139,20 @@ struct GpuTreeMeta
     u32      index_count;   //  4 B  num_tris * 3
     u32      ib_first;      //  4 B  First index (element offset into IB)
     u32      first_vertex;  //  4 B  Base vertex (element offset into VB)
-    u32      _pad;          //  4 B  std430 alignment
+    u32      flags;         //  4 B  was _pad. bit 0 = TREE_FLOD_BACKED (see below)
 };
+// This tree lives inside an FLOD container that CLODManager will draw as a
+// billboard past kImposterMinDist — so past that range the full mesh is pure
+// duplicate work and may be dropped. Trees WITHOUT this bit have no billboard
+// replacement and must never be distance-culled (they would just vanish).
+// Mirrored in tree_cull.comp.glsl; the VSM bin shaders read the field as `pad`
+// and ignore it, so setting it costs them nothing.
+static constexpr u32 TREE_FLOD_BACKED = 1u << 0;
+
+// r_tree_dist, resolved (0 = cut disabled). Both the colour cull and the camera
+// depth prepass MUST read the distance through this one accessor — see the note
+// on its definition in vk_TreeManager_Render.cpp.
+float TreeFlodCutDist();
 static_assert(sizeof(GpuTreeMeta) == 32, "GpuTreeMeta must be 32 B");
 
 // ============================================================================
@@ -275,9 +302,14 @@ public:
     // cached STATIC layer (far: minDist=wind_shadow_dist) and a per-frame DYNAMIC
     // layer (near: maxDist=wind_shadow_dist) so near trees sway in the wind without
     // re-rasterizing the whole forest. Defaults = all trees (no split).
+    // flodCut > 0: additionally drop TREE_FLOD_BACKED trees farther than flodCut —
+    // the camera-prepass twin of the colour cull's r_tree_dist. ⚠ Pass it ONLY on
+    // the prepass path: the colour cull MUST stay a superset of the prepass (see
+    // tree_cull.comp.glsl), and shadow casters have no billboard stand-in at all.
     void RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade = -1,
                      const CFrustum* frustum = nullptr,
-                     float minDist = 0.0f, float maxDist = 1e9f);
+                     float minDist = 0.0f, float maxDist = 1e9f,
+                     float flodCut = 0.0f);
 
     // Wind-sway motion-vector overlay. Called by VK::MotionVec::ExecuteDynamic
     // INSIDE its already-begun MV render pass (MV target + scene depth bound,
@@ -328,9 +360,16 @@ public:
 private:
     // Recursive helper: descends MT_HIERRARHY / MT_LOD into children
     // until it reaches MT_TREE_ST/PM leaves.
+    // outFlodBacked collects (with duplicates) every leaf reached through an FLOD
+    // container that has a VALID billboard — i.e. the trees CLODManager will draw
+    // as imposters past kImposterMinDist. Build() turns that into TREE_FLOD_BACKED.
+    // The flag must be carried through the recursion, not inferred from `source`:
+    // an FLOD child can itself be an MT_HIERRARHY whose leaves are the trees.
     void ExtractFromVisual(::vkRender_Visual* vis,
                            xr_vector<::vkFTreeVisual*>& outTrees,
-                           u32 source = 0);   // 0=top-level 1=hierarchy 2=LOD
+                           xr_vector<::vkFTreeVisual*>& outFlodBacked,
+                           u32 source = 0,              // 0=top-level 1=hierarchy 2=LOD
+                           bool underValidFlod = false);
 
     void UploadMetadata(const xr_vector<GpuTreeMeta>& meta);
     void UploadTransforms(const xr_vector<GpuTreeInstance>& xforms);
@@ -359,6 +398,9 @@ private:
 private:
     bool m_bBuilt           = false;
     u32  m_TotalCount       = 0;
+    u32  m_FlodBackedCount  = 0;   // trees carrying TREE_FLOD_BACKED (diagnostic)
+    VkImageView m_CullHzbView = VK_NULL_HANDLE;   // last HZB view written to binding 4 (rewrite ONLY on change)
+    u32         m_CullHzbGen  = 0xFFFFFFFFu;      // its generation — handles can be recycled, generations cannot
     u32  m_MaxGroupMeshCount = 0;
 
     xr_vector<TreeIndirectGroup> m_Groups;

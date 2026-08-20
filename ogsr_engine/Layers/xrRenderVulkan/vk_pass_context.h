@@ -14,6 +14,7 @@
 
 #pragma once
 #include "vk_core.h"
+#include "vk_rendering.h"
 // Fmatrix lives in xrCore/_matrix.h, pulled in transitively via stdafx in
 // every TU that includes this header.
 
@@ -53,35 +54,9 @@ namespace VK
     inline void BeginOverlayRendering(VkCommandBuffer cmd, const FrameContext& ctx,
                                       VkAttachmentStoreOp depthStore = VK_ATTACHMENT_STORE_OP_STORE)
     {
-        VkRenderingAttachmentInfo cAtt{};
-        cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        cAtt.imageView   = ctx.colorView;
-        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-        VkRenderingAttachmentInfo dAtt{};
-        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        dAtt.imageView   = ctx.depthView;
-        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dAtt.storeOp     = depthStore;
-
-        VkRenderingInfo ri{};
-        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent    = ctx.extent;
-        ri.layerCount           = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments    = &cAtt;
-        ri.pDepthAttachment     = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-
-        VkViewport vp{};
-        vp.x = 0.0f; vp.y = float(ctx.extent.height);
-        vp.width = float(ctx.extent.width); vp.height = -float(ctx.extent.height);
-        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{ {}, ctx.extent };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
+        RenderingBuilder(ctx.extent)
+            .Color(ctx.colorView)
+            .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_LOAD, depthStore)
+            .BeginFlipped(cmd);
     }
 }

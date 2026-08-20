@@ -246,6 +246,12 @@ public:
     virtual void End() = 0;
     virtual void ClearTarget() = 0;
 
+    // Does the renderer still have level-load warm-up work that needs FRAMES to
+    // finish (pipeline compiles spread one per frame)? The precache countdown asks
+    // once per frame and stops early when the answer is no. Default false: a
+    // renderer that warms nothing per-frame should not hold the load screen up.
+    virtual bool PrecacheWarmupPending() { return false; }
+
     virtual void SetCacheXform(Fmatrix& mView, Fmatrix& mProject) = 0;
     virtual void SetCacheXformOld(Fmatrix& mView, Fmatrix& mProject) = 0;
 

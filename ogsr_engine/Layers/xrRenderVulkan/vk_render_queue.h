@@ -45,6 +45,12 @@ struct DrawItem
     // Translucent glass pane (WorldMaterial::isGlass): Push routes it to the
     // LATE glass list, drawn by Pass_WorldGlass after the whole opaque world.
     bool             lateGlass      = false;
+
+    // Water body (WorldMaterial::isWater): Push routes it to the WATER list,
+    // drawn by Pass_Water (own pipeline + shader) after the opaque world + sky.
+    // Checked BEFORE lateGlass in Push — water is never also glass, but the
+    // routing must be unambiguous.
+    bool             lateWater      = false;
 };
 
 class RenderQueue
@@ -68,6 +74,18 @@ public:
     // Post-FlushGlass view (deduped): the particles pass re-draws these panes
     // into the heat-haze distortion RT = glass refraction (r_glass_refr).
     const xr_vector<DrawItem>& GlassItems() const { return m_GlassItems; }
+
+    // WATER list — same lifetime discipline as the glass one (accumulated by
+    // Push across the statics/dynamics flushes, consumed by Pass_Water, cleared
+    // at the next frame's Pass_World start). Pass_Water owns its own draw loop
+    // (its pipeline is not a PipelineCache world variant), so there is no
+    // FlushWater here — it reads WaterItems() directly.
+    void ClearWater() { m_WaterItems.clear(); }
+    bool HasWater() const { return !m_WaterItems.empty(); }
+    const xr_vector<DrawItem>& WaterItems() const { return m_WaterItems; }
+    // Hierarchy double-submit dedup (see FlushGlass's note — a blended surface
+    // drawn three times stacks its alpha into an opaque one). Called by Pass_Water.
+    void DedupWater();
 
     // Sky-ambient occlusion stamped onto every subsequently-pushed item (until
     // changed). Set per dynamic object before its Submit; reset to 1.0 for
@@ -123,6 +141,7 @@ public:
 private:
     xr_vector<DrawItem> m_Items;
     xr_vector<DrawItem> m_GlassItems;   // late translucent panes (see FlushGlass)
+    xr_vector<DrawItem> m_WaterItems;   // water bodies (see Pass_Water)
     float               m_SubmitHemi = 1.0f;
     bool                m_AllowTess  = true;
     bool                m_ATEqual    = false;   // see SetATEqual

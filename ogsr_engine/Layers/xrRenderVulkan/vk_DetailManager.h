@@ -326,6 +326,7 @@ private:
     VkExtent2D      m_HZBDepthExtent  = { 0, 0 };         // depth extent HZB was sized for (resize detect)
     bool            m_bHZBLayoutInit  = false;            // HZB transitioned UNDEFINED→GENERAL once
     u32             m_HZBBuiltFrame   = 0xFFFFFFFFu;      // Device.dwFrame the pyramid was last built (build-once-per-frame guard)
+    u32             m_HZBGeneration   = 0;                // ++ on every (re)creation — descriptor-cache key (handles can be recycled)
 
     // HZB build compute pipeline. One descriptor set per mip pass.
     VkPipeline             m_HZBPipeline       = VK_NULL_HANDLE;
@@ -401,8 +402,21 @@ public:
     // regardless of which caller runs first. HZB lives in VK_IMAGE_LAYOUT_GENERAL.
     void        BuildHZBForFrame(struct VK::FrameContext& ctx) { BuildHZB(ctx); }
     bool        HZBReady()   const { return m_HZBImage != VK_NULL_HANDLE && m_HZBView != VK_NULL_HANDLE && m_HZBPipeline != VK_NULL_HANDLE; }
+    // "Was the pyramid actually built for THIS frame?" — HZBReady() only says the
+    // resources exist. Consumers that run LATER in the frame (the tree cull) and
+    // deliberately do NOT build it themselves must check this: sampling a pyramid
+    // left over from the previous frame would occlusion-cull against a stale
+    // camera. Pass_World builds it when r_hzb_cull + the GPU world set are on.
+    bool        HZBBuiltThisFrame() const { return m_HZBBuiltFrame == Device.dwFrame; }
     VkImageView HZBView()    const { return m_HZBView; }
     VkSampler   HZBSampler() const { return m_HZBSampler; }
+    // 1x1 white (depth 1.0 = "nothing occludes") stand-in. Consumers that keep a
+    // permanently-declared HZB binding point it here when occlusion is off — a
+    // combined-image-sampler left unbound is UB on dispatch even if the branch
+    // reading it is never taken.
+    VkImageView DummyHZBView() const { return m_DummyHZBView; }
+    // Increments on every pyramid (re)creation — see the note at the bump site.
+    u32         HZBGeneration() const { return m_HZBGeneration; }
 
 private:
     // Session A

@@ -136,6 +136,16 @@ layout(set = ENV_SET, binding = 0) uniform Lighting {
     // (r_bump), y = debug view (r_bump_debug: 1 world normal, 2 gloss), z = gloss
     // scale into IBL roughness (r_gloss_scale), w reserved. Appended last.
     vec4 bump_params;
+    // SHORE WETNESS: xy = world XZ of the wetness tile's texel (0,0),
+    // z = 1 / tile size in metres, w = strength (0 = off). Appended last.
+    vec4 shorewet;
+    // LEVEL WATER MAP: xy = world XZ of texel (0,0), z = 1 / size in metres,
+    // w = enable. Appended last.
+    vec4 waterlvl;
+    // SWASH FOAM left on bared ground. x = strength (0 = off), y = the exponent
+    // that turns the wetness map's own decay into a two-second foam clock (see
+    // shoreFoam), z = time (s) for the drift, w reserved. Appended last.
+    vec4 shorefoam;
 } L;
 
 // Splat-mask UV: baked world-space mask (mask-less maps) or the material's own

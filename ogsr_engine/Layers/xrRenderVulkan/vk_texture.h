@@ -336,5 +336,103 @@ private:
 
 // Глобальный instance
 extern CUserTextureRegistry g_UserTextureRegistry;
+// ============================================================================
+// Level texture prefetch.
+//
+// A level load opens ~2460 .dds files and, measured on pripyat_full, spends
+// 2860 of the texture phase's 6565 ms inside FS.r_open alone — one thread, one
+// file at a time, while fifteen cores idle. Nothing about that work is ordered:
+// the files are independent, and WHICH files are needed is known the moment the
+// level shader table exists, long before the visual walk that consumes them.
+//
+// So workers open them ahead of the walk and park the ready IReader here; the
+// loader's own `FS.r_open` becomes a lookup. Deliberately a BYTE cache and not
+// a texture cache: the same files get loaded by the same call sites with the
+// same parameters in the same order — only the bytes arrive earlier. A miss is
+// simply the old path, so a wrong guess about what to prefetch costs I/O, never
+// a wrong pixel.
+//
+// Bounded by r_tex_prefetch_mb: workers stall when the parked bytes exceed it
+// and resume as the walk takes them.
+// ============================================================================
+// What a prefetched file IS. The old contract carried a bare path, so the only
+// thing a worker could do with a file was read it and park it: turning those bytes
+// into a texture (which stream class, which colour space, which cache owns it)
+// needed knowledge that lived on the loading thread. The role travels with the
+// path, so a worker can finish the job instead of handing it over half-done.
+enum class TexRole : u8 { Diffuse = 0, Detail, Bump, Height, Mask, Lmap };
+
+struct TexJob
+{
+    std::string path;            // resolved full path on disk
+    std::string key;             // key the owning cache in vk_world_material uses
+    TexRole     role = TexRole::Diffuse;
+};
+
+// Fills `out` with every texture file one material's diffuse pulls in (the
+// diffuse itself, its .thm detail, its bump normal + height, its terrain mask).
+// Supplied by vk_world_material.cpp — that is where the resolution rules live.
+using ExpandFn = void (*)(const char* diffuseName, xr_vector<TexJob>& out);
+
+// Load ONE job to completion on the calling worker: read, create the image, upload
+// it and publish it into its cache, so the walk finds it instead of building it.
+// Also supplied by vk_world_material.cpp (the caches are its). r_tex_materialize 0
+// falls back to the old behaviour: read the file and park it for the walk.
+using LoadFn = void (*)(const TexJob& job);
+
+namespace TexPrefetch
+{
+// True on a texture-prefetch worker. Read by the BC3->BC4 gather, which must not
+// recruit helpers from the shared farm when sixteen workers are already running.
+extern thread_local bool t_TexWorker;
+
+// `diffuseNames` = level shader table bases (expanded by `expand` on a worker);
+// `directPaths` = already-resolved files (lightmaps). No-op if r_tex_prefetch 0.
+//
+// `leadFile` is prefaulted BEFORE any of that, by all workers at once, front to
+// back. It is not parked — the point is only to get its pages resident, because
+// its reader (level.geom, through a 1 MB sliding window) is sequential and single
+// threaded and spends all its time faulting: measured 1869 MB at 705 MB/s with the
+// window remaps costing 8 ms of it. Workers outrun that reader immediately, so the
+// lead file needs no head start; it just has to go first, since the geometry load
+// runs before the visual walk that wants the textures.
+void Start(xr_vector<shared_str>&& diffuseNames, xr_vector<TexJob>&& directJobs, ExpandFn expand,
+           LoadFn materialize, const char* leadFile = nullptr);
+
+
+// Close a reader on a worker instead of here. Measured on pripyat_full: closing the
+// 2463 texture files costs 394 ms of the 956 ms texture phase — an archived file
+// frees its whole decompressed image, a loose one unmaps 4.7 GB of view between them,
+// and both happen on the main thread between two texture loads. Bounded by bytes in
+// flight: past the cap the caller closes inline, so this can never grow the peak.
+void CloseAsync(IReader*& F);
+
+// Wait for the deferred closes to finish. Called where the level would otherwise
+// unload underneath them.
+void CloseDrain();
+
+// The lead file's whole-file view -- the mapping the workers prefault, front to
+// back. A caller that has to read the same file should read it out of THIS view:
+// a mapping of its own costs a page fault per 4 KB on its own thread (measured on
+// level.geom: 465 ms of a 644 ms stage), while these pages are being faulted in by
+// sixteen workers ahead of the read. Null unless `path` IS the lead file.
+const u8* LeadView(const char* path, u64& size);
+
+// Ready reader for `fullPath`, ownership transferred (caller FS.r_close's it),
+// or null when it was never parked. Safe to call with the prefetch stopped.
+IReader* Take(const char* fullPath);
+
+// Let the workers start BUILDING textures (r_tex_materialize 2). Until this is
+// called they only read and park, which is all they should do while the geometry
+// stage owns the upload ring and the memory bus: measured, texture uploads mixed
+// into that stage drag the whole ring from 18.5 to 8.4 GB/s and the geometry pays
+// every millisecond the walk saves. Called where the visual walk begins.
+void EnableMaterialize();
+
+// Join workers, close whatever nobody took, log the hit rate.
+void Stop();
+}   // namespace TexPrefetch
+
+
 
 } // namespace VK

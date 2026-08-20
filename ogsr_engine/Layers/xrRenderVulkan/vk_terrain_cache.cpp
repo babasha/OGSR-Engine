@@ -15,18 +15,21 @@
 //    the terrain set layout carries VK_SHADER_STAGE_COMPUTE_BIT now.
 
 #include "stdafx.h"
+#include "vk_rendering.h"          // VK::RenderingBuilder
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_terrain_cache.h"
 #include "vk_image.h"            // VK::CreateImage / CreateImageView
 #include "vk_compute_util.h"     // VK::MakePipelineLayout / CreateComputePipeline
 #include "vk_shaders.h"          // g_ShaderManager
 #include "vk_world_material.h"   // GetTerrainSetLayout()
-#include "vk_pipeline_cache.h"   // PipelineCache::GetCacheObject (shared disk-backed cache)
+#include "vk_gfx_pipeline.h"     // VK::GfxPipelineBuilder
 #include "vk_profiler.h"         // VK::Prof::NameImage
 #include "vk_env_light.h"        // EnvLight::TerrainChOff — per-level SSFX channel offsets
 #include "vk_Visual.h"           // vkFVisual/vkFHierrarhyVisual — TerrainMask bake walks Visuals[]
 #include "vk_barriers.h"         // VK::ImageBarrier — TerrainMask bake layout transitions
 #include "vk_command_buffer.h"   // CommandManager.BeginImmediate — one-shot bake submit
 #include "CRender_Vulkan.h"      // RImplementation.Visuals
+#include "vk_world_gpu.h"        // WorldGPU::LeafVisuals — shared load-time leaf walk
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer::sun_dir (horizon bake azimuth)
 
@@ -107,29 +110,8 @@ namespace {
     // direction (game-time sun moves slowly; the smoothstep penumbra hides it).
     constexpr float kSunCos = 0.999f;
 
-    void barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout oldL, VkImageLayout newL,
-                 VkPipelineStageFlags srcS, VkPipelineStageFlags dstS, VkAccessFlags srcA, VkAccessFlags dstA,
-                 u32 mips = 1)
-    {
-        VkImageMemoryBarrier b{};
-        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout = oldL; b.newLayout = newL;
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = img;
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1 };
-        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
-        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
-    }
-
-    // Compute -> compute "everything written is visible" barrier between the
-    // bake / mip-reduce / cone dispatches (all images stay GENERAL).
-    void computeBarrier(VkCommandBuffer cmd)
-    {
-        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 1, &mb, 0, nullptr, 0, nullptr);
-    }
+    // Compute -> compute "everything written is visible" between the bake /
+    // mip-reduce / cone dispatches (all images stay GENERAL) → VK::ComputeBarrier.
 
     bool createImage(VkFormat fmt, const char* name, Buf& out, u32 size = kSize, u32 mips = 1)
     {
@@ -268,28 +250,13 @@ bool Init()
 
     // Set 1: b0 height (rw storage), b1 weights, b2 pyramid sampled (texelFetch),
     // b3..b5 pyramid mip storage views (max-reduce targets).
-    VkDescriptorSetLayoutBinding b[6]{};
-    for (u32 i = 0; i < 6; ++i) {
-        b[i].binding = i; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        b[i].descriptorType = (i == 2) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    }
-    VkDescriptorSetLayoutCreateInfo slci{};
-    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 6; slci.pBindings = b;
-    vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout);
-
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 },
-                                   { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 } };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool);
-
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setLayout;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) {
-        Msg("![VK TerraCache] descriptor alloc failed"); s_failed = true; return false;
+    constexpr auto kImg = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (!VK::MakeDescriptorSets({ kImg, kImg,
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,   // 2 = pyramid, sampled
+                                  kImg, kImg, kImg },
+                                1, s_setLayout, s_pool, &s_set,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "TerraCache")) {
+        s_failed = true; return false;
     }
     const VkDescriptorImageInfo di[6] = {
         { VK_NULL_HANDLE, s_height.view,  VK_IMAGE_LAYOUT_GENERAL },
@@ -299,14 +266,11 @@ bool Init()
         { VK_NULL_HANDLE, s_pyrMip[1],    VK_IMAGE_LAYOUT_GENERAL },
         { VK_NULL_HANDLE, s_pyrMip[2],    VK_IMAGE_LAYOUT_GENERAL },
     };
-    VkWriteDescriptorSet w[6]{};
-    for (u32 i = 0; i < 6; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = s_set; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = (i == 2) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[i].pImageInfo = &di[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+    VK::DescriptorWriter w(s_set);
+    for (u32 i = 0; i < 6; ++i)
+        w.Image(i, (i == 2) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                            : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, di[i]);
+    w.Flush();
 
     // Pipeline layout: set 0 = terrain material (mask + heights), set 1 = outputs.
     VkDescriptorSetLayout tset = WorldMaterialCache::GetTerrainSetLayout();
@@ -447,11 +411,12 @@ void Update(VkCommandBuffer cmd)
     const float cz = floorf(eye.z / texel) * texel;
 
     const VkImageLayout oldL = s_baked ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
-    const VkPipelineStageFlags kConsumers = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    barrier(cmd, s_height.img,  oldL, VK_IMAGE_LAYOUT_GENERAL, kConsumers, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            s_baked ? VK_ACCESS_SHADER_READ_BIT : 0, VK_ACCESS_SHADER_WRITE_BIT);
-    barrier(cmd, s_weights.img, oldL, VK_IMAGE_LAYOUT_GENERAL, kConsumers, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            s_baked ? VK_ACCESS_SHADER_READ_BIT : 0, VK_ACCESS_SHADER_WRITE_BIT);
+    const VkPipelineStageFlags2 kConsumers = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    const VkAccessFlags2 priorRead = s_baked ? VK_ACCESS_2_SHADER_READ_BIT : 0;
+    VK::ImageBarrier(cmd, s_height.img,  oldL, VK_IMAGE_LAYOUT_GENERAL,
+                     kConsumers, priorRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+    VK::ImageBarrier(cmd, s_weights.img, oldL, VK_IMAGE_LAYOUT_GENERAL,
+                     kConsumers, priorRead, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
 
     PushCS pc{};
     pc.originExtent[0] = cx - kHalf;
@@ -483,30 +448,32 @@ void Update(VkCommandBuffer cmd)
     // fixed-layer path (tcache_params.y stays 0 via EnvLight).
     if (ps_r_terra_cone) {
         if (!s_pyrLayoutInit) {
-            barrier(cmd, s_pyr.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, kPyrMips);
+            VK::ImageBarrier(cmd, s_pyr.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT, kPyrMips);
             s_pyrLayoutInit = true;
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipeMip);
         for (u32 lvl = 0; lvl < kPyrMips; ++lvl) {
-            computeBarrier(cmd);   // prev writes (bake / prev mip) -> this reduce
+            VK::ComputeBarrier(cmd);   // prev writes (bake / prev mip) -> this reduce
             float mp[4] = { float(lvl), 0.f, 0.f, 0.f };
             vkCmdPushConstants(cmd, s_pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mp), mp);
             const u32 msz = (kSize / 2) >> lvl;
             vkCmdDispatch(cmd, (msz + 7) / 8, (msz + 7) / 8, 1);
         }
-        computeBarrier(cmd);
+        VK::ComputeBarrier(cmd);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipeCone);
         const float sunPC[4] = { sunU, sunV, wantHor ? 1.f : 0.f, 0.f };
         vkCmdPushConstants(cmd, s_pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sunPC), sunPC);
         vkCmdDispatch(cmd, (kSize + 7) / 8, (kSize + 7) / 8, 1);
     }
 
-    barrier(cmd, s_height.img,  VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kConsumers, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    barrier(cmd, s_weights.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kConsumers, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    VK::ImageBarrier(cmd, s_height.img,  VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, kConsumers, VK_ACCESS_2_SHADER_READ_BIT);
+    VK::ImageBarrier(cmd, s_weights.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, kConsumers, VK_ACCESS_2_SHADER_READ_BIT);
 
     if (!s_baked)
         Msg("[VK TerraCache] first bake at (%.1f, %.1f), lod %.2f, cone %d hor %d", cx, cz, pc.originExtent[3], ps_r_terra_cone, int(wantHor));
@@ -582,26 +549,15 @@ namespace {
         u8          channel;
     };
 
-    // Recursive terrain-geometry walk — mirrors CTreeManager::ExtractFromVisual's
-    // container handling (MT_HIERRARHY/MT_LOD children are references into
-    // Visuals[], so dedup by object).
-    void Collect(vkRender_Visual* vis, xr_vector<BakeItem>& out, Fbox& bounds,
-                 std::unordered_set<void*>& seen)
+    // Terrain-region filter over the shared leaf index (WorldGPU::LeafVisuals):
+    // the container recursion and the by-object dedup this used to do itself now
+    // happen once for the whole load phase. Same order, so the bake is unchanged.
+    void Collect(vkFVisual* fv, xr_vector<BakeItem>& out, Fbox& bounds)
     {
-        if (!vis) return;
-        if (vis->Type == MT_HIERRARHY || vis->Type == MT_LOD) {
-            auto* hv = dynamic_cast<vkFHierrarhyVisual*>(vis);
-            if (hv)
-                for (auto* child : hv->children)
-                    Collect(child, out, bounds, seen);
-            return;
-        }
-        auto* fv = dynamic_cast<vkFVisual*>(vis);
         if (!fv || !fv->m_pWorldMaterial) return;
         WorldMaterial* m = fv->m_pWorldMaterial;
         if (!m->isTerrain || m->terrainChannel == 255) return;   // real-mask terrain: never baked
         if (!fv->m_mesh.IsValid() || !fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) return;
-        if (!seen.insert(fv).second) return;
 
         BakeItem it{};
         it.vb      = fv->m_mesh.p_rm_Vertices->GetHandle();
@@ -639,63 +595,16 @@ namespace {
             }
         }
 
-        VkPipelineShaderStageCreateInfo st[2]{};
-        st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
-        st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-
-        VkVertexInputBindingDescription vb{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription va{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };   // position
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb;
-        vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &va;
-
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkViewport vp{ 0.f, 0.f, (float)kMaskSize, (float)kMaskSize, 0.f, 1.f };
-        VkRect2D   sc{ { 0, 0 }, { kMaskSize, kMaskSize } };
-        VkPipelineViewportStateCreateInfo vps{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vps.viewportCount = 1; vps.pViewports = &vp;
-        vps.scissorCount  = 1; vps.pScissors  = &sc;
-
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;      // top-down projection — winding is irrelevant
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineColorBlendAttachmentState cba{};
-        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        cb.attachmentCount = 1; cb.pAttachments = &cba;
-
-        VkFormat colorFmt = kFormat;
-        VkPipelineRenderingCreateInfo ri{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        ri.colorAttachmentCount    = 1;
-        ri.pColorAttachmentFormats = &colorFmt;
-
-        VkGraphicsPipelineCreateInfo gp{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        gp.pNext               = &ri;
-        gp.stageCount          = 2;
-        gp.pStages             = st;
-        gp.pVertexInputState   = &vi;
-        gp.pInputAssemblyState = &ia;
-        gp.pViewportState      = &vps;
-        gp.pRasterizationState = &rs;
-        gp.pMultisampleState   = &ms;
-        gp.pColorBlendState    = &cb;
-        gp.layout              = s_layout;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &gp, nullptr, &s_pipe) != VK_SUCCESS) {
-            Msg("![VK TerrainMask] pipeline create failed");
-            s_pipe = VK_NULL_HANDLE;
+        // Top-down projection — winding is irrelevant, so no culling. Viewport and
+        // scissor are dynamic (Bake sets them to the full mask before drawing).
+        s_pipe = VK::GfxPipelineBuilder(s_layout)
+            .Vert(vs).Frag(fs)
+            .Binding(0, stride)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)   // position
+            .Color(kFormat)
+            .Build("TerrainMask stride=%u", stride);
+        if (s_pipe == VK_NULL_HANDLE)
             return false;
-        }
         s_pipeStride = stride;
         return true;
     }
@@ -706,16 +615,23 @@ void BakeIfNeeded()
     s_active = false;
     s_params[0] = s_params[1] = s_params[2] = s_params[3] = 0.f;
 
+    // Sub-timers (`[load step]`): this pass cost 499 ms of a 19.5 s load and the
+    // split between the visual walk, pipeline creation and the GPU draw was unknown.
+    CTimer _p; _p.Start();
+    float msCollect = 0, msPipe = 0, msRecord = 0, msSubmit = 0;
+
     // Collect the level's mask-less terrain draws (real-mask maps collect nothing).
     xr_vector<BakeItem> items;
     Fbox bounds; bounds.invalidate();
-    std::unordered_set<void*> seen;
-    for (IRenderVisual* iv : RImplementation.Visuals)
-        Collect(static_cast<vkRender_Visual*>(iv), items, bounds, seen);
+    const xr_vector<vkFVisual*>& leaves = VK::WorldGPU::LeafVisuals();
+    for (vkFVisual* fv : leaves)
+        Collect(fv, items, bounds);
+    msCollect = _p.GetElapsed_ms_total();
     if (items.empty()) return;
 
     // All entries share the statics vertex layout; a mixed-stride level would
     // need per-stride pipelines — split on it if it ever shows up.
+    _p.Start();
     const u32 stride = items[0].stride;
     for (const BakeItem& it : items)
         if (it.stride != stride) {
@@ -739,23 +655,19 @@ void BakeIfNeeded()
     const float sx = (bounds.max.x + pad) - ox, sz = (bounds.max.z + pad) - oz;
     if (sx <= 1.f || sz <= 1.f) return;
 
+    msPipe = _p.GetElapsed_ms_total();
+    _p.Start();
+
     VkCommandBuffer cmd = CommandManager.BeginImmediate();
     if (cmd == VK_NULL_HANDLE) return;
 
     ImageBarrier(cmd, s_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    VkRenderingAttachmentInfo ca{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    ca.imageView   = s_view;
-    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ca.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    ca.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    ca.clearValue.color = { { 0.f, 0.f, 1.f, 0.f } };   // uncovered texels = earth channel
-    VkRenderingInfo rinf{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    rinf.renderArea           = { { 0, 0 }, { kMaskSize, kMaskSize } };
-    rinf.layerCount           = 1;
-    rinf.colorAttachmentCount = 1;
-    rinf.pColorAttachments    = &ca;
-    vkCmdBeginRendering(cmd, &rinf);
+    // Uncovered texels clear to the earth channel. BeginPlain sets the full
+    // unflipped viewport/scissor the pipeline needs (it is dynamic-viewport).
+    RenderingBuilder(kMaskSize, kMaskSize)
+        .ColorClear(s_view, VkClearColorValue{ { 0.f, 0.f, 1.f, 0.f } })
+        .BeginPlain(cmd);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipe);
     static const float kOneHot[4][4] = {
@@ -775,7 +687,10 @@ void BakeIfNeeded()
 
     vkCmdEndRendering(cmd);
     ImageBarrier(cmd, s_img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    msRecord = _p.GetElapsed_ms_total();
+    _p.Start();
     CommandManager.EndAndSubmitImmediate(cmd);
+    msSubmit = _p.GetElapsed_ms_total();
 
     // Point every mask-less terrain material's binding 1 at the bake and expose
     // the world->UV affine to the shaders (L.tmask_params).
@@ -784,6 +699,8 @@ void BakeIfNeeded()
     s_active = true;
     Msg("[VK TerrainMask] baked %zu terrain region draw(s) into %ux%u mask, world rect (%.0f, %.0f)+(%.0f x %.0f)",
         items.size(), kMaskSize, kMaskSize, ox, oz, sx, sz);
+    Msg("[load step]   TerrainMask: collect %.0f (%u leaves -> %u draws) | pipeline+image %.0f | record %.0f | submit+wait %.0f ms",
+        msCollect, (u32)leaves.size(), (u32)items.size(), msPipe, msRecord, msSubmit);
 }
 
 void OnLevelUnload()

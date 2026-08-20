@@ -14,10 +14,19 @@
 // rougher reflection) that the receivers sample with the split-sum specular IBL term
 // (env_common.glsl iblSpecular). The sun's own GGX highlight rides the same F0/roughness.
 //
-// Prefilter runs on the fence-waited IMMEDIATE queue on demand (only when the weather
-// cube view changes or the cross-fade moves) — the sky is low-frequency and changes
-// rarely, so there is no per-frame cost. v1 = straight resample + box-blit mips; the
-// clean upgrade is per-mip GGX importance-sample convolution.
+// The prefilter is recorded into the FRAME's command buffer, on demand (only when the
+// weather cube view changes or the cross-fade moves). v1 = straight resample + box-blit
+// mips; the clean upgrade is per-mip GGX importance-sample convolution.
+//
+// ⚠⚠It used to run on the fence-waited IMMEDIATE queue, and "the sky changes rarely so
+// there is no per-frame cost" was true of the GPU work and false of the cost. The submit
+// went to the GRAPHICS queue and then blocked the main thread on its fence, so the CPU
+// waited for the whole queue to drain — the entire frame's rendering — for a ~1 MB cube.
+// Measured 01-08: 22-40 ms of CPU inside Pass_World, every few seconds, while the frame's
+// own GPU zones read completely normal (the work was on a SEPARATE submit, so no zone
+// could see it). That was the stutter users reported, and it fired while standing still
+// because the trigger is the sky cross-fade, which advances on the game clock.
+// See vk_env_light.cpp EnvLight::Update for the call site and the W/pro/env probe.
 #pragma once
 #include "HW_Vulkan.h"
 
@@ -29,7 +38,13 @@ bool        Ready();                // true once a prefiltered cube exists (has 
 
 // Refresh the prefiltered cube from the current weather cubes if they changed.
 // Called from EnvLight::Update with the same views/weight it binds for skyAmbient.
-// No-op (cheap early-out) when nothing changed. Uses BeginImmediate (fence-waited).
+// No-op (cheap early-out) when nothing changed.
+//
+// `cmd` must be the frame's command buffer, OUTSIDE any dynamic-rendering scope
+// (compute + blits are illegal inside one) and BEFORE anything samples binding 26/31
+// this frame — i.e. exactly where Pass_World calls EnvLight::Update. Pass VK_NULL_HANDLE
+// from call sites that cannot promise that: the refresh is simply skipped and the probe
+// keeps last frame's content, which for a <2%-per-refresh sky is invisible.
 //
 // skyRotation (rad) is the weather's sky_rotation — the SAME spin the dome draw
 // applies. It is part of the probe's identity, not a cosmetic extra: without it
@@ -56,7 +71,7 @@ struct SkyDesc {
     float mieG         = 0.76f;
 };
 
-void        Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyDesc& sky);
+void        Update(VkCommandBuffer cmd, VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyDesc& sky);
 
 VkImageView GetSpecView();          // prefiltered specular cube (roughness mips); null until Ready
 VkSampler   GetSampler();           // trilinear clamp sampler (maxLod = mip count)

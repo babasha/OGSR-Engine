@@ -5,17 +5,14 @@
 #ifndef SHADOW_COMMON_GLSL
 #define SHADOW_COMMON_GLSL
 
+// spotLinZ + cascTap live in shadow_math.glsl: they are pure functions of their
+// arguments, so vol_inject.comp (own descriptor set, own UBO) shares them from
+// there rather than keeping the private copies it used to.
+#include "shadow_math.glsl"
+
 // Spot shadow POOL: project by the light's TILE view·proj, 3x3 PCF manual
 // compare inside the tile's atlas rect (4x2 tiles of 1024² — see vk_shadow).
-// Compared in LINEAR depth with a WORLD-space epsilon: a constant NDC bias on
-// the perspective spot projection is worth centimetres near the lamp but
-// METRES near the far plane — light leaked straight through fences standing a
-// few metres past a parked headlight.
-float spotLinZ(float zndc, float f)
-{
-    const float n = 0.5;   // ComputeSpotVPFor near plane
-    return n * f / max(f - zndc * (f - n), 1e-4);
-}
+// Compared in LINEAR depth with a WORLD-space epsilon (spotLinZ).
 float spotShadowF(vec3 wp, float range, int tile)
 {
     vec4 c = L.spot_pool_vp[tile] * vec4(wp, 1.0);
@@ -116,18 +113,7 @@ vec4 pointDebugOverlay(vec3 wp)
     return vec4(mix(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), shadow), 1.0);
 }
 
-// Bilinear-weighted PCF tap on a manual-compare map: textureGather fetches the
-// 2x2 quad, each texel is COMPARED, then the binary results blend with the
-// bilinear weights -> smooth gradient with no texel stair-stepping.
-float cascTap(sampler2D smap, vec2 uv, float ref)
-{
-    vec2 sz = vec2(textureSize(smap, 0));
-    vec2 t  = uv * sz - 0.5;
-    vec2 f  = fract(t);
-    vec4 d  = textureGather(smap, (floor(t) + 1.0) / sz, 0);  // w=(0,0) z=(1,0) x=(0,1) y=(1,1)
-    vec4 c  = step(vec4(ref), d);                             // 1 = lit
-    return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
-}
+// cascTap → shadow_math.glsl (included above).
 
 // One sun-cascade lookup: 2x2 spread of bilinear gather taps ~ a 3x3 smooth
 // kernel. Returns the lit factor, or -1.0 when worldPos falls outside this

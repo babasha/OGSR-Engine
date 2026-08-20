@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // Cluster-LOD debug overlay (r_cluster_debug) — see vk_world_gpu DrawDebug.
 // Redraws the culled indirect set; the cull shader stored the ENTRY ID in
 // firstInstance, which Vulkan folds into gl_InstanceIndex (instanceCount=1) —
@@ -9,11 +10,7 @@ layout(location = 0) in vec3 aPos;
 layout(location = 0) flat out uint vCluster;
 layout(location = 1) flat out vec4 vHealth;
 
-struct Meta {
-    vec4 sphere; vec4 lodSelf; vec4 lodParent;
-    uint indexCount; uint ibFirst; uint firstVertex; uint group;
-    float selfError; float parentError; uint flags; uint _p1;
-};
+#include "cluster_meta.glsl"   // struct Meta — matches VK::WorldGPU::GpuMeshMeta
 layout(set = 0, binding = 0) readonly buffer Metas { Meta metas[]; };
 
 // tint: a > 1.5 = health view; 0.5..1.5 = mode 3 flat path color (per group).

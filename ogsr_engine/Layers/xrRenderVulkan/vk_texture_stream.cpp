@@ -10,11 +10,14 @@
 #include "HW_Vulkan.h"
 #include "vk_command_buffer.h"
 #include "vk_profiler.h"   // VK_CPU_PROBE — per-frame CPU attribution
+#include "vk_clk.h"        // VK::ClkToMs — the load's one calibrated rdtsc->ms
 
 #include <mutex>
 #include <algorithm>
 #include <vector>
 #include <cmath>
+#include <thread>
+#include <atomic>
 
 // Console cvars (defined in vk_console_min.cpp).
 extern int psTextureLOD;              // manual quality slider 0..3 (WorldDiffuse only)
@@ -22,6 +25,9 @@ extern int ps_r_txstream;             // 1 = dynamic per-frame mip streaming (op
 extern int ps_r_txstream_budget;      // texture VRAM budget in MB (0 = auto)
 extern int ps_r_txstream_headroom;    // VRAM safety margin left free at load, MB
 extern int ps_r_txstream_reserve;     // MB of device VRAM to keep free after load (FG room)
+extern int ps_r_txstream_loadcap;     // max base dimension a texture may LOAD at (0 = off)
+extern int ps_r_txstream_plan_live;   // 1 = plan the load-time fit off the LIVE VRAM figure (pre-19-08 behaviour)
+extern int ps_r_tex_residency_threads;// helpers that read a residency plan's .dds files (0 = serial)
 
 namespace VK {
 
@@ -265,18 +271,36 @@ u32 TextureStreamer::GetFeedbackSlot(CVulkanTexture* tex) const
 
 void TextureStreamer::EnsureMinResidency(CVulkanTexture* tex, u32 minDim)
 {
-    if (!tex) return;
+    EnsureMinResidencyBatch(&tex, 1, minDim);
+}
+
+// Batched form. ApplyResidencyPlan ends in FlushUploadsAndWait, so ONE call per
+// texture is one queue round trip per texture: the tree path's 65 materials
+// measured 73 ms of load that way, nearly all of it waiting. Collect the whole
+// set, rebuild it in one plan, wait once.
+void TextureStreamer::EnsureMinResidencyBatch(CVulkanTexture* const* texs, size_t count, u32 minDim)
+{
+    if (!texs || count == 0) return;
     std::vector<std::pair<StreamTexture*, u32>> plan;
     {
         std::lock_guard<std::mutex> lk(s_Mutex);
-        auto it = m_Tex.find(tex);
-        if (it == m_Tex.end()) return;
-        StreamTexture& s = it->second;
-        if (s.file.size() == 0 || s.fullMips <= 1) return;
-        const u32 floorB = MaxBaseForDims(s.fullW, s.fullH, s.fullMips, minDim);
-        if (s.residentBase <= floorB) return;   // already at or above the floor
-        s.wantedBase = floorB;
-        plan.emplace_back(&s, floorB);
+        for (size_t k = 0; k < count; ++k) {
+            CVulkanTexture* tex = texs[k];
+            if (!tex) continue;
+            auto it = m_Tex.find(tex);
+            if (it == m_Tex.end()) continue;
+            StreamTexture& s = it->second;
+            if (s.file.size() == 0 || s.fullMips <= 1) continue;
+            const u32 floorB = MaxBaseForDims(s.fullW, s.fullH, s.fullMips, minDim);
+            if (s.residentBase <= floorB) continue;   // already at or above the floor
+            // Two materials can share one texture — a second plan entry would build
+            // and swap the same image twice.
+            bool dup = false;
+            for (const auto& pr : plan) if (pr.first == &s) { dup = true; break; }
+            if (dup) continue;
+            s.wantedBase = floorB;
+            plan.emplace_back(&s, floorB);
+        }
     }
     ApplyResidencyPlan(plan);
 }
@@ -458,6 +482,21 @@ void TextureStreamer::Shutdown()
 u32 TextureStreamer::PlanLoadMipSkip(u32 fullW, u32 fullH, u32 fullMips, VkFormat fmt,
                                      TexStreamClass klass) const
 {
+    const u32 skip = PlanSkipUnaccounted(fullW, fullH, fullMips, fmt, klass);
+    // Commit the bytes BEFORE the image exists. The live VRAM figure only learns
+    // about a texture once it is allocated, which is far too late when sixteen
+    // workers are planning at once -- each would see a card the other fifteen have
+    // not filled yet. Every class counts here, not just the ones the budget may
+    // shrink: an unshrinkable texture still takes the room.
+    if (m_InLevelLoad)
+        m_PlannedTexBytes.fetch_add(MipChainBytes(fullW, fullH, fullMips, skip, fmt),
+                                    std::memory_order_relaxed);
+    return skip;
+}
+
+u32 TextureStreamer::PlanSkipUnaccounted(u32 fullW, u32 fullH, u32 fullMips, VkFormat fmt,
+                                         TexStreamClass klass) const
+{
     if (fullMips <= 1) return 0;
 
     // Largest skip that keeps the base mip >= kMinResidentDim (never shrink tiny
@@ -490,6 +529,21 @@ u32 TextureStreamer::PlanLoadMipSkip(u32 fullW, u32 fullH, u32 fullMips, VkForma
     if (budgetFit && psTextureLOD > 0)
         skip = std::min<u32>((u32)psTextureLOD, maxSkip);
 
+    // 1b) LOAD-TIME cap (r_txstream_loadcap). The budget-fit below only reacts to a
+    //     FULL card, so on a roomy one every texture arrives at full res and the load
+    //     pays for all of it: 3558 MB read + 2556 MB uploaded = 8.4 s on pripyat_full.
+    //     Coming in coarse costs a few seconds of soft textures at spawn, which the
+    //     feedback-driven promote path in StreamStep then sharpens for whatever is
+    //     actually on screen — the same trade UE's virtual texturing makes. Load-only
+    //     on purpose: a texture requested mid-session is wanted NOW.
+    if (budgetFit && m_InLevelLoad && ps_r_txstream_loadcap > 0) {
+        const u32 cap = (u32)ps_r_txstream_loadcap;
+        u32 capSkip = 0;
+        while (capSkip < maxSkip && (std::max(fullW, fullH) >> capSkip) > cap)
+            ++capSkip;
+        skip = std::max(skip, capSkip);
+    }
+
     // 2) Automatic budget-fit.
     if (budgetFit) {
         VkDeviceSize usage = 0, devBudget = 0;
@@ -499,11 +553,24 @@ u32 TextureStreamer::PlanLoadMipSkip(u32 fullW, u32 fullH, u32 fullMips, VkForma
         // this texture will sub-allocate into them without growing real usage).
         const VkDeviceSize fib = VmaFreeInBlocks();
         usage = (usage > fib) ? (usage - fib) : 0;
+        if (m_InLevelLoad && ps_r_txstream_plan_live == 0) {
+            // ...but during a load the live figure answers a question about a card
+            // that is not full YET, and answering it honestly is not possible: the
+            // geometry lands after the textures, and with r_tex_materialize sixteen
+            // workers build textures ahead of it. Measured with the live figure:
+            // 0 demotions and 3144 MB resident against a 6256 MB budget, evicted
+            // again a few a frame once the level started. So plan on arithmetic we
+            // own -- what was resident when the load began, what the rest of the
+            // level will take (level.geom, from the loader), and what the textures
+            // planned so far have already committed.
+            usage = m_LoadBaseUsage + m_LoadNonTexReserve
+                  + m_PlannedTexBytes.load(std::memory_order_relaxed);
+        }
         if (devBudget > 0) {
-            // During a level load the live usage figure LIES LOW: geometry, VSM pages
-            // and Streamline FG buffers all land after most textures. Protect their
-            // room too (headroom + reserve), or textures fill the card first and the
-            // late allocations crash Streamline (seen: 7948 MB alloc vs 7123 budget).
+            // Protect the room the late allocations need (headroom + reserve), or
+            // textures fill the card first and the late allocations crash Streamline
+            // (seen: 7948 MB alloc vs 7123 budget). devBudget stays LIVE: the driver
+            // lowers it while the level loads and that advice is worth taking.
             VkDeviceSize protect = (VkDeviceSize)std::max(0, ps_r_txstream_headroom) << 20;
             if (m_InLevelLoad)
                 protect += (VkDeviceSize)std::max(0, ps_r_txstream_reserve) << 20;
@@ -526,9 +593,19 @@ void TextureStreamer::BeginLevelLoad()
     m_LoadCapCount = 0;
     VkDeviceSize usage = 0, budget = 0;
     VulkanHW.GetVramBudget(usage, budget);
-    Msg("[VK-TexStream] level load begin — VRAM %llu/%llu MB, tracked textures %llu MB (lod=%d)",
+    // The baseline the whole load's plan is measured from — sampled ONCE, with the
+    // same free-in-blocks credit the per-texture path used to re-take. Re-taking it
+    // per texture was how a load could credit itself for blocks its own workers had
+    // just opened.
+    {
+        const VkDeviceSize fib = VmaFreeInBlocks();
+        m_LoadBaseUsage = (usage > fib) ? (usage - fib) : 0;
+        m_PlannedTexBytes.store(0, std::memory_order_relaxed);
+    }
+    Msg("[VK-TexStream] level load begin — VRAM %llu/%llu MB, tracked textures %llu MB (lod=%d), non-texture reserve %llu MB",
         (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20),
-        (unsigned long long)(m_TrackedBytes >> 20), psTextureLOD);
+        (unsigned long long)(m_TrackedBytes >> 20), psTextureLOD,
+        (unsigned long long)(m_LoadNonTexReserve >> 20));
 }
 
 void TextureStreamer::EndLevelLoad()
@@ -539,9 +616,12 @@ void TextureStreamer::EndLevelLoad()
         m_InLevelLoad = false;
         VkDeviceSize usage = 0, budget = 0;
         VulkanHW.GetVramBudget(usage, budget);
-        Msg("[VK-TexStream] level load end — VRAM %llu/%llu MB, %zu textures (%llu MB), %u demoted by budget/lod cap",
+        Msg("[VK-TexStream] level load end — VRAM %llu/%llu MB, %zu textures (%llu MB), %u demoted by budget/lod cap | planned %llu MB against base %llu + reserve %llu MB",
             (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20),
-            m_Tex.size(), (unsigned long long)(m_TrackedBytes >> 20), m_LoadCapCount);
+            m_Tex.size(), (unsigned long long)(m_TrackedBytes >> 20), m_LoadCapCount,
+            (unsigned long long)(m_PlannedTexBytes.load() >> 20),
+            (unsigned long long)(m_LoadBaseUsage >> 20),
+            (unsigned long long)(m_LoadNonTexReserve >> 20));
         {   // Class breakdown at load end — the "who owns the irreducible MB" answer.
             VkDeviceSize byClass[6] = {};
             u32          nClass[6]  = {};
@@ -1134,27 +1214,116 @@ void TextureStreamer::StreamStepLRU()
 //      the new frame records — pending frames keep their old sets + old views),
 //   4) old images retire into m_Retired; TickRetire frees them once every frame
 //      that could sample them has fenced out.
+// Split of the last plan, for the load-time callers: is the cost the rebuild
+// (a DDS re-read + image create + staged copy, one after another on this thread)
+// or the transfer wait at the end? The tree path pays 62 ms of it per load and
+// the two answers point at completely different fixes.
+float g_lastResidencyBuildMs = 0.f, g_lastResidencyFlushMs = 0.f, g_lastResidencySwapMs = 0.f;
+u32   g_lastResidencyBuilt = 0;
+
+// And inside the rebuild: the per-texture load profiler already splits one .dds
+// into read / parse / repack / create / upload (vk_texture.cpp). Its counters are
+// dumped and reset at the end of the visual walk, so anything they hold after
+// that belongs to this plan — a delta over the loop is the split, for free.
+namespace TexLoadProf {
+extern std::atomic<u64> s_totalClk, s_openClk, s_repackClk, s_createClk, s_uploadClk, s_parseClk, s_closeClk;
+}
+float g_lastResidencyOpenMs = 0.f, g_lastResidencyRepackMs = 0.f,
+      g_lastResidencyCreateMs = 0.f, g_lastResidencyUploadMs = 0.f, g_lastResidencyCloseMs = 0.f;
+float g_lastResidencyReadMs = 0.f;   // the parallel pre-read, when it runs
+
 void TextureStreamer::ApplyResidencyPlan(std::vector<std::pair<StreamTexture*, u32>>& plan)
 {
+    g_lastResidencyBuildMs = g_lastResidencyFlushMs = g_lastResidencySwapMs = 0.f;
+    g_lastResidencyReadMs = 0.f;
+    g_lastResidencyBuilt = 0;
     if (plan.empty()) return;
 
     struct Pending { StreamTexture* st; CVulkanTexture* built; u32 newBase; };
     std::vector<Pending> pend;
     pend.reserve(plan.size());
 
-    for (auto& pr : plan) {
-        if (!pr.first || !pr.first->tex) continue;
-        if (pr.second == pr.first->residentBase) continue;   // nothing to change
-        CVulkanTexture* nt = xr_new<CVulkanTexture>();
-        if (pr.first->tex->BuildStreamImage(*nt, pr.second) && nt->IsValid())
-            pend.push_back({ pr.first, nt, pr.second });
-        else
-            xr_delete(nt);   // build failed — keep current residency
+    // Read the .dds files first, on helper threads. Measured on the tree path:
+    // 57 ms of rebuild was read 45 + upload 9 + create 1 — the whole cost is 42
+    // archive entries being LZO-decompressed one after another on the thread the
+    // level is waiting on. FS is safe for concurrent reads (r_open maps a fresh
+    // view per call, LZO uses thread_local workmem — the async IO worker below
+    // and the spawn path already rely on it). Building the IMAGE stays serial:
+    // that is VMA + the staging ring, and it is 10 ms of the 57.
+    // A blob is the WHOLE .dds (every mip), so reading all 42 at once would hold a
+    // quarter of a gigabyte at the peak for no gain — a chunk keeps every reader
+    // busy and bounds that.
+    constexpr size_t kReadChunk = 16;
+    const u64 _cBuild = CPU::GetCLK();
+    u64 clkRead = 0;
+    const u64 _p0open = TexLoadProf::s_openClk,   _p0rep = TexLoadProf::s_repackClk,
+              _p0cre  = TexLoadProf::s_createClk, _p0upl = TexLoadProf::s_uploadClk,
+              _p0cls  = TexLoadProf::s_closeClk;
+    std::vector<void*>  blobs(plan.size(), nullptr);
+    std::vector<size_t> blobSz(plan.size(), 0);
+
+    for (size_t base = 0; base < plan.size(); base += kReadChunk) {
+        const size_t hi = _min(base + kReadChunk, plan.size());
+
+        if (ps_r_tex_residency_threads > 0 && hi - base > 1) {
+            const u64 _cRead = CPU::GetCLK();
+            std::atomic<size_t> next{ base };
+            const u32 nThr = _min((u32)ps_r_tex_residency_threads, (u32)(hi - base));
+            std::vector<std::thread> pool;
+            pool.reserve(nThr);
+            for (u32 w = 0; w < nThr; ++w)
+                pool.emplace_back([&] {
+                    for (;;) {
+                        const size_t k = next.fetch_add(1);
+                        if (k >= hi) return;
+                        StreamTexture* st = plan[k].first;
+                        if (!st || !st->tex || st->file.size() == 0) continue;
+                        if (plan[k].second == st->residentBase) continue;
+                        if (IReader* F = FS.r_open(st->file.c_str())) {
+                            const size_t n = (size_t)F->length();
+                            if (n > 0) { blobs[k] = xr_malloc(n); memcpy(blobs[k], F->pointer(), n); blobSz[k] = n; }
+                            FS.r_close(F);
+                        }
+                    }
+                });
+            for (auto& th : pool) th.join();
+            clkRead += CPU::GetCLK() - _cRead;
+        }
+
+        for (size_t k = base; k < hi; ++k) {
+            auto& pr = plan[k];
+            if (!pr.first || !pr.first->tex) continue;
+            if (pr.second == pr.first->residentBase) continue;   // nothing to change
+            CVulkanTexture* nt = xr_new<CVulkanTexture>();
+            // Same build either way; the blob path just skips the read a worker
+            // already did. A worker that failed to read falls back to the file.
+            const bool ok = blobs[k]
+                ? pr.first->tex->BuildStreamImageFromBlob(*nt, pr.second, blobs[k], blobSz[k])
+                : pr.first->tex->BuildStreamImage(*nt, pr.second);
+            if (ok && nt->IsValid())
+                pend.push_back({ pr.first, nt, pr.second });
+            else
+                xr_delete(nt);   // build failed — keep current residency
+            if (blobs[k]) { xr_free(blobs[k]); blobs[k] = nullptr; }
+        }
     }
+    for (void* b : blobs) if (b) xr_free(b);
+    g_lastResidencyReadMs  = VK::ClkToMs() * float(clkRead);
+    g_lastResidencyBuildMs = VK::ClkToMs() * float(CPU::GetCLK() - _cBuild);
+    g_lastResidencyBuilt = (u32)pend.size();
+    const float _k = VK::ClkToMs();
+    g_lastResidencyOpenMs   = _k * float(TexLoadProf::s_openClk   - _p0open);
+    g_lastResidencyRepackMs = _k * float(TexLoadProf::s_repackClk - _p0rep);
+    g_lastResidencyCreateMs = _k * float(TexLoadProf::s_createClk - _p0cre);
+    g_lastResidencyUploadMs = _k * float(TexLoadProf::s_uploadClk - _p0upl);
+    g_lastResidencyCloseMs  = _k * float(TexLoadProf::s_closeClk  - _p0cls);
     if (pend.empty()) return;
 
+    const u64 _cFlush = CPU::GetCLK();
     CommandManager.FlushUploadsAndWait();        // new images uploaded (transfer wait only)
+    g_lastResidencyFlushMs = VK::ClkToMs() * float(CPU::GetCLK() - _cFlush);
 
+    const u64 _cSwap = CPU::GetCLK();
     {
         std::lock_guard<std::mutex> lk(s_Mutex);
         for (auto& p : pend) {
@@ -1178,6 +1347,8 @@ void TextureStreamer::ApplyResidencyPlan(std::vector<std::pair<StreamTexture*, u
     m_Retired.reserve(m_Retired.size() + pend.size());
     for (auto& p : pend)
         m_Retired.push_back({ Device.dwFrame, p.built });
+
+    g_lastResidencySwapMs = VK::ClkToMs() * float(CPU::GetCLK() - _cSwap);
 }
 
 // ---------------------------------------------------------------------------

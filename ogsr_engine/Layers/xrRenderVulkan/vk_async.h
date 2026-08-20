@@ -38,11 +38,22 @@ namespace VK { namespace Async {
 // initializes the pool/timeline on first true.
 bool Available();
 
-// Record + submit this frame's async compute work to the compute queue, signaling
-// the timeline. v1 = inert (empty command buffer). `slot` = the frame-in-flight
-// index (CommandManager::GetCurrentFrame()); its command buffer is safe to reset
-// because the graphics frame that used it last has retired (its fence gated reuse).
-void FrameSubmit(u32 slot);
+// Start of frame (CRender::Begin): remembers the frame-in-flight slot and clears
+// last frame's pending state. Cheap and unconditional — call it even when no async
+// work ends up being recorded, so a stale "wait me" never leaks into this frame.
+void FrameBegin(u32 slot);
+
+// Open this frame's compute command buffer for recording, or VK_NULL_HANDLE when
+// async is unavailable (r_async off / no dedicated compute family) — callers then
+// record onto the graphics buffer as before. The slot's buffer is safe to reset:
+// the graphics frame that used it last has retired behind its fence.
+VkCommandBuffer Begin();
+
+// Close + submit what Begin() opened, signaling the timeline the graphics submit
+// waits on. Waits on the graphics timeline value of the PREVIOUS frame first, so
+// compute never overwrites a volume the last frame's passes are still reading —
+// that ordering costs nothing against the CURRENT frame, which is what we overlap.
+void Submit();
 
 // For the graphics submit (CommandManager::Submit): if async work was submitted
 // this frame, yields the timeline semaphore + value the graphics queue must wait

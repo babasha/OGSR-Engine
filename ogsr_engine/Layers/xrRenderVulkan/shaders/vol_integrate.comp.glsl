@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // xrRenderVulkan — froxel volumetric INTEGRATION (vk_volumetrics, P1).
 //
 // One thread per (x,y) froxel column. March front-to-back over Z, accumulating
@@ -14,28 +15,7 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) uniform Vol {
-    vec4 camPos;
-    vec4 camDir;
-    vec4 camRightT;
-    vec4 camTopT;
-    vec4 sun_dir;
-    vec4 sun_color;
-    vec4 sky_ambient;
-    mat4 sun_vp;
-    mat4 sun_near_vp;
-    mat4 sun_c1_vp;
-    vec4 gridParams;   // x=dimX y=dimY z=dimZ
-    vec4 zParams;      // x=near y=far z=log2(far/near)
-    vec4 fog;
-    vec4 fog2;
-    mat4 rain_vp;      // (layout match with vol_inject; unused here)
-    mat4 prevViewProj; // (layout match; unused here)
-    vec4 prevCamPos;   // (layout match; unused here)
-    vec4 prevCamDir;   // (layout match; unused here)
-    vec4 temporal;     // (layout match; unused here)
-    mat4 fog_shadow_vp; // (layout match; unused here)
-} V;
+#include "vol_params.glsl"   // Vol UBO (set 0 b0) — matches VK::Volumetrics::VolUBO
 
 layout(set = 0, binding = 1, rgba16f) uniform readonly  image3D uScatter;     // rgb=in-scatter, a=extinction
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D uIntegrated;  // rgb=accum, a=transmittance

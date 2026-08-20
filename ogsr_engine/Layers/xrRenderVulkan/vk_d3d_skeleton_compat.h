@@ -3,12 +3,11 @@
 // stub itself; the interface it mirrors is GSC Game World code (root LICENSE.md).
 // Non-commercial use only; keep this notice on redistribution.
 
-// xrRenderVulkan - D3D type compatibility for skeleton TUs.
+// xrRenderVulkan - opaque handle typedefs for the skeleton TUs.
 //
-// As of the move to monolith-style USE_DX10/USE_DX11 guards in shared
-// xrRender headers, the bulk of D3D type stubs now live in
-// `xrRender/xrD3DDefs.h` (Vulkan branch). This header is kept as a
-// placeholder and to ensure xrD3DDefs.h is brought in for skeleton TUs.
+// The typedefs themselves live in `xrRender/xrD3DDefs.h`, which is no longer
+// backend-switched now that the D3D11 renderer is gone. This header is kept as
+// a placeholder and to ensure xrD3DDefs.h is brought in for skeleton TUs.
 
 #ifndef vk_d3d_skeleton_compat_H
 #define vk_d3d_skeleton_compat_H

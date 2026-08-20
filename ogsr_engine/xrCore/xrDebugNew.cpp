@@ -204,6 +204,11 @@ void xrDebug::backend(const char* expression, const char* description, const cha
 
     error_after_dialog = true;
 
+    // quick_exit below runs no static destructors, so anything still sitting in the
+    // log stream buffer would be lost -- and this is exactly the log somebody will
+    // read afterwards (see XROS_LOG_FLUSH in log.cpp).
+    LogFlushNow();
+
     ShowErrorMessage(assertion_info);
 
     if (!IsDebuggerPresent())

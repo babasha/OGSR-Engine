@@ -8,6 +8,7 @@
 #include "stdafx.h"
 #include "vk_compute_util.h"
 #include "vk_pipeline_cache.h"   // VK::PipelineCache::GetCacheObject
+#include "vk_shaders.h"          // g_ShaderManager (SPIR-V loader)
 #include "HW_Vulkan.h"           // VulkanHW (device)
 
 namespace VK
@@ -55,6 +56,19 @@ VkPipeline CreateComputePipeline(VkShaderModule cs, VkPipelineLayout layout, con
         return VK_NULL_HANDLE;
     }
     return pipe;
+}
+
+VkPipeline CreateComputePipeline(const char* spv, VkPipelineLayout layout, const char* tag)
+{
+    if (!tag) tag = spv;
+
+    VkShaderModule cs = g_ShaderManager ? g_ShaderManager->Load(spv) : VK_NULL_HANDLE;
+    if (cs == VK_NULL_HANDLE)
+    {
+        Msg("![VK] compute shader '%s' load failed (pipeline '%s')", spv, tag);
+        return VK_NULL_HANDLE;
+    }
+    return CreateComputePipeline(cs, layout, tag);
 }
 
 } // namespace VK

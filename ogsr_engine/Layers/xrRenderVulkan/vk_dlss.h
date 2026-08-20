@@ -76,9 +76,19 @@ bool        EnsureFeatureSL(u32 renderW, u32 renderH, u32 displayW, u32 displayH
 bool        ResolvedThisFrame();
 void        SetResolvedThisFrame(bool ok);
 
+// Should this frame's evaluate DISCARD the temporal history? DLSS reprojects the
+// previous OUTPUT through this frame's motion vectors — valid only while the MVs
+// actually describe the change. Call ONCE per evaluated frame (it rolls the
+// detector's own state) and pass the result to Evaluate/SL::EvaluateSR as `reset`.
+bool        TakeHistoryReset();
+
 // Run DLSS: color(render) + depth + mv(render) + jitter → OutputView (display).
-// `reset` = 1 discards temporal history (level load / camera cut). Transitions the
-// inputs + output to GENERAL for NGX; leaves output in GENERAL (caller samples it).
+// `reset` = 1 discards temporal history (see TakeHistoryReset).
+// ⚠LAYOUT CONTRACT: color/depth/mv must ALREADY be in GENERAL — the caller owns
+// the input transitions (it is the one that knows their attachment layouts, and
+// routing them through SHADER_READ on the way just doubled the transition count
+// on a 1440p depth surface). Evaluate transitions only its OWN output and leaves
+// it in GENERAL for the caller to flip to SHADER_READ.
 void        Evaluate(VkCommandBuffer cmd, const Img& color, const Img& depth, const Img& mv,
                      u32 renderW, u32 renderH, bool reset);
 

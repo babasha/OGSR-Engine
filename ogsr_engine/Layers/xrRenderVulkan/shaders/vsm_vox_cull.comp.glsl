@@ -43,7 +43,9 @@ layout(set = 0, binding =  4) readonly buffer Xform      { TreeInst inst[]; };
 layout(set = 0, binding =  5) readonly buffer CasterPages{ uint casterPages[]; };
 layout(set = 0, binding =  6) readonly buffer PageListD  { uvec4 pageListD[]; };  // dyn slot -> (L, page.xy)
 layout(set = 0, binding =  7) readonly buffer PageListS  { uvec4 pageListS[]; };  // static slot -> (L, page.xy)
-layout(set = 0, binding =  8) uniform VsmParams { mat4 view; vec4 level[VSM_LEVELS]; vec4 zparams; } vsm;
+#define VSM_PARAMS_SET     0
+#define VSM_PARAMS_BINDING 8
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 layout(set = 0, binding =  9) writeonly buffer OutCmdD   { uint od[]; };     // compacted VkDrawIndirectCommand[]
 layout(set = 0, binding = 10) writeonly buffer OutCmdS   { uint ost[]; };
 layout(set = 0, binding = 11) writeonly buffer BrickList { uint blist[]; };  // surviving global brick indices

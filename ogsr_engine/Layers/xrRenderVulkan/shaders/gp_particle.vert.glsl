@@ -30,9 +30,13 @@ struct TexInfo {
     vec4  alignDir;     // bit3: billboard T axis for zero-velocity particles
 };
 
-layout(set = 0, binding = 0) buffer PoolBuf     { GPUParticle pool[]; };
-layout(set = 0, binding = 2) buffer AliveBuf    { uint aliveList[]; };
-layout(set = 0, binding = 7) buffer TexInfoBuf  { TexInfo texInfo[]; };
+// readonly: this stage only READS the three simulation buffers (the compute passes
+// own the writes). Without the qualifier the SPIR-V declares them writable and the
+// driver must assume a vertex stage may store into them — VUID-RuntimeSpirv-NonWritable-06341
+// ×6, caught 16-08. Marking them also lets the compiler treat the loads as invariant.
+layout(set = 0, binding = 0) readonly buffer PoolBuf     { GPUParticle pool[]; };
+layout(set = 0, binding = 2) readonly buffer AliveBuf    { uint aliveList[]; };
+layout(set = 0, binding = 7) readonly buffer TexInfoBuf  { TexInfo texInfo[]; };
 
 layout(push_constant) uniform PC {
     mat4  viewProj;

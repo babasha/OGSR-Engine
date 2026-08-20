@@ -59,7 +59,27 @@ void RenderQueue::Push(const DrawItem& item)
     // blend without z-write, so drawing them in the normal flush let everything
     // rendered after (GPU-world statics, trees, grass, sky) overwrite the
     // blended pixels — glass looked missing or opaque.
+    // Water bodies go to their own list: Pass_Water draws them with a dedicated
+    // pipeline (analytic waves, Fresnel sky reflection, Beer-Lambert body), so
+    // they must not reach the world flush at all — there they were shaded as
+    // opaque vert-lit geometry and came out BLACK.
+    if (it.lateWater) { m_WaterItems.push_back(it); return; }
     (it.lateGlass ? m_GlassItems : m_Items).push_back(it);
+}
+
+// Hierarchy walks double-submit children (see DedupExclude): harmless for
+// opaque, fatal for a BLENDED surface — three stacked 0.5 alphas read as
+// opaque. One item per unique visual.
+void RenderQueue::DedupWater()
+{
+    if (m_WaterItems.size() < 2) return;
+    std::unordered_set<const void*> seen;
+    seen.reserve(m_WaterItems.size());
+    xr_vector<DrawItem> out;
+    out.reserve(m_WaterItems.size());
+    for (const DrawItem& it : m_WaterItems)
+        if (seen.insert(it.vis).second) out.push_back(it);
+    m_WaterItems.swap(out);
 }
 
 void RenderQueue::Clear()

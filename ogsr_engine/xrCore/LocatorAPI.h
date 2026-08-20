@@ -19,6 +19,36 @@ struct sqfs_dir_iterator_t;
 struct sqfs_file_t;
 } // namespace sqfs
 
+// ---------------------------------------------------------------------------
+// Where opened files actually COME FROM. A level load spends seconds inside
+// r_open, and the three sources have completely different fixes: a loose file is
+// three cheap syscalls plus lazy paging, an uncompressed archive entry is one
+// MapViewOfFile, and a compressed one is a whole-file LZO decompress on the
+// CALLING thread. Counting them apart is the only way to know which one is the
+// cost. Snapshot before/after a phase and subtract.
+// ---------------------------------------------------------------------------
+// Sliding-window reader accounting (CMapStreamReader). `map_us` is the
+// MapViewOfFile/Unmap churn, `copy_us` the memcpy out of the window — which is
+// also where the page faults land, so a low MB/s here means paging, not copying.
+struct FS_StreamStats
+{
+    u64 maps{}, map_us{};
+    u64 copy_bytes{}, copy_us{};
+};
+XRCORE_API FS_StreamStats FS_GetStreamStats();
+
+// Window size used by every sliding-window reader (default 1 MB, overridable
+// with XROS_FS_WINDOW_MB).
+XRCORE_API size_t FS_StreamWindowSize();
+
+struct FS_OpenStats
+{
+    u64 loose_n{},  loose_b{},  loose_us{};    // on-disk file    -> CreateFile + MapViewOfFile
+    u64 packed_n{}, packed_b{}, packed_us{};   // archive, stored -> MapViewOfFile
+    u64 compr_n{},  compr_b{},  compr_us{};    // archive, LZO    -> alloc + decompress
+};
+XRCORE_API FS_OpenStats FS_GetOpenStats();
+
 class XRCORE_API CLocatorAPI
 {
     friend class FS_Path;
@@ -52,6 +82,7 @@ public:
 
 private:
     static constexpr size_t VFS_STANDARD_FILE = std::numeric_limits<size_t>::max();
+    // Superseded by FS_StreamWindowSize() so the window can be A/B-ed at runtime.
     static constexpr size_t BIG_FILE_READER_WINDOW_SIZE = 1024 * 1024;
 
     DEFINE_MAP_PRED(LPCSTR, FS_Path*, PathMap, PathPairIt, pred_str)

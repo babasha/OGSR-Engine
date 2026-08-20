@@ -4,4 +4,4 @@
 // Used ONLY by the GPU-driven world path (vk_world_gpu DrawColor/DrawDepth).
 #extension GL_GOOGLE_include_directive : require
 #define CLUSTER_FADE 1
-#include "world_lmap_frag_body.glsl"
+#include "world_frag_body.glsl"

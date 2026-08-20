@@ -7,6 +7,8 @@
 
 // xrRenderVulkan — per-light volumetric cones. See vk_pass_lightcones.h.
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
+#include "vk_rendering.h"     // VK::RenderingBuilder
 #include "vk_pass_lightcones.h"
 #include "vk_swapchain.h"               // Swapchain.m_DepthImage/m_DepthView
 #include "vk_scene_color.h"             // HDR scene target format
@@ -136,30 +138,10 @@ namespace {
 
         // Set 0: binding 0 = scene depth, binding 1 = spot shadow map (per-step
         // beam occlusion for the spot-budget pick). Both combined samplers.
-        VkDescriptorSetLayoutBinding b[2]{};
-        b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        b[1] = b[0]; b[1].binding = 1;
-        VkDescriptorSetLayoutCreateInfo slci{};
-        slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        slci.bindingCount = 2; slci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
-            s_failed = true; return false;
-        }
-
-        VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kFramesInFlight };
-        VkDescriptorPoolCreateInfo pci{};
-        pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pci.maxSets = kFramesInFlight; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-        if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) {
-            s_failed = true; return false;
-        }
-        VkDescriptorSetLayout layouts[kFramesInFlight];
-        for (u32 i = 0; i < kFramesInFlight; ++i) layouts[i] = s_setLayout;
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = s_pool; dai.descriptorSetCount = kFramesInFlight; dai.pSetLayouts = layouts;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_set) != VK_SUCCESS) {
+        constexpr auto kTex = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (!VK::MakeDescriptorSets({ kTex, kTex }, kFramesInFlight,
+                                    s_setLayout, s_pool, s_set,
+                                    VK_SHADER_STAGE_FRAGMENT_BIT, "LightCones")) {
             s_failed = true; return false;
         }
 
@@ -458,40 +440,14 @@ void Pass_LightCones(FrameContext& ctx)
 
     const u32 slot = CommandManager.GetCurrentFrame() % kFramesInFlight;
     {
-        VkDescriptorImageInfo ii[2]{};
-        ii[0].sampler     = ShadowMap::GetSampler();
-        ii[0].imageView   = Swapchain.m_DepthView;
-        ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        ii[1] = ii[0];
-        ii[1].imageView   = ShadowMap::GetSpotBeamView();   // spot + GRASS casters (SHADER_READ after Pass_SunShadow)
-        VkWriteDescriptorSet w[2]{};
-        for (u32 k = 0; k < 2; ++k) {
-            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[k].dstSet = s_set[slot]; w[k].dstBinding = k; w[k].descriptorCount = 1;
-            w[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[k].pImageInfo = &ii[k];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+        VK::DescriptorWriter(s_set[slot])
+            .ImageSampler(0, Swapchain.m_DepthView, ShadowMap::GetSampler())
+            // spot + GRASS casters (SHADER_READ after Pass_SunShadow)
+            .ImageSampler(1, ShadowMap::GetSpotBeamView(), ShadowMap::GetSampler())
+            .Flush();
     }
 
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{ 0.f, 0.f, (float)ctx.extent.width, (float)ctx.extent.height, 0.f, 1.f };
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    VK::RenderingBuilder(ctx.extent).Color(ctx.colorView).BeginPlain(cmd);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &s_set[slot], 0, nullptr);

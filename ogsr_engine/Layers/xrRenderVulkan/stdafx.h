@@ -19,12 +19,15 @@
 
 #define XRRENDER_VULKAN_EXPORTS
 
-// d3d9types.h — pulled in for D3DFVF_*, D3DDECLTYPE_*, etc. constants.
-// shared Layers/xrRender/FVF.h and our vk_d3d_compat.h reference them as
-// integer values to identify vertex layouts. No D3D9 DLL is loaded.
-#include <d3d9types.h>
-// dxgiformat.h — DXGI_FORMAT enum used by shared CRT / sh_rt.h header for
-// render-target format identification. Tiny header, no DLL dependency.
+// Vertex-declaration / FVF constants as stored in the level and model files.
+// Vendored (see the header) so nothing here includes <d3d9types.h> any more —
+// shared Layers/xrRender/FVF.h and our vk_d3d_compat.h read them as plain
+// integers identifying vertex layouts.
+#include "../xrRender/xrVertexDeclTypes.h"
+// dxgiformat.h — DXGI_FORMAT enum. Kept as the Windows SDK header because DDS
+// files with a DX10 header literally store these numbers, and the NGX/DLSS SDK
+// headers pull the same definition in; this is a header-only enum, no DLL or
+// import library behind it.
 #include <dxgiformat.h>
 
 // Vulkan API + VMA — pulled into the PCH so vk_core.h (copied from monolith,

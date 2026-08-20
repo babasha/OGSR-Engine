@@ -504,7 +504,11 @@ void CDetailManager::Render(VK::FrameContext& ctx)
     gpc.slotCountX = m_Frame.slotCountX;
     gpc.slotCountZ = m_Frame.slotCountZ;
 
-    gpc.casterParams.set(0.f, 0.f, 0.f, 0.f);   // visible pass: frustum+HZB cull as usual
+    // z = vertical focal scale P11 = 1/tan(fovY/2), the term the shared HZB
+    // footprint needs (hzb_test.glsl). Same expression as the tree/LOD/world cull
+    // sites — grass used to omit it entirely and under-sample its own footprint.
+    const float hzbFocal = 1.f / _max(0.05f, tanf(deg2rad(Device.fFOV) * 0.5f));
+    gpc.casterParams.set(0.f, 0.f, hzbFocal, 0.f);   // visible pass: frustum+HZB cull as usual
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_GenPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_GenPipelineLayout,
@@ -523,7 +527,7 @@ void CDetailManager::Render(VK::FrameContext& ctx)
         DetailGenPushConstants cpc = gpc;
         const float lim = float(_max(ps_r__detail_radius, 1));
         const float cr  = _min(_max(55.f, ps_r_sun_grass_dist), lim);
-        cpc.casterParams.set(cr * cr, float(GPU_CASTER_CAPACITY), 0.f, 0.f);
+        cpc.casterParams.set(cr * cr, float(GPU_CASTER_CAPACITY), hzbFocal, 0.f);   // focal unused here (caster pass skips HZB) — kept consistent so enabling it later can't read a zero
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_GenPipelineLayout,
                                 0, 1, &m_CasterDescSet, 0, nullptr);
         vkCmdPushConstants(cmd, m_GenPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -641,7 +645,14 @@ void CDetailManager::Render(VK::FrameContext& ctx)
         // Per-detail-type wind scale: DO_NO_WAVING models (tiny shoots in asphalt)
         // stay static like R4 (push 0 into wind_params.w); normal grass waves (1).
         const float windScale = (ps_r_grass_nowave && (obj->m_Flags & DO_NO_WAVING)) ? 0.0f : 1.0f;
-        vkCmdPushConstants(cmd, m_GfxPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+        // ⚠Stages must match the DECLARED range, not the stage that happens to read
+        // the field. This layout declares ONE range covering VS+FS (vk_DetailManager.cpp),
+        // so a partial update naming only VERTEX is illegal even though only the vertex
+        // shader reads wind_params — VUID-vkCmdPushConstants-offset-01796, caught 16-08.
+        // (The MV pass below looks identical but is NOT the same case: its layout
+        // declares a VERTEX-only range, so VERTEX-only there is correct.)
+        vkCmdPushConstants(cmd, m_GfxPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            offsetof(DetailGfxPushConstants, wind_params) + 3u * sizeof(float),
                            sizeof(float), &windScale);
 

@@ -10,7 +10,7 @@
 #include "vk_scene_color.h"       // HDR scene target format
 #include "vk_swapchain.h"         // depth format
 #include "vk_shaders.h"           // g_ShaderManager
-#include "vk_pipeline_cache.h"    // shared pipeline cache object
+#include "vk_gfx_pipeline.h"      // VK::GfxPipelineBuilder
 #include "vk_env_light.h"         // EnvLight::GetSetLayout / GetCurrentSet (lighting set)
 #include "vk_deform.h"            // Deform::Ready (the press field this samples)
 #include "vk_shadow.h"            // ShadowMap::RainEyeY (exact base-height reconstruction)
@@ -67,44 +67,14 @@ bool SnowMesh_Init()
         Msg("![VK SnowMesh] pipeline layout failed"); s_failed = true; return false;
     }
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_vs; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_fs; stages[1].pName = "main";
-
-    VkPipelineVertexInputStateCreateInfo vi{};   vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;  // procedural
-    VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{};      vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO; vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{};   ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{};  ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo cb{}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{}; dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO; dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkFormat colorFormat = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFormat;
-    prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; pi.pNext = &prci;
-    pi.stageCount = 2; pi.pStages = stages;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_pipeLayout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &s_pipe) != VK_SUCCESS) {
-        Msg("![VK SnowMesh] pipeline create failed"); s_failed = true; return false;
-    }
+    // Procedural grid — no vertex input, the VS builds it from gl_VertexIndex.
+    s_pipe = GfxPipelineBuilder(s_pipeLayout)
+        .Vert(s_vs).Frag(s_fs)
+        .Depth(true, true)
+        .Color(VK::SceneColor::Format())
+        .DepthTarget(Swapchain.m_DepthFormat)
+        .Build("SnowMesh");
+    if (s_pipe == VK_NULL_HANDLE) { s_failed = true; return false; }
 
     Msg("[VK SnowMesh] init OK (grid %dx%d, +-%.0f m, %.1f cm quads)", kN, kN, kHalf, 200.f * kHalf / float(kN - 1));
     return true;

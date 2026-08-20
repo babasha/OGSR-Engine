@@ -107,6 +107,13 @@ struct WorldMaterial
     // Lit-blend (lightplanes beams; alphaRef == -4): R4 model_def_lq — LIT
     // colour, plain srcalpha blend (the wmark pipeline), alpha = tex.a·fog².
     bool            isLitBlend = false;
+
+    // WATER body (level shader `effects\water*`; alphaRef == -5). Not drawn by
+    // the world pipelines at all: Pass_Water owns it (own pipeline, own shader,
+    // premultiplied blend over the finished opaque scene). Shares the wmark
+    // marker so it stays out of the depth prepass and the shadow-caster bins —
+    // a water plane must not occlude its own bottom, nor cast a shadow onto it.
+    bool            isWater    = false;
 };
 
 namespace WorldMaterialCache {
@@ -138,6 +145,17 @@ void SetLevelTag(const char* tag);
 // ("каша" ground on mask-less maps like pripyat_full).
 WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark = false,
                            const char* shader_name = nullptr);
+
+
+// Kick off the parallel texture prefetch for this level (VK::TexPrefetch). Pass
+// the level shader table's base + lightmap names; this cache owns the rules that
+// turn a base name into the actual file set (.thm detail, bump normal + height,
+// terrain mask), so the expansion lives here rather than in the loader.
+// Purely an I/O head start: GetOrCreate below is untouched and still decides what
+// is really loaded, so prefetching a file nothing asks for wastes a read and
+// nothing else. Pair with VK::TexPrefetch::Stop() after the visual walk.
+void StartTexturePrefetch(xr_vector<shared_str>&& diffuseNames, xr_vector<shared_str>&& lmapNames,
+                          const char* leadFile);
 
 VkDescriptorSetLayout GetSetLayout();
 VkDescriptorSetLayout GetTerrainSetLayout();   // 7-binding terrain splat set

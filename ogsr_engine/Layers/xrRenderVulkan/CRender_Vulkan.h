@@ -165,6 +165,7 @@ public:
     void Clear() override;
     void End() override;
     void ClearTarget() override;
+    bool PrecacheWarmupPending() override;
 
     // ----- IRender_interface : Cached transforms ----------------------------
     void SetCacheXform(Fmatrix& mView, Fmatrix& mProject) override;

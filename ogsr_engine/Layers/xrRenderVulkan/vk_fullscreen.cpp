@@ -7,7 +7,8 @@
 
 #include "stdafx.h"
 #include "vk_fullscreen.h"
-#include "vk_pipeline_cache.h"   // PipelineCache::GetCacheObject
+#include "vk_rendering.h"     // VK::RenderingBuilder
+#include "vk_gfx_pipeline.h"     // VK::GfxPipelineBuilder
 #include "HW_Vulkan.h"
 
 namespace VK { namespace Fullscreen {
@@ -41,74 +42,25 @@ VkPipeline CreatePipeline(VkShaderModule vs, VkShaderModule fs, VkFormat colorFm
                           const char* tag,
                           VkExtent2D shadingRate)
 {
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-    VkPipelineShaderStageCreateInfo st[2]{};
-    st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
-    st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    // depthTest/Write default to FALSE — fullscreen passes never touch depth.
-
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1; cb.pAttachments = &blend;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
-
     // Optional STATIC coarse shading rate (pipelineFragmentShadingRate). Combiners KEEP =
     // ignore primitive/attachment rate, use this pipeline rate. Only when the device
     // supports it AND the caller asked for > 1x1 (else per-pixel as before).
-    const void* head = &prci;
     VkPipelineFragmentShadingRateStateCreateInfoKHR fsr{};
+    const void* rateNext = nullptr;
     if (VulkanHW.m_bVRSPipelineSupported && (shadingRate.width > 1 || shadingRate.height > 1)) {
         fsr.sType = VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR;
         fsr.fragmentSize = shadingRate;
         fsr.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
         fsr.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
-        fsr.pNext = &prci;
-        head = &fsr;
+        rateNext = &fsr;
     }
 
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = head; pi.stageCount = 2; pi.pStages = st;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = layout;
-
-    VkPipeline out = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS)
-        Msg("![VK %s] fullscreen pipeline create failed", tag ? tag : "Fullscreen");
-    return out;
+    // No vertex input, no depth — a fullscreen triangle drawn from gl_VertexIndex.
+    return GfxPipelineBuilder(layout)
+        .Vert(vs).Frag(fs)
+        .ColorBlend(colorFmt, blend)
+        .RenderingNext(rateNext)
+        .Build("%s fullscreen", tag ? tag : "Fullscreen");
 }
 
 VkPipeline CreatePipelineMRT(VkShaderModule vs, VkShaderModule fs,
@@ -117,84 +69,19 @@ VkPipeline CreatePipelineMRT(VkShaderModule vs, VkShaderModule fs,
                              const VkPipelineColorBlendAttachmentState* blends,
                              const char* tag)
 {
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-    VkPipelineShaderStageCreateInfo st[2]{};
-    st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
-    st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = count; cb.pAttachments = blends;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = count; prci.pColorAttachmentFormats = colorFmts;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = st;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = layout;
-
-    VkPipeline out = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS)
-        Msg("![VK %s] fullscreen MRT pipeline create failed", tag ? tag : "Fullscreen");
-    return out;
+    GfxPipelineBuilder b(layout);
+    b.Vert(vs).Frag(fs);
+    for (u32 i = 0; i < count; ++i)
+        b.ColorBlend(colorFmts[i], blends[i]);
+    return b.Build("%s fullscreen MRT", tag ? tag : "Fullscreen");
 }
 
 void DrawSimple(VkCommandBuffer cmd, VkImageView dstView, VkExtent2D extent,
                 VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
                 const void* push, u32 pushSize)
 {
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView = dstView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    RenderingBuilder(extent).Color(dstView, VK_ATTACHMENT_LOAD_OP_DONT_CARE).BeginPlain(cmd);
 
-    VkRenderingInfo ri{};
-    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent = extent;
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments = &cAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{ 0.f, 0.f, (float)extent.width, (float)extent.height, 0.f, 1.f };
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {0,0}, extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
     if (push && pushSize)
@@ -207,27 +94,11 @@ void DrawMRT(VkCommandBuffer cmd, const VkImageView* dstViews, u32 count, VkExte
              VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
              const void* push, u32 pushSize)
 {
-    VkRenderingAttachmentInfo cAtt[8]{};
-    for (u32 i = 0; i < count && i < 8; ++i) {
-        cAtt[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        cAtt[i].imageView = dstViews[i];
-        cAtt[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        cAtt[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    }
+    RenderingBuilder rb(extent);
+    for (u32 i = 0; i < count && i < RenderingBuilder::kMaxColor; ++i)
+        rb.Color(dstViews[i], VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+    rb.BeginPlain(cmd);
 
-    VkRenderingInfo ri{};
-    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent = extent;
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = count;
-    ri.pColorAttachments = cAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{ 0.f, 0.f, (float)extent.width, (float)extent.height, 0.f, 1.f };
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {0,0}, extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
     if (push && pushSize)

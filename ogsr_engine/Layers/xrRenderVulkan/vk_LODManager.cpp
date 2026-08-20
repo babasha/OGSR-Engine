@@ -21,6 +21,8 @@
 #include "vk_pipeline_cache.h"    // PipelineCache::GetCacheObject
 #include "vk_command_buffer.h"    // CommandManager
 #include "vk_compute_util.h"      // MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"      // GfxPipelineBuilder
+#include "vk_descriptors.h"       // VK::DescriptorWriter
 #include "vk_cull.h"              // ExtractFrustumPlanes (GPU cull push)
 #include "vk_DetailManager.h"     // shared HZB pyramid (grass/world)
 #include "vk_profiler.h"          // GPU zones for the cull dispatch
@@ -29,10 +31,9 @@
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent->Environment()
 #include "../../xr_3da/Environment.h"      // CEnvDescriptorMixer (sun_color/hemi_color)
 
-// Imposters only show beyond this range so up-close trees keep their full mesh
-// (and don't overlay flat billboards on detailed geometry near the player). Far
-// enough that the flatness reads as distant haze, not a low-poly pop-in.
-static constexpr float kImposterMinDist = 250.0f;
+// kImposterMinDist moved to vk_LODManager.h — CTreeManager's r_tree_dist cut has
+// to floor itself at the same value (drop the mesh only where the billboard is
+// already drawing), and two copies of that number would drift.
 
 // GPU path (compute cull + vertex pulling) — instant A/B against the CPU walk.
 extern int ps_r_lods_gpu;
@@ -99,14 +100,26 @@ void CLODManager::Build()
     if (m_bBuilt) return;
     m_bBuilt = true;
 
+    CTimer _t; _t.Start();
+    float msCollect = 0, msVB = 0, msAtlas = 0, msPipe = 0, msGpu = 0;
+
     // ----- Collect FLODs with valid billboard facets.
     m_Lods.reserve(2048);
+    // MT_LOD is set by exactly one class: vkVisual_Create builds a vkFLOD for it
+    // and nothing else, so the type tag IS the cast. The dynamic_cast this used
+    // to do cost ~0.4 us each over the 92k MT_LOD visuals — half of this pass —
+    // and RTTI here is not free insurance either: it was the 18-08 crash site
+    // (a corrupted vtable faulted INSIDE _RTDynamicCast). That corruption is
+    // fixed, and VisualGuard::Check now watches the vtables between phases.
     for (IRenderVisual* iv : RImplementation.Visuals)
     {
-        auto* lod = dynamic_cast<vkFLOD*>(static_cast<vkRender_Visual*>(iv));
-        if (lod && lod->facetsValid && lod->vis.sphere.R > 0.01f)
+        auto* rv = static_cast<vkRender_Visual*>(iv);
+        if (!rv || rv->Type != MT_LOD) continue;
+        auto* lod = static_cast<vkFLOD*>(rv);
+        if (lod->facetsValid && lod->vis.sphere.R > 0.01f)
             m_Lods.push_back(lod);
     }
+    msCollect = _t.GetElapsed_ms_total();
 
     if (m_Lods.empty())
     {
@@ -115,6 +128,7 @@ void CLODManager::Build()
     }
 
     // ----- Triple-buffered dynamic VB: 6 verts (2 tris) per FLOD quad.
+    _t.Start();
     m_MaxVerts = (u32)m_Lods.size() * 6;
     const VkDeviceSize vbSize = (VkDeviceSize)m_MaxVerts * sizeof(LodImposterVertex);
     for (u32 f = 0; f < LOD_FRAMES; ++f)
@@ -123,13 +137,16 @@ void CLODManager::Build()
         m_DynVB[f]->Create(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
         m_DynVB[f]->Map();   // persistent map — VERTEX buffers aren't auto-mapped (only UBO/SSBO are)
     }
+    msVB = _t.GetElapsed_ms_total();
 
-    CreateAtlasDescriptor();
-    CreatePipeline();
-    BuildGpuPath();
+    _t.Start(); CreateAtlasDescriptor(); msAtlas = _t.GetElapsed_ms_total();
+    _t.Start(); CreatePipeline();        msPipe  = _t.GetElapsed_ms_total();
+    _t.Start(); BuildGpuPath();          msGpu   = _t.GetElapsed_ms_total();
 
     Msg("[VK LOD] Built: %u FLOD imposters (VB %u KB ×%u)",
         (u32)m_Lods.size(), (u32)(vbSize / 1024), LOD_FRAMES);
+    Msg("[load step]   LODs::Build: collect %.0f (%u of %u visuals) | dynVB %.0f | atlas %.0f | pipeline %.0f | gpuPath %.0f ms",
+        msCollect, (u32)m_Lods.size(), (u32)RImplementation.Visuals.size(), msVB, msAtlas, msPipe, msGpu);
 }
 
 // ============================================================================
@@ -172,33 +189,12 @@ void CLODManager::CreateAtlasDescriptor()
     sci.maxLod       = VK_LOD_CLAMP_NONE;
     vkCreateSampler(VulkanHW.m_Device, &sci, nullptr, &m_Sampler);
 
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo lci{};
-    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 1; lci.pBindings = &b;
-    vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &m_DescLayout);
+    if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER }, 1,
+                                m_DescLayout, m_DescPool, &m_DescSet,
+                                VK_SHADER_STAGE_FRAGMENT_BIT, "LOD.Atlas"))
+        return;
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &m_DescPool);
-
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = m_DescPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &m_DescLayout;
-    vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_DescSet);
-
-    VkDescriptorImageInfo ii{};
-    ii.sampler = m_Sampler; ii.imageView = view;
-    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet w{};
-    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w.dstSet = m_DescSet; w.dstBinding = 0; w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+    VK::DescriptorWriter(m_DescSet).ImageSampler(0, view, m_Sampler).Flush();
 
     Msg("[VK LOD] Atlas 'level_lods' %s", m_AtlasTex ? "loaded from $level$" : "MISSING (white fallback)");
 }
@@ -216,81 +212,19 @@ static VkPipeline CreateImposterPipeline(const char* vsName, bool vertexInput, V
         Msg("![VK LOD] %s / lod_imposter.frag.spv load failed", vsName); return VK_NULL_HANDLE;
     }
 
-    VkPipelineShaderStageCreateInfo ss[2]{};
-    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-    VkVertexInputBindingDescription vibd{ 0, sizeof(LodImposterVertex), VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription via[3]{};
-    via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0  };   // pos
-    via[1] = { 1, 0, VK_FORMAT_R32G32_SFLOAT,    12 };   // uv
-    via[2] = { 2, 0, VK_FORMAT_R8G8B8A8_UNORM,   20 };   // color
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    if (vertexInput) {
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = via;
-    }   // else: empty input state — the GPU path pulls verts from SSBOs
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;      // billboards double-sided
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkFormat colorFmt = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
-    pi.pViewportState = &vp; pi.pRasterizationState = &rs;
-    pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState;
-    pi.layout = layout;
-    VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                  1, &pi, nullptr, &pipe) != VK_SUCCESS) {
-        Msg("![VK LOD] pipeline create failed (%s)", vsName); return VK_NULL_HANDLE;
+    VK::GfxPipelineBuilder b(layout);
+    b.Vert(vs).Frag(fs)
+     .Cull(VK_CULL_MODE_NONE)             // billboards double-sided
+     .Depth(true, true)
+     .Color(VK::SceneColor::Format())
+     .DepthTarget(Swapchain.m_DepthFormat);
+    if (vertexInput) {   // else: empty input state — the GPU path pulls verts from SSBOs
+        b.Binding(0, (u32)sizeof(LodImposterVertex))
+         .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)    // pos
+         .Attr(1, 0, VK_FORMAT_R32G32_SFLOAT,    12)   // uv
+         .Attr(2, 0, VK_FORMAT_R8G8B8A8_UNORM,   20);  // color
     }
-    return pipe;
+    return b.Build("LOD %s", vsName);
 }
 
 // ============================================================================
@@ -364,25 +298,12 @@ void CLODManager::BuildGpuPath()
 
     // ----- Descriptor layouts: cull (3 SSBO + HZB sampler), pulling VS (2 SSBO).
     {
-        VkDescriptorSetLayoutBinding cb[4]{};
-        for (u32 i = 0; i < 3; ++i) {
-            cb[i].binding = i; cb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            cb[i].descriptorCount = 1; cb[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-        cb[3].binding = 3; cb[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        cb[3].descriptorCount = 1; cb[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        VkDescriptorSetLayoutCreateInfo lci{};
-        lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        lci.bindingCount = 4; lci.pBindings = cb;
-        vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_CullDescLayout);
-
-        VkDescriptorSetLayoutBinding vb[2]{};
-        for (u32 i = 0; i < 2; ++i) {
-            vb[i].binding = i; vb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            vb[i].descriptorCount = 1; vb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-        }
-        lci.bindingCount = 2; lci.pBindings = vb;
-        vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_VtxDescLayout);
+        constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        m_CullDescLayout = VK::MakeSetLayout({ kSSBO, kSSBO, kSSBO,
+                                               VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },   // 3 = HZB
+                                             VK_SHADER_STAGE_COMPUTE_BIT, "LOD.Cull");
+        m_VtxDescLayout  = VK::MakeSetLayout({ kSSBO, kSSBO }, VK_SHADER_STAGE_VERTEX_BIT, "LOD.Vtx");
+        if (!m_CullDescLayout || !m_VtxDescLayout) return;
     }
 
     // ----- Pool + sets. Cull sets are per-frame-in-flight so the HZB binding can
@@ -397,35 +318,20 @@ void CLODManager::BuildGpuPath()
         pci.maxSets = LOD_FRAMES + 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
         vkCreateDescriptorPool(dev, &pci, nullptr, &m_GpuDescPool);
 
-        VkDescriptorSetLayout layouts[LOD_FRAMES];
-        for (u32 f = 0; f < LOD_FRAMES; ++f) layouts[f] = m_CullDescLayout;
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = m_GpuDescPool; dai.descriptorSetCount = LOD_FRAMES; dai.pSetLayouts = layouts;
-        vkAllocateDescriptorSets(dev, &dai, m_CullSets);
-        dai.descriptorSetCount = 1; dai.pSetLayouts = &m_VtxDescLayout;
-        vkAllocateDescriptorSets(dev, &dai, &m_VtxSet);
+        if (!VK::AllocSets(m_GpuDescPool, m_CullDescLayout, LOD_FRAMES, m_CullSets, "LOD.Cull")) return;
+        if (!VK::AllocSets(m_GpuDescPool, m_VtxDescLayout,  1,          &m_VtxSet,  "LOD.Vtx"))  return;
 
         // Static buffer bindings (b0..b2 cull, b0..b1 vtx). HZB (b3) is per frame.
-        VkDescriptorBufferInfo bLods{ m_GpuLods->GetHandle(),     0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo bInst{ m_GpuInsts->GetHandle(),    0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo bInd { m_GpuIndirect->GetHandle(), 0, VK_WHOLE_SIZE };
-        xr_vector<VkWriteDescriptorSet> ws;
-        auto add = [&ws](VkDescriptorSet set, u32 binding, const VkDescriptorBufferInfo* bi) {
-            VkWriteDescriptorSet w{};
-            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet = set; w.dstBinding = binding; w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = bi;
-            ws.push_back(w);
-        };
-        for (u32 f = 0; f < LOD_FRAMES; ++f) {
-            add(m_CullSets[f], 0, &bLods);
-            add(m_CullSets[f], 1, &bInst);
-            add(m_CullSets[f], 2, &bInd);
-        }
-        add(m_VtxSet, 0, &bLods);
-        add(m_VtxSet, 1, &bInst);
-        vkUpdateDescriptorSets(dev, (u32)ws.size(), ws.data(), 0, nullptr);
+        for (u32 f = 0; f < LOD_FRAMES; ++f)
+            VK::DescriptorWriter(m_CullSets[f])
+                .StorageBuffer(0, m_GpuLods->GetHandle())
+                .StorageBuffer(1, m_GpuInsts->GetHandle())
+                .StorageBuffer(2, m_GpuIndirect->GetHandle())
+                .Flush();
+        VK::DescriptorWriter(m_VtxSet)
+            .StorageBuffer(0, m_GpuLods->GetHandle())
+            .StorageBuffer(1, m_GpuInsts->GetHandle())
+            .Flush();
     }
 
     // ----- Pipelines: cull compute + pulling graphics (set 0 = atlas, set 1 = geo).
@@ -561,11 +467,9 @@ void CLODManager::RenderGpu(VK::FrameContext& ctx)
             ii.imageView   = m_AtlasTex ? m_AtlasTex->GetView() : WorldMaterialCache::GetDefault()->view;
             ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = m_CullSets[frame]; w.dstBinding = 3; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(m_CullSets[frame])
+            .Image(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ii)
+            .Flush();
     }
 
     const int zc = Prof::ZoneBegin(cmd, "LODs/cull");

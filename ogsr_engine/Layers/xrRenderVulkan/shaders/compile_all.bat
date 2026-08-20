@@ -40,6 +40,19 @@ call :onedef "world_vlit.frag.glsl"      fragment EARLY_ZTEST "world_vlit_earlyz
 call :onedef "world_lmap_fade.frag.glsl" fragment EARLY_ZTEST "world_lmap_fade_earlyz.frag.spv"
 call :onedef "world_vlit_fade.frag.glsl" fragment EARLY_ZTEST "world_vlit_fade_earlyz.frag.spv"
 
+REM Pool mask with the SECOND target the shore wetness runs on (live water
+REM surface + ground height per tile texel). Same source, one more attachment;
+REM the plain twin above still drives the 2048^2 level map, which would pay
+REM 16 MB for a second target that means nothing at 2 m per texel.
+call :onedef "water_mask.frag.glsl"      fragment WATER_MASK_SURF "water_mask_surf.frag.spv"
+
+REM ZOFF twin of the terrain FS: exports a displaced gl_FragDepth (layout
+REM depth_greater) so SSAO and shadows land inside the POM cracks. This one used
+REM to be compiled BY HAND and was therefore the only .spv this script did not
+REM own -- the committed binary had already drifted away from its source (see
+REM the terrain-splatting notes). Building it here keeps the pair honest.
+call :onedef "world_terrain.frag.glsl"   fragment ZOFF "world_terrain_zoff.frag.spv"
+
 if %ERR% NEQ 0 (
     echo.
     echo BUILD FAILED: %ERR% shader had errors.

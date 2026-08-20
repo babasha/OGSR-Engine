@@ -52,7 +52,17 @@ public:
      *                которые пишет/читает только GPU (CPU-путь — через Upload/Fill).
      *                Map() у такого буфера вернёт nullptr (Upload сам уйдёт в staging).
      */
-    void Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage, bool gpuOnly = false);
+    // `computeShared`: the buffer is touched by BOTH the graphics and the dedicated
+    // compute queue (async compute, r_async). Its contents then survive the family
+    // switch only under CONCURRENT sharing — see the same flag on VK::ImageDesc.
+    // No-op when the compute family aliases graphics. Cost is negligible for buffers
+    // (no framebuffer compression to lose), unlike images.
+    // `hostRead`: the CPU READS this mapping (a readback staging target). Without
+    // it a host-visible buffer is allocated write-combined, where reads run at
+    // ~230 MB/s — a 21 MB tree readback spent 92 ms in its memcpy, against 3 ms
+    // of actual GPU wait. HOST_ACCESS_RANDOM asks VMA for CACHED memory instead.
+    void Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage, bool gpuOnly = false,
+                bool computeShared = false, bool hostRead = false);
 
     /** VMA allocation handle (диагностика размещения: vmaGetAllocationMemoryProperties). */
     VmaAllocation GetAllocation() const { return m_Allocation; }

@@ -7,6 +7,8 @@
 
 // xrRenderVulkan — tonemap / exposure composite pass. See vk_pass_tonemap.h.
 #include "stdafx.h"
+#include "vk_descriptors.h"       // VK::DescriptorWriter
+#include "vk_rendering.h"     // VK::RenderingBuilder
 #include "vk_pass_tonemap.h"
 
 // Editor viewport state (CRender_Vulkan.cpp) — 0 objects means an EMPTY viewport, the only
@@ -21,6 +23,7 @@ namespace VKEditor { int HostModelCount(); }
 #include "vk_shaders.h"            // g_ShaderManager
 #include "vk_pipeline_cache.h"     // PipelineCache::GetCacheObject
 #include "vk_barriers.h"           // ImageBarrier
+#include "vk_framegraph.h"         // g_FrameGraph — keep the swapchain layout entry honest
 #include "vk_profiler.h"           // VK::Prof::NameSet — TEMP VUID-hunt instrumentation
 #include "vk_env_light.h"          // EnvLight set (set 1) — rain map/VP + camera terms for SSR puddles
 #include "vk_vsm.h"                // VSM::MaskReady — dyn-shadow red debug overlay (set 1 binding 14)
@@ -173,33 +176,11 @@ bool Init()
     // 3 = scene depth (SSR puddles), 4 = integrated volumetrics (sampler3D),
     // 5 = SSIL indirect light (half-res), 6 = RESOLVED base colour (display res; the DLSS
     // upscaled output when upscaling, else the render-res scene). All FS.
-    VkDescriptorSetLayoutBinding b[7]{};
-    for (u32 i = 0; i < 7; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo lci{};
-    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 7; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_SetLayout) != VK_SUCCESS) {
-        Msg("![VK Tonemap] set layout failed"); return false;
-    }
-
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxImages * 7 };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = kMaxImages; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_Pool) != VK_SUCCESS) {
-        Msg("![VK Tonemap] pool failed"); return false;
-    }
-    VkDescriptorSetLayout layouts[kMaxImages];
-    for (u32 i = 0; i < kMaxImages; ++i) layouts[i] = s_SetLayout;
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = s_Pool; dai.descriptorSetCount = kMaxImages; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_Set) != VK_SUCCESS) {
-        Msg("![VK Tonemap] alloc sets failed"); return false;
-    }
+    constexpr auto kTex = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    if (!VK::MakeDescriptorSets({ kTex, kTex, kTex, kTex, kTex, kTex, kTex }, kMaxImages,
+                                s_SetLayout, s_Pool, s_Set,
+                                VK_SHADER_STAGE_FRAGMENT_BIT, "Tonemap"))
+        return false;
     for (u32 i = 0; i < kMaxImages; ++i) VK::Prof::NameSet(s_Set[i], "Tonemap.Set");   // TEMP diag: VUID hunt
 
     VkSamplerCreateInfo si{};
@@ -382,16 +363,11 @@ void Pass_TonemapComposite(FrameContext& ctx)
             if (ii[5].imageView == VK_NULL_HANDLE) { ii[5].sampler = s_Sampler; ii[5].imageView = SceneColor::GetSampleView(i); } // SSIL off/not-ready (never sampled: p5.z 0)
             // Write each valid binding by explicit index — binding 4 (3D volume)
             // exists from Vol::Init (eager); the others can transiently be null.
-            VkWriteDescriptorSet w[7]{};
-            u32 wc = 0;
-            for (u32 k = 0; k < 7; ++k) {
-                if (ii[k].imageView == VK_NULL_HANDLE) continue;
-                w[wc].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                w[wc].dstSet = s_Set[i]; w[wc].dstBinding = k; w[wc].descriptorCount = 1;
-                w[wc].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[wc].pImageInfo = &ii[k];
-                ++wc;
-            }
-            vkUpdateDescriptorSets(VulkanHW.m_Device, wc, w, 0, nullptr);
+            VK::DescriptorWriter dw(s_Set[i]);
+            for (u32 k = 0; k < 7; ++k)
+                if (ii[k].imageView != VK_NULL_HANDLE)
+                    dw.Image(k, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ii[k]);
+            dw.Flush();
         }
         s_boundGen        = gen;
         s_boundBloomGen   = bloomGen;
@@ -406,33 +382,41 @@ void Pass_TonemapComposite(FrameContext& ctx)
     // (Depth was already transitioned to SHADER_READ above, before the SSIL gather.)
 
     // Swapchain image: UNDEFINED (untouched this frame) → COLOR_ATTACHMENT for the composite.
+    // The UNDEFINED source is DELIBERATE, not sloppiness: the composite overwrites
+    // every pixel (loadOp DONT_CARE below), so discarding the previous contents in
+    // the transition is both legal and cheaper than preserving them. Kept as a
+    // hand-placed barrier for that reason — Require() would preserve.
+    // ⚠srcStage MUST be COLOR_ATTACHMENT_OUTPUT, not the TOP_OF_PIPE the UNDEFINED
+    // layout derives to. This image is the one vkAcquireNextImageKHR hands us, and the
+    // submit waits its semaphore at COLOR_ATTACHMENT_OUTPUT (vk_command_buffer.cpp).
+    // A layout transition is a WRITE; with srcStage=TOP_OF_PIPE nothing orders that
+    // write after the acquire, so it may run while the presentation engine still owns
+    // the image. Sync validation caught it as SYNC-HAZARD-WRITE-AFTER-READ at
+    // vkQueueSubmit ("previously accessed by vkAcquireNextImageKHR", 16-08) — core
+    // validation cannot see this class of bug at all, which is why it stood for months.
     ImageBarrier(cmd, Swapchain.m_Images[idx],
-                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = Swapchain.m_ImageViews[idx];
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;   // fullscreen overwrite
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+    // ...but the frame graph has to be TOLD, or it still believes PRESENT_SRC and
+    // the UI pass after us re-transitions from a layout the image left. A tracker
+    // that is only half-informed is worse than none: it states wrong things
+    // confidently. Seed records without emitting.
+    g_FrameGraph.Track(Swapchain.m_Images[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED)
+        .Seed(Swapchain.m_Images[idx], VK_IMAGE_ASPECT_COLOR_BIT,
+              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
     // Composite renders at DISPLAY resolution (the swapchain image). When DLSS
     // upscales, ctx.extent is the smaller render res — the base colour comes from the
     // display-res DLSS output (binding 6); the render-res effects (bloom/depth/SSIL/
     // vol) are sampled with normalised UVs, so they upsample bilinearly.
     const VkExtent2D outExt = ctx.displayExtent;
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = outExt;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{ 0.f, 0.f, (float)outExt.width, (float)outExt.height, 0.f, 1.f };
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {0,0}, outExt };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    VK::RenderingBuilder(outExt)
+        .Color(Swapchain.m_ImageViews[idx], VK_ATTACHMENT_LOAD_OP_DONT_CARE)   // fullscreen overwrite
+        .BeginPlain(cmd);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_PipelineLayout, 0, 1, &s_Set[idx], 0, nullptr);

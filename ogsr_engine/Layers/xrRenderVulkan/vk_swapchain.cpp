@@ -9,6 +9,7 @@
 #include "vk_swapchain.h"
 #include "HW_Vulkan.h"
 #include "vk_profiler.h"   // VK::Prof::DumpCheckpoints — GPU-hang post-mortem
+#include "vk_framegraph.h" // VK::g_FrameGraph.Forget — drop layout entries on recreate
 
 // Глобальный экземпляр
 CVulkanSwapchain Swapchain;
@@ -64,6 +65,17 @@ VkPresentModeKHR CVulkanSwapchain::ChoosePresentMode(const std::vector<VkPresent
     if (noVsync && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
         Msg("[Vulkan] Using IMMEDIATE present mode (-no_vsync — uncapped, may tear)");
         return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+
+    // ⭐rs_v_sync — the options-screen checkbox. It was bound to a psDeviceFlags
+    // bit that no line of Vulkan code read: the present mode came from the launch
+    // params and nothing else, so the box toggled and the frame pacing did not.
+    // The launch params stay ABOVE it on purpose — they are a deliberate override
+    // for a capture session and should not be argued with by a saved config.
+    // Needs `vid_restart`; the swapchain owns the present mode.
+    if (psDeviceFlags.test(rsVSync)) {
+        Msg("[Vulkan] Using FIFO present mode (vsync — rs_v_sync on)");
+        return VK_PRESENT_MODE_FIFO_KHR;  // guaranteed available by the spec
     }
 
     // NB (DLSS-G): the FG plugin reports "VSync with FG: not supported" — Frame
@@ -239,6 +251,16 @@ void CVulkanSwapchain::Destroy()
         vkDestroyImageView(VulkanHW.m_Device, imageView, nullptr);
     }
     m_ImageViews.clear();
+
+    // Drop the frame graph's layout entry for every image BEFORE the swapchain
+    // (and with it the images) goes away. MANDATORY, not tidiness: the driver
+    // hands out the same VkImage handle values for the recreated swapchain, so a
+    // surviving entry would tell the next frame that a brand-new image is already
+    // in PRESENT_SRC — and the transition that should have happened would be
+    // skipped. Resize is exactly when that bites.
+    for (auto image : m_Images) {
+        if (image != VK_NULL_HANDLE) VK::g_FrameGraph.Forget(image);
+    }
 
     // Уничтожаем swapchain
     if (m_Swapchain != VK_NULL_HANDLE) {

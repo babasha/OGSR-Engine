@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // GPU-driven world forward culling. One invocation per cullable ENTRY — a whole
 // static mesh or, when r_cluster split it, one ~128-tri cluster of it (the shader
 // doesn't distinguish; a cluster is just a small mesh) — sphere vs the camera's
@@ -10,19 +11,8 @@
 // per-entry group index (no per-group dispatch).
 layout(local_size_x = 256) in;
 
-// Meta = one cullable entry (whole mesh OR one cluster of its LOD DAG, 80 B).
-// lodSelf/lodParent (xyz centre, w radius) + selfError/parentError drive the
-// DAG-cut selection: draw iff projected selfError <= threshold < projected
-// parentError. Siblings share the exact values their parent tests as self →
-// the whole group flips atomically (crack-free). Plain meshes: self 0 / parent INF.
-struct Meta {
-    vec4 sphere;        // cull sphere (frustum)
-    vec4 lodSelf;       // birth-group sphere (self LOD test)
-    vec4 lodParent;     // parent-group sphere (parent LOD test)
-    uint indexCount; uint ibFirst; uint firstVertex; uint group;
-    float selfError; float parentError; uint flags; uint _p1;   // flags bit0 = hard cut (alpha-tested material)
-};
-struct Cmd  { uint indexCount; uint instanceCount; uint firstIndex; int vertexOffset; uint firstInstance; };
+#include "cluster_meta.glsl"   // struct Meta — matches VK::WorldGPU::GpuMeshMeta
+#include "draw_cmd.glsl"       // struct Cmd — matches VkDrawIndexedIndirectCommand
 
 layout(set = 0, binding = 0) readonly buffer Metas  { Meta metas[]; };
 layout(set = 0, binding = 1)          buffer Cmds   { Cmd  cmds[];  };
@@ -52,18 +42,8 @@ layout(push_constant) uniform PC {
     uint _pad;
 } pc;
 
-// Projected error / threshold: <= 1 means this LOD is fine at this distance.
-// VIEW-Z, not Euclidean distance: perspective projection divides by view depth,
-// and Euclidean distance overshoots it toward the screen edges (by 1/cos of the
-// off-axis angle) — which picked coarser LODs exactly where perspective STRETCHES
-// geometry. UE's Nanite uses view-Z for the same reason. Monotonicity across the
-// DAG is preserved: the parent sphere contains the child sphere, so
-// viewZ(parent)-rP <= viewZ(child)-rC still holds (containment bounds the dot).
-float projErr(vec4 s, float e)
-{
-    float d = max(pc.lodParams.y, dot(pc.viewDir.xyz, s.xyz - pc.cameraPos.xyz) - s.w);
-    return e * pc.lodParams.x / d;
-}
+#include "world_cull_common.glsl"   // projErr + emitDrawCmd — the prepass and color culls MUST agree
+
 
 void main()
 {
@@ -143,12 +123,5 @@ void main()
 
     atomicOr(touched[m._p1 >> 5u], 1u << (m._p1 & 31u));   // page LRU feedback
 
-    uint g    = m.group;
-    uint o    = atomicAdd(counts[g], 1u);
-    uint base = groupBase[g];
-    cmds[base + o].indexCount    = m.indexCount;
-    cmds[base + o].instanceCount = 1u;
-    cmds[base + o].firstIndex    = pageSlotBase[2u * m._p1] + m.ibFirst;   // page-local -> pool offset
-    cmds[base + o].vertexOffset  = int(pageSlotBase[2u * m._p1 + 1u] + m.firstVertex);   // + page VB base (slice 2)
-    cmds[base + o].firstInstance = l | (fA << 20) | (fB << 26);   // entry id (20b) + crossfade fades
+    emitDrawCmd(m, l, fA, fB);
 }

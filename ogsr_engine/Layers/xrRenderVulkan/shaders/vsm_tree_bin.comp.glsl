@@ -18,11 +18,9 @@ layout(local_size_x = 64) in;
 
 struct TreeMeta { vec3 sphere_P; float sphere_R; uint index_count, ib_first, first_vertex, pad; };
 layout(set = 0, binding = 0) readonly buffer Meta { TreeMeta meta[]; };
-layout(set = 0, binding = 1) uniform VsmParams {
-    mat4 view;
-    vec4 level[VSM_LEVELS];   // xy = level origin (light XY), z = extent (m)
-    vec4 zparams;
-} vsm;
+#define VSM_PARAMS_SET     0
+#define VSM_PARAMS_BINDING 1
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 layout(set = 0, binding = 2) readonly buffer PageTable  { uint pageTable[]; };   // virtual page -> slot / UNMAPPED (static or dyn table per mode)
 layout(set = 0, binding = 3) buffer CasterPages { uint casterPages[]; };         // shared ARENA: (treeIdx<<13)|slot; cursor = stats[6] (static+dyn dispatches share it)
 layout(set = 0, binding = 4) buffer Indirect    { uint indirect[]; };            // 5 u32 per tree (per-mode buffer); firstInstance = arena base
@@ -97,14 +95,7 @@ void main()
     uint cnt = 0u;
     if (pass)
     for (int L = 0; L < VSM_LEVELS; ++L) {
-        vec2  origin = vsm.level[L].xy;
-        float pw     = vsm.level[L].z / float(VSM_PAGES_AXIS);
-        vec2  lo = (lp - vec2(R) - origin) / pw;
-        vec2  hi = (lp + vec2(R) - origin) / pw;
-        if (hi.x < 0.0 || hi.y < 0.0 || lo.x >= float(VSM_PAGES_AXIS) || lo.y >= float(VSM_PAGES_AXIS))
-            continue;
-        ivec2 p0 = clamp(ivec2(floor(lo)), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));
-        ivec2 p1 = clamp(ivec2(floor(hi)), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));
+        VSM_PAGE_RANGE(L, lp, R, lo, hi, p0, p1);
         for (int py = p0.y; py <= p1.y; ++py)
         for (int px = p0.x; px <= p1.x; ++px)
             if (acceptPage(L, ivec2(px, py), lo, hi, nearestD, true) != VSM_UNMAPPED) ++cnt;
@@ -122,14 +113,7 @@ void main()
             inst = min(cnt, pc.arenaSlots - abase);
             uint w = 0u;
             for (int L = 0; L < VSM_LEVELS; ++L) {
-                vec2  origin = vsm.level[L].xy;
-                float pw     = vsm.level[L].z / float(VSM_PAGES_AXIS);
-                vec2  lo = (lp - vec2(R) - origin) / pw;
-                vec2  hi = (lp + vec2(R) - origin) / pw;
-                if (hi.x < 0.0 || hi.y < 0.0 || lo.x >= float(VSM_PAGES_AXIS) || lo.y >= float(VSM_PAGES_AXIS))
-                    continue;
-                ivec2 p0 = clamp(ivec2(floor(lo)), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));
-                ivec2 p1 = clamp(ivec2(floor(hi)), ivec2(0), ivec2(VSM_PAGES_AXIS - 1));
+                VSM_PAGE_RANGE(L, lp, R, lo, hi, p0, p1);
                 for (int py = p0.y; py <= p1.y; ++py)
                 for (int px = p0.x; px <= p1.x; ++px) {
                     uint slot = acceptPage(L, ivec2(px, py), lo, hi, nearestD, false);

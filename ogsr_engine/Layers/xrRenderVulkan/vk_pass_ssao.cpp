@@ -7,6 +7,7 @@
 
 // xrRenderVulkan — GTAO pass. See vk_pass_ssao.h.
 #include "stdafx.h"
+#include "vk_descriptors.h"       // VK::DescriptorWriter
 #include "vk_pass_ssao.h"
 #include "vk_swapchain.h"          // Swapchain.m_DepthView (prepass depth)
 #include "vk_shaders.h"            // g_ShaderManager
@@ -348,35 +349,13 @@ bool Init()
     // 5 = motion vectors, 6 = AO history, 7 = IL history (blur temporal only).
     // Each pipeline statically uses a subset; the others' stale layout during a
     // draw is legal (all bindings are written each frame).
-    constexpr u32 kBindings = 8;
-    VkDescriptorSetLayoutBinding b[kBindings]{};
-    for (u32 i = 0; i < kBindings; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo slci{};
-    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = kBindings; slci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
-        s_failed = true; return false;
-    }
-
+    constexpr auto kTex = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     const u32 nSets = kFramesInFlight * 2;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets * kBindings };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) {
-        s_failed = true; return false;
-    }
     {
-        VkDescriptorSetLayout layouts[kFramesInFlight * 2];
-        for (u32 i = 0; i < nSets; ++i) layouts[i] = s_setLayout;
         VkDescriptorSet sets[kFramesInFlight * 2]{};
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = s_pool; dai.descriptorSetCount = nSets; dai.pSetLayouts = layouts;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, sets) != VK_SUCCESS) {
+        if (!VK::MakeDescriptorSets({ kTex, kTex, kTex, kTex, kTex, kTex, kTex, kTex }, nSets,
+                                    s_setLayout, s_pool, sets,
+                                    VK_SHADER_STAGE_FRAGMENT_BIT, "SSAO")) {
             s_failed = true; return false;
         }
         for (u32 i = 0; i < kFramesInFlight; ++i) {
@@ -452,16 +431,13 @@ void Execute(VkCommandBuffer cmd, VkExtent2D sceneExtent)
         VkDescriptorImageInfo aoHistI{ s_sampLin,  s_aoHistView,          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo ilHistI{ s_sampLin,  s_ilHistView,          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         // gtao uses 0,2,3; blur uses 0,1,4,5,6,7 — write all 8 to both sets so none is stale.
-        const VkDescriptorImageInfo* src[8] = { &depthI, &rawI, &normI, &prevI, &ilrawI, &mvI, &aoHistI, &ilHistI };
-        VkWriteDescriptorSet w[16]{};
-        for (u32 i = 0; i < 16; ++i) {
-            const u32 bi = i % 8;
-            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = (i < 8) ? s_setGtao[slot] : s_setBlur[slot];
-            w[i].dstBinding = bi; w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = src[bi];
+        const VkDescriptorImageInfo src[8] = { depthI, rawI, normI, prevI, ilrawI, mvI, aoHistI, ilHistI };
+        for (VkDescriptorSet set : { s_setGtao[slot], s_setBlur[slot] }) {
+            VK::DescriptorWriter dw(set);
+            for (u32 b = 0; b < 8; ++b)
+                dw.Image(b, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, src[b]);
+            dw.Flush();
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 16, w, 0, nullptr);
     }
 
     // First use after (re)create: clear the prev-colour history to black so the

@@ -77,6 +77,7 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\xrRender\xrVertexDeclTypes.h" />
     <ClInclude Include="..\..\Include\xrRender\DebugRender.h" />
     <ClInclude Include="..\..\Include\xrRender\DrawUtils.h" />
     <ClInclude Include="..\..\Include\xrRender\RenderDeviceRender.h" />
@@ -93,6 +94,7 @@
     <ClInclude Include="vk_command_buffer.h" />
     <ClInclude Include="vk_compute_util.h" />
     <ClInclude Include="vk_core.h" />
+    <ClInclude Include="vk_gfx_pipeline.h" />
     <ClInclude Include="vk_image.h" />
     <ClInclude Include="vk_swapchain.h" />
     <ClInclude Include="vk_sync.h" />
@@ -106,6 +108,7 @@
     <ClInclude Include="vk_ModelPool.h" />
     <ClInclude Include="vk_FBasicVisual.h" />
     <ClInclude Include="vk_pass_context.h" />
+    <ClInclude Include="vk_rendering.h" />
     <ClInclude Include="vk_cull.h" />
     <ClInclude Include="vk_exposure.h" />
     <ClInclude Include="vk_fullscreen.h" />
@@ -118,6 +121,9 @@
     <ClInclude Include="vk_shadow.h" />
     <ClInclude Include="vk_pass_shadow.h" />
     <ClInclude Include="vk_pass_lightcones.h" />
+    <ClInclude Include="vk_pass_water.h" />
+    <ClInclude Include="vk_water_ripple.h" />
+    <ClInclude Include="vk_water_fft.h" />
     <ClInclude Include="vk_pass_sky.h" />
     <ClInclude Include="vk_scene_color.h" />
     <ClInclude Include="vk_pass_tonemap.h" />
@@ -127,6 +133,7 @@
     <ClInclude Include="vk_dlss.h" />
     <ClInclude Include="vk_sl.h" />
     <ClInclude Include="vk_gpu_particles.h" />
+    <ClInclude Include="vk_parallel.h" />
     <ClInclude Include="vk_pipeline_cache.h" />
     <ClInclude Include="vk_render_queue.h" />
     <ClInclude Include="vk_world_material.h" />
@@ -179,11 +186,11 @@
     <ClCompile Include="vk_compute_util.cpp" />
     <ClCompile Include="vk_console_min.cpp" />
     <ClCompile Include="vk_core.cpp" />
+    <ClCompile Include="vk_gfx_pipeline.cpp" />
     <ClCompile Include="vk_image.cpp" />
     <ClCompile Include="vk_descriptors.cpp" />
     <ClCompile Include="vk_fullscreen.cpp" />
     <ClCompile Include="vk_DynamicStream.cpp" />
-    <ClCompile Include="vk_pipeline.cpp" />
     <ClCompile Include="vk_ring_allocator.cpp" />
     <ClCompile Include="vk_shader.cpp" />
     <ClCompile Include="vk_shaders.cpp" />
@@ -219,6 +226,9 @@
     <ClCompile Include="vk_shadow.cpp" />
     <ClCompile Include="vk_pass_shadow.cpp" />
     <ClCompile Include="vk_pass_lightcones.cpp" />
+    <ClCompile Include="vk_pass_water.cpp" />
+    <ClCompile Include="vk_water_ripple.cpp" />
+    <ClCompile Include="vk_water_fft.cpp" />
     <ClCompile Include="vk_pipeline_cache.cpp" />
     <ClCompile Include="vk_render_queue.cpp" />
     <ClCompile Include="vk_world_material.cpp" />

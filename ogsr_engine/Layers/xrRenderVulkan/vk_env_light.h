@@ -157,8 +157,23 @@ struct LightUBO {
     // strength (r_bump), y = debug view (r_bump_debug), z = gloss scale feeding the
     // IBL roughness (r_gloss_scale), w reserved. Appended last (prefix-safe).
     float bump_params[4];
+    // SHORE WETNESS (binding 32). Water that has TOUCHED a surface leaves it dark
+    // and glossy, and it dries afterwards — every wet surface in this renderer used
+    // to be wet because of rain and nothing else. x/y = world XZ of the tile's
+    // texel (0,0), z = 1/tile size in metres, w = strength (0 = off).
+    // Appended last (prefix-safe).
+    float shorewet[4];
+    // LEVEL WATER MAP (binding 33). xy = world XZ of texel (0,0), z = 1/size in
+    // metres, w = the dry sentinel. Makes wetness a fact about the WORLD instead
+    // of about how close the player got. Appended last (prefix-safe).
+    float waterlvl[4];
+    // SWASH FOAM on bared ground. x = strength (r_wtr_foam_land), y = the exponent
+    // that reads a two-second foam clock out of the wetness map's own decay
+    // (= r_wtr_wet_dry / foam life — see shoreFoam in shore_wet.glsl), z = time in
+    // seconds for the drift, w reserved. Appended last (prefix-safe).
+    float shorefoam[4];
 };
-static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16 + 64 + 64 * Lights::kMaxShadowSpots + 64 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
+static_assert(sizeof(LightUBO) == 128 + 16 + 48 * kMaxGpuLights + 80 + 64 + 64 + 48 + 16 + 16 + 80 + 112 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 * 256 + 64 + 16 + 16 + 64 + 64 * Lights::kMaxShadowSpots + 64 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16 + 16,
               "LightUBO must match the GLSL Lighting block");
 // Per-field offset guards. The size-only assert above still passes if two equal-
 // sized fields are swapped; these pin the layout at structural anchors and across
@@ -176,7 +191,13 @@ static_assert(offsetof(LightUBO, deform_stamps)  - offsetof(LightUBO, deform_cou
 bool                  Init();                 // idempotent; safe to call from multiple pass inits
 void                  Destroy();
 VkDescriptorSetLayout GetSetLayout();          // the shared set layout (binding 0 = UBO, FRAGMENT)
-void                  Update(u32 slot);        // fill slot's UBO from env; remember it as the current set
+// Fill slot's UBO from env; remember it as the current set.
+// `cmd` (optional) is the frame's command buffer and must be OUTSIDE any dynamic-
+// rendering scope: given one, Update also records the sky-probe prefilter refresh
+// (IBL::Update) into it. Call sites that cannot promise that pass nothing — the probe
+// then keeps last frame's content. See vk_ibl.h for why this is no longer a blocking
+// immediate submit.
+void                  Update(u32 slot, VkCommandBuffer cmd = VK_NULL_HANDLE);
 VkDescriptorSet       GetCurrentSet();         // set chosen by the last Update() this frame
 const float*          TerrainChOff();          // per-level SSFX channel depth offsets (terrain_details.ltx), float[4]
 // Sun direction for anything that DRAWS the sun (sky disc, volumetric sun beam).

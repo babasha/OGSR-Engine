@@ -18,10 +18,12 @@
 #include "vk_world_material.h"   // WorldMaterialCache::FrameTick — retired-set recycling
 #include "vk_UIPipeline.h"
 #include "vk_pass_world.h"
+#include "vk_render_queue.h"   // g_RenderQueue (its glass/water lists are reset in Calculate)
 #include "vk_pass_sky.h"
 #include "vk_pass_snow.h"
 #include "vk_scene_color.h"     // HDR scene target (passes render here, then tonemap)
 #include "vk_shaders.h"         // g_ShaderManager (SPIRV loader) — editor overlay lines (Spike 2)
+#include "vk_gfx_pipeline.h"    // VK::GfxPipelineBuilder
 #include "vk_pass_context.h"    // VK::BeginOverlayRendering — editor overlay pass (Spike 2)
 #include "vk_motionvec.h"       // screen-space motion vectors + r_mv_debug overlay
 #include "vk_dlss.h"            // VK::Dlss — DLSS Super Resolution (DLAA) upscale before tonemap
@@ -31,8 +33,10 @@ extern u32 ps_r_dlss;           // r_dlss — master toggle (latched OFF here on
 extern int ps_r_dlss_sl;        // r_dlss_sl — route the SR evaluate through Streamline (FG prerequisite)
 extern int ps_r_dlss_fg;        // r_dlss_fg — Stage C: DLSS Frame Generation (MFG)
 extern int ps_r_dlss_fg_mult;   // r_dlss_fg_mult — frame multiplier 2..6
+extern float ps_r_render_scale; // r_render_scale — internal resolution / display resolution when DLSS is not upscaling
 #include "vk_pass_tonemap.h"    // Pass_TonemapComposite — HDR → swapchain
 #include "vk_pass_registry.h"   // VK::RegisterPass / ExecutePasses — framegraph seam
+#include "vk_pipeline_cache.h"  // PrewarmPending — the precache countdown asks whether the warm-up still needs frames
 #include "vk_framegraph.h"      // VK::g_FrameGraph — frame-wide resource-state tracker
 #include "vk_async.h"           // VK::Async — async compute (cross-queue) foundation
 #include "vk_profiler.h"        // VK::Prof — GPU/CPU zones, debug labels, VRAM
@@ -50,8 +54,10 @@ extern int ps_r_dlss_fg_mult;   // r_dlss_fg_mult — frame multiplier 2..6
 #include "vk_wallmarks.h"        // VK::Wallmarks — bullet holes / decals on level geometry
 #include "vk_rain.h"             // VK::Pass_Rain — rain drops/splashes + thunderbolt
 #include "vk_pass_shadow.h"      // VK::Pass_SunShadow (sun shadow caster, before World)
+#include "vk_volumetrics.h"      // VK::Vol::SnapshotShadows (async fog shadow source)
 #include "vk_pass_skinned.h"     // VK::Skinned_PreSkin (compute pre-skinning, before every consumer)
 #include "vk_pass_lightcones.h"  // VK::Pass_LightCones (per-light volumetric beams)
+#include "vk_pass_water.h"       // VK::Pass_Water (level water bodies)
 #include "vk_light.h"            // VK::vkLight (dynamic point/spot lights, STEP 3)
 #include "vk_instance_gpu.h"     // VK::InstanceGPU (host scene → GPU-driven instanced casters)
 #include "../../xrCDB/ISpatial.h"      // g_SpatialSpace, ISpatial, STYPE_RENDERABLE (dynamic collection)
@@ -62,6 +68,8 @@ extern int ps_r_dlss_fg_mult;   // r_dlss_fg_mult — frame multiplier 2..6
 #include "../../xr_3da/PS_instance.h"  // CPS_Instance::PerformFrame (tick particle simulation)
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent (VKEditor readiness gate — same as Pass_Sky)
 #include <mutex>                       // per-object hemi cache guard (add_Visual)
+#include <cstdlib>                     // std::getenv — XROS_AUTO_SHOT unattended capture
+#include "../../xr_3da/XR_IOConsole.h"  // Console->Execute — XROS_AUTO_SHOT_CMDS sweep
 
 CRender RImplementation;
 
@@ -198,6 +206,14 @@ static void ScreenshotRecord(VkCommandBuffer cmd, VkImage src, VkExtent2D extent
     barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_PIPELINE_STAGE_2_COPY_BIT,         VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+    // The round-trip lands back on PRESENT_SRC, so the tracked LAYOUT is still
+    // right — but the stage/access it went through are not the ones the registry
+    // recorded at End(). Tell it, for the same reason the tonemap does: a tracker
+    // is only worth having while it is never quietly behind.
+    VK::g_FrameGraph.Track(src, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED)
+        .Seed(src, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+              VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT);
 
     g_pendingShot.width  = width;
     g_pendingShot.height = height;
@@ -603,58 +619,18 @@ static void EnsureInit()
     plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_Layout);
 
-    VkVertexInputBindingDescription vibd{ 0, sizeof(LineVertex), VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription via[2] = {
-        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 },
-        { 1, 0, VK_FORMAT_R8G8B8A8_UNORM,  12 },
-    };
-    VkPipelineVertexInputStateCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-
-    VkPipelineShaderStageCreateInfo ss[2]{};
-    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{}; vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_FALSE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable = VK_TRUE;
-    ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; ba.colorBlendOp = VK_BLEND_OP_ADD;
-    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;       ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;       ba.alphaBlendOp = VK_BLEND_OP_ADD;
-    VkPipelineColorBlendStateCreateInfo cb{}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{}; dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkFormat colorFmt = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{}; prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt; prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-
-    VkGraphicsPipelineCreateInfo pi{}; pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_Layout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &s_Pipe) != VK_SUCCESS) {
-        Msg("![VK EditorOverlay] pipeline create failed"); return;
-    }
+    s_Pipe = VK::GfxPipelineBuilder(s_Layout)
+        .Vert(vs).Frag(fs)
+        .Binding(0, sizeof(LineVertex))
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Attr(1, 0, VK_FORMAT_R8G8B8A8_UNORM,  12)
+        .Topology(VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
+        .Depth(true, false)
+        .Color(VK::SceneColor::Format()).BlendAlpha()
+        .DepthTarget(Swapchain.m_DepthFormat)
+        .Build("EditorOverlay lines");
+    if (s_Pipe == VK_NULL_HANDLE)
+        return;
 
     VkBufferCreateInfo bci{}; bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = VkDeviceSize(MAX_VERTS) * sizeof(LineVertex);
@@ -702,47 +678,16 @@ static void EnsureInitSwap()
     VkShaderModule fs = g_ShaderManager->Load("editor_line.frag.spv");
     if (vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE) return;
 
-    VkVertexInputBindingDescription vibd{ 0, sizeof(LineVertex), VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription via[2] = {
-        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 },
-        { 1, 0, VK_FORMAT_R8G8B8A8_UNORM,  12 },
-    };
-    VkPipelineVertexInputStateCreateInfo vi{}; vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-
-    VkPipelineShaderStageCreateInfo ss[2]{};
-    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    VkPipelineViewportStateCreateInfo vp{}; vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO; vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;  // no depth
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable = VK_TRUE;
-    ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; ba.colorBlendOp = VK_BLEND_OP_ADD;
-    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;       ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;       ba.alphaBlendOp = VK_BLEND_OP_ADD;
-    VkPipelineColorBlendStateCreateInfo cb{}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO; cb.attachmentCount = 1; cb.pAttachments = &ba;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{}; dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO; dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkFormat colorFmt = Swapchain.m_Format;   // final LDR swapchain (B8G8R8A8_UNORM)
-    VkPipelineRenderingCreateInfo prci{}; prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt; prci.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
-
-    VkGraphicsPipelineCreateInfo pi{}; pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_Layout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &s_PipeSwap) != VK_SUCCESS)
-        Msg("![VK EditorOverlay] swapchain pipeline create failed");
-    else
+    // Same as s_Pipe but no depth at all, into the final LDR swapchain image.
+    s_PipeSwap = VK::GfxPipelineBuilder(s_Layout)
+        .Vert(vs).Frag(fs)
+        .Binding(0, sizeof(LineVertex))
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Attr(1, 0, VK_FORMAT_R8G8B8A8_UNORM,  12)
+        .Topology(VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
+        .Color(Swapchain.m_Format).BlendAlpha()   // B8G8R8A8_UNORM
+        .Build("EditorOverlay lines (swapchain)");
+    if (s_PipeSwap != VK_NULL_HANDLE)
         Msg("[VK EditorOverlay] post-tonemap (swapchain) pipeline OK");
 }
 
@@ -756,16 +701,7 @@ void ExecutePostTonemap(VkCommandBuffer cmd, VkImageView colorView, VkExtent2D e
     u32 n = (u32)s_Lines.size(); if (n > MAX_VERTS) n = MAX_VERTS;
     memcpy(s_VBMap, s_Lines.data(), size_t(n) * sizeof(LineVertex));
 
-    VkRenderingAttachmentInfo cAtt{}; cAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView = colorView; cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo ri{}; ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent = extent; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &cAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{}; vp.x = 0.f; vp.y = float(extent.height); vp.width = float(extent.width); vp.height = -float(extent.height); vp.minDepth = 0.f; vp.maxDepth = 1.f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {}, extent }; vkCmdSetScissor(cmd, 0, 1, &sc);
+    VK::RenderingBuilder(extent).Color(colorView).BeginFlipped(cmd);
 
     // Flat grey backdrop, direct LDR — matches the original SDK editor's
     // scene_clear_color 0x555555. Done here (post-tonemap) because the HDR clear
@@ -1397,33 +1333,13 @@ void ClearTargets(VK::FrameContext& ctx)
 {
     if (!s_active || ctx.cmd == VK_NULL_HANDLE || ctx.colorView == VK_NULL_HANDLE) return;
 
-    VkClearValue cc{}; cc.color = { { 0.044f, 0.044f, 0.044f, 1.0f } }; // → tonemaps to the SDK grey 0x555555 (85,85,85) once fog is off (see vk_pass_tonemap editor gate)
-    VkClearValue cd{}; cd.depthStencil = { 1.0f, 0 };
-
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    cAtt.clearValue  = cc;
-
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView   = ctx.depthView;
-    dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    dAtt.clearValue  = cd;
-
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = ctx.depthView ? &dAtt : nullptr;
-    vkCmdBeginRendering(ctx.cmd, &ri);
+    // 0.044 → tonemaps to the SDK grey 0x555555 (85,85,85) once fog is off (see
+    // the vk_pass_tonemap editor gate). A null depthView leaves the scope
+    // depth-less, exactly as before.
+    VK::RenderingBuilder(ctx.extent)
+        .ColorClear(ctx.colorView, VkClearColorValue{ { 0.044f, 0.044f, 0.044f, 1.0f } })
+        .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_CLEAR)
+        .Begin(ctx.cmd);
     vkCmdEndRendering(ctx.cmd);
 }
 
@@ -1449,6 +1365,17 @@ void CRender::Calculate()
     // renderable_Render(), which calls back into add_Visual({visual, xform}).
     VK::g_DynamicVisuals.clear();
     VK::g_HudVisuals.clear();
+
+    // The late-glass and water lists live ACROSS the frame that builds them (the
+    // particles pass re-draws glass into the distortion RT), so somebody has to
+    // drop them at the START of the next one. That used to be Pass_World -- which
+    // returns early when no level is loaded, while Pass_WorldGlass has no such
+    // guard. Result: after a level unload the main menu flushed a list of RAW
+    // pointers to deleted visuals, every frame, and the fault was swallowed by
+    // CMainMenu's catch(...) (xrGame is built without /EH). Calculate() runs on
+    // every frame with or without a level, so the lifetime is now owned here.
+    VK::g_RenderQueue.ClearGlass();
+    VK::g_RenderQueue.ClearWater();
 
     // SPIKE 1 (editor-on-Vulkan): with -vk_spike, inject one .ogf. In-level it is
     // placed in front of the camera; then normal collection runs so the world
@@ -1530,7 +1457,15 @@ void CRender::Render()
         VK::RegisterPass("PreSkin", [](VK::FrameContext& c) { VK::Skinned_PreSkin(c.cmd); });
         // Sun shadow caster FIRST: renders static world depth from the sun POV into
         // the shadow map (own depth target), leaves it SHADER_READ for the receivers.
-        VK::RegisterPass("SunShadow", [](VK::FrameContext& c) { VK::Pass_SunShadow(c); });
+        VK::RegisterPass("SunShadow", [](VK::FrameContext& c) {
+            VK::Pass_SunShadow(c);
+            // Async compute (r_async): the fog inject records onto the COMPUTE queue,
+            // where sampling these cascades would race the graphics queue rewriting
+            // them next frame. Take the downscaled snapshot the inject reads instead,
+            // here — the one point where the cascades are complete and still in
+            // SHADER_READ. No-op with r_async off.
+            VK::Vol::SnapshotShadows(c.cmd);
+        });
         VK::RegisterPass("World", [](VK::FrameContext& c) { VK::Pass_World(c); });
         // PHASE B (editor-on-Vulkan, chunk 2): with -vk_editor Pass_World returns early
         // (no level) so add_Visual'd models aren't drawn. Draw them here — into the same
@@ -1578,6 +1513,11 @@ void CRender::Render()
         // Per-light volumetric cones: real raymarched beams for the volumetric
         // spots (headlights/searchlights/pole lamps) — replaces the R4
         // lightplanes texture-sheet fakes. Additive over the lit scene.
+        // WATER bodies — after the whole opaque world AND the sky (both are the
+        // "bottom" the surface blends over: a pond reflects the sky and shows the
+        // riverbed through itself), before glass/particles/rain, which composite
+        // on top of it. See vk_pass_water.h.
+        VK::RegisterPass("Water", [](VK::FrameContext& c) { VK::Pass_Water(c); });
         VK::RegisterPass("LightCones", [](VK::FrameContext& c) { VK::Pass_LightCones(c); });
         // Translucent GLASS panes — late flush AFTER the whole opaque world + sky
         // (they blend without z-write; anything drawn after them behind the pane
@@ -1655,6 +1595,18 @@ void CRender::Render()
         // SL route: sl.dlss owns the NGX feature — the raw EnsureFeature would build
         // a SECOND tensor set (the mid-game-enable OOM crash, 22:51 log).
         const bool useSL = ps_r_dlss_sl && VK::SL::SuperResAvailable();
+        // Streamline can only be brought up BEFORE the Vulkan device exists, so it is
+        // decided at startup from user.ltx (HW_Vulkan.cpp Step 0). Flipping r_dlss_sl
+        // mid-run therefore silently does nothing — say so instead of pretending.
+        if (ps_r_dlss_sl && !VK::SL::Inited()) {
+            static bool s_saidNoSL = false;
+            if (!s_saidNoSL) {
+                s_saidNoSL = true;
+                Msg("![VK DLSS] r_dlss_sl 1 but Streamline was NOT initialised this run — it must init "
+                    "before the Vulkan device is created. Put `r_dlss_sl 1` in user.ltx (or pass "
+                    "-force_sl) and RESTART; raw NGX stays active meanwhile.");
+            }
+        }
         if (scImg != VK_NULL_HANDLE && mvImg != VK_NULL_HANDLE &&
             (useSL ? VK::Dlss::EnsureFeatureSL(rext.width, rext.height, dext.width, dext.height)
                    : VK::Dlss::EnsureFeature(cmd, rext.width, rext.height, dext.width, dext.height,
@@ -1663,11 +1615,25 @@ void CRender::Render()
             VK::Dlss::EnsureOutput(dext.width, dext.height);
             const int zd = VK::Prof::ZoneBegin(cmd, "DLSS");
 
-            // Inputs → SHADER_READ (Evaluate's contract). SceneColor mip0:
-            // COLOR_ATTACHMENT→SHADER_READ; depth: DEPTH_ATTACHMENT→SHADER_READ.
-            VK::ImageBarrier(cmd, scImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            // Discard the temporal history on a discontinuity the motion vectors
+            // cannot describe (eval-chain gap / level load / teleport). Called ONCE
+            // per evaluated frame — it rolls the detector's own camera+frame state.
+            const bool histReset = VK::Dlss::TakeHistoryReset();
+
+            // INPUT LAYOUTS. The two routes want different ones, so pick here and
+            // restore symmetrically after the eval:
+            //   raw NGX  — GENERAL (what NGX requires; go straight there from the
+            //              attachment layout, 2 transitions instead of 4);
+            //   sl.dlss  — SHADER_READ, because EvaluateSR TAGS its resources with
+            //              that layout (vk_sl.cpp MakeRes) and SL trusts the tag.
+            // MV already sits in SHADER_READ from its producing pass.
+            const VkImageLayout inLayout = useSL ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                 : VK_IMAGE_LAYOUT_GENERAL;
+            VK::ImageBarrier(cmd, scImg, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, inLayout);
             VK::ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                         inLayout, VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (!useSL)
+                VK::ImageBarrier(cmd, mvImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
 
             // Stage B (r_dlss_sl): route the SR evaluate through Streamline's sl.dlss
             // instead of raw NGX — same inputs/output/barriers, prerequisite for FG.
@@ -1689,7 +1655,14 @@ void CRender::Render()
                     VK::SL::DebugTick();   // r_dlss_fg_debug: verify FG generating + Reflex live
                 }
                 // Output → GENERAL (fully overwritten; raw path does this inside Evaluate).
-                VK::ImageBarrier(cmd, VK::Dlss::OutputImage(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                // Explicit stage/access for the same reason as the raw path: sl.dlss ends
+                // up in the same NGX snippet, which CLEARS this image as well as computing
+                // into it, and the layout-derived compute-only pair does not cover that.
+                VK::ImageBarrier(cmd, VK::Dlss::OutputImage(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 float jpx = 0.f, jpy = 0.f;
                 VK::Dlss::GetJitterPix(jpx, jpy);
                 VK::SL::SrImg c{ scImg, scView, VK::SceneColor::Format(), rext.width, rext.height };
@@ -1697,14 +1670,14 @@ void CRender::Render()
                 VK::SL::SrImg m{ mvImg, mvView, VK::MotionVec::Format(), rext.width, rext.height };
                 VK::SL::SrImg o{ VK::Dlss::OutputImage(), VK::Dlss::OutputView(), VK::Dlss::OutputFormat(), dext.width, dext.height };
                 evalOk = slProbe && VK::SL::EvaluateSR(cmd, c, d, m, o, VK::MotionVec::CurVP(), VK::MotionVec::PrevVP(),
-                                                      jpx, jpy, /*reset=*/false);
+                                                      jpx, jpy, histReset);
             } else {
                 VK::Dlss::Img c{ scView, scImg, VK::SceneColor::Format() };
                 VK::Dlss::Img d{ Swapchain.m_DepthView, Swapchain.m_DepthImage, Swapchain.m_DepthFormat };
                 VK::Dlss::Img m{ mvView, mvImg, VK::MotionVec::Format() };
-                VK::Dlss::Evaluate(cmd, c, d, m, rext.width, rext.height, /*reset=*/false);
+                VK::Dlss::Evaluate(cmd, c, d, m, rext.width, rext.height, histReset);
             }
-            // Evaluate leaves inputs SHADER_READ and the output GENERAL.
+            // Both routes leave the inputs in `inLayout` and the output in GENERAL.
 
             // Gate the tonemap on the ACTUAL resolve — a failed SL evaluate leaves the
             // output undefined (was: solid blue screen), so until it succeeds the
@@ -1737,12 +1710,24 @@ void CRender::Render()
             // DlssOutput (display res) → SHADER_READ so the tonemap samples it as the
             // base colour. SceneColor → COLOR_ATTACHMENT again so GenerateMips (avg-lum
             // + bloom source) runs on the render-res scene. Depth → DEPTH_ATTACHMENT
-            // for the tonemap's own DEPTH→SHADER_READ barrier.
+            // for the tonemap's own DEPTH→SHADER_READ barrier. MV back to SHADER_READ
+            // for the r_mv_debug overlay. Each undoes exactly the `inLayout` hop above.
             VkImage outImg = VK::Dlss::OutputImage();
-            VK::ImageBarrier(cmd, outImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            VK::ImageBarrier(cmd, scImg,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            VK::ImageBarrier(cmd, Swapchain.m_DepthImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            // ⚠Explicit src, mirroring the pre-evaluate barrier: the LAST write to this
+            // image is not the compute the GENERAL layout implies — sync validation names
+            // it outright, `vkCmdClearColorImage[DLSS::nv.ngx.dlss.Evaluate]`. NGX clears
+            // the output inside its own evaluate, so a src of COMPUTE/STORAGE_WRITE alone
+            // leaves this transition racing that clear (151 hits in one run, 16-08).
+            VK::ImageBarrier(cmd, outImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            VK::ImageBarrier(cmd, scImg,  inLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            VK::ImageBarrier(cmd, Swapchain.m_DepthImage, inLayout,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (!useSL)
+                VK::ImageBarrier(cmd, mvImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             VK::Prof::ZoneEnd(cmd, zd);
         }
     }
@@ -1773,6 +1758,24 @@ void CRender::Render()
     // unless r_mv_debug is set. Verifies the MV reconstruction before any DLSS.
     VK::MotionVec::DrawDebugOverlay(g_FrameCtx.cmd, Swapchain.m_ImageViews[g_FrameCtx.imageIndex], g_FrameCtx.displayExtent);
     VK::Prof::FrameEnd(g_FrameCtx.cmd);
+
+    // ⚠⚠From here on the UI may open its own pass; BEFORE this point it must not,
+    // and that is not tidiness -- it is the 18-08 crash.
+    //
+    // 📏The order in a menu-over-a-level frame, from the ui_pass_trace log:
+    //   seqRender pri 1..3 (the cursor) draws  -> UI pass OPENS
+    //   seqRender pri 5    CMainMenu::OnRender -> Render->Render() lands INSIDE it
+    // and the scene's first acts are vkCmdResetQueryPool and image barriers, which
+    // are all illegal inside a rendering instance. The validation layer says so
+    // six ways; the driver then faults in vkCmdEndRendering with no pass active,
+    // 100% of the time, on ESC from a loaded level.
+    // ⭐The UI has a queue for exactly this ("deferred", replayed by End on top of
+    // the finished image) -- it just was not being used, because the immediate
+    // path only checked whether a command buffer existed, never whether the frame
+    // was at a point where drawing was legal.
+    // ⚠Raised at the END of the scene rather than at Begin: the flag is what makes
+    // the cursor of an early seqRender member queue instead of fault.
+    VulkanUI::s_SceneDone = true;
 }
 void CRender::AfterWorldRender() { VK_STUB_ONCE("CRender"); }
 void CRender::AfterUIRender()    { VK_STUB_ONCE("CRender"); }
@@ -1813,14 +1816,35 @@ void CRender::Begin()
     // PHASE B — editor viewport: lazily register the no-menu sink once ready.
     VKEditor::Tick();
     VK::Prof::CpuPhaseScope _cpu(VK::Prof::CPU_BEGIN);   // [VK CPUphase] fence wait + acquire
+    // ⚠⚠A frame that fails here must ALSO disown the UI command buffer, and that
+    // was the hole: g_VkUI_FrameCmd is only cleared at the bottom of End(), which
+    // an invalid frame never reaches -- so it kept pointing at the PREVIOUS
+    // frame's already-submitted buffer. The UI does not skip drawing when the
+    // scene does (CMainMenu::OnRender and CHUDManager::RenderUI run either way),
+    // so it took the IMMEDIATE path (cmd non-null) and recorded vkCmdBeginRendering
+    // into a buffer the GPU already owns. s_bUIPassActive then stuck true, so the
+    // NEXT real frame refused to open a pass and recorded every UI draw outside
+    // one -- vkCmdEndRendering with no pass active, and the driver faults.
+    //
+    // 📏Found 18-08 as a 100% crash on ESC from a loaded level with the new RmlUi
+    // menu (CRender::End -> VulkanUI::EndUIPass, ACCESS_VIOLATION inside the
+    // driver). The validation layer names both halves in one frame:
+    // "vkCmdBeginRendering(): ... inside an active render pass instance" at the
+    // top, then eleven "vkCmdDraw(): must be issued inside an active render pass".
+    // ⭐With the cmd cleared, UI draws take the deferred path -- they queue into
+    // the mapped ring and get dropped by ReplayDeferredUI, which is the right
+    // answer for a frame nobody is going to present.
+    // ⚠The same comment three screens down (in Render()) describes this exact
+    // hazard for the SCENE and was written before the UI shared the buffer.
     if (!Swapchain.ShouldRender() || g_bDeviceLost) {
         g_FrameInFlight.valid = false;
+        g_VkUI_FrameCmd = VK_NULL_HANDLE;
         return;
     }
 
     const u32 frame = CommandManager.GetCurrentFrame();
-    if (!Sync.WaitForFence(frame)) { g_FrameInFlight.valid = false; return; }
-    if (!Sync.ResetFence(frame))   { g_FrameInFlight.valid = false; return; }
+    if (!Sync.WaitForFence(frame)) { g_FrameInFlight.valid = false; g_VkUI_FrameCmd = VK_NULL_HANDLE; return; }
+    if (!Sync.ResetFence(frame))   { g_FrameInFlight.valid = false; g_VkUI_FrameCmd = VK_NULL_HANDLE; return; }
 
     // Texture streamer tick — BEFORE this frame's command buffer opens: the frame
     // fence just proved slot N-3 done, so (a) the feedback readback slot is safe to
@@ -1837,12 +1861,13 @@ void CRender::Begin()
     g_FrameInFlight.imageIndex = Swapchain.AcquireNextImage(sync.imageAvailable);
     if (g_FrameInFlight.imageIndex == UINT32_MAX) {
         g_FrameInFlight.valid = false;
+        g_VkUI_FrameCmd = VK_NULL_HANDLE; // see the note above the fence waits
         return;
     }
 
     g_FrameInFlight.cmd   = CommandManager.Begin();
     g_FrameInFlight.valid = (g_FrameInFlight.cmd != VK_NULL_HANDLE);
-    if (!g_FrameInFlight.valid) return;
+    if (!g_FrameInFlight.valid) { g_VkUI_FrameCmd = VK_NULL_HANDLE; return; }
 
     // Texture-streaming GPU feedback resolve: copy LAST frame's per-texture
     // desired-LOD buffer into this slot's host region, then refill it with
@@ -1874,9 +1899,25 @@ void CRender::Begin()
     // DLSS. When not upscaling, renderExtent == the swapchain extent → identical to
     // before. NGX gives the recommended render dims for the r_dlss_quality preset.
     VkExtent2D renderExtent = Swapchain.m_Extent;
-    if (VK::Dlss::Upscaling() && VK::MotionVec::Enabled())
+    const char* extentOwner = "native";
+    if (VK::Dlss::Upscaling() && VK::MotionVec::Enabled()) {
         VK::Dlss::GetRenderExtent(Swapchain.m_Extent.width, Swapchain.m_Extent.height,
                                   renderExtent.width, renderExtent.height);
+        extentOwner = "DLSS quality";
+    }
+    else if (ps_r_render_scale < 0.999f) {
+        // ⭐r_render_scale — the same render<display path DLSS drives, offered as
+        // a plain knob for the machines DLSS cannot serve (and for anyone who
+        // wants it off). No new machinery: every scene pass already sizes itself
+        // from renderExtent, and the tonemap composites at displayExtent while
+        // sampling the smaller buffers with normalised UVs.
+        // ⚠Even dimensions — half-res passes (bloom, SSAO) derive their extent by
+        // halving this one, and an odd width there costs a column of pixels.
+        const float s = _max(0.5f, ps_r_render_scale);
+        renderExtent.width  = _max(64u, u32(float(Swapchain.m_Extent.width)  * s + 0.5f)) & ~1u;
+        renderExtent.height = _max(64u, u32(float(Swapchain.m_Extent.height) * s + 0.5f)) & ~1u;
+        extentOwner = "r_render_scale";
+    }
 
     // A render-resolution change resizes SHARED scene targets — the scene depth is a
     // single image across frames-in-flight — so wait the GPU idle before recreating.
@@ -1885,6 +1926,13 @@ void CRender::Begin()
     if (renderExtent.width != s_lastRenderExtent.width || renderExtent.height != s_lastRenderExtent.height) {
         vkDeviceWaitIdle(VulkanHW.m_Device);
         s_lastRenderExtent = renderExtent;
+        // ⭐One line, and it is the ONLY evidence a settings change had an effect
+        // on the resolution the scene is actually drawn at. DLSS logs its own
+        // extent inside GetRenderExtent; r_render_scale had nothing, so a run
+        // could not tell "the slider moved" from "the slider did something".
+        Msg("[VK] render extent %ux%u -> display %ux%u, set by %s",
+            renderExtent.width, renderExtent.height,
+            Swapchain.m_Extent.width, Swapchain.m_Extent.height, extentOwner);
     }
     Swapchain.ResizeDepth(renderExtent);   // scene depth follows the render resolution
 
@@ -2002,10 +2050,11 @@ void CRender::Begin()
         Device.mFullTransform_hud.mulA_44(Tj);    // same sub-pixel shift for the HUD FOV
     }
 
-    // Async compute (r_async): submit this frame's compute work to the dedicated
-    // compute queue (v1 = inert probe). The graphics Submit() in End() adds a wait
-    // on its timeline. No-op when r_async 0 or no dedicated compute family.
-    VK::Async::FrameSubmit(frame);
+    // Async compute (r_async): latch this frame's in-flight slot and the graphics
+    // timeline point the compute batch orders against. The work itself is recorded
+    // later, by whichever pass owns it (Pass_World records the fog inject), and the
+    // graphics Submit() in End() adds the wait on its timeline.
+    VK::Async::FrameBegin(frame);
 }
 
 void CRender::Clear()
@@ -2035,13 +2084,106 @@ void CRender::End()
 
     VkImage image = Swapchain.m_Images[g_FrameInFlight.imageIndex];
 
-    // Single-layout convention: the image has been in COLOR_ATTACHMENT since
-    // Begin (scene passes + UI no longer transition it). Bring it home to
-    // PRESENT exactly once. ScreenshotRecord below round-trips PRESENT↔TRANSFER_SRC
-    // on its own, so it still works from here.
-    VK::ImageBarrier(g_FrameInFlight.cmd, image,
-                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // Bring the image home to PRESENT exactly once. This used to assert a fixed
+    // COLOR_ATTACHMENT source ("in COLOR_ATTACHMENT since Begin") — which is only
+    // true on frames where the tonemap or the UI actually touched it; a frame that
+    // drew neither transitioned FROM a layout the image was never in. Asking the
+    // registry instead makes the source whatever it really is, and correctly emits
+    // NOTHING when the image is already in PRESENT_SRC (untouched frame).
+    // ScreenshotRecord below round-trips PRESENT↔TRANSFER_SRC on its own.
+    VK::g_FrameGraph.Track(image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED)
+        .Require(g_FrameInFlight.cmd, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                 VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
     Swapchain.m_bRenderedThisFrame = false;
+
+    // UNATTENDED CAPTURE (XROS_AUTO_SHOT). A scripted run has no keyboard, so
+    // the only way it could ever look at what it built was the console channel —
+    // and when that channel is unavailable the run is blind. This is the same
+    // idea as XROS_CLIENT_CONSOLE, one level lower and with no dependencies:
+    //   XROS_AUTO_SHOT=<dir\prefix>    write <prefix>NNN.tga
+    //   XROS_AUTO_SHOT_AT=120,240,…    at these frame numbers (default 120)
+    //   XROS_AUTO_SHOT_CMDS=a|b|c      console command run 1 frame BEFORE each
+    //                                  capture, so one run can sweep debug views
+    // Frames are counted from the first frame WITH A LEVEL (b_loaded), so the
+    // capture lands at the same point in the scene regardless of how long the
+    // load screen or the intro took on this machine.
+    {
+        static bool  s_autoInit = false;
+        static char  s_autoPrefix[512] = {};
+        static char  s_autoCmds[1024]  = {};
+        // 32, not 8: an A/B sweep needs many alternations so scene drift averages
+        // out between the paired samples — 8 points is barely three pairs.
+        static u32   s_autoAt[32] = {};
+        static u32   s_autoN      = 0;
+        static u32   s_autoDone   = 0;
+        static u32   s_autoFrame  = 0;
+        static bool  s_autoArmed  = false;   // command for shot N already issued
+        if (!s_autoInit) {
+            s_autoInit = true;
+            if (const char* p = std::getenv("XROS_AUTO_SHOT")) {
+                xr_strcpy(s_autoPrefix, p);
+                if (const char* c = std::getenv("XROS_AUTO_SHOT_CMDS")) xr_strcpy(s_autoCmds, c);
+                const char* at = std::getenv("XROS_AUTO_SHOT_AT");
+                if (at && at[0]) {
+                    u32 v = 0; bool any = false;
+                    for (const char* c = at; ; ++c) {
+                        if (*c >= '0' && *c <= '9') { v = v * 10 + u32(*c - '0'); any = true; }
+                        else { if (any && s_autoN < 32) s_autoAt[s_autoN++] = v; v = 0; any = false; if (!*c) break; }
+                    }
+                }
+                if (!s_autoN) { s_autoAt[0] = 120; s_autoN = 1; }
+                Msg("[VK AutoShot] armed: prefix='%s', %u capture point(s), cmds='%s'",
+                    s_autoPrefix, s_autoN, s_autoCmds);
+            }
+        }
+        // A loaded save parks on the level's "press any key" screen, which does
+        // Device.Pause(bTimer=TRUE). That freezes the GLOBAL CLOCK — which is
+        // also why the XROS_CLIENT_CONSOLE channel goes deaf there (it polls on
+        // dwTimeGlobal) — while frames keep rendering the backdrop. Injected key
+        // events do not reach the game's DirectInput, so an unattended run can
+        // never get past it. Do exactly what CGamePersistent::OnKeyboardPress
+        // does, ~300 frames in so the scripts have settled (starting the level
+        // INSTANTLY, via keypress_on_start off, makes the mod's scripts throw).
+        if (s_autoPrefix[0] && b_loaded && load_screen_renderer.b_registered) {
+            static u32 s_autoWait = 0;
+            if (++s_autoWait > 300) {
+                Msg("[VK AutoShot] dismissing the start autopause (unattended run)");
+                Device.Pause(FALSE, TRUE, TRUE, "AUTOSHOT_START");
+                load_screen_renderer.stop();
+            }
+        }
+        // Count only frames the game actually runs: while it is paused nothing
+        // in the scene advances, so counted frames would photograph a freeze.
+        if (s_autoPrefix[0] && b_loaded && !Device.Paused()) {
+            ++s_autoFrame;
+            if (s_autoDone < s_autoN) {
+                // One frame early: run this capture's console command so the
+                // cvar is already in effect for the frame that gets captured.
+                if (!s_autoArmed && s_autoFrame + 1 >= s_autoAt[s_autoDone]) {
+                    s_autoArmed = true;
+                    if (s_autoCmds[0] && Console) {
+                        // pick the s_autoDone-th '|'-separated command
+                        const char* c = s_autoCmds; u32 idx = 0;
+                        while (idx < s_autoDone && *c) { if (*c == '|') ++idx; ++c; }
+                        if (*c) {
+                            string256 one; u32 k = 0;
+                            while (*c && *c != '|' && k < sizeof(one) - 1) one[k++] = *c++;
+                            one[k] = 0;
+                            if (one[0]) { Msg("[VK AutoShot] cmd: %s", one); Console->Execute(one); }
+                        }
+                    }
+                }
+                if (s_autoFrame >= s_autoAt[s_autoDone] && g_PendingScreenshotPath.empty()) {
+                    string_path fn;
+                    xr_sprintf(fn, "%s%03u.tga", s_autoPrefix, s_autoDone);
+                    g_PendingScreenshotPath = fn;
+                    Msg("[VK AutoShot] level-frame %u -> %s", s_autoFrame, fn);
+                    ++s_autoDone;
+                    s_autoArmed = false;
+                }
+            }
+        }
+    }
 
     // F12 / `screenshot` console cmd → record CopyImageToBuffer into this
     // frame's cmd buffer.
@@ -2090,6 +2232,12 @@ void CRender::End()
 }
 
 void CRender::ClearTarget() {}
+
+// The only per-frame warm-up a level load owes the renderer: the weather-variant
+// pipeline prewarm, deliberately spread one compile per frame because a cold uber-FS
+// takes ~300 ms. While its queue holds keys the precache frames are earning their
+// cost; once it is dry they are 40 ms of GPU each for a screen nobody sees.
+bool CRender::PrecacheWarmupPending() { return VK::PipelineCache::PrewarmPending(); }
 
 // ----- Cached transforms ----------------------------------------------------
 void CRender::SetCacheXform(Fmatrix&, Fmatrix&)    {}

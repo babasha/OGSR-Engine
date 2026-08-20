@@ -11,6 +11,7 @@
 // descriptor sets. No rendering yet — Session B adds compute cull + draw.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_TreeManager.h"
 #include "vk_Visual.h"
 #include "vk_material.h"
@@ -18,16 +19,22 @@
 #include "vk_texture.h"
 #include "vk_texture_stream.h"   // SetStreamable — tree-path textures opt OUT of mip streaming
 #include "vk_buffer.h"
+#include "vk_parallel.h"      // VK::ParallelChunks — the per-instance packs run on the idle cores
 #include "HW_Vulkan.h"
 #include "CRender_Vulkan.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <map>       // icosphere edge-midpoint dedup (crown-hull bake)
+#include <thread>    // per-species parallel crown bake (BuildMeshlets)
+#include <atomic>
+#include <cstdlib>   // std::getenv — XROS_LEAFWALK_FULL (recursive reference walk)
 
 // GLOBAL scope (an extern inside namespace VK would mangle as VK::* → LNK2001).
 extern int ps_r_vsm_tree_impostor;   // r_vsm_tree_impostor — parked/default 0; gates the load-time silhouette bake
 extern int ps_r_vsm_tree_hull_vox;   // r_vsm_tree_hull_vox — hull shape: 0 = PCA lobes, >0 = voxel-shell resolution (baked)
+extern int ps_r_vsm_tree_hull_debug; // r_vsm_tree_hull_debug — the ONLY consumer of the visual voxel cloud (see the upload below)
+extern int ps_r_vsm_tree_vox_cloud;  // r_vsm_tree_vox_cloud — bake the cube cloud even with the viewmode off (the old always-on behaviour)
 
 namespace VK
 {
@@ -39,31 +46,34 @@ CTreeManager::~CTreeManager() { Destroy(); }
 // Recursive extraction. Mirrors monolith's ExtractMeshesFromVisual but only
 // the tree-relevant cases — no AREF static or shadow GBuffer paths here.
 // ============================================================================
-void CTreeManager::ExtractFromVisual(::vkRender_Visual* vis, xr_vector<::vkFTreeVisual*>& outTrees, u32 source)
+void CTreeManager::ExtractFromVisual(::vkRender_Visual* vis, xr_vector<::vkFTreeVisual*>& outTrees,
+                                     xr_vector<::vkFTreeVisual*>& outFlodBacked, u32 source, bool underValidFlod)
 {
     if (!vis) return;
 
     const u32 type = vis->Type;
 
+    // static_cast, not dynamic_cast, on all three arms below: vkVisual_Create maps
+    // MT_TREE_ST/PM to vkFTreeVisual_ST/PM, MT_HIERRARHY to vkFHierrarhyVisual and
+    // MT_LOD to vkFLOD, exactly and exclusively. RTTI on every node of a 450k-visual
+    // level was measurable load time for an answer Type already gives.
     if (type == MT_TREE_ST || type == MT_TREE_PM)
     {
-        auto* tv = dynamic_cast<vkFTreeVisual*>(vis);
-        if (!tv) return;
+        auto* tv = static_cast<vkFTreeVisual*>(vis);
         if (!tv->m_mesh.p_rm_Vertices || !tv->m_mesh.p_rm_Indices) return;
         if (tv->m_mesh.dwPrimitives == 0) return;
         // Live diffuse for level statics lives in m_pWorldMaterial (the parked
         // CMaterial / m_pMaterial is a stub for the deferred path — null here).
         if (!tv->m_pWorldMaterial || tv->m_pWorldMaterial->view == VK_NULL_HANDLE) return;
         outTrees.push_back(tv);
+        if (underValidFlod) outFlodBacked.push_back(tv);
         return;
     }
 
     if (type == MT_HIERRARHY)
     {
-        auto* hv = dynamic_cast<vkFHierrarhyVisual*>(vis);
-        if (!hv) return;
-        for (auto* child : hv->children)
-            ExtractFromVisual(child, outTrees, 1);
+        for (auto* child : static_cast<vkFHierrarhyVisual*>(vis)->children)
+            ExtractFromVisual(child, outTrees, outFlodBacked, 1, underValidFlod);
         return;
     }
 
@@ -76,10 +86,14 @@ void CTreeManager::ExtractFromVisual(::vkRender_Visual* vis, xr_vector<::vkFTree
     // (Ref: r__dsgraph_build.cpp:557-562 `for (Vis : pV->children) add_leafs_static`.)
     if (type == MT_LOD)
     {
-        auto* hv = dynamic_cast<vkFHierrarhyVisual*>(vis);
-        if (!hv) return;
-        for (auto* child : hv->children)
-            ExtractFromVisual(child, outTrees, 2);
+        // Does CLODManager actually draw a billboard for THIS container? Its
+        // accept test is the authority — mirror it exactly (vk_LODManager.cpp,
+        // "Collect FLODs with valid billboard facets"). A container that fails it
+        // has no imposter, so its trees must keep their full mesh at any range.
+        auto* flod = static_cast<vkFLOD*>(vis);
+        const bool validFlod = flod->facetsValid && flod->vis.sphere.R > 0.01f;
+        for (auto* child : flod->children)
+            ExtractFromVisual(child, outTrees, outFlodBacked, 2, underValidFlod || validFlod);
         return;
     }
     // MT_NORMAL / MT_PROGRESSIVE / MT_SKELETON_*: skip (not trees).
@@ -92,6 +106,47 @@ void CTreeManager::ExtractFromVisual(::vkRender_Visual* vis, xr_vector<::vkFTree
 // with ~5 GB of tree pools alone against a 7123 MB budget.
 static bool s_UploadFailed = false;
 
+// Trees reachable THROUGH a billboard-backed FLOD. This is a relation, not a set of
+// leaves, so it is the one thing the flat pass below cannot answer on its own  but
+// only an FLOD can start it, so descending from the FLOD entries alone replaces a walk
+// of all 450k visuals with one of ~92k.
+static void MarkFlodBacked(::vkRender_Visual* v, xr_vector<::vkFTreeVisual*>& out)
+{
+    if (!v) return;
+    const u32 t = v->Type;
+    if (t == MT_TREE_ST || t == MT_TREE_PM) { out.push_back(static_cast<::vkFTreeVisual*>(v)); return; }
+    if (t == MT_HIERRARHY || t == MT_LOD)
+        for (auto* c : static_cast<::vkFHierrarhyVisual*>(v)->children) MarkFlodBacked(c, out);
+}
+
+
+// Crown alpha preload — defined next to the map it fills (see s_alphaCache), in
+// the anonymous namespace this file keeps its bake helpers in.
+namespace { void StartCrownAlphaPreload(const xr_vector<WorldMaterial*>& mats); void JoinCrownAlphaPreload(); }
+
+// Wind class by diffuse TEXTURE NAME (tree materials don't expose alphaRef, and
+// this "tree" path also carries non-foliage statics — vehicles, props, walls).
+// Only real foliage gets wind:
+//   2 = foliage (bend + flow-map flutter): under "trees\" and NOT bark/spil
+//   1 = trunk   (gentle bend only): under "trees\" bark/spil (sways with crown)
+//   0 = rigid   (no wind): everything else (veh\, prop\, mtl\, wood\, ...)
+// Per MATERIAL, not per instance: as a per-instance test it lowercased the same
+// few dozen names 193471 times.
+static u8 WindClassOf(const WorldMaterial* wm)
+{
+    auto hasKw = [](const char* s, std::initializer_list<const char*> kws) {
+        if (!s || !s[0]) return false;
+        xr_string low = s; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+        for (auto* k : kws) if (low.find(k) != xr_string::npos) return true;
+        return false;
+    };
+    const char* nm = "";
+    if (wm) { const char* n = wm->name.c_str(); if (n) nm = n; }
+    const bool underTrees = (strncmp(nm, "trees\\", 6) == 0) || (strncmp(nm, "trees/", 6) == 0);
+    if (!underTrees) return 0u;
+    return hasKw(nm, { "bark", "spil" }) ? 1u : 2u;   // trunk / cut-stump cross-section
+}
+
 // ============================================================================
 // Build — main entry point. Called from CRender::level_Load after Visuals[]
 // is populated.
@@ -102,10 +157,57 @@ void CTreeManager::Build()
     if (m_bBuilt) return;
     s_UploadFailed = false;
 
+    // Sub-timers: this pass is 1.70 s of a 21 s pripyat_full load (18-08). It walks
+    // 450k visuals, forces a texture residency floor (which can RE-LOAD textures),
+    // packs and uploads GPU arrays, builds meshlets and creates pipelines — four
+    // different fixes depending on which one owns the time. Measure first.
+    CTimer _t;
+    float msExtract, msTexFloor = 0.f, msPack = 0.f, msUpload = 0.f, msMeshlet = 0.f, msPipes = 0.f;
+
     xr_vector<vkFTreeVisual*> trees;
+    xr_vector<vkFTreeVisual*> flodBacked;   // reached through an FLOD with a real billboard
     trees.reserve(2048);
-    for (IRenderVisual* iv : RImplementation.Visuals)
-        ExtractFromVisual(static_cast<vkRender_Visual*>(iv), trees);
+    flodBacked.reserve(2048);
+    _t.Start();
+    // FLAT pass, same reasoning as WorldGPU::LeafVisuals: MT_HIERRARHY/MT_LOD children
+    // are getVisual(id) results, i.e. entries of Visuals[] themselves, so every tree
+    // visual is already a top-level entry and the old recursion only re-found them
+    // (which is exactly what its own dedup pass was cleaning up afterwards).
+    // Set XROS_LEAFWALK_FULL=1 to run the recursive reference implementation and
+    // compare the two counts in the log.
+    static const bool s_fullWalk = [] {
+        const char* e = std::getenv("XROS_LEAFWALK_FULL");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (s_fullWalk) {
+        for (IRenderVisual* iv : RImplementation.Visuals)
+            ExtractFromVisual(static_cast<vkRender_Visual*>(iv), trees, flodBacked);
+    } else {
+        for (IRenderVisual* iv : RImplementation.Visuals) {
+            auto* rv = static_cast<vkRender_Visual*>(iv);
+            if (!rv) continue;
+            if (rv->Type == MT_TREE_ST || rv->Type == MT_TREE_PM) {
+                auto* tv = static_cast<::vkFTreeVisual*>(rv);
+                if (!tv->m_mesh.p_rm_Vertices || !tv->m_mesh.p_rm_Indices) continue;
+                if (tv->m_mesh.dwPrimitives == 0) continue;
+                if (!tv->m_pWorldMaterial || tv->m_pWorldMaterial->view == VK_NULL_HANDLE) continue;
+                trees.push_back(tv);
+            }
+            else if (rv->Type == MT_LOD) {
+                // CLODManager's accept test is the authority for "this container really
+                // draws a billboard"  mirror it exactly (vk_LODManager.cpp).
+                auto* flod = static_cast<::vkFLOD*>(rv);
+                if (!flod->facetsValid || flod->vis.sphere.R <= 0.01f) continue;
+                for (auto* c : flod->children) MarkFlodBacked(c, flodBacked);
+            }
+        }
+    }
+    msExtract = _t.GetElapsed_ms_total();
+
+    // Sorted+uniqued so the per-tree lookup below is a binary search. Must happen
+    // BEFORE `trees` is re-sorted for grouping — these are independent orderings.
+    std::sort(flodBacked.begin(), flodBacked.end());
+    flodBacked.erase(std::unique(flodBacked.begin(), flodBacked.end()), flodBacked.end());
 
     // Dedup: MT_HIERRARHY/MT_LOD children are getVisual(id) REFERENCES into
     // Visuals[], so the same tree object gets collected both as a top-level
@@ -140,6 +242,11 @@ void CTreeManager::Build()
 
     // ----- Sort by (tcOffset, diffuse, vb, ib) so consecutive trees share
     // pipeline + descriptor + buffer binds.
+    // Timed: the comparator chases FOUR pointers per comparison into 193k visuals
+    // scattered across the heap, O(n log n) times. texFloor next door pays the same
+    // chase once per instance and measures 75 ms for what is a pointer compare and
+    // an array write -- so the chase, not the work, is what this phase costs.
+    _t.Start();
     std::sort(trees.begin(), trees.end(),
         [](vkFTreeVisual* a, vkFTreeVisual* b) {
             if (a->m_mesh.tcOffset != b->m_mesh.tcOffset) return a->m_mesh.tcOffset < b->m_mesh.tcOffset;
@@ -150,45 +257,126 @@ void CTreeManager::Build()
             if (av != bv) return av < bv;
             return a->m_mesh.p_rm_Indices->GetHandle() < b->m_mesh.p_rm_Indices->GetHandle();
         });
+    const float msSortTrees = _t.GetElapsed_ms_total();
 
     // ----- Collect unique diffuse views and assign per-tree desc index.
     xr_vector<VkImageView> uniqueViews;
     uniqueViews.reserve(64);
     xr_vector<u32> treeTexIdx(trees.size(), 0u);
-    for (size_t i = 0; i < trees.size(); ++i)
+    _t.Start();
+    // Everything here is per MATERIAL -- raising the residency floor, freezing the
+    // streaming state and picking the descriptor slot all belong to the material,
+    // not the instance. 193471 tree instances share 65 of them.
+    //
+    // Three passes instead of one interleaved walk, because the middle step wants
+    // the whole set at once: ApplyResidencyPlan ends in a transfer wait, so the
+    // old per-material call waited 65 times (73 ms of pure queue round trips).
+    CTimer _tf;
+    float msGather = 0, msResidency = 0;
+
+    // (1) Material pointer per tree, on the idle cores: one scattered visual each.
+    _tf.Start();
+    xr_vector<WorldMaterial*> treeMat(trees.size(), nullptr);
+    ParallelChunks((int)trees.size(), [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) treeMat[i] = trees[i]->m_pWorldMaterial;
+    });
+    // Dense material index in FIRST-APPEARANCE order — the order the view slots
+    // are handed out in, so the descriptor table comes out exactly as before.
+    xr_vector<WorldMaterial*> uniqMat; uniqMat.reserve(128);
+    xr_vector<u32> treeMatIdx(trees.size(), 0u);
     {
-        // This instanced path bakes the RAW VkImageView into its own descriptor
-        // sets for the whole level lifetime — a dynamic mip swap would retire and
-        // destroy that view under us (white/transparent trunks), and this path's
-        // FS writes no streaming feedback, so the streamer would judge these
-        // textures "invisible" and demote them while they fill the screen. So:
-        // raise anything the load-time cap crushed to a presentable 512px floor
-        // (safe: nothing captured our view yet), THEN opt out of streaming for
-        // good — the residency is frozen from here on.
-        WorldMaterial* wm = trees[i]->m_pWorldMaterial;
-        // 1024px floor: this path also carries building walls/vehicles — at the
-        // earlier 512 floor large facades still read as mush (frozen forever).
-        VK::TextureStreamer::Instance().EnsureMinResidency(wm->tex, 1024);
+        std::unordered_map<const WorldMaterial*, u32> seen;
+        const WorldMaterial* lastMat = nullptr;
+        u32 lastIdx = 0;
+        for (size_t i = 0; i < trees.size(); ++i) {
+            WorldMaterial* const wmi = treeMat[i];
+            if (wmi != lastMat) {
+                if (const auto it = seen.find(wmi); it != seen.end()) lastIdx = it->second;
+                else { lastIdx = (u32)uniqMat.size(); uniqMat.push_back(wmi); seen.emplace(wmi, lastIdx); }
+                lastMat = wmi;
+            }
+            treeMatIdx[i] = lastIdx;
+        }
+    }
+    msGather = _tf.GetElapsed_ms_total();
+
+    // The crown bake at the end of this function needs one alpha map per species.
+    // Start that load NOW, on its own thread: everything between here and the bake
+    // is texture residency, packing and uploads, none of which touch these files.
+    StartCrownAlphaPreload(uniqMat);
+
+    // (2) ONE residency order for the whole set, one wait.
+    // This instanced path bakes the RAW VkImageView into its own descriptor sets
+    // for the whole level lifetime — a dynamic mip swap would retire and destroy
+    // that view under us (white/transparent trunks), and this path's FS writes no
+    // streaming feedback, so the streamer would judge these textures "invisible"
+    // and demote them while they fill the screen. So: raise anything the load-time
+    // cap crushed to a presentable floor (safe: nothing captured our view yet),
+    // THEN opt out of streaming for good — residency is frozen from here on.
+    // 1024px floor: this path also carries building walls/vehicles — at the earlier
+    // 512 floor large facades still read as mush (frozen forever).
+    _tf.Start();
+    {
+        xr_vector<CVulkanTexture*> texs; texs.reserve(uniqMat.size());
+        for (WorldMaterial* wm : uniqMat) if (wm && wm->tex) texs.push_back(wm->tex);
+        if (!texs.empty())
+            VK::TextureStreamer::Instance().EnsureMinResidencyBatch(texs.data(), texs.size(), 1024);
+    }
+    msResidency = _tf.GetElapsed_ms_total();
+
+    // (3) Freeze + view slots + wind class, per unique material. The view is read
+    // AFTER the residency batch: that is what may have swapped it.
+    xr_vector<u32> matSlot(uniqMat.size(), 0u);
+    xr_vector<u8>  matWind(uniqMat.size(), 0u);
+    for (u32 m = 0; m < (u32)uniqMat.size(); ++m) {
+        WorldMaterial* wm = uniqMat[m];
+        if (!wm) continue;
         VK::TextureStreamer::Instance().SetStreamable(wm->tex, false);
         wm->streamID = 0xFFFFFFFFu;   // stale feedback slot must not be pushed by the world pass
 
-        VkImageView view = wm->view;
+        const VkImageView view = wm->view;
         u32 idx = ~0u;
         for (u32 j = 0; j < uniqueViews.size(); ++j)
             if (uniqueViews[j] == view) { idx = j; break; }
-        if (idx == ~0u) {
-            idx = (u32)uniqueViews.size();
-            uniqueViews.push_back(view);
-        }
-        treeTexIdx[i] = idx;
+        if (idx == ~0u) { idx = (u32)uniqueViews.size(); uniqueViews.push_back(view); }
+        matSlot[m] = idx;
+        matWind[m] = WindClassOf(wm);   // per material: the pack loop just reads it
     }
+    xr_vector<u8> treeWind(trees.size(), 0u);
+    ParallelChunks((int)trees.size(), [&](int lo, int hi) {
+        for (int i = lo; i < hi; ++i) {
+            const u32 m = treeMatIdx[i];
+            treeTexIdx[i] = matSlot[m];
+            treeWind[i]   = matWind[m];
+        }
+    });
+
+    msTexFloor = _t.GetElapsed_ms_total();
+    Msg("[load step]   Trees::texFloor: gather %.0f | residency %.0f (%u materials, %u views) | slots %.0f ms",
+        msGather, msResidency, (u32)uniqMat.size(), (u32)uniqueViews.size(),
+        msTexFloor - msGather - msResidency);
+    // Which half of that residency wait is which: rebuilding the images (DDS
+    // re-read + create + staged copy, serial on this thread) or the transfer wait.
+    Msg("[load step]   Trees::texFloor residency split: %u rebuilt | parallel read %.0f | build %.0f | flush %.0f | swap %.0f ms",
+        VK::g_lastResidencyBuilt, VK::g_lastResidencyReadMs, VK::g_lastResidencyBuildMs,
+        VK::g_lastResidencyFlushMs, VK::g_lastResidencySwapMs);
+    Msg("[load step]     of the build: read %.0f | repack %.0f | create %.0f | upload %.0f | close %.0f ms",
+        VK::g_lastResidencyOpenMs, VK::g_lastResidencyRepackMs, VK::g_lastResidencyCreateMs,
+        VK::g_lastResidencyUploadMs, VK::g_lastResidencyCloseMs);
 
     // ----- Pack per-instance + per-mesh GPU arrays.
+    _t.Start();
     m_TotalCount = (u32)trees.size();
     xr_vector<GpuTreeMeta>     meta(m_TotalCount);
     xr_vector<GpuTreeInstance> xforms(m_TotalCount);
+    m_WindClassCPU.assign(m_TotalCount, 0);
 
-    for (u32 i = 0; i < m_TotalCount; ++i)
+    // Index-independent: entry i reads its own visual and writes meta[i],
+    // xforms[i], m_WindClassCPU[i]. flodBacked/treeWind are read-only here. The
+    // cost is the pointer chase into 193k scattered visuals, which is exactly
+    // what spreads well across cores.
+    ParallelChunks((int)m_TotalCount, [&](int lo, int hi) {
+    for (u32 i = (u32)lo; i < (u32)hi; ++i)
     {
         vkFTreeVisual* t = trees[i];
         GpuTreeMeta& m   = meta[i];
@@ -197,7 +385,8 @@ void CTreeManager::Build()
         m.index_count  = t->m_mesh.dwPrimitives * 3;
         m.ib_first     = t->m_mesh.iBase;       // element offset into the IB pool
         m.first_vertex = t->m_mesh.vBase;       // element offset into the VB pool
-        m._pad         = 0;
+        m.flags        = std::binary_search(flodBacked.begin(), flodBacked.end(), t)
+                       ? TREE_FLOD_BACKED : 0u;
 
         // Progressive trees (MT_TREE_PM): draw the finest sliding window sw[0]
         // (== R4 select_lod_id at closest range), NOT the full container. The
@@ -219,28 +408,23 @@ void CTreeManager::Build()
         x.xform        = t->xform;
         x.c_scale_hemi = t->c_scale.hemi;
         x.c_bias_hemi  = t->c_bias.hemi;
-        // Wind class by diffuse TEXTURE NAME (tree materials don't expose alphaRef,
-        // and this "tree" path also carries non-foliage statics — vehicles, props,
-        // walls). Only real foliage gets wind:
-        //   2 = foliage (bend + flow-map flutter): under "trees\" and NOT bark/spil
-        //   1 = trunk   (gentle bend only): under "trees\" bark/spil (sways with crown)
-        //   0 = rigid   (no wind): everything else (veh\, prop\, mtl\, wood\, ...)
-        auto hasKw = [](const char* s, std::initializer_list<const char*> kws) {
-            if (!s || !s[0]) return false;
-            xr_string low = s; std::transform(low.begin(), low.end(), low.begin(), ::tolower);
-            for (auto* k : kws) if (low.find(k) != xr_string::npos) return true;
-            return false;
-        };
-        const char* nm = "";
-        if (t->m_pWorldMaterial) { const char* n = t->m_pWorldMaterial->name.c_str(); if (n) nm = n; }
-        const bool underTrees = (strncmp(nm, "trees\\", 6) == 0) || (strncmp(nm, "trees/", 6) == 0);
-        const bool isBark     = hasKw(nm, { "bark", "spil" });   // trunk / cut-stump cross-section
-        u32 windClass = 0u;
-        if (underTrees) windClass = isBark ? 1u : 2u;
-        x._pad0 = windClass;
+        // Wind class is the MATERIAL's (see WindClassOf) — decided once per
+        // material in the texture-floor pass above, not per instance.
+        x._pad0 = treeWind[i];
         x._pad1 = 0;
-        if (m_WindClassCPU.size() != m_TotalCount) m_WindClassCPU.assign(m_TotalCount, 0);
-        m_WindClassCPU[i] = (u8)windClass;   // hull tier gates on foliage (crowns-only)
+        m_WindClassCPU[i] = (u8)treeWind[i];   // hull tier gates on foliage (crowns-only)
+    }
+    });
+
+    // How much of the forest the r_tree_dist cut can even touch. A low share here
+    // means most trees have no billboard stand-in, so raising r_tree_dist won't
+    // help and the honest next step is a real tree LOD, not a bigger cut.
+    {
+        u32 backed = 0;
+        for (const GpuTreeMeta& m : meta) if (m.flags & TREE_FLOD_BACKED) ++backed;
+        m_FlodBackedCount = backed;
+        Msg("[VK Trees] FLOD-backed: %u of %u instances (%.1f%%) have a billboard stand-in — r_tree_dist can drop these past its range",
+            backed, m_TotalCount, m_TotalCount ? 100.0 * double(backed) / double(m_TotalCount) : 0.0);
     }
 
     // ----- Group consecutive trees with same (tcOffset, descSet, vb, ib, stride).
@@ -283,18 +467,26 @@ void CTreeManager::Build()
     }
 
 
+    msPack = _t.GetElapsed_ms_total();
+
     // ----- Upload + allocate.
+    _t.Start();
     UploadMetadata(meta);
     UploadTransforms(xforms);
+    msUpload = _t.GetElapsed_ms_total();
     // Out of VRAM: stop here rather than build pipelines around buffers that do not
     // exist. The level still loads — it just renders without trees, and the log says
     // why. Previously this path dereferenced a null buffer and took the process down.
     if (s_UploadFailed) {
+        JoinCrownAlphaPreload();   // a joinable static thread terminates at exit
         Msg("!![VK Trees] DISABLED for this level: tree buffers did not fit in VRAM "
             "(%u instances). Lower texture quality / r_bump 0, or free VRAM.", m_TotalCount);
         return;
     }
+    _t.Start();
     BuildMeshlets(trees, meta);   // Phase A: VSM meshlet-cull clusters (r_vsm_meshlet)
+    msMeshlet = _t.GetElapsed_ms_total();
+    _t.Start();
     CreateIndirectBuffers();
     CreateTextureDescriptors(uniqueViews);
     // r_vsm_tree_impostor: bake per-mesh crown silhouettes — ONLY when the (parked,
@@ -310,9 +502,12 @@ void CTreeManager::Build()
     CreateCullPipeline();
     CreateXformDescriptor();
     CreateGfxPipelines();
+    msPipes = _t.GetElapsed_ms_total();
 
     Msg("[VK Trees] Built: %u instances in %u groups, %u textures, max group %u",
         m_TotalCount, (u32)m_Groups.size(), (u32)uniqueViews.size(), m_MaxGroupMeshCount);
+    Msg("[load step]   Trees::Build: extract %.0f | sort %.0f | texFloor %.0f | pack %.0f | upload %.0f | meshlets %.0f | indirect+desc+pipes %.0f ms",
+        msExtract, msSortTrees, msTexFloor, msPack, msUpload, msMeshlet, msPipes);
 
     m_bBuilt = true;
 }
@@ -412,7 +607,8 @@ bool ReadbackRange(VkBuffer src, VkDeviceSize offset, VkDeviceSize size, xr_vect
 {
     if (src == VK_NULL_HANDLE || size == 0) return false;
     CVulkanBuffer stg;
-    stg.Create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    stg.Create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+               false, false, /*hostRead*/ true);   // cached: this mapping is READ
     VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
     if (cmd == VK_NULL_HANDLE) { stg.Destroy(); return false; }
     VkBufferCopy cp{ offset, 0, size };
@@ -425,6 +621,58 @@ bool ReadbackRange(VkBuffer src, VkDeviceSize offset, VkDeviceSize size, xr_vect
     memcpy(out.data(), p, (size_t)size);
     stg.Unmap();
     stg.Destroy();
+    return true;
+}
+
+// Batched sibling of ReadbackRange: ONE host staging buffer, ONE command buffer, ONE
+// submit+wait for the whole set. BuildMeshlets used to call ReadbackRange twice per
+// unique mesh — 568 allocate/submit/fence-wait round trips to move 21 MB, measured at
+// 256 ms of the 18-08 load. The bytes are the same; the round trips are not.
+struct RbRange { VkBuffer src; VkDeviceSize off, size; size_t dst; };
+
+bool ReadbackRanges(const xr_vector<RbRange>& rr, size_t total, xr_vector<u8>& out)
+{
+    if (rr.empty() || total == 0) return false;
+    // Split (`[load step]`): this measured 93 ms for 21 MB, which is nowhere near
+    // a copy rate — so the question is whether it is the staging allocation, the
+    // recording, or the queue round trip, and only one of those has a fix.
+    CTimer _r; _r.Start();
+    float msAlloc = 0, msRecord = 0, msWait = 0, msCopyOut = 0;
+    CVulkanBuffer stg;
+    stg.Create(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+               false, false, /*hostRead*/ true);   // cached: this mapping is READ
+    if (!stg.IsValid()) {
+        Msg("![VK Trees] batched readback: staging alloc failed (%u MB)", (u32)(total >> 20));
+        return false;
+    }
+    msAlloc = _r.GetElapsed_ms_total();
+    _r.Start();
+    VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) { stg.Destroy(); return false; }
+    // One vkCmdCopyBuffer per SOURCE buffer (a pool), N regions each — the ranges
+    // alternate VB/IB per mesh, so grouping by source is what keeps this to a handful
+    // of commands instead of one per range. Destination ranges are disjoint, so the
+    // order the groups are recorded in does not matter.
+    xr_map<VkBuffer, xr_vector<VkBufferCopy>> byBuf;
+    for (const RbRange& r : rr)
+        byBuf[r.src].push_back({ r.off, (VkDeviceSize)r.dst, r.size });
+    for (auto& kv : byBuf)
+        vkCmdCopyBuffer(cmd, kv.first, stg.GetHandle(), (u32)kv.second.size(), kv.second.data());
+    msRecord = _r.GetElapsed_ms_total();
+    _r.Start();
+    VulkanHW.EndSingleTimeCommands(cmd);   // waits (one-shot)
+    msWait = _r.GetElapsed_ms_total();
+    _r.Start();
+    stg.Invalidate();
+    void* p = stg.Map();
+    if (!p) { stg.Destroy(); return false; }
+    out.resize(total);
+    memcpy(out.data(), p, total);
+    stg.Unmap();
+    stg.Destroy();
+    msCopyOut = _r.GetElapsed_ms_total();
+    Msg("[load step]     readback split: staging alloc %.0f (%u MB) | record %.0f (%u sources) | submit+wait %.0f | map+copy %.0f ms",
+        msAlloc, (u32)(total >> 20), msRecord, (u32)byBuf.size(), msWait, msCopyOut);
     return true;
 }
 
@@ -789,6 +1037,20 @@ struct CrownAlphaMap
     }
 };
 
+// Crown alpha maps are file IO plus a BC alpha decode (68 ms for 91 species) and
+// nothing before the crown bake needs them — so the load runs on its own thread
+// from the START of Build, behind the texture-floor and pack passes, and the bake
+// joins it. It used to hide behind the meshlet readback instead, which stopped
+// being a place to hide once that readback dropped from 97 ms to 8.
+// File-static (not a member): CrownAlphaMap is local to this translation unit.
+static xr_vector<std::pair<xr_string, CrownAlphaMap>> s_alphaCache;
+static std::thread                                    s_alphaThread;
+
+void JoinCrownAlphaPreload()
+{
+    if (s_alphaThread.joinable()) s_alphaThread.join();
+}
+
 static bool LoadCrownAlphaMap(const char* texName, CrownAlphaMap& out)
 {
     if (!texName || !texName[0]) return false;
@@ -889,6 +1151,29 @@ static bool LoadCrownAlphaMap(const char* texName, CrownAlphaMap& out)
     return true;
 }
 
+// One alpha map per unique tree MATERIAL, loaded off-thread. Names are copied in
+// (the worker must not chase material pointers the main thread is rebuilding) and
+// the cache is written only here — from the join on, it is read-only, which is
+// what makes the pointers handed to the parallel crown bake stable.
+void StartCrownAlphaPreload(const xr_vector<WorldMaterial*>& mats)
+{
+    JoinCrownAlphaPreload();   // paranoia: a previous level
+    s_alphaCache.clear();
+    xr_vector<xr_string> names; names.reserve(mats.size());
+    for (WorldMaterial* wm : mats) if (wm) names.emplace_back(wm->name.c_str());
+    if (names.empty()) return;
+    s_alphaThread = std::thread([names = std::move(names)] {
+        for (const xr_string& nm : names) {
+            if (nm.empty()) continue;
+            bool have = false;
+            for (const auto& e : s_alphaCache) if (e.first == nm) { have = true; break; }
+            if (have) continue;
+            s_alphaCache.emplace_back(nm, CrownAlphaMap{});
+            LoadCrownAlphaMap(nm.c_str(), s_alphaCache.back().second);
+        }
+    });
+}
+
 // VOXEL CLOUD crown (the UE Nanite-foliage / "Witcher 4 demo" look): individual small
 // colored cubes where the leaf cards actually are — NOT a merged watertight shell.
 // The shell (BuildHullVoxels above) reads as one solid blob and is only right for the
@@ -911,11 +1196,19 @@ static bool LoadCrownAlphaMap(const char* texName, CrownAlphaMap& out)
 // 4×4×4-cell bricks with 64-bit occupancy masks (full + high-coverage core) — see
 // GpuTreeBrick. Interior (fully-enclosed) cells stay IN the masks: they can never be
 // the first hit of a ray, and the bits are free.
+// Where the bake's time goes, summed per builder thread: the rasterization that
+// fills the occupancy grid (shared by both outputs), the CUBE emission (a sweep
+// over every cell of every LOD plus a 26-neighbour crowding lookup per occupied
+// one), and the brick pass. Only the first and last feed anything the shipping
+// renderer reads.
+struct VoxProf { float raster = 0, cubes = 0, bricks = 0; };
+
 static u32 BuildVoxelCloud(const xr_vector<Fvector>& tris, const xr_vector<Fvector2>& uvs,
                            const CrownAlphaMap* am,
                            xr_vector<GpuTreeVoxel>& outVox, xr_vector<GpuTreeBrick>& outBricks,
-                           u32 voxN, float& cellOut)
+                           u32 voxN, float& cellOut, bool emitVox, VoxProf& prof)
 {
+    CTimer _vp;
     cellOut = 0.f;
     const u32 nC = (u32)tris.size();
     Fvector lo, hi;
@@ -954,6 +1247,7 @@ static u32 BuildVoxelCloud(const xr_vector<Fvector>& tris, const xr_vector<Fvect
     // the crossfade hands over to.
     constexpr u8 kARef = 160;
     const bool alphaAware = am && am->ok() && uvs.size() == tris.size();
+    _vp.Start();
     for (u32 t = 0; t + 2 < nC; t += 3) {
         const Fvector &a = tris[t], &b = tris[t + 1], &c = tris[t + 2];
         const float eab = a.distance_to(b), eac = a.distance_to(c), ebc = b.distance_to(c);
@@ -978,6 +1272,7 @@ static u32 BuildVoxelCloud(const xr_vector<Fvector>& tris, const xr_vector<Fvect
             mark(p, pass);
         }
     }
+    prof.raster += _vp.GetElapsed_ms_total();
     auto occAt = [&](int x, int y, int z) -> bool {
         if (x < 0 || y < 0 || z < 0 || x >= gx || y >= gy || z >= gz) return false;
         return occ[cellIdx(x, y, z)] != 0;
@@ -995,9 +1290,17 @@ static u32 BuildVoxelCloud(const xr_vector<Fvector>& tris, const xr_vector<Fvect
     };
     static const u8 kPick[16] = { 0,0,0,0, 1,1,1, 2,2, 3,3, 4,4, 5, 0,1 };   // weighted
 
+    // The cube cloud has exactly ONE consumer, the r_vsm_tree_hull_debug viewmode,
+    // and that viewmode needs a level reload anyway — so when it is off, do not
+    // build the cubes at all. Not just "do not upload them": this loop sweeps every
+    // cell of every LOD of every species (~85M cells on pripyat_full) and does a
+    // 26-neighbour crowding lookup plus a push_back for each of the 777k occupied
+    // ones. The occupancy grid above is what the SHADOW BRICKS need, and it is
+    // already built. r_vsm_tree_vox_cloud 1 restores the unconditional bake.
     const u32 base = (u32)outVox.size();
+    _vp.Start();
     const float invExtY = 1.f / (std::max)(ext[1], 1e-3f);
-    for (int z = 0; z < gz; ++z)
+    for (int z = 0; emitVox && z < gz; ++z)
     for (int y = 0; y < gy; ++y)
     for (int x = 0; x < gx; ++x) {
         if (!occ[cellIdx(x, y, z)]) continue;
@@ -1028,6 +1331,8 @@ static u32 BuildVoxelCloud(const xr_vector<Fvector>& tris, const xr_vector<Fvect
         vx.rgba = ch(pc[0]) | (ch(pc[1]) << 8) | (ch(pc[2]) << 16) | ((((h >> 16) & 0xF0u) | cov4) << 24);
         outVox.push_back(vx);
     }
+    prof.cubes += _vp.GetElapsed_ms_total();
+    _vp.Start();
 
     // ---- SHADOW bricks: 4×4×4 cells → one 64-bit mask (+ high-coverage core mask).
     // A brick with an empty core simply vanishes at its band swap point — that IS the
@@ -1072,6 +1377,7 @@ static u32 BuildVoxelCloud(const xr_vector<Fvector>& tris, const xr_vector<Fvect
                   return ra > rb;
               });
 
+    prof.bricks += _vp.GetElapsed_ms_total();
     cellOut = cell;
     return (u32)outVox.size() - base;
 }
@@ -1092,7 +1398,6 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
                    ibFirst == o.ibFirst && idxCount == o.idxCount && stride == o.stride;
         }
     };
-    xr_vector<MeshKey>            keys;
     xr_vector<GpuTreeMeshletRange> uniqRange;   // meshlet slice per unique mesh
     xr_vector<u32>               treeUniq(m_TotalCount, ~0u);   // tree -> unique-mesh index
 
@@ -1112,16 +1417,36 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
     // Diffuse alpha maps for the alpha-aware voxel bake, one per unique texture
     // (species share textures). The returned pointer is only valid until the next
     // lookup (vector may reallocate) — consumed within the same tree iteration.
-    xr_vector<std::pair<xr_string, CrownAlphaMap>> alphaCache;
+    // Filled by the preload thread started in Build (see s_alphaCache).
     u32 alphaSpecies = 0, blindSpecies = 0;   // diag: voxel bakes with/without texture alpha
-    auto crownAlpha = [&](const char* nm) -> const CrownAlphaMap* {
+
+    // Sub-timers (`[load step]`, printed once). This function measured 747 ms of a
+    // 19.5 s load and nobody knew which half was the CPU bake and which was the two
+    // GPU readbacks per unique mesh — each of those is a full VMA alloc + submit +
+    // fence wait. Split before fixing.
+    CTimer _p;
+    float msReadback = 0, msCluster = 0, msHullPrep = 0, msHull = 0, msVox = 0, msUp = 0;
+    VoxProf voxProf;
+    float msBakeWall = 0, msMerge = 0;
+    u64   bytesRead = 0;
+    u32   readbacks = 0, msBakeThreads = 1;
+    // Loading touches the filesystem and grows `alphaCache`, so it happens ONCE up
+    // front, serially (see the preload below). During the parallel bake the cache is
+    // read-only, which also makes the returned pointers stable — they used to be valid
+    // only until the next lookup reallocated the vector.
+    auto crownAlpha = [](const char* nm) -> const CrownAlphaMap* {
         if (!nm || !nm[0]) return nullptr;
-        for (auto& e : alphaCache) if (e.first == nm) return e.second.ok() ? &e.second : nullptr;
-        alphaCache.emplace_back(nm, CrownAlphaMap{});
-        LoadCrownAlphaMap(nm, alphaCache.back().second);
-        return alphaCache.back().second.ok() ? &alphaCache.back().second : nullptr;
+        for (const auto& e : s_alphaCache) if (e.first == nm) return e.second.ok() ? &e.second : nullptr;
+        return nullptr;
     };
 
+    // ---- Phase 1: which meshes are unique (no IO, no GPU work) ----------------
+    // Instances share a species mesh, so the bake below runs once per unique span.
+    // `firstTree` is the instance that introduced the span: its wind class, tcOffset
+    // and material are what the bake reads — exactly as when discovery and bake were
+    // one interleaved loop.
+    struct Uniq { MeshKey k; u32 firstTree; size_t vbOff, ibOff; };
+    xr_vector<Uniq> uniq; uniq.reserve(512);
     for (u32 i = 0; i < m_TotalCount; ++i)
     {
         const vkFTreeVisual* t = trees[i];
@@ -1131,23 +1456,105 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
                    t->m_mesh.vStride };
         if (k.vCount == 0 || k.idxCount < 3 || k.stride < 12) continue;
 
-        // Already meshletized?
         u32 u = ~0u;
-        for (u32 j = 0; j < keys.size(); ++j) if (keys[j] == k) { u = j; break; }
-        if (u != ~0u) { treeUniq[i] = u; continue; }
+        for (u32 j = 0; j < (u32)uniq.size(); ++j) if (uniq[j].k == k) { u = j; break; }
+        if (u == ~0u) { u = (u32)uniq.size(); uniq.push_back({ k, i, 0, 0 }); }
+        treeUniq[i] = u;
+    }
+    if (uniq.empty()) { Msg("[VK Trees] Meshlets: no eligible tree meshes"); return; }
 
-        // --- Read back this mesh's positions + indices (relative to vBase). ---
-        xr_vector<u8> vbytes, ibbytes;
-        if (!ReadbackRange(k.vb, (VkDeviceSize)k.vBase * k.stride, (VkDeviceSize)k.vCount * k.stride, vbytes)) continue;
-        if (!ReadbackRange(k.ib, (VkDeviceSize)k.ibFirst * sizeof(u16), (VkDeviceSize)k.idxCount * sizeof(u16), ibbytes)) continue;
-        const u16* idx = (const u16*)ibbytes.data();
+    // ---- Phase 2: ONE batched readback of every unique mesh's VB + IB ---------
+    xr_vector<RbRange> rr; rr.reserve(uniq.size() * 2);
+    size_t blobSize = 0;
+    auto plan = [&](VkBuffer b, VkDeviceSize off, VkDeviceSize size) -> size_t {
+        blobSize = (blobSize + 15) & ~size_t(15);   // keep vertex reads naturally aligned
+        const size_t at = blobSize;
+        rr.push_back({ b, off, size, at });
+        blobSize += (size_t)size;
+        return at;
+    };
+    for (Uniq& u : uniq) {
+        u.vbOff = plan(u.k.vb, (VkDeviceSize)u.k.vBase * u.k.stride, (VkDeviceSize)u.k.vCount * u.k.stride);
+        u.ibOff = plan(u.k.ib, (VkDeviceSize)u.k.ibFirst * sizeof(u16), (VkDeviceSize)u.k.idxCount * sizeof(u16));
+    }
+    xr_vector<u8> blob;
+
+    _p.Start();
+    const bool rbOk = ReadbackRanges(rr, blobSize, blob);
+    msReadback = _p.GetElapsed_ms_total();
+    readbacks  = (u32)rr.size();
+    bytesRead  = blobSize;
+    if (!rbOk) {
+        JoinCrownAlphaPreload();   // it writes s_alphaCache
+        // All-or-nothing by construction: a partial batch would desync the per-unique
+        // tables below (they are indexed by unique id), so bail instead of half-filling.
+        Msg("![VK Trees] meshlet/hull readback failed — VSM meshlet cull and crown hulls unavailable");
+        return;
+    }
+
+    // ---- Phase 3: bake, once per unique mesh, from the blob -------------------
+    // Collect the alpha maps started above. From here the cache is read-only, which
+    // is what makes the pointers handed to the parallel bake stable.
+    _p.Start();
+    JoinCrownAlphaPreload();
+    const float msAlpha = _p.GetElapsed_ms_total();   // what is LEFT of the preload
+
+    // Read the cvars ONCE, before the workers start: the cube cloud is baked at load
+    // and the viewmode that reads it already needs a level reload, so this cannot
+    // change under the bake.
+    const bool s_emitVoxCloud = (ps_r_vsm_tree_hull_debug > 0) || (ps_r_vsm_tree_vox_cloud > 0);
+
+    // Per-species bake outputs. Absolute offsets inside them (meshlet first_index,
+    // range base, hull ib/vb first, voxel/brick lod first) are species-local here and
+    // get rebased during the merge.
+    struct Baked {
+        xr_vector<GpuMeshlet>   meshlets;
+        xr_vector<u16>          mIndices;
+        xr_vector<Fvector>      hullVerts;
+        xr_vector<u16>          hullIdx;
+        xr_vector<GpuTreeVoxel> vox;
+        xr_vector<GpuTreeBrick> bricks;
+        GpuTreeMeshletRange     range{ 0, 0 };
+        GpuTreeHullInfo         hull{ 0, 0, 0, 0 };
+        TreeVoxLod              voxLod[CTreeManager::kHullLods]{};
+        TreeVoxLod              brickLod[CTreeManager::kHullLods]{};
+        u32   alphaHit = 0, alphaMiss = 0;
+        float msCluster = 0, msHullPrep = 0, msHull = 0, msVox = 0;
+        VoxProf voxProf;
+    };
+    xr_vector<Baked> baked(uniq.size());
+
+    // One species' bake writes ONLY into its own Baked slot, so the 284 of them are
+    // independent and run on worker threads (measured: this phase was 480 ms of CPU,
+    // ~85% of it the voxel rasterization). The merge below concatenates the slots in
+    // unique order and rebases the few absolute offsets, so the result is bit-identical
+    // to the serial version — the counts in the two summary lines are the check.
+    auto bakeOne = [&](u32 ui)
+    {
+        Baked& B = baked[ui];
+        // Aliases: the body below is unchanged from when these were the shared
+        // accumulators. Everything it appends to is now per-species.
+        xr_vector<GpuMeshlet>&   meshlets  = B.meshlets;
+        xr_vector<u16>&          mIndices  = B.mIndices;
+        xr_vector<Fvector>&      hullVerts = B.hullVerts;
+        xr_vector<u16>&          hullIdx   = B.hullIdx;
+        xr_vector<GpuTreeVoxel>& voxData   = B.vox;
+        xr_vector<GpuTreeBrick>& brickData = B.bricks;
+        CTimer _p;
+
+        const MeshKey&       k = uniq[ui].k;
+        const u32            i = uniq[ui].firstTree;
+        const vkFTreeVisual* t = trees[i];
+        const u8*  vbytes = blob.data() + uniq[ui].vbOff;
+        const u16* idx    = (const u16*)(blob.data() + uniq[ui].ibOff);
         auto pos = [&](u32 v) -> Fvector {
-            const float* f = (const float*)(vbytes.data() + (size_t)v * k.stride);
+            const float* f = (const float*)(vbytes + (size_t)v * k.stride);
             return Fvector{ f[0], f[1], f[2] };
         };
         const u32 triCount = k.idxCount / 3;
 
         // --- Per-triangle centroids + their AABB (Morton normalization box). ---
+        _p.Start();
         xr_vector<Fvector> cen(triCount);
         Fvector cmin{ FLT_MAX, FLT_MAX, FLT_MAX }, cmax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
         for (u32 tri = 0; tri < triCount; ++tri) {
@@ -1173,7 +1580,7 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
         std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return code[a] < code[b]; });
 
         // --- Slice into clusters; local sphere per cluster; emit reordered indices. ---
-        const u32 base = (u32)meshlets.size();
+        const u32 base = 0;   // rebased at merge
         for (u32 s = 0; s < triCount; s += kMeshletTris) {
             const u32 e = (std::min)(triCount, s + kMeshletTris);
             const u32 firstIndex = (u32)mIndices.size();
@@ -1198,6 +1605,7 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
             ml.first_index = firstIndex; ml.index_count = (e - s) * 3;
             meshlets.push_back(ml);
         }
+        B.msCluster = _p.GetElapsed_ms_total();
 
         // --- Crown hull: FOLIAGE meshes only (windClass 2). Trunks/props never enter the
         // hull tier (crowns-only gate in VsmUpdateNearSet), so baking them would be waste.
@@ -1205,6 +1613,7 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
         {
             // Per-vertex weight = incident triangle area: leaf cards (big quads) dominate,
             // twig strips barely register → lobes centre on the leaf TUFTS.
+            _p.Start();
             xr_vector<float> vertArea(k.vCount, 0.f);
             for (u32 tri = 0; tri < triCount; ++tri) {
                 const u16 i0 = idx[tri * 3 + 0], i1 = idx[tri * 3 + 1], i2 = idx[tri * 3 + 2];
@@ -1226,7 +1635,7 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
             const u32  tcOff = t->m_mesh.tcOffset;
             const bool hasUV = tcOff + 2 * sizeof(s16) <= k.stride;
             auto uvAt = [&](u32 v) -> Fvector2 {
-                const s16* s = (const s16*)(vbytes.data() + (size_t)v * k.stride + tcOff);
+                const s16* s = (const s16*)(vbytes + (size_t)v * k.stride + tcOff);
                 return Fvector2{ (float)s[0] / 2048.f, (float)s[1] / 2048.f };
             };
             xr_vector<Fvector>  tris;  tris.reserve((size_t)triCount * 3);
@@ -1239,7 +1648,9 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
             }
             const CrownAlphaMap* am = hasUV && t->m_pWorldMaterial
                                     ? crownAlpha(t->m_pWorldMaterial->name.c_str()) : nullptr;
-            if (ps_r_vsm_tree_hull_vox > 0) { am ? ++alphaSpecies : ++blindSpecies; }
+            if (ps_r_vsm_tree_hull_vox > 0) { am ? ++B.alphaHit : ++B.alphaMiss; }
+            B.msHullPrep = _p.GetElapsed_ms_total();
+            _p.Start();
             // SHADOW hull — one merged watertight shell at a modest resolution (depth-only
             // caster wants a cheap SOLID silhouette, not the fine visual cubes). Kept
             // deliberately close to the pre-voxel default (~12–16 cells across) no matter
@@ -1253,7 +1664,9 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
             } else {
                 hs.ib_count = BuildHullLobes(pts, wts, hullVerts, hullIdx);
             }
-            uniqHull.push_back(hs);
+            B.hull = hs;
+            B.msHull = _p.GetElapsed_ms_total();
+            _p.Start();
 
             // VISUAL voxel cloud (UE Nanite-foliage style) — kHullLods levels of individual
             // colored cubes; voxel edge DOUBLES per level (resolution halves), exactly the
@@ -1264,29 +1677,92 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
                 bl.first = (u32)brickData.size();
                 if (ps_r_vsm_tree_hull_vox > 0) {
                     const u32 voxN = (std::max)(4u, (u32)ps_r_vsm_tree_hull_vox >> l);
-                    vl.count = BuildVoxelCloud(tris, triUV, am, voxData, brickData, voxN, vl.size);
+                    vl.count = BuildVoxelCloud(tris, triUV, am, voxData, brickData, voxN, vl.size,
+                                               s_emitVoxCloud, B.voxProf);
                     bl.count = (u32)brickData.size() - bl.first;
                     bl.size  = vl.size;
                 }
-                uniqVoxLods.push_back(vl);
-                uniqBrickLods.push_back(bl);
+                B.voxLod[l] = vl;
+                B.brickLod[l] = bl;
             }
+            B.msVox = _p.GetElapsed_ms_total();
         }
-        else {
-            uniqHull.push_back(GpuTreeHullInfo{ 0, 0, 0, 0 });   // no hull → tree keeps its real mesh
-            for (u32 l = 0; l < CTreeManager::kHullLods; ++l) {
-                uniqVoxLods.push_back(TreeVoxLod{});
-                uniqBrickLods.push_back(TreeVoxLod{});
-            }
-        }
+        // else: not foliage — no hull, so B.hull / B.voxLod / B.brickLod stay zeroed,
+        // which is exactly what the old `push_back(GpuTreeHullInfo{0,0,0,0})` meant:
+        // ib_count 0 = "hull unavailable", the tree keeps its real mesh.
 
-        u = (u32)keys.size();
-        keys.push_back(k);
-        uniqRange.push_back({ base, (u32)meshlets.size() - base });
-        treeUniq[i] = u;
+        B.range = { base, (u32)meshlets.size() };
+    };
+
+    // ---- Run the bakes ------------------------------------------------------
+    _p.Start();
+    {
+        const u32 nUniq = (u32)uniq.size();
+        u32 nThr = std::thread::hardware_concurrency();
+        nThr = _min(_max(1u, nThr), 16u);
+        nThr = _min(nThr, nUniq);
+        if (nThr <= 1) {
+            for (u32 ui = 0; ui < nUniq; ++ui) bakeOne(ui);
+        } else {
+            // Dynamic hand-out, not a static split: species differ by orders of
+            // magnitude in triangle count, so equal-sized chunks would leave most
+            // threads idle behind one big crown.
+            std::atomic<u32> next{ 0 };
+            xr_vector<std::thread> pool;
+            pool.reserve(nThr);
+            for (u32 w = 0; w < nThr; ++w)
+                pool.emplace_back([&] { for (u32 ui = next++; ui < nUniq; ui = next++) bakeOne(ui); });
+            for (auto& th : pool) th.join();
+        }
+        msBakeWall = _p.GetElapsed_ms_total();
+        msBakeThreads = nThr;
     }
 
+    // ---- Merge in unique order (deterministic, independent of thread order) --
+    _p.Start();
+    for (u32 ui = 0; ui < (u32)uniq.size(); ++ui) {
+        Baked& B = baked[ui];
+        const u32 meshletBase = (u32)meshlets.size();
+        const u32 idxBase     = (u32)mIndices.size();
+        const u32 hullVBase   = (u32)hullVerts.size();
+        const u32 hullIBase   = (u32)hullIdx.size();
+        const u32 voxBase     = (u32)voxData.size();
+        const u32 brickBase   = (u32)brickData.size();
+
+        for (GpuMeshlet& m : B.meshlets) m.first_index += idxBase;
+        meshlets.insert(meshlets.end(), B.meshlets.begin(), B.meshlets.end());
+        mIndices.insert(mIndices.end(), B.mIndices.begin(), B.mIndices.end());
+        uniqRange.push_back({ B.range.base + meshletBase, B.range.count });
+
+        // Hull indices are LOCAL to the species (BuildHullLobes/BuildHullVoxels emit
+        // them relative to the vertex base they started at, which is what vb_first
+        // feeds the draw as vertexOffset) — so only the two bases move.
+        GpuTreeHullInfo h = B.hull;
+        if (h.ib_count) { h.ib_first += hullIBase; h.vb_first += hullVBase; }
+        uniqHull.push_back(h);
+        hullVerts.insert(hullVerts.end(), B.hullVerts.begin(), B.hullVerts.end());
+        hullIdx.insert(hullIdx.end(), B.hullIdx.begin(), B.hullIdx.end());
+
+        for (u32 l = 0; l < CTreeManager::kHullLods; ++l) {
+            TreeVoxLod vl = B.voxLod[l], bl = B.brickLod[l];
+            if (vl.count) vl.first += voxBase;
+            if (bl.count) bl.first += brickBase;
+            uniqVoxLods.push_back(vl);
+            uniqBrickLods.push_back(bl);
+        }
+        voxData.insert(voxData.end(), B.vox.begin(), B.vox.end());
+        brickData.insert(brickData.end(), B.bricks.begin(), B.bricks.end());
+
+        alphaSpecies += B.alphaHit; blindSpecies += B.alphaMiss;
+        msCluster += B.msCluster; msHullPrep += B.msHullPrep;
+        msHull    += B.msHull;    msVox      += B.msVox;
+        voxProf.raster += B.voxProf.raster; voxProf.cubes += B.voxProf.cubes;
+        voxProf.bricks += B.voxProf.bricks;
+    }
+    msMerge = _p.GetElapsed_ms_total();
+
     if (meshlets.empty() || mIndices.empty()) { Msg("[VK Trees] Meshlets: nothing built"); return; }
+    _p.Start();   // → msUp: per-tree table expansion + every UploadDeviceLocal below
 
     // Per-tree range (index-aligned with transforms/meta); trees with no mesh get {0,0}.
     xr_vector<GpuTreeMeshletRange> treeRange(m_TotalCount, GpuTreeMeshletRange{ 0, 0 });
@@ -1304,7 +1780,7 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
     m_MeshletIndexTotal = (u32)mIndices.size();
     m_MeshletsReady     = true;
     Msg("[VK Trees] Meshlets: %u clusters (%u tris/cluster) from %u unique meshes, %u idx (%u KB) — %u instances",
-        m_MeshletTotal, kMeshletTris, (u32)keys.size(), m_MeshletIndexTotal,
+        m_MeshletTotal, kMeshletTris, (u32)uniq.size(), m_MeshletIndexTotal,
         (u32)(m_MeshletIndexTotal * sizeof(u16) / 1024), m_TotalCount);
 
     // --- Crown-HULL upload (r_vsm_tree_hull): tight vec3 VB + u16 IB + per-tree info. ---
@@ -1330,7 +1806,17 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
         UploadDeviceLocal(m_HullInfoBuffer, treeHull.data(), treeHull.size() * sizeof(GpuTreeHullInfo), 0);
         m_HullInfoCPU = treeHull;   // shadow-shell ranges (also the debug fallback overlay)
-        m_VoxTotal = (u32)voxData.size();
+        // The VISUAL cube cloud has exactly ONE consumer — the r_vsm_tree_hull_debug
+        // viewmode (vk_TreeManager_Render.cpp, "Crown VOXEL-cloud viewmode"). Nothing
+        // in the shipping path reads m_VoxVB. Uploading it unconditionally cost ~12 MB
+        // of VRAM on this level for a view that is off by default, so it now follows
+        // the cvar. The bake itself cannot be skipped — BuildVoxelCloud emits the
+        // cubes and the SHADOW BRICKS (which the live caster path does use) in one
+        // pass — but the cubes need never reach the GPU.
+        // ⚠ Baked at load, like r_vsm_tree_hull_vox: turning the debug view on needs a
+        // level reload, not just the cvar.
+        const bool wantVoxCloud = ps_r_vsm_tree_hull_debug > 0;
+        m_VoxTotal = wantVoxCloud ? (u32)voxData.size() : 0u;
         if (m_VoxTotal)
             UploadDeviceLocal(m_VoxVB, voxData.data(), voxData.size() * sizeof(GpuTreeVoxel),
                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -1339,15 +1825,29 @@ void CTreeManager::BuildMeshlets(const xr_vector<vkFTreeVisual*>& trees,
             UploadDeviceLocal(m_BrickVB, brickData.data(), brickData.size() * sizeof(GpuTreeBrick), 0);
         m_HullLobeTotal = (u32)hullIdx.size() / 3;   // total hull triangles (shape-agnostic: lobes or voxels)
         m_HullDataReady = true;
+        if (!wantVoxCloud && !voxData.empty())
+            Msg("[VK Trees] visual voxel cloud NOT uploaded (%u cubes, %u KB saved) — r_vsm_tree_hull_debug is off; set it and reload the level to inspect crowns",
+                (u32)voxData.size(), (u32)(voxData.size() * sizeof(GpuTreeVoxel) / 1024));
         Msg("[VK Trees] Crown hulls: %s, %u tris / %u species, %u verts (%u KB); voxel cloud %u cubes + %u shadow bricks x%u LODs (%u+%u KB), alpha-aware %u/%u species — r_vsm_tree_hull ready",
             ps_r_vsm_tree_hull_vox > 0 ? "VOXEL shell" : "PCA lobes",
-            m_HullLobeTotal, (u32)keys.size(), (u32)hullVerts.size(),
+            m_HullLobeTotal, (u32)uniq.size(), (u32)hullVerts.size(),
             (u32)((hullVerts.size() * sizeof(Fvector) + hullIdx.size() * sizeof(u16)) / 1024),
             m_VoxTotal, m_BrickTotal, CTreeManager::kHullLods,
-            (u32)(voxData.size() * sizeof(GpuTreeVoxel) / 1024),
+            // m_VoxTotal, not voxData.size(): when the cloud is gated off the buffer
+            // is empty, and printing the would-be size next to "0 cubes" reads as a
+            // 12 MB allocation that does not exist.
+            (u32)((size_t)m_VoxTotal * sizeof(GpuTreeVoxel) / 1024),
             (u32)(brickData.size() * sizeof(GpuTreeBrick) / 1024),
             alphaSpecies, alphaSpecies + blindSpecies);
     }
+
+    msUp = _p.GetElapsed_ms_total();
+    Msg("[load step]   Trees::Meshlets: readback %.0f (%u ranges, 1 submit, %u MB) | alpha %.0f | bake WALL %.0f on %u threads | merge %.0f | expand+upload %.0f ms",
+        msReadback, readbacks, (u32)(bytesRead >> 20), msAlpha, msBakeWall, msBakeThreads, msMerge, msUp);
+    Msg("[load step]     bake CPU-time across threads: cluster %.0f | hullPrep %.0f | hull %.0f | vox %.0f ms (sum %.0f vs wall %.0f)",
+        msCluster, msHullPrep, msHull, msVox, msCluster + msHullPrep + msHull + msVox, msBakeWall);
+    Msg("[load step]     of the vox bake: raster %.0f | cubes %.0f (%s) | bricks %.0f ms",
+        voxProf.raster, voxProf.cubes, s_emitVoxCloud ? "emitted" : "skipped", voxProf.bricks);
 }
 
 void CTreeManager::CreateIndirectBuffers()
@@ -1398,60 +1898,23 @@ void CTreeManager::CreateTextureDescriptors(const xr_vector<VkImageView>& unique
         vkCreateSampler(VulkanHW.m_Device, &sci, nullptr, &m_TexSampler);
     }
 
-    // Layout: 1 binding, COMBINED_IMAGE_SAMPLER (fragment).
-    {
-        VkDescriptorSetLayoutBinding b{};
-        b.binding         = 0;
-        b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        b.descriptorCount = 1;
-        b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutCreateInfo ci{};
-        ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        ci.bindingCount = 1;
-        ci.pBindings    = &b;
-        vkCreateDescriptorSetLayout(VulkanHW.m_Device, &ci, nullptr, &m_TexDescLayout);
-    }
-
-    // Pool.
+    // Layout: 1 binding, COMBINED_IMAGE_SAMPLER (fragment); one set per unique view.
     const u32 setCount = (u32)uniqueViews.size();
-    {
-        VkDescriptorPoolSize sz{};
-        sz.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sz.descriptorCount = setCount;
-
-        VkDescriptorPoolCreateInfo ci{};
-        ci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        ci.poolSizeCount = 1;
-        ci.pPoolSizes    = &sz;
-        ci.maxSets       = setCount;
-        vkCreateDescriptorPool(VulkanHW.m_Device, &ci, nullptr, &m_TexDescPool);
-    }
+    m_TexDescLayout = VK::MakeSetLayout({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },
+                                        VK_SHADER_STAGE_FRAGMENT_BIT, "Trees.Tex");
+    m_TexDescPool   = VK::MakeDescriptorPool({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },
+                                             setCount, "Trees.Tex");
+    if (!m_TexDescLayout || !m_TexDescPool) return;
 
     // Allocate + write.
     m_TexDescSets.resize(setCount);
     for (u32 i = 0; i < setCount; ++i)
     {
-        VkDescriptorSetAllocateInfo ai{};
-        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        ai.descriptorPool     = m_TexDescPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &m_TexDescLayout;
-        vkAllocateDescriptorSets(VulkanHW.m_Device, &ai, &m_TexDescSets[i]);
+        if (!VK::AllocSets(m_TexDescPool, m_TexDescLayout, 1, &m_TexDescSets[i], "Trees.Tex")) return;
 
-        VkDescriptorImageInfo ii{};
-        ii.sampler     = m_TexSampler;
-        ii.imageView   = uniqueViews[i];
-        ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = m_TexDescSets[i];
-        w.dstBinding      = 0;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo      = &ii;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(m_TexDescSets[i])
+            .ImageSampler(0, uniqueViews[i], m_TexSampler)
+            .Flush();
     }
 }
 
@@ -1461,6 +1924,11 @@ void CTreeManager::CreateTextureDescriptors(const xr_vector<VkImageView>& unique
 // ============================================================================
 void CTreeManager::Destroy()
 {
+    // The crown-alpha preload must never outlive the level: a still-joinable
+    // std::thread at static destruction time calls std::terminate.
+    JoinCrownAlphaPreload();
+    s_alphaCache.clear();
+
     DestroySessionB();
 
     auto destroyBuf = [](CVulkanBuffer*& b) {

@@ -41,6 +41,16 @@ private:
     VkCommandPool   m_UploadPool     = VK_NULL_HANDLE;   // on transfer family
     VkCommandBuffer m_UploadCmd      = VK_NULL_HANDLE;
     bool            m_UploadOpen     = false;            // m_UploadCmd has pending copies
+    // ONE upload command buffer meant every reopen after a flush waited for the
+    // WHOLE timeline (see EnsureUploadCmdOpen) -- a full drain wearing another
+    // name, which is why finer ring segments moved the stall from "ring wait"
+    // into "cmd-reopen wait" instead of removing it. A small ring of buffers,
+    // each remembering the value its own submit signals, makes a reopen wait
+    // only for what THAT buffer is still executing.
+    static constexpr u32 kUploadCmds = 4;
+    VkCommandBuffer m_UploadCmds[kUploadCmds]      = {};
+    u64             m_UploadCmdValue[kUploadCmds]  = {};   // timeline value of that buffer's last submit
+    u32             m_UploadCmdCur                 = 0;
     VkSemaphore     m_UploadTimeline = VK_NULL_HANDLE;   // monotonic, signaled per flush
     u64             m_UploadValue    = 0;                // last value submitted / to wait on
     VkBuffer        m_StagingBuf     = VK_NULL_HANDLE;
@@ -48,6 +58,29 @@ private:
     u8*             m_StagingPtr     = nullptr;          // persistently mapped
     VkDeviceSize    m_StagingSize    = 0;
     VkDeviceSize    m_StagingHead    = 0;
+
+    // The ring is written by the CPU and read by the transfer queue, so reusing
+    // a byte means waiting for the batch that read it. Waiting for ALL of them
+    // (the old ring-wrap drain) serialises the two sides completely: measured
+    // 66 wraps x ~5.9 ms = 388 ms of a texture phase, at ~10.7 GB/s -- i.e. the
+    // PCIe copy time itself, spent with the CPU standing still. A BIGGER ring
+    // does not help (fewer, longer waits sum to the same). Tracking which batch
+    // last wrote each segment does: crossing into a segment submits what has
+    // accumulated (so the GPU starts) and waits only for that segment's own
+    // batch, which by then is several segments old and usually finished.
+    static constexpr u32 kStagingSegments = 8;
+    u64             m_SegValue[kStagingSegments] = {};   // timeline value of the batch that last wrote segment i
+    u32             m_SegCur = 0;                        // segment the head currently sits in
+
+    // --- Graphics frame timeline (async compute ordering) ---
+    // Signaled by EVERY graphics submit with a monotonically increasing value. The
+    // async compute submit waits on the value observed at the START of the frame,
+    // i.e. "everything the previous frames submitted has completed". Without it the
+    // compute queue could overwrite a volume that the previous frame's tonemap or
+    // particle pass is still reading. Waiting on the PREVIOUS frame costs nothing
+    // against the current one — which is the frame we actually want to overlap.
+    VkSemaphore     m_FrameTimeline  = VK_NULL_HANDLE;
+    u64             m_FrameValue     = 0;
 
     // The whole upload path (m_UploadCmd recording + staging ring + m_UploadValue)
     // is touched from BOTH the main render thread (per-frame FlushUploads/Submit)
@@ -107,6 +140,11 @@ public:
 
     void NextFrame() { m_CurrentFrame = (m_CurrentFrame + 1) % FRAMES_IN_FLIGHT; }
     u32 GetCurrentFrame() const { return m_CurrentFrame; }
+
+    // Graphics frame timeline — see the members. The value is what the async compute
+    // submit waits on; read it at frame start, before this frame's submits bump it.
+    VkSemaphore GetFrameTimeline() const { return m_FrameTimeline; }
+    u64         GetFrameTimelineValue() const { return m_FrameValue; }
 
     VkCommandBuffer GetCurrentCommandBuffer() const { return m_CommandBuffers[m_CurrentFrame]; }
     VkCommandPool   GetCurrentPool() const { return m_CommandPools[m_CurrentFrame]; }

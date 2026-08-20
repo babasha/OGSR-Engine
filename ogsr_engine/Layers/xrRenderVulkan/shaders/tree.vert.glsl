@@ -15,30 +15,9 @@
 layout(location = 0) in vec3 aPos;   // local-space position
 layout(location = 1) in vec2 aUV;    // SHORT2 SSCALED raw int16 → float
 
-// set 0: per-tree instance data (mirrors VK::GpuTreeInstance, 80 B).
-struct TreeInstance {
-    mat4  xform;        // 64 B per-instance world transform
-    float c_scale_hemi; //  4 B
-    float c_bias_hemi;  //  4 B
-    uint  _p0;          //  4 B
-    uint  _p1;          //  4 B
-};
-layout(set = 0, binding = 0, std430) readonly buffer XformBuf {
-    TreeInstance inst[];
-};
+#include "tree_instance.glsl"   // TreeInstance + XformBuf (set 0 b0) — matches VK::GpuTreeInstance
 
-layout(push_constant) uniform PC {
-    mat4  mViewProj;    // world → clip
-    float uvScale;      // 1/2048 — tree UV quant (FTreeVisual_quant = 32768/16)
-    float alphaRef;     // fragment alpha cutoff
-    float _pad0;
-    float _pad1;
-    vec4  vSunColor;    // env sun colour (rgb)
-    vec4  vHemiColor;   // env hemi colour (rgb)
-    vec4  wind_params;  // SSFX (wind_direction, wind_velocity, _, _)
-    vec4  wsetup_trees; // SSFX (branchSpeed, trunkSpeed, bend, minWindSpeed)
-    vec4  wind_anim;    // Environment.wind_anim drift (xyz)
-} pc;
+#include "tree_gfx_push.glsl"   // TreeGfxPush (160 B) — matches VK::TreeGfxPush
 
 // SSFX tree wind (trunk sway + crown flutter). Shared with the shadow caster
 // (tree_depth.vert) so the bent geometry and its shadow stay in sync.
@@ -61,14 +40,9 @@ void main()
     // the scaled UV (fades flutter toward the trunk base).
     float baseY = t.xform[3].y;
     float H     = worldPos.y - baseY;
-    float r     = -pc.wind_params.x + 1.57079;
-    vec2  wdir  = vec2(cos(r), sin(r));
-    float spd   = max(pc.wsetup_trees.w, clamp(pc.wind_params.y * 0.001, 0.0, 1.0));
-    float tc_y  = aUV.y * pc.uvScale;
-    // Wind class (set at Build by texture name): 2 = foliage, 1 = trunk, 0 = rigid.
-    worldPos.xyz += ssfxTreeWind(t._p0, worldPos.xyz, H, tc_y, wdir, spd, baseY,
-                                 pc.wind_anim.xyz, pc.wsetup_trees.x, pc.wsetup_trees.y,
-                                 pc.wsetup_trees.z, pc.wind_anim.w, pc.wind_params.w);
+    float tc_y = aUV.y * pc.uvScale;
+    worldPos.xyz += ssfxTreeWindWorld(worldPos.xyz, H, tc_y, t._p0, baseY,
+                                      pc.wind_params, pc.wsetup_trees, pc.wind_anim);
     gl_Position   = pc.mViewProj * worldPos;
 
     vUV = aUV * pc.uvScale;

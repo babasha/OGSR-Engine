@@ -31,6 +31,7 @@ void InvalidateCache();      // drop the toroidal page cache. MUST be called on 
 bool Ready();                // resources created, not dead
 bool Wanted();               // r_vsm on (cheap, NO Init dependency) — gate the Pass_World call
 bool Enabled();              // Ready() && r_vsm (post-Init; checked inside MarkPages)
+bool LoadScreenFrozen();     // load screen up (precache frames) → same freeze, and the prime waits for the first VISIBLE frame
 bool NightFrozen();          // sun below the horizon → the whole sun-shadow update is frozen this frame
                              // (mask kept from the last daylit frame; receivers × sun_color≈0 → invisible).
                              // Set by BeginFrame; gate MarkPages/RenderAtlas/ResolveMask on !NightFrozen().

@@ -7,6 +7,7 @@
 
 // xrRenderVulkan - Skinned-mesh pass (STEP B sub-step 2). See vk_pass_skinned.h.
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 
 // CKinematics (children + LL_GetTransform_R/LL_BoneCount) â€” same compat trick as
 // the skeleton wrapper TUs. Keep dxRender_Visual mapped (children is xr_vector<dxRender_Visual*>).
@@ -28,6 +29,8 @@
 #include "HW_Vulkan.h"                // VulkanHW.m_Device
 #include "vk_command_buffer.h"        // CommandManager.GetCurrentFrame() â€” in-flight slot
 #include "vk_pipeline_cache.h"        // PipelineCache::GetCacheObject() â€” shared disk-backed cache
+#include "vk_compute_util.h"          // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"          // GfxPipelineBuilder
 #include "vk_env_light.h"             // EnvLight â€” shared per-frame sun/hemi/ambient UBO (set 2)
 #include "vk_shadow.h"                // ShadowMap::SphereVisible â€” caster culling
 #include "vk_pass_lightcones.h"       // SynthCones::Submit â€” lightplanes-derived beam cones
@@ -153,7 +156,7 @@ namespace {
     // 256 here, see vk_pipeline.cpp). curVP/prevVP are UNJITTERED and project the
     // cur/prev poses (jitter-free MV); jitter re-applies the sub-pixel offset to
     // gl_Position only, so depth still bit-matches the jittered forward geometry.
-    struct MVSkinPush { Fmatrix curVP; Fmatrix prevVP; u32 skinMode; u32 curBase; u32 prevBase; u32 boneCount; float jitterX; float jitterY; };
+    struct MVSkinPush { Fmatrix curVP; Fmatrix prevVP; u32 skinMode; u32 baseBone; u32 prevBase; u32 boneCount; float jitterX; float jitterY; };
     static_assert(sizeof(MVSkinPush) == 152, "must match motion_vec_skinned.vert PC block");
 
     // Vertex input for the vertHW_* layouts. loc0 pos FLOAT4; loc1/3/4 packed
@@ -198,114 +201,41 @@ namespace {
         VkVertexInputAttributeDescription attrs[6]{};
         BuildSkinnedVI(stride, binding, attrs);
 
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount   = 1;
-        vi.pVertexBindingDescriptions      = &binding;
-        vi.vertexAttributeDescriptionCount = 6;
-        vi.pVertexAttributeDescriptions    = attrs;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_vs; stages[0].pName = "main";
-        stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = distort ? s_glassDistFS : s_fs; stages[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = (additive || glass || distort) ? VK_FALSE : VK_TRUE;   // marks/glass don't write depth (R4 zb(true,false))
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        ba.blendEnable    = VK_FALSE;
+        // Variant 3 renders into the particle heat-haze RT (RGBA8), not the scene.
+        VK::GfxPipelineBuilder b(s_layout);
+        b.Vert(s_vs).Frag(distort ? s_glassDistFS : s_fs)
+         .Bindings(&binding, 1).Attrs(attrs, 6)
+         .Cull(VK_CULL_MODE_NONE)
+         // marks/glass don't write depth (R4 zb(true,false))
+         .Depth(true, !(additive || glass || distort))
+         .Color(distort ? VK_FORMAT_R8G8B8A8_UNORM : VK::SceneColor::Format())
+         .DepthTarget(Swapchain.m_DepthFormat);
         if (additive) {
             // Collimator marks (R4 hud_reddotsight: blend(srcalpha, one)) â€”
             // the dot ADDS light over the sight glass.
-            ba.blendEnable         = VK_TRUE;
-            ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-            ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-            ba.colorBlendOp        = VK_BLEND_OP_ADD;
-            ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-            ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-            ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+            b.BlendAdd();
         }
         if (glass || distort) {
             // Translucent pane over whatever is behind (lit output, capped
             // alpha comes from the fragment â€” skinMode bit 32). The distort
             // variant blends the wobble over the haze RT's neutral 0.5.
-            ba.blendEnable         = VK_TRUE;
-            ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-            ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-            ba.colorBlendOp        = VK_BLEND_OP_ADD;
-            ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-            ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-            ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+            b.BlendAlpha();
         }
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
 
         // VRS: variants 0/1/2 draw inside the world-color pass with the SRI
         // attached — STATIC {1x1, KEEP, REPLACE} state so distant NPCs coarse-
         // shade with the world (static, not dynamic: see vk_pipeline_cache.cpp —
         // a dynamic rate gets invalidated by unrelated binds). The distort
         // variant renders into the haze RT (no SRI) and stays full-rate.
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        // Variant 3 renders into the particle heat-haze RT (RGBA8), not the scene.
-        VkFormat colorFormat = distort ? VK_FORMAT_R8G8B8A8_UNORM : VK::SceneColor::Format();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &colorFormat;
-        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
         VkPipelineFragmentShadingRateStateCreateInfoKHR fsrState{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
         fsrState.fragmentSize   = { 1, 1 };
         fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
         fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;   // SRI attachment wins
-        if (VulkanHW.m_bVRSSupported && !distort) prci.pNext = &fsrState;
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext               = &prci;
-        pi.stageCount          = 2;          pi.pStages = stages;
-        pi.pVertexInputState   = &vi;        pi.pInputAssemblyState = &ia;
-        pi.pViewportState      = &vp;        pi.pRasterizationState = &rs;
-        pi.pMultisampleState   = &ms;        pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState    = &cb;        pi.pDynamicState       = &dynState;
-        pi.layout              = s_layout;
-
         if (VulkanHW.m_bVRSSupported && !distort)
-            pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+            b.RenderingNext(&fsrState).CreateFlags(VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
 
-        VkPipeline h = VK_NULL_HANDLE;
-        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
-        if (r != VK_SUCCESS) { Msg("![VK Skinned] pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        VkPipeline h = b.Build("Skinned stride=%u variant=%u", stride, variant);
+        if (h == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         Msg("[VK Skinned] pipeline created stride=%u variant=%u", stride, variant);
         return h;
     }
@@ -353,24 +283,11 @@ namespace {
             Msg("![VK Skinned] motion_vec_skinned.{vert,frag}.spv missing â€” NPC animation motion vectors disabled");
 
         // Descriptor set layout: 1 storage buffer (bone matrices), VERTEX stage.
-        VkDescriptorSetLayoutBinding b{};
-        b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-        VkDescriptorSetLayoutCreateInfo slci{};
-        slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        slci.bindingCount = 1; slci.pBindings = &b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) { s_failed = true; return false; }
-
-        VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
-        VkDescriptorPoolCreateInfo pci{};
-        pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-        if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) { s_failed = true; return false; }
-
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setLayout;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) { s_failed = true; return false; }
+        if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER }, 1,
+                                    s_setLayout, s_pool, &s_set,
+                                    VK_SHADER_STAGE_VERTEX_BIT, "Skinned.Bones")) {
+            s_failed = true; return false;
+        }
 
         // Set 2 = shared per-frame env lighting (sun/hemi/ambient). Owned by EnvLight;
         // ensure it's initialised so its set layout exists for the pipeline layout.
@@ -419,12 +336,7 @@ namespace {
         s_boneMapped = static_cast<Fmatrix*>(s_boneSSBO.Map());
         if (!s_boneMapped) { Msg("![VK Skinned] bone SSBO map failed"); s_failed = true; return false; }
 
-        VkDescriptorBufferInfo bi{ s_boneSSBO.GetHandle(), 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = s_set; w.dstBinding = 0; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(s_set).StorageBuffer(0, s_boneSSBO.GetHandle()).Flush();
 
         Msg("[VK Skinned] init OK (SSBO %u bones, push=%u)", kMaxBones, (u32)sizeof(SkinPush));
         return true;
@@ -439,66 +351,16 @@ namespace {
         VkVertexInputAttributeDescription attrs[6]{};
         BuildSkinnedVI(stride, binding, attrs);
 
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_VERTEX_BIT; stage.module = s_shadowVS; stage.pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType           = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode     = VK_POLYGON_MODE_FILL;
-        rs.cullMode        = VK_CULL_MODE_NONE;
-        rs.frontFace       = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth       = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;       // dynamic â€” caller sets the same bias as statics
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendStateCreateInfo cb{};   // no color attachments
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;   // matches the shadow map
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext             = &prci;
-        pi.stageCount        = 1;     pi.pStages             = &stage;
-        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
-        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
-        pi.layout            = s_layout;
-
-        VkPipeline h = VK_NULL_HANDLE;
-        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
-        if (r != VK_SUCCESS) { Msg("![VK Skinned] shadow pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        // VERTEX only, no color attachments — depth-only pass.
+        VkPipeline h = VK::GfxPipelineBuilder(s_layout)
+            .Vert(s_shadowVS)
+            .Bindings(&binding, 1).Attrs(attrs, 6)
+            .Cull(VK_CULL_MODE_NONE)
+            .DynamicDepthBias()                  // caller sets the same bias as statics
+            .Depth(true, true)
+            .DepthTarget(VK_FORMAT_D32_SFLOAT)   // matches the shadow map
+            .Build("Skinned shadow stride=%u", stride);
+        if (h == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         Msg("[VK Skinned] shadow pipeline created stride=%u", stride);
         return h;
     }
@@ -521,67 +383,14 @@ namespace {
         VkVertexInputAttributeDescription attrs[6]{};
         BuildSkinnedVI(stride, binding, attrs);
 
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_prepassVS; stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_prepassFS; stages[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendStateCreateInfo cb{};   // no color attachments
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.depthAttachmentFormat = Swapchain.m_DepthFormat;   // scene depth (prepass gates on D32)
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext             = &prci;
-        pi.stageCount        = 2;     pi.pStages             = stages;
-        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
-        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
-        pi.layout            = s_layout;
-
-        VkPipeline h = VK_NULL_HANDLE;
-        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
-        if (r != VK_SUCCESS) { Msg("![VK Skinned] prepass pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        VkPipeline h = VK::GfxPipelineBuilder(s_layout)   // no color attachments
+            .Vert(s_prepassVS).Frag(s_prepassFS)
+            .Bindings(&binding, 1).Attrs(attrs, 6)
+            .Cull(VK_CULL_MODE_NONE)
+            .Depth(true, true)
+            .DepthTarget(Swapchain.m_DepthFormat)   // scene depth (prepass gates on D32)
+            .Build("Skinned prepass stride=%u", stride);
+        if (h == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         Msg("[VK Skinned] prepass pipeline created stride=%u", stride);
         return h;
     }
@@ -605,75 +414,15 @@ namespace {
         VkVertexInputAttributeDescription attrs[6]{};
         BuildSkinnedVI(stride, binding, attrs);
 
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_normalVS; stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_normalFS; stages[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_FALSE;                  // test only â€” the prepass owns the depth
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState cba{};
-        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                           | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        cba.blendEnable    = VK_FALSE;
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &cba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        const VkFormat normalFmt = SSAOPass::GetNormalFormat();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &normalFmt;
-        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;   // tests the scene prepass depth
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext             = &prci;
-        pi.stageCount        = 2;     pi.pStages             = stages;
-        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
-        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
-        pi.layout            = s_layout;
-
-        VkPipeline h = VK_NULL_HANDLE;
-        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
-        if (r != VK_SUCCESS) { Msg("![VK Skinned] normal pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        VkPipeline h = VK::GfxPipelineBuilder(s_layout)
+            .Vert(s_normalVS).Frag(s_normalFS)
+            .Bindings(&binding, 1).Attrs(attrs, 6)
+            .Cull(VK_CULL_MODE_NONE)
+            .Depth(true, false)                     // test only â€” the prepass owns the depth
+            .Color(SSAOPass::GetNormalFormat())
+            .DepthTarget(Swapchain.m_DepthFormat)   // tests the scene prepass depth
+            .Build("Skinned normal stride=%u", stride);
+        if (h == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         Msg("[VK Skinned] normal G-buffer pipeline created stride=%u", stride);
         return h;
     }
@@ -698,74 +447,15 @@ namespace {
         VkVertexInputAttributeDescription attrs[6]{};
         BuildSkinnedVI(stride, binding, attrs);
 
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_mvVS; stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_mvFS; stages[1].pName = "main";
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_FALSE;                  // scene depth already owns the surface
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState cba{};
-        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;   // RG16F motion
-        cba.blendEnable    = VK_FALSE;
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &cba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        VkFormat mvFmt = VK::MotionVec::Format();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &mvFmt;
-        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext             = &prci;
-        pi.stageCount        = 2;     pi.pStages             = stages;
-        pi.pVertexInputState = &vi;   pi.pInputAssemblyState = &ia;
-        pi.pViewportState    = &vp;   pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms;   pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState  = &cb;   pi.pDynamicState       = &dynState;
-        pi.layout            = s_mvLayout;
-
-        VkPipeline h = VK_NULL_HANDLE;
-        VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &h);
-        if (r != VK_SUCCESS) { Msg("![VK Skinned] motion pipeline create failed (%d) stride=%u", r, stride); return VK_NULL_HANDLE; }
+        VkPipeline h = VK::GfxPipelineBuilder(s_mvLayout)
+            .Vert(s_mvVS).Frag(s_mvFS)
+            .Bindings(&binding, 1).Attrs(attrs, 6)
+            .Cull(VK_CULL_MODE_NONE)
+            .Depth(true, false)   // scene depth already owns the surface
+            .Color(VK::MotionVec::Format(), VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT)   // RG16F motion
+            .DepthTarget(Swapchain.m_DepthFormat)
+            .Build("Skinned motion stride=%u", stride);
+        if (h == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         Msg("[VK Skinned] motion-vector pipeline created stride=%u", stride);
         return h;
     }
@@ -1000,6 +690,87 @@ void Skinned_UploadBones()
                     Msg("[VK Skinned] up-diag: bones=%u blends=%u vis=0x%llx/0x%llx mT0=(%.2f,%.2f,%.2f) xform=(%.1f,%.1f,%.1f) bone0=(%.1f,%.1f,%.1f) boneN=(%.1f,%.1f,%.1f)",
                         bc, nBlends, vm._visimask.flags, vm._visimask_ex.flags, VPUSH(mT0), VPUSH(d.xform.c), VPUSH(b0.c), VPUSH(bl.c));
                 }
+
+                // ⭐⭐⭐WHICH SKINNED VISUAL PUTS VERTICES IN THE SKY.
+                //
+                // Reported from play twice and hunted from the game side for
+                // three builds without success: a body standing in a bind pose
+                // under a fan of grey spikes tens of metres tall. The game-side
+                // sweep never even saw the object -- every candidate the game
+                // does own was tested and cleared, including the first-person
+                // body -- so it is a visual reaching us without a game-side owner.
+                //
+                // ⚠A bind pose ALONE cannot make spikes: identity skinning
+                // matrices simply draw the mesh where it was authored, which is
+                // the T-pose we see. Vertices leave for infinity when the shader
+                // reads bone matrices OUTSIDE this skeleton's slice, i.e. when a
+                // child's declared RenderMode disagrees with the vertex layout
+                // the shader is told to assume (skinMode below). So name the mode
+                // per child, for every unanimated skeleton, once each.
+                //
+                // ⭐Costs nothing in the normal case: an animated skeleton has
+                // blends and never reaches this branch.
+                {
+                    u32 blends_now = 0;
+                    if (auto* ka = dynamic_cast<CKinematicsAnimated*>(K))
+                        for (u32 p = 0; p < 4; ++p)
+                            blends_now += ka->LL_PartBlendsCount(p);
+
+                    // ⚠⚠ONCE-PER-VISUAL WAS THE WRONG CADENCE, AND IT COST A
+                    // WRONG DIAGNOSIS.
+                    //
+                    // The first cut printed each visual once and never again. Its
+                    // xform was therefore a FIRST-SIGHT SNAPSHOT, and reading
+                    // those stale coordinates next to live creature positions
+                    // "showed" the phantom bodies riding on the NPCs. They were
+                    // not: when the positions were finally compared at the same
+                    // instant, the phantoms sat 80 m away, and a fix built on the
+                    // false correlation had to be reverted (see
+                    // CAttachmentOwner::renderable_Render).
+                    //
+                    // ⭐So: re-announce the same visual every two seconds. A
+                    // diagnostic whose value goes stale must say WHEN it is
+                    // speaking, or it invents relationships that are not there.
+                    //
+                    // Bone names come along because they identify the MODEL CLASS
+                    // without any name string being available in a release build:
+                    // `bip01_*` is a body, `wpn_*` a weapon, anything else a prop.
+                    if (0 == blends_now)
+                    {
+                        struct Seen { CKinematics* K; u32 ms; };
+                        static xr_vector<Seen> s_seen;
+                        const u32 now_ms = Device.dwTimeGlobal;
+                        auto it = std::find_if(s_seen.begin(), s_seen.end(), [K](const Seen& s) { return s.K == K; });
+                        const bool due = (it == s_seen.end()) || (now_ms - it->ms >= 2000);
+                        if (due && s_seen.size() < 64)
+                        {
+                            if (it == s_seen.end())
+                                s_seen.push_back({K, now_ms});
+                            else
+                                it->ms = now_ms;
+
+                            u32 kids = 0;
+                            string512 modes{};
+                            for (auto* child : K->children)
+                            {
+                                VK_Render_Mesh* mesh = nullptr;
+                                u16 rmode = 0;
+                                if (!ResolveSkinnedLeaf(child, mesh, rmode))
+                                    continue;
+                                ++kids;
+                                const u32 skinMode = (rmode <= 2u) ? 1u : (u32(rmode) - 1u);
+                                string32 one;
+                                xr_sprintf(one, "%s%u->%u", kids > 1 ? "," : "", u32(rmode), skinMode);
+                                xr_strcat(modes, one);
+                            }
+                            // first and last bone name: enough to tell a body from a prop
+                            LPCSTR b_first = (bc > 0) ? K->LL_BoneName(0) : "?";
+                            LPCSTR b_last = (bc > 0) ? K->LL_BoneName(u16(bc - 1)) : "?";
+                            Msg("![VK Skinned] UNANIMATED visual @%u: bones=%u children=%u bone0='%s' boneN='%s' rmode->skinMode[%s] xform=(%.1f,%.1f,%.1f)", now_ms, bc, kids,
+                                b_first, b_last, modes, VPUSH(d.xform.c));
+                        }
+                    }
+                }
             }
             cursor += bc;
             out.push_back({ K, d.xform, base, bc, d.hemi });
@@ -1036,29 +807,10 @@ static bool PreSkinInit()
 
     // set 0: binding 0 = the SAME bone SSBO the graphics pipelines read,
     //        binding 1 = the shared output pool.
-    VkDescriptorSetLayoutBinding b[2]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[1] = b[0]; b[1].binding = 1;
-    VkDescriptorSetLayoutCreateInfo slci{};
-    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 2; slci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_psSetL) != VK_SUCCESS) {
-        Msg("![VK PreSkin] set layout failed"); s_psFailed = true; return false;
-    }
-
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_psPool) != VK_SUCCESS) {
-        Msg("![VK PreSkin] descriptor pool failed"); s_psFailed = true; return false;
-    }
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = s_psPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_psSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_psSet) != VK_SUCCESS) {
-        Msg("![VK PreSkin] descriptor set alloc failed"); s_psFailed = true; return false;
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO }, 1, s_psSetL, s_psPool, &s_psSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "PreSkin")) {
+        s_psFailed = true; return false;
     }
 
     // gpuOnly=TRUE is mandatory: a STORAGE buffer without it gets
@@ -1071,37 +823,16 @@ static bool PreSkinInit()
     if (!s_psBuf.IsValid()) { Msg("![VK PreSkin] pool alloc failed"); s_psFailed = true; return false; }
     Prof::NameBuffer(s_psBuf.GetHandle(), "PreSkinPool");
 
-    VkDescriptorBufferInfo bi[2] = {
-        { s_boneSSBO.GetHandle(), 0, VK_WHOLE_SIZE },
-        { s_psBuf.GetHandle(),    0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet w[2]{};
-    for (u32 i = 0; i < 2; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = s_psSet; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+    VK::DescriptorWriter(s_psSet)
+        .StorageBuffer(0, s_boneSSBO.GetHandle())
+        .StorageBuffer(1, s_psBuf.GetHandle())
+        .Flush();
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PreSkinPush) };
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_psSetL;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_psLayout) != VK_SUCCESS) {
-        Msg("![VK PreSkin] pipeline layout failed"); s_psFailed = true; return false;
-    }
+    s_psLayout = VK::MakePipelineLayout({ s_psSetL }, sizeof(PreSkinPush));
+    if (s_psLayout == VK_NULL_HANDLE) { s_psFailed = true; return false; }
 
-    VkComputePipelineCreateInfo cpi{};
-    cpi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpi.stage.module = cs;
-    cpi.stage.pName  = "main";
-    cpi.layout       = s_psLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &s_psPipe) != VK_SUCCESS) {
-        Msg("![VK PreSkin] compute pipeline failed"); s_psFailed = true; return false;
-    }
+    s_psPipe = VK::CreateComputePipeline(cs, s_psLayout, "PreSkin");
+    if (s_psPipe == VK_NULL_HANDLE) { s_psFailed = true; return false; }
 
     Msg("[VK PreSkin] init OK (pool %u MB/slot x%u = %u verts/slot, stride %u)",
         kPsBytesSlot >> 20, kFramesInFlight, kPsVertsSlot, kPsStride);
@@ -1736,6 +1467,9 @@ void Pass_Skinned(FrameContext& ctx)
     // Per-frame env lighting (set 2). Pass_World already called EnvLight::Update this
     // frame (it runs before this pass), so just grab the current set; fall back to
     // updating here if this pass ever runs standalone.
+    // ⚠No command buffer on purpose: this pass records inside dynamic rendering, where
+    // the sky-probe prefilter's dispatch/blits would be illegal. The UBO fill is all
+    // that is wanted here; the probe keeps last frame's content.
     if (EnvLight::GetCurrentSet() == VK_NULL_HANDLE) EnvLight::Update(CommandManager.GetCurrentFrame());
     VkDescriptorSet lightSet = EnvLight::GetCurrentSet();
 

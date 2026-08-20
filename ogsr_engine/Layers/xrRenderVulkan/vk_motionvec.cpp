@@ -7,9 +7,11 @@
 
 // xrRenderVulkan — screen-space motion vectors. See vk_motionvec.h.
 #include "stdafx.h"
-#include "vk_profiler.h"   // TEMP VUID-hunt: VK::Prof::NameImage
+#include "vk_profiler.h"           // TEMP VUID-hunt: VK::Prof::NameImage
+#include "vk_rendering.h"          // VK::RenderingBuilder
 #include "vk_motionvec.h"
 #include "vk_pass_ssao.h"          // VK::DeriveProjTerms / VK::ProjTerms (shared depth→world basis)
+#include "vk_descriptors.h"        // VK::DescriptorWriter
 #include "vk_pass_context.h"       // VK::FrameContext (dynamic MV pass)
 #include "vk_pass_skinned.h"       // VK::Skinned_RenderMotion (NPC animation MV)
 #include "CRender_Vulkan.h"        // RImplementation (grass detail manager access)
@@ -171,32 +173,12 @@ bool Init()
     }
 
     // One binding (sampler2D), reused: MV pass binds depth, debug binds the MV target.
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo slci{};
-    slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 1; slci.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &slci, nullptr, &s_setLayout) != VK_SUCCESS) {
-        s_failed = true; return false;
-    }
-
     const u32 nSets = kFramesInFlight * 2;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = nSets; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) {
-        s_failed = true; return false;
-    }
     {
-        VkDescriptorSetLayout layouts[kFramesInFlight * 2];
-        for (u32 i = 0; i < nSets; ++i) layouts[i] = s_setLayout;
         VkDescriptorSet sets[kFramesInFlight * 2]{};
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = s_pool; dai.descriptorSetCount = nSets; dai.pSetLayouts = layouts;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, sets) != VK_SUCCESS) {
+        if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER }, nSets,
+                                    s_setLayout, s_pool, sets,
+                                    VK_SHADER_STAGE_FRAGMENT_BIT, "MotionVec")) {
             s_failed = true; return false;
         }
         for (u32 i = 0; i < kFramesInFlight; ++i) {
@@ -247,11 +229,8 @@ void Execute(VkCommandBuffer cmd, VkExtent2D extent)
 
     // (Re)bind the scene depth (its view can change on swapchain recreate).
     {
-        VkDescriptorImageInfo depthI{ s_samp, Swapchain.m_DepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w.dstSet = s_setMV[slot]; w.dstBinding = 0; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &depthI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(s_setMV[slot])
+            .ImageSampler(0, Swapchain.m_DepthView, s_samp).Flush();
     }
 
     // Reconstruction basis from the UNJITTERED cur view-proj (s_curVP, set by
@@ -303,32 +282,15 @@ void ExecuteDynamic(VkCommandBuffer cmd, const FrameContext& ctx)
     //    same complete depth so only visible NPC pixels overwrite the camera field.
     ImageBarrier(cmd, s_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    VkRenderingAttachmentInfo cAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    cAtt.imageView   = s_view;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;    // keep the static camera field
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingAttachmentInfo dAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    dAtt.imageView   = ctx.depthView;
-    dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;   // complete opaque depth (post-LODs)
-    dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;           // test only, no write
-
-    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea.extent    = s_extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = &dAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    // Negative-height viewport — MUST match the forward/prepass raster so the NPC
-    // lands on the same pixels and its depth bit-matches (LEQUAL passes on equal).
-    VkViewport vp{ 0.0f, (float)s_extent.height, (float)s_extent.width, -(float)s_extent.height, 0.0f, 1.0f };
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {}, s_extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    // Colour LOAD keeps the static camera field; depth is the complete opaque
+    // depth (post-LODs), LOADed for the test only — the pipeline has no write.
+    // BeginFlipped's negative-height viewport MUST match the forward/prepass
+    // raster so the NPC lands on the same pixels and its depth bit-matches
+    // (LEQUAL passes on equal).
+    RenderingBuilder(s_extent)
+        .Color(s_view)
+        .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+        .BeginFlipped(cmd);
 
     // Jitter-free MV (Option A): overlays reproject with the UNJITTERED cur/prev VP
     // (s_curVP / s_prevVP, rolled from CRender::Begin's pre-jitter capture) and
@@ -368,11 +330,7 @@ void DrawDebugOverlay(VkCommandBuffer cmd, VkImageView dstView, VkExtent2D exten
 
     const u32 slot = CommandManager.GetCurrentFrame() % kFramesInFlight;
     {
-        VkDescriptorImageInfo mvI{ s_samp, s_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w.dstSet = s_setDbg[slot]; w.dstBinding = 0; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &mvI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(s_setDbg[slot]).ImageSampler(0, s_view, s_samp).Flush();
     }
     DbgPush dp{};
     dp.p[0] = (ps_r_mv_debug_scale > 0.0f) ? ps_r_mv_debug_scale : 30.0f;

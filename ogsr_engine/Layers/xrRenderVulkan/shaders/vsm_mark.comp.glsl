@@ -12,11 +12,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D uDepth;   // scene prepass depth (statics+AT)
 
-layout(set = 0, binding = 1) uniform VsmParams {
-    mat4 view;                 // world -> sun light space
-    vec4 level[VSM_LEVELS];    // xy = level origin (light XY of texel 0,0), z = extent (m)
-    vec4 zparams;              // x = light-space zNear, y = 1/(zFar-zNear)
-} vsm;
+#define VSM_PARAMS_SET     0
+#define VSM_PARAMS_BINDING 1
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 
 layout(set = 0, binding = 2) buffer Needed  { uint needed[]; };   // per-level page flags
 layout(set = 0, binding = 3) buffer Counter { uint uniquePages; }; // first-mark counter

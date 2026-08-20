@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // xrRenderVulkan - GPU grass generation compute shader
 // Copyright (c) 2024-2026 Egor Babushkin (https://github.com/babasha)
 // SPDX-License-Identifier: MIT
@@ -10,6 +11,8 @@
 //
 // Dispatch: one thread per potential grass position in the visible slot range.
 // Each thread: lookup slot → palette dither → heightmap Y → cull → output.
+
+#include "hzb_test.glsl"   // HZB_SphereOccluded — shared with world_cull_hzb / tree_cull / lod_cull
 
 layout(local_size_x = 256) in;
 
@@ -85,7 +88,7 @@ layout(push_constant) uniform PushConstants
     vec4 frustumPlanes[6];      // 96 bytes
     vec4 cameraPos;             // 16 bytes (xyz=pos, w=time)
     vec4 fadeParams;            // 16 bytes (fadeStartSq, fadeLimitSq, fadeRangeSq, density)
-    vec4 casterParams;          // 16 bytes (x>0 = CASTER pass: cull radiusSq, no frustum/HZB; y = output capacity override)
+    vec4 casterParams;          // 16 bytes (x>0 = CASTER pass: cull radiusSq, no frustum/HZB; y = output capacity override; z = P11 focal 1/tan(fovY/2) for the HZB footprint; w free)
     ivec4 slotRange;            // 16 bytes (minSX, minSZ, countX, countZ)
     // Total: 224 bytes
 } pc;
@@ -414,48 +417,29 @@ void main()
     // from (co-planar), so testing it just flickers at the cull boundary — and
     // near grass is sparse in instance count, so culling it saves little.
     // Occlusion pays off on the far band where area (∝ r²) packs most instances.
-    // Within HZB_NEAR_SKIP metres we keep everything; beyond it we test the
-    // grass's NEAR face (base pulled toward the camera by its radius) so a small
-    // heightmap-vs-rendered-mesh mismatch doesn't cull surface-grazing grass.
+    // Within HZB_NEAR_SKIP metres we keep everything; beyond it the shared test
+    // compares the grass's NEAR face (base pulled toward the camera by its
+    // radius), so a small heightmap-vs-rendered-mesh mismatch cannot cull
+    // surface-grazing grass.
+    //
+    // ⭐The footprint maths now lives ONCE, in hzb_test.glsl, shared with
+    // world_cull_hzb / tree_cull / lod_cull. Grass was the last consumer still
+    // carrying a private copy, and that copy had missed BOTH fixes the others
+    // received: no focal (P11) scale on the footprint, understating it ~1.5-1.9x
+    // vertically, and one UV radius used on both axes even though UV is
+    // anisotropic. Both errors SHRINK the sampled block, so the MAX is taken over
+    // less area than the blade actually covers, reads "there is something nearer
+    // in front of me", and culls grass that is in plain view. That is the patch
+    // flicker HZB_NEAR_SKIP was raised to hide.
+    // ⚠HZB_NEAR_SKIP is left at 25 m on purpose: lowering it changes the PICTURE
+    // (more far grass culled) and belongs to its own measured A/B, not to this
+    // correctness fix.
     const float HZB_NEAR_SKIP = 25.0;
-    vec3  toCam   = pc.cameraPos.xyz - worldPos;
-    float camDist = length(toCam);
-    if (camDist > HZB_NEAR_SKIP && pc.casterParams.x <= 0.0)   // caster pass: occluded grass still casts
-    {
-        vec3 testPos = worldPos + (toCam / camDist) * radius;  // near face
-        vec4 clipPos = pc.viewProj * vec4(testPos, 1.0);
-        if (clipPos.w > 0.0)
-        {
-            vec2 ndc = clipPos.xy / clipPos.w;
-            // Y flip: viewport uses negative height, so HZB texture Y is inverted
-            vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-
-            if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0)
-            {
-                // Select mip level where object covers ~1 HZB texel
-                float projDiameter = 2.0 * radius / clipPos.w;
-                ivec2 hzbSize = textureSize(u_HZB, 0);
-                float screenTexels = projDiameter * 0.5 * float(hzbSize.x);
-                float mipLevel = ceil(log2(max(1.0, screenTexels)));
-
-                // A single centre sample (NEAREST) misses up to 3 of the 2x2
-                // texels the footprint straddles at this mip — the max gets
-                // underestimated and visible grass is culled for a frame as
-                // the camera moves (patch flicker). Take the max of the 4
-                // footprint corners instead; conservative by construction.
-                float uvRadius = projDiameter * 0.25;   // NDC→UV halving
-                float d0 = textureLod(u_HZB, uv + vec2(-uvRadius, -uvRadius), mipLevel).r;
-                float d1 = textureLod(u_HZB, uv + vec2( uvRadius, -uvRadius), mipLevel).r;
-                float d2 = textureLod(u_HZB, uv + vec2(-uvRadius,  uvRadius), mipLevel).r;
-                float d3 = textureLod(u_HZB, uv + vec2( uvRadius,  uvRadius), mipLevel).r;
-                float hzbDepth = max(max(d0, d1), max(d2, d3));
-                float instanceDepth = clipPos.z / clipPos.w;
-
-                if (instanceDepth > hzbDepth && hzbDepth > 0.0)
-                    return;
-            }
-        }
-    }
+    float camDist = distance(pc.cameraPos.xyz, worldPos);
+    if (camDist > HZB_NEAR_SKIP && pc.casterParams.x <= 0.0   // caster pass: occluded grass still casts
+        && HZB_SphereOccluded(u_HZB, pc.viewProj, worldPos, radius,
+                              pc.cameraPos.xyz, pc.casterParams.z /* P11 focal */))
+        return;
 
     // ---- Fade alpha (scale-based, matches detail_cull.comp) ----
     float alpha = 1.0;

@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "vsm_common.glsl"   // VSM clipmap math (vsmSelect/vsmPageIndex) for the smooth atlas occlusion
 #include "froxel.glsl"        // exp-Z slice <-> view-Z mapping (shared with tonemap + particle probe)
+#include "shadow_math.glsl"   // spotLinZ/cascTap — set-agnostic, shared with shadow_common.glsl
 // xrRenderVulkan — froxel volumetric INJECTION (vk_volumetrics, P1).
 //
 // One thread per froxel. Reconstruct the froxel's world position from the camera
@@ -17,51 +18,8 @@
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
-struct VolLight { vec4 pos; vec4 color; vec4 dir; };  // pos.w=range, color.w=1 spot/0 point, dir.w=cos(cone/2)
 
-layout(set = 0, binding = 0) uniform Vol {
-    vec4 camPos;       // xyz world camera pos
-    vec4 camDir;       // xyz camera forward (unit)
-    vec4 camRightT;    // xyz right * tan(fovX/2)
-    vec4 camTopT;      // xyz top   * tan(fovY/2)
-    vec4 sun_dir;      // xyz sun TRAVEL dir (down); to-sun = -sun_dir
-    vec4 sun_color;    // rgb
-    vec4 sky_ambient;  // rgb flat fill
-    mat4 sun_vp;       // far cascade VP
-    mat4 sun_near_vp;  // cascade 0 VP
-    mat4 sun_c1_vp;    // cascade 1 VP
-    vec4 gridParams;   // x=dimX y=dimY z=dimZ
-    vec4 zParams;      // x=near y=far z=log2(far/near)
-    vec4 fog;          // x=baseDensity y=heightBase z=heightFalloff w=HG_g
-    vec4 fog2;         // x=intensity y=ambient floor z=indoor density boost w=sun-beam boost
-    mat4 rain_vp;      // top-down ortho VP for the sky-visibility (ambient) occlusion
-    mat4 prevViewProj; // temporal reprojection (prev frame world→clip)
-    vec4 prevCamPos;   // xyz prev cam pos, w = prev near
-    vec4 prevCamDir;   // xyz prev cam forward, w = prev log2(far/near)
-    vec4 temporal;     // xyz = froxel jitter (−0.5..0.5), w = history blend (0 = off)
-    mat4 fog_shadow_vp; // r_vol_shadow: dedicated per-frame fog sun-shadow VP
-    vec4 lightParams;  // P2: x = count, y = boost, z = unused (-1), w = point-shadowed idx (-1)
-    VolLight lights[8];
-    vec4 noiseParams;  // P3: x = amount, y = scale, z = speed, w = time
-    // Spot shadow POOL: per-tile VP. A light's tile rides in color.w bits 2+
-    // (tile+1, <<2) — every pooled spot's fog cone is cut by its own tile.
-    mat4 spot_pool_vp[8];
-    vec4 smokeParams;  // Stage-1 VMS: x = smoke-inject strength (0 = no injected smoke)
-    vec4 light_occ;    // r_light_occ: x = enable, y = bury bias, z = frag-below band, w = strength
-    // Atmospheric scattering (r_atmo): physical Rayleigh (blue) + Mie (forward halo)
-    // in-scatter of the sun → aerial perspective. Appended last (integrate prefix-safe).
-    vec4 atmo;         // x = enable, y = Rayleigh strength, z = Mie strength, w = Mie g
-    vec4 atmoR;        // rgb = Rayleigh scattering tint (blue-heavy), w unused
-    mat4 terra_vp;     // world → terrain-height-map clip (baked once per level)
-    vec4 terra;        // x = map eye Y, y = zNear, z = zRange, w = valid (0 = eye-relative fallback)
-    vec4 fog3;         // V-0: x = albedo (sigma_s = sigma_t * albedo), y = noise on scatter (0 = legacy: on extinction), zw reserved
-    vec4 fog4;         // V-1: x = multiple-scattering octaves (1 = single scatter), y = backward lobe g, z = backward lobe weight, w = term isolation
-    vec4 fog5;         // V-1: GROUND-MIST layer — x = density at ground, y = 1/thickness (m), z = HG g, w = hollow bias (m; 0 = layer is everywhere)
-    vec4 fog6;         // V-1: MICRO relief from the rain map — x = dip depth scale (m), y = strength (0 = off), z = eyeY - zNear, w = zFar - zNear
-    vec4 fog7;         // V-1b: mist thinning — x = density scale INSIDE (1 = off), y = near-camera radius (m; 0 = off), z = immersion falloff rate 1/m (0 = immersion off), w = V-2 hollow-gate bypass (0..1)
-    vec4 canopy;       // GRASS CANOPY — x = extinction strength (0 = off), y = metres per height unit, z = tallest canopy (m), w unused
-    vec4 canopy_uv;    // world XZ → canopy uv: u = x*canopy_uv.x + canopy_uv.y, v = z*canopy_uv.z + canopy_uv.w
-} V;
+#include "vol_params.glsl"   // Vol UBO (set 0 b0) — matches VK::Volumetrics::VolUBO
 
 layout(set = 0, binding = 1) uniform sampler2D uShadowNear; // cascade 0
 layout(set = 0, binding = 2) uniform sampler2D uShadowC1;   // cascade 1
@@ -77,7 +35,10 @@ layout(set = 0, binding = 9) uniform VsmClipmap {
     vec4 level[VSM_LEVELS];    // xy = level origin (light XY of texel 0,0), z = extent (m)
     vec4 zparams;              // x = zNear, y = 1/(zFar-zNear), z = depth bias
 } vsmC;
-layout(set = 0, binding = 10) uniform sampler2D uFogShadow;  // dedicated per-frame fog sun-shadow
+// binding 10 — RESERVED hole (was the dedicated fog sun-shadow, removed 12-08-2026).
+// Not declared here on purpose: the C++ side still BINDS it (the set layout list is
+// positional, so removing the slot would renumber 11..19), and a bound descriptor
+// that no shader declares is perfectly legal.
 layout(set = 0, binding = 11) uniform sampler2D   uSpotShadow;  // spot (flashlight) shadow — occlude the fog cone
 layout(set = 0, binding = 12) uniform samplerCubeArray uPointShadow; // point shadow cube POOL
 layout(set = 0, binding = 13) uniform sampler3D   uSmokeMedia;  // Stage-1 VMS: splatted+resolved smoke (rgb=albedo, a=density)
@@ -121,15 +82,8 @@ float vnoise3(vec3 x)
 float fbm3(vec3 p) { return 0.62 * vnoise3(p) + 0.38 * vnoise3(p * 2.3 + 11.7); }
 
 // --- Sun shadow, R4 cascade scheme (ported from world_lmap.frag) -------------
-float cascTap(sampler2D smap, vec2 uv, float ref)
-{
-    vec2 sz = vec2(textureSize(smap, 0));
-    vec2 t  = uv * sz - 0.5;
-    vec2 f  = fract(t);
-    vec4 d  = textureGather(smap, (floor(t) + 1.0) / sz, 0);
-    vec4 c  = step(vec4(ref), d);
-    return mix(mix(c.w, c.z, f.x), mix(c.x, c.y, f.x), f.y);
-}
+// cascTap → shadow_math.glsl (included at the top). cascSample below is
+// deliberately NOT the shared one: the fog wants a WIDE, soft penumbra.
 float cascSample(sampler2D smap, mat4 vp, vec3 wp, float bias_)
 {
     vec3 n = (vp * vec4(wp, 1.0)).xyz;          // ortho → already NDC
@@ -205,24 +159,9 @@ float sampleVSMStatic(vec3 wp)
     return lit * (1.0 / 9.0);
 }
 
-// Dedicated per-frame fog sun-shadow (r_vol_shadow): re-rendered EVERY frame with a
-// fresh anchor-snapped VP → CONTINUOUS occlusion (no cache tick). Soft 3x3 PCF (the
-// r_vol_soft radius). Ortho. Returns lit 1..0, or -1.0 outside the box → cascade.
-float sampleFogShadow(vec3 wp)
-{
-    vec3 n = (V.fog_shadow_vp * vec4(wp, 1.0)).xyz;   // ortho → already NDC
-    vec2 uv = n.xy * 0.5 + 0.5;
-    uv.y = 1.0 - uv.y;
-    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99 || n.z <= 0.0 || n.z >= 1.0)
-        return -1.0;
-    float ref = n.z - 0.0006;
-    vec2  tx  = (1.0 / vec2(textureSize(uFogShadow, 0))) * max(V.zParams.w, 0.5);
-    float s = 0.0;
-    for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx)
-        s += cascTap(uFogShadow, uv + vec2(float(dx), float(dy)) * tx, ref);
-    return s * (1.0 / 9.0);
-}
+// (sampleFogShadow lived here — REMOVED 12-08-2026 with the dedicated fog sun-shadow
+// map it read. Sun occlusion now comes from the VSM atlas, falling back to the
+// cascades. Binding 10 is a reserved hole; see vk_volumetrics.cpp.)
 
 float skyVis(vec3 wp);   // defined below (top-down statics depth, 1 = open sky)
 
@@ -232,14 +171,11 @@ int g_occSrc = 0;
 
 float sunShadow(vec3 worldPos)
 {
-    // Occlusion source (gridParams.w): 2 = dedicated per-frame fog shadow (continuous,
-    // no tick), 1 = VSM atlas, 0 = cascade. Each falls through to the cascade where it
-    // has no coverage (outside the box / no VSM page / r_vsm off).
+    // Occlusion source (gridParams.w): 1 = VSM atlas, 0 = cascade. (Mode 2, the
+    // dedicated per-frame fog shadow, was removed 12-08-2026.) Falls through to the
+    // cascade where there is no coverage (no VSM page / r_vsm off).
     float mode = V.gridParams.w;
-    if (mode > 1.5) {
-        float f = sampleFogShadow(worldPos);
-        if (f >= 0.0) return f;
-    } else if (mode > 0.5) {
+    if (mode > 0.5) {
         // VSM ATLASES (static + dynamic) are the occluder. Under VSM the near cascades
         // are NOT rendered for the fog (vk_pass_shadow cascForVol → cascRaster false),
         // so their combined maps hold stale/frozen depth — DON'T fall through to them.
@@ -439,11 +375,7 @@ float dualLobe(float cosT, float gF, float gB, float wB)
 // Spot shadow POOL — 3x3 PCF in the light's own atlas tile (4x2 of 1024², see
 // shadow_common.glsl), LINEAR-depth compare with a world epsilon. Occludes the
 // fog cone of EVERY pooled spot so beams stop at walls / grass cuts them.
-float spotLinZ(float zndc, float f)
-{
-    const float n = 0.5;   // ComputeSpotVPFor near plane
-    return n * f / max(f - zndc * (f - n), 1e-4);
-}
+// spotLinZ → shadow_math.glsl (included at the top).
 float spotShadowF(vec3 wp, float range, int tile)
 {
     vec4 c = V.spot_pool_vp[tile] * vec4(wp, 1.0);

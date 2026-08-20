@@ -35,11 +35,17 @@
 #include "vk_texture.h"
 #include "vk_shaders.h"          // g_ShaderManager
 #include "vk_pipeline_cache.h"   // PipelineCache::GetCacheObject
+#include "vk_compute_util.h"     // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"     // GfxPipelineBuilder
+#include "vk_descriptors.h"      // VK::DescriptorWriter
 #include "vk_vsm.h"              // VSM::GetRMaskHandle — receiver mask for the dyn bins (r_vsm_rmask)
 #include "vk_profiler.h"         // VK::Prof::ZoneBegin — Bins/Meshlet + Bins/VoxCull sub-zones (r_profiler 2)
 #include "vk_barriers.h"         // VK::ImageBarrier / BufferBarrier — impostor bake + indirect
 #include "vk_env_light.h"        // VK::EnvLight — set 2 (sun_vp + sun shadow map)
 #include "vk_shadow.h"           // ShadowMap::SphereVisible — caster culling (RenderDepth)
+#include "vk_LODManager.h"       // VK::kImposterMinDist — floor for the r_tree_dist cut
+#include "vk_DetailManager.h"    // shared Hi-Z pyramid (HZBView/HZBSampler/HZBBuiltThisFrame)
+#include "CRender_Vulkan.h"      // RImplementation.Details — owner of that pyramid
 #include "vk_cull.h"             // VK::ExtractFrustumPlanes (shared with DetailManager)
 #include "HW_Vulkan.h"
 #include "vk_vrs.h"            // VK::VRS::CmdSetPipelineRate — 2x2 coarse crown-shadow shading
@@ -81,9 +87,35 @@ extern int   ps_r_vsm_tree_hull_vox_cull;   // r_vsm_tree_hull_vox_cull — stag
 extern float ps_r_vsm_base;                 // r_vsm_base — VSM clipmap level-0 extent (m); texel(L) = base·2^L / 4096
 extern int   ps_r_vsm_tree_hull_vox;       // r_vsm_tree_hull_vox — voxel bake resolution (0 = shell/lobes only)
 extern float ps_r_vsm_tree_hull_band;      // r_vsm_tree_hull_band — crown↔voxel shadow crossfade band (fraction of _dist)
+extern float ps_r_tree_dist;               // r_tree_dist — forward draw distance for billboard-backed trees (0 = off)
+extern int   ps_r_tree_hzb;                // r_tree_hzb — Hi-Z occlusion cull of the forward tree set
+extern float ps_r_tree_shade_dist;         // r_tree_shade_dist — range past which tree.frag drops its subtle shading terms
 
 namespace VK
 {
+
+// Single source of truth for the cut distance, shared by the colour cull and the
+// camera depth prepass. They MUST agree: if the prepass keeps a tree the colour
+// pass drops, that tree writes depth with nothing shading it — black silhouettes
+// (the bug the frustum margin in tree_cull.comp already guards against). Reading
+// the cvar from two places invites exactly that drift, so both go through here.
+float TreeFlodCutDist()
+{
+    if (ps_r_tree_dist <= 0.0f) return 0.0f;            // cut disabled
+    // Never cut CLOSER than where the imposter starts drawing, whatever the cvar
+    // says — inside that range the mesh is the ONLY thing representing the tree,
+    // so an over-eager r_tree_dist would delete trees outright instead of
+    // de-duplicating them. Cutting later than the imposter is merely less saving.
+    return _max(ps_r_tree_dist, kImposterMinDist);
+}
+
+// Shorthands for the set-layout type lists handed to VK::MakeSetLayout — this
+// file declares ten sets and the lists read as tables of bindings.
+namespace {
+    constexpr VkDescriptorType kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    constexpr VkDescriptorType kUBO  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constexpr VkDescriptorType kTex  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+}
 
 bool CTreeManager::IsReady() const
 {
@@ -116,49 +148,25 @@ void CTreeManager::CreateCullPipeline()
     if (!g_ShaderManager) { Msg("![VK Trees] g_ShaderManager null — cull pipeline disabled"); return; }
     if (!m_TreeMetadataBuffer || !m_FrustumUBO || !m_TreeIndirectBuffer || !m_TreeDrawCountBuffer) return;
 
-    // Descriptor layout: 0=meta(SSBO) 1=frustum(UBO) 2=indirect(SSBO) 3=count(SSBO).
-    VkDescriptorSetLayoutBinding b[4]{};
-    b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-    b[1] = { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-    b[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-    b[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    // 0=meta(SSBO) 1=frustum(UBO, legacy) 2=indirect(SSBO) 3=count(SSBO) 4=HZB(tex).
+    m_CullDescLayout = VK::MakeSetLayout({ kSSBO, kUBO, kSSBO, kSSBO, kTex },
+                                         VK_SHADER_STAGE_COMPUTE_BIT, "Trees.Cull");
+    if (m_CullDescLayout == VK_NULL_HANDLE) return;
 
-    VkDescriptorSetLayoutCreateInfo lci{};
-    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 4; lci.pBindings = b;
-    vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &m_CullDescLayout);
+    m_CullDescPool = VK::MakeDescriptorPool({ kSSBO, kUBO, kSSBO, kSSBO, kTex }, 1, "Trees.Cull");
+    if (m_CullDescPool == VK_NULL_HANDLE) return;
+    if (!VK::AllocSets(m_CullDescPool, m_CullDescLayout, 1, &m_CullDescSet, "Trees.Cull")) return;
 
-    VkDescriptorPoolSize ps[2]{};
-    ps[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
-    ps[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &m_CullDescPool);
-
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = m_CullDescPool; dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &m_CullDescLayout;
-    vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_CullDescSet);
-
-    VkDescriptorBufferInfo bi[4]{};
-    bi[0] = { m_TreeMetadataBuffer->GetHandle(),  0, VK_WHOLE_SIZE };
-    bi[1] = { m_FrustumUBO->GetHandle(),          0, VK_WHOLE_SIZE };
-    bi[2] = { m_TreeIndirectBuffer->GetHandle(),  0, VK_WHOLE_SIZE };
-    bi[3] = { m_TreeDrawCountBuffer->GetHandle(), 0, VK_WHOLE_SIZE };
-
-    VkWriteDescriptorSet w[4]{};
-    for (u32 i = 0; i < 4; ++i) {
-        w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet          = m_CullDescSet;
-        w[i].dstBinding      = i;
-        w[i].descriptorCount = 1;
-        w[i].descriptorType  = (i == 1) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                                        : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w[i].pBufferInfo     = &bi[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+    VK::DescriptorWriter(m_CullDescSet)
+        .StorageBuffer(0, m_TreeMetadataBuffer->GetHandle())
+        .UniformBuffer(1, m_FrustumUBO->GetHandle())
+        .StorageBuffer(2, m_TreeIndirectBuffer->GetHandle())
+        .StorageBuffer(3, m_TreeDrawCountBuffer->GetHandle())
+        .Flush();
+    // Binding 4 (HZB) is written per frame in Render() — the pyramid is created
+    // and can be RECREATED on resize by CDetailManager, so a write here would go
+    // stale. Until the first write it stays unbound, hence hzb_on gates on the
+    // view being non-null rather than on the cvar alone.
 
     // Pipeline layout: 1 set + push = frustum planes (6×vec4 = 96 B) + 5 u32 (20 B).
     // The frustum used to live in a single-buffered UBO (binding 1) but that raced
@@ -166,29 +174,19 @@ void CTreeManager::CreateCullPipeline()
     // frame's planes before the GPU cull read them) → the colour cull tested a rotated
     // frustum vs the depth prepass → black tree silhouettes at screen edges. Push
     // constants are recorded per dispatch, so they can't alias across frames.
-    VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.offset = 0; pcr.size = sizeof(TreeCullPush);   // 116 B (< 128 B push limit)
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1; plci.pSetLayouts = &m_CullDescLayout;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &m_CullPipelineLayout);
-
-    VkShaderModule cs = g_ShaderManager->Load("tree_cull.comp.spv");
-    if (cs == VK_NULL_HANDLE) { Msg("![VK Trees] tree_cull.comp.spv load failed"); return; }
-
-    VkPipelineShaderStageCreateInfo ss{};
-    ss.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss.stage = VK_SHADER_STAGE_COMPUTE_BIT; ss.module = cs; ss.pName = "main";
-
-    VkComputePipelineCreateInfo cpi{};
-    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpi.stage = ss; cpi.layout = m_CullPipelineLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                 1, &cpi, nullptr, &m_CullPipeline) != VK_SUCCESS) {
-        Msg("![VK Trees] cull pipeline create failed"); m_CullPipeline = VK_NULL_HANDLE; return;
+    // TreeCullPush = 208 B: over the 128 B guaranteed minimum, under the 256 B
+    // every desktop GPU exposes (this renderer already ships a 240 B graphics
+    // push). Check it rather than let vkCreatePipelineLayout fail obscurely.
+    if (sizeof(TreeCullPush) > VulkanHW.Caps.maxPushConstantsSize) {
+        Msg("![VK Trees] TreeCullPush %u B exceeds device maxPushConstantsSize %u B — cull pipeline disabled",
+            (u32)sizeof(TreeCullPush), VulkanHW.Caps.maxPushConstantsSize);
+        return;
     }
+    m_CullPipelineLayout = VK::MakePipelineLayout({ m_CullDescLayout }, sizeof(TreeCullPush));
+    if (m_CullPipelineLayout == VK_NULL_HANDLE) return;
+
+    m_CullPipeline = VK::CreateComputePipeline("tree_cull.comp.spv", m_CullPipelineLayout, "Trees.Cull");
+    if (m_CullPipeline == VK_NULL_HANDLE) return;
     Msg("[VK Trees] Cull pipeline OK");
 }
 
@@ -267,25 +265,15 @@ void CTreeManager::CreateXformDescriptor()
         if (m_SeenBitsPtr) memset(m_SeenBitsPtr, 0, (size_t)W * sizeof(u32));
     }
 
-    VkDescriptorBufferInfo bi{ m_TreeTransformsBuffer->GetHandle(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo si{ m_SeenBits->GetHandle(), 0, VK_WHOLE_SIZE };
-    // s_waves view — fall back to the SSBO-only case is unsafe (shader samples it),
-    // so bind the flow map; if it failed to load the tree still draws (flat wind).
-    VkDescriptorImageInfo wi{ m_WaveSampler,
-                              m_WaveTex ? m_WaveTex->GetView() : VK_NULL_HANDLE,
-                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkWriteDescriptorSet w[3]{};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].dstSet = m_XformDescSet; w[0].dstBinding = 0; w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &bi;
-    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[1].dstSet = m_XformDescSet; w[1].dstBinding = 2; w[1].descriptorCount = 1;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &si;
-    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[2].dstSet = m_XformDescSet; w[2].dstBinding = 1; w[2].descriptorCount = 1;
-    w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[2].pImageInfo = &wi;
-    const u32 wc = (wi.imageView != VK_NULL_HANDLE) ? 3u : 2u;   // skip the null-view write (last)
-    vkUpdateDescriptorSets(VulkanHW.m_Device, wc, w, 0, nullptr);
+    VK::DescriptorWriter dw(m_XformDescSet);
+    dw.StorageBuffer(0, m_TreeTransformsBuffer->GetHandle())
+      .StorageBuffer(2, m_SeenBits->GetHandle());
+    // s_waves view — falling back to the SSBO-only case is unsafe (the shader
+    // samples it), so bind the flow map; if it failed to load the tree still
+    // draws (flat wind) and we simply skip the write rather than bind a null view.
+    if (m_WaveTex)
+        dw.ImageSampler(1, m_WaveTex->GetView(), m_WaveSampler);
+    dw.Flush();
 }
 
 // ============================================================================
@@ -317,82 +305,21 @@ void CTreeManager::CreateGfxPipelines()
         Msg("![VK Trees] tree.{vert,frag}.spv load failed"); return;
     }
 
+    // Vertex input for every tree pipeline below: stride=32, FLOAT3 pos @ 0,
+    // SHORT2 SSCALED UV @ tcOffset.
     auto createVariant = [&](u32 tcOffset, VkPipeline& out) -> bool
     {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-        // Vertex input: stride=32, FLOAT3 pos @ 0, SHORT2 SSCALED UV @ tcOffset.
-        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via[2]{};
-        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
-
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;   // trees: double-sided leaves
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp  = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        ba.blendEnable = VK_FALSE;
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        VkFormat colorFmt = VK::SceneColor::Format();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
-        prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
-        pi.pViewportState = &vp; pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState;
-        pi.layout = m_GfxPipelineLayout;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                      1, &pi, nullptr, &out) != VK_SUCCESS) {
-            Msg("![VK Trees] gfx pipeline (tcOff=%u) create failed", tcOffset);
-            out = VK_NULL_HANDLE; return false;
-        }
-        return true;
+        out = VK::GfxPipelineBuilder(m_GfxPipelineLayout)
+            .Vert(vs).Frag(fs)
+            .Binding(0, 32)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+            .Cull(VK_CULL_MODE_NONE)          // trees: double-sided leaves
+            .Depth(true, true)
+            .Color(VK::SceneColor::Format())
+            .DepthTarget(Swapchain.m_DepthFormat)
+            .Build("Trees gfx (tcOff=%u)", tcOffset);
+        return out != VK_NULL_HANDLE;
     };
 
     bool ok24 = createVariant(24, m_GfxPipeline24);
@@ -410,71 +337,16 @@ void CTreeManager::CreateGfxPipelines()
     }
     auto createDepthVariant = [&](u32 tcOffset, VkPipeline& out)
     {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = dvs; ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = dfs; ss[1].pName = "main";
-
-        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via[2]{};
-        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;   // double-sided leaves
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;         // dynamic — caller sets the sun bias
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp  = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendStateCreateInfo cb{};   // no color attachments
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;   // sun shadow map
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
-        pi.pViewportState = &vp; pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState;
-        pi.layout = m_GfxPipelineLayout;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                      1, &pi, nullptr, &out) != VK_SUCCESS) {
-            Msg("![VK Trees] depth pipeline (tcOff=%u) create failed", tcOffset);
-            out = VK_NULL_HANDLE;
-        }
+        out = VK::GfxPipelineBuilder(m_GfxPipelineLayout)
+            .Vert(dvs).Frag(dfs)
+            .Binding(0, 32)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+            .Cull(VK_CULL_MODE_NONE)          // double-sided leaves
+            .DynamicDepthBias()               // caller sets the sun bias
+            .Depth(true, true)
+            .DepthTarget(VK_FORMAT_D32_SFLOAT)   // sun shadow map, no color attachments
+            .Build("Trees depth (tcOff=%u)", tcOffset);
     };
     createDepthVariant(24, m_DepthPipeline24);
     createDepthVariant(28, m_DepthPipeline28);
@@ -486,7 +358,7 @@ void CTreeManager::CreateGfxPipelines()
 // metadata walk + per-tree draws are off the per-frame path).
 // ============================================================================
 void CTreeManager::RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 cascade,
-                               const CFrustum* frustum, float minDist, float maxDist)
+                               const CFrustum* frustum, float minDist, float maxDist, float flodCut)
 {
     if (!m_bBuilt || m_MetaCPU.empty()) return;
     if (m_XformDescSet == VK_NULL_HANDLE || m_GfxPipelineLayout == VK_NULL_HANDLE) return;
@@ -532,6 +404,14 @@ void CTreeManager::RenderDepth(VkCommandBuffer cmd, const Fmatrix& lightVP, s32 
             if (minDist > 0.0f || maxDist < 1e9f) {
                 const float d = Device.vCameraPosition.distance_to(m.sphere_P);
                 if (d < minDist || d >= maxDist) continue;
+            }
+            // r_tree_dist twin of the colour cull (camera prepass only — callers
+            // pass flodCut == 0 everywhere else). CENTRE distance, no radius slack,
+            // so this set is strictly SMALLER than what tree_cull.comp keeps
+            // (it subtracts sphere_R): colour ⊇ prepass holds by construction, and
+            // FP differences between the two code paths can't invert it.
+            if (flodCut > 0.0f && (m.flags & TREE_FLOD_BACKED) != 0u) {
+                if (Device.vCameraPosition.distance_to(m.sphere_P) > flodCut) continue;
             }
             if (frustum) {
                 if (!frustum->testSphere_dirty(m.sphere_P, m.sphere_R)) continue;
@@ -582,6 +462,57 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     // buffered UBO did, producing black tree silhouettes at the screen edge).
     TreeCullPush cullPush{};
     VK::ExtractFrustumPlanes(vp, cullPush.planes);
+    // Distance cut for billboard-backed trees (r_tree_dist). The prepass applies
+    // the SAME value via RenderDepth(..., flodCut) but on centre distance, so this
+    // one — measured from the sphere's near side — always keeps a superset. See
+    // tree_cull.comp.glsl.
+    cullPush.cut_dist = TreeFlodCutDist();
+    cullPush.eye_x = Device.vCameraPosition.x;
+    cullPush.eye_y = Device.vCameraPosition.y;
+    cullPush.eye_z = Device.vCameraPosition.z;
+
+    // ----- 1b) Hi-Z occlusion (r_tree_hzb). We deliberately do NOT build the
+    // pyramid ourselves: Pass_World builds it from the finished prepass depth
+    // (which trees are part of) and runs BEFORE this pass. If it did not build
+    // this frame, the only pyramid available is last frame's — culling against a
+    // stale camera would pop trees in and out, so we simply skip the test.
+    // ⚠ The prepass keeps drawing the full frustum set on purpose: it IS the
+    // pyramid's source. See the argument in tree_cull.comp.glsl for why culling
+    // only the colour set cannot leave unshaded pixels here.
+    cullPush.viewProj  = vp;
+    cullPush.hzb_focal = 1.0f / _max(0.05f, tanf(deg2rad(Device.fFOV) * 0.5f));
+    cullPush.hzb_on    = 0;
+    VkImageView hzbView = VK_NULL_HANDLE;
+    if (ps_r_tree_hzb && RImplementation.Details
+        && RImplementation.Details->HZBReady() && RImplementation.Details->HZBBuiltThisFrame())
+    {
+        hzbView = RImplementation.Details->HZBView();
+        if (hzbView != VK_NULL_HANDLE) cullPush.hzb_on = 1;
+    }
+    // The descriptor must ALWAYS point at something valid, even with the test off
+    // (an unbound combined-image-sampler is UB the moment the shader is dispatched,
+    // regardless of whether the branch reading it is taken).
+    if (hzbView == VK_NULL_HANDLE && RImplementation.Details)
+        hzbView = RImplementation.Details->DummyHZBView();
+    // Key the cache on view + GENERATION: after DestroyHZB+CreateHZB the driver can
+    // hand back the same numeric VkImageView, and a handle-only check would then keep
+    // a descriptor bound to the destroyed object.
+    const u32 hzbGen = RImplementation.Details ? RImplementation.Details->HZBGeneration() : 0u;
+    if (hzbView == VK_NULL_HANDLE) {
+        cullPush.hzb_on = 0;                       // no pyramid, no dummy — never sample
+    } else if (hzbView != m_CullHzbView || hzbGen != m_CullHzbGen) {
+        // ⚠ ONLY on change. m_CullDescSet is a SINGLE set while kFramesInFlight
+        // frames are in flight, so rewriting it every frame would update a set
+        // that an executing command buffer still references (UB — the same trap
+        // the VSM cascade rebind documents). The view changes only when
+        // CDetailManager recreates the pyramid (resize), and the device is idle
+        // across that, so a write here is safe.
+        VK::DescriptorWriter(m_CullDescSet)
+            .ImageSampler(4, hzbView, RImplementation.Details->HZBSampler(), VK_IMAGE_LAYOUT_GENERAL)
+            .Flush();
+        m_CullHzbView = hzbView;
+        m_CullHzbGen  = hzbGen;
+    }
 
     // ----- 2) Clear per-group draw counts; barrier transfer→compute. ----------
     // Same cross-frame WAR hazard as grass: m_TreeIndirectBuffer and
@@ -634,9 +565,10 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     for (u32 g = 0; g < numGroups; ++g)
     {
         const TreeIndirectGroup& grp = m_Groups[g];
-        // planes stay as extracted above; only the per-group indices change.
+        // planes, cut_dist and eye_* stay as set above (frame-constant); only the
+        // per-group indices change. This slot used to be `_unused` and was zeroed
+        // here every group — it now carries cut_dist, so leave it alone.
         cullPush.mesh_count  = grp.meshCount;
-        cullPush._unused     = 0u;
         cullPush.mesh_offset = grp.meshOffset;
         cullPush.output_base = g * m_MaxGroupMeshCount;
         cullPush.count_index = g;
@@ -685,8 +617,12 @@ void CTreeManager::Render(VK::FrameContext& ctx)
                 u32 vis = 0;
                 if (m_SeenBitsPtr)
                     for (u32 i = 0; i < (m_TotalCount + 31u) / 32u; ++i) vis += (u32)std::popcount(m_SeenBitsPtr[i]);
-                Msg("[VK Trees] forward drawn: %llu of %u instances (visible %u) | %u/%u groups, max group %u",
-                    (unsigned long long)drawn, m_TotalCount, vis, nonEmpty, numGroups, maxGrp);
+                // cut= is stamped into the line on purpose: an A/B of r_tree_dist
+                // compares two logs, and "which mode was this run in" must be IN
+                // the measurement, not remembered alongside it.
+                Msg("[VK Trees] forward drawn: %llu of %u instances (visible %u) | %u/%u groups, max group %u | cut=%.0fm flod-backed=%u shade=%.0fm hzb=%d",
+                    (unsigned long long)drawn, m_TotalCount, vis, nonEmpty, numGroups, maxGrp,
+                    TreeFlodCutDist(), m_FlodBackedCount, ps_r_tree_shade_dist, ps_r_tree_hzb);
             }
         }
     }
@@ -701,7 +637,11 @@ void CTreeManager::Render(VK::FrameContext& ctx)
     // (FTreeVisual.cpp tree_data consts.xy), NOT the static-geometry 1/1024.
     pc.uvScale   = 1.0f / 2048.0f;
     pc.alphaRef  = 200.0f / 255.0f;
-    pc._pad0     = treeStats ? 1.0f : 0.0f;   // tree.frag statsOn: mark the visible-tree bitset
+    pc.statsOn   = treeStats ? 1.0f : 0.0f;   // tree.frag: mark the visible-tree bitset
+    // r_tree_shade_dist — ONLY the forward colour pass gets this. The depth caster
+    // and the hull debug view share this push block but have no shading to drop, and
+    // the shadow passes must not thin out by camera distance at all.
+    pc.shadeDist = ps_r_tree_shade_dist;
     // Env lighting (colorize the baked per-tree hemi factor + open-sky sun term so
     // foliage tracks time-of-day like the world). Neutral fallback if env not up.
     pc.vSunColor.set(0.6f, 0.6f, 0.6f, 0.0f);
@@ -967,76 +907,16 @@ void CTreeManager::CreateMotionPipelines()
 
     auto createVariant = [&](u32 tcOffset, VkPipeline& out)
     {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via[2]{};
-        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;   // double-sided leaves (matches forward)
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_FALSE;   // scene depth owns the surface
-        ds.depthCompareOp  = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;   // RG16F motion
-        ba.blendEnable = VK_FALSE;
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{};
-        dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-        VkFormat mvFmt = VK::MotionVec::Format();
-        VkPipelineRenderingCreateInfo prci{};
-        prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &mvFmt;
-        prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-
-        VkGraphicsPipelineCreateInfo pi{};
-        pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
-        pi.pViewportState = &vp; pi.pRasterizationState = &rs;
-        pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState;
-        pi.layout = m_MotionPipelineLayout;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                      1, &pi, nullptr, &out) != VK_SUCCESS) {
-            Msg("![VK Trees] MV pipeline (tcOff=%u) create failed", tcOffset);
-            out = VK_NULL_HANDLE;
-        }
+        out = VK::GfxPipelineBuilder(m_MotionPipelineLayout)
+            .Vert(vs).Frag(fs)
+            .Binding(0, 32)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+            .Cull(VK_CULL_MODE_NONE)             // double-sided leaves (matches forward)
+            .Depth(true, false)                  // scene depth owns the surface
+            .Color(VK::MotionVec::Format(), VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT)   // RG16F motion
+            .DepthTarget(Swapchain.m_DepthFormat)
+            .Build("Trees MV (tcOff=%u)", tcOffset);
     };
     createVariant(24, m_MotionPipeline24);
     createVariant(28, m_MotionPipeline28);
@@ -1300,97 +1180,52 @@ void CTreeManager::CreateVsmResources()
     // Bin set layout (13 bindings: +7 dynUsed, +8 nearFlags, +9 pageMax, +10 staticPageTable=Option A,
     // +11 receiver mask r_vsm_rmask, +12 diag tree bitsets) + N static + N dyn sets.
     {
-        VkDescriptorSetLayoutBinding b[13]{};
-        VkDescriptorType t[13];
-        for (u32 i = 0; i < 13; ++i) t[i] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        t[1] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        for (u32 i = 0; i < 13; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 13; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_VsmBinSetL) != VK_SUCCESS) return;
-        VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_VsmBinSetL;
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = m_VsmDescPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-        if (vkAllocateDescriptorSets(dev, &dai, m_VsmBinSet) != VK_SUCCESS) return;
-        if (vkAllocateDescriptorSets(dev, &dai, m_VsmDynBinSet) != VK_SUCCESS) return;
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 7 * sizeof(u32) };   // count, cap, mode, hzbOn, margin(float), rmaskOn, bitBase
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &m_VsmBinSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_VsmBinLayout) != VK_SUCCESS) return;
-        VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = binCS; cpci.stage.pName = "main"; cpci.layout = m_VsmBinLayout;
-        if (vkCreateComputePipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &cpci, nullptr, &m_VsmBinPipe) != VK_SUCCESS) return;
+        m_VsmBinSetL = VK::MakeSetLayout({ kSSBO, kUBO,  kSSBO, kSSBO, kSSBO, kSSBO, kSSBO,
+                                           kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                         VK_SHADER_STAGE_COMPUTE_BIT, "Trees.VsmBin");
+        if (m_VsmBinSetL == VK_NULL_HANDLE) return;
+        if (!VK::AllocSets(m_VsmDescPool, m_VsmBinSetL, N, m_VsmBinSet,    "Trees.VsmBin.static")) return;
+        if (!VK::AllocSets(m_VsmDescPool, m_VsmBinSetL, N, m_VsmDynBinSet, "Trees.VsmBin.dyn")) return;
+        // push: count, cap, mode, hzbOn, margin(float), rmaskOn, bitBase
+        m_VsmBinLayout = VK::MakePipelineLayout({ m_VsmBinSetL }, 7 * sizeof(u32));
+        if (m_VsmBinLayout == VK_NULL_HANDLE) return;
+        m_VsmBinPipe = VK::CreateComputePipeline(binCS, m_VsmBinLayout, "Trees.VsmBin");
+        if (m_VsmBinPipe == VK_NULL_HANDLE) return;
     }
 
     // Page set layout (3 bindings: pageList, casterPages, clipmap UBO) + N static + N dynamic sets.
     {
-        VkDescriptorSetLayoutBinding b[3]{};
-        const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-        for (u32 i = 0; i < 3; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT; }
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 3; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_VsmPageSetL) != VK_SUCCESS) return;
-        VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_VsmPageSetL;
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = m_VsmDescPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-        if (vkAllocateDescriptorSets(dev, &dai, m_VsmPageSet) != VK_SUCCESS) return;
-        if (vkAllocateDescriptorSets(dev, &dai, m_VsmDynPageSet) != VK_SUCCESS) return;
+        m_VsmPageSetL = VK::MakeSetLayout({ kSSBO, kSSBO, kUBO },
+                                          VK_SHADER_STAGE_VERTEX_BIT, "Trees.VsmPage");
+        if (m_VsmPageSetL == VK_NULL_HANDLE) return;
+        if (!VK::AllocSets(m_VsmDescPool, m_VsmPageSetL, N, m_VsmPageSet,    "Trees.VsmPage.static")) return;
+        if (!VK::AllocSets(m_VsmDescPool, m_VsmPageSetL, N, m_VsmDynPageSet, "Trees.VsmPage.dyn")) return;
     }
 
     // Page pipeline layout: set0 = transforms (reuse), set1 = diffuse (reuse), set2 = page data.
-    {
-        VkDescriptorSetLayout sets[3] = { m_XformDescLayout, m_TexDescLayout, m_VsmPageSetL };
-        // 16 B base (uvScale, alphaRef, cap, pad) + 48 B TEST wind (wind_params,
-        // wsetup_trees, wind_anim) for r_vsm_tree_wind. See tree_vsm_page.vert.
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64 };
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 3; plci.pSetLayouts = sets; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_VsmPageLayout) != VK_SUCCESS) return;
-    }
+    // Push: 16 B base (uvScale, alphaRef, cap, pad) + 48 B TEST wind (wind_params,
+    // wsetup_trees, wind_anim) for r_vsm_tree_wind. See tree_vsm_page.vert.
+    m_VsmPageLayout = VK::MakePipelineLayout({ m_XformDescLayout, m_TexDescLayout, m_VsmPageSetL }, 64,
+                                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+    if (m_VsmPageLayout == VK_NULL_HANDLE) return;
 
     // Page pipelines (tcOffset 24 / 28 × static/dynamic VS) — depth-only into the D16 atlas, alpha-test FS.
     auto createPageVariant = [&](VkShaderModule vs, u32 tcOffset, VkPipeline& out, bool wantFsr) {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = pfs; ss[1].pName = "main";
-        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via[2]{};
-        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        VK::GfxPipelineBuilder b(m_VsmPageLayout);
+        b.Vert(vs).Frag(pfs)
+         .Binding(0, 32)
+         .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+         .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+         .Cull(VK_CULL_MODE_NONE)
+         .DynamicDepthBias()
+         .Depth(true, true)
+         .DepthTarget(VK_FORMAT_D16_UNORM);   // VSM atlas is D16 (see vk_vsm CreateRenderResources)
         // Dynamic crown pipelines add a FRAGMENT_SHADING_RATE dynamic state so VsmRenderDyn
         // can 2x2-coarse the crown-shadow fill at runtime (r_vsm_tree_vrs). Static pipelines
-        // keep 3 states (they never set a rate).
-        VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
-                                  VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR };
-        const bool fsr = wantFsr && VulkanHW.m_bVRSPipelineSupported;
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dynState.dynamicStateCount = fsr ? 4u : 3u; dynState.pDynamicStates = dyn;
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // VSM atlas is D16 (see vk_vsm CreateRenderResources)
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = m_VsmPageLayout;
-        if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS) {
-            Msg("![VK Trees] VSM page pipeline (tcOff=%u) create failed", tcOffset); out = VK_NULL_HANDLE;
-        }
+        // never set a rate.
+        if (wantFsr && VulkanHW.m_bVRSPipelineSupported)
+            b.Dynamic(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
+        out = b.Build("Trees VSM page (tcOff=%u)", tcOffset);
     };
     createPageVariant(pvs,  24, m_VsmPagePipe24,    false);
     createPageVariant(pvs,  28, m_VsmPagePipe28,    false);
@@ -1490,64 +1325,31 @@ void CTreeManager::CreateMeshletVsmResources()
     if (vkCreateDescriptorPool(dev, &pci, nullptr, &m_MeshletDescPool) != VK_SUCCESS) return;
 
     {
-        VkDescriptorSetLayoutBinding b[13]{};
-        for (u32 i = 0; i < 13; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-        b[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;   // VsmParams
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 13; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_MeshletBinSetL) != VK_SUCCESS) return;
-        VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_MeshletBinSetL;
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = m_MeshletDescPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-        if (vkAllocateDescriptorSets(dev, &dai, m_MeshletBinSet) != VK_SUCCESS) return;
-        if (vkAllocateDescriptorSets(dev, &dai, m_MeshletDynBinSet) != VK_SUCCESS) return;
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 4 * sizeof(u32) };   // casterCount, cap, slop(float), pad
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &m_MeshletBinSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_MeshletBinLayout) != VK_SUCCESS) return;
-        VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = binCS; cpci.stage.pName = "main"; cpci.layout = m_MeshletBinLayout;
-        if (vkCreateComputePipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &cpci, nullptr, &m_MeshletBinPipe) != VK_SUCCESS) return;
+        m_MeshletBinSetL = VK::MakeSetLayout({ kSSBO, kUBO,  kSSBO, kSSBO, kSSBO, kSSBO, kSSBO,   // 1 = VsmParams
+                                               kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                             VK_SHADER_STAGE_COMPUTE_BIT, "Trees.MeshletBin");
+        if (m_MeshletBinSetL == VK_NULL_HANDLE) return;
+        if (!VK::AllocSets(m_MeshletDescPool, m_MeshletBinSetL, N, m_MeshletBinSet,    "Trees.MeshletBin.static")) return;
+        if (!VK::AllocSets(m_MeshletDescPool, m_MeshletBinSetL, N, m_MeshletDynBinSet, "Trees.MeshletBin.dyn")) return;
+        // push: casterCount, cap, slop(float), pad
+        m_MeshletBinLayout = VK::MakePipelineLayout({ m_MeshletBinSetL }, 4 * sizeof(u32));
+        if (m_MeshletBinLayout == VK_NULL_HANDLE) return;
+        m_MeshletBinPipe = VK::CreateComputePipeline(binCS, m_MeshletBinLayout, "Trees.MeshletBin");
+        if (m_MeshletBinPipe == VK_NULL_HANDLE) return;
     }
 
     // ----- Meshlet page pipelines (reuse m_VsmPageLayout: set0 xform, set1 tex, set2 page).
     auto createPageVariant = [&](VkShaderModule vs, u32 tcOffset, VkPipeline& out) {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs;  ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = pfs; ss[1].pName = "main";
-        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via[2]{};
-        via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-        via[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // VSM atlas is D16 (see vk_vsm CreateRenderResources)
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = m_VsmPageLayout;
-        if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS) {
-            Msg("![VK Trees] meshlet page pipeline (tcOff=%u) create failed", tcOffset); out = VK_NULL_HANDLE;
-        }
+        out = VK::GfxPipelineBuilder(m_VsmPageLayout)
+            .Vert(vs).Frag(pfs)
+            .Binding(0, 32)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+            .Cull(VK_CULL_MODE_NONE)
+            .DynamicDepthBias()
+            .Depth(true, true)
+            .DepthTarget(VK_FORMAT_D16_UNORM)   // VSM atlas is D16 (see vk_vsm CreateRenderResources)
+            .Build("Trees meshlet page (tcOff=%u)", tcOffset);
     };
     createPageVariant(pvs,  24, m_MeshletPagePipe24);
     createPageVariant(pvs,  28, m_MeshletPagePipe28);
@@ -1587,25 +1389,21 @@ void CTreeManager::DispatchMeshletBin(VkCommandBuffer cmd, u32 mode, VkBuffer pa
     // VsmBinClears in the frame-start fill block, and the caller (vk_vsm MarkPages)
     // issued the single stage-1→stage-2 barrier ordering the tree bins' casterPages/
     // indirect writes before this refinement's reads.
-    VkDescriptorBufferInfo bi[13] = {
-        { m_TreeMetadataBuffer->GetHandle(),      0, VK_WHOLE_SIZE },   // 0 meta
-        { clipmapUBO,                             0, VK_WHOLE_SIZE },   // 1 VsmParams (UBO)
-        { m_TreeTransformsBuffer->GetHandle(),    0, VK_WHOLE_SIZE },   // 2 xform
-        { m_MeshletBuffer->GetHandle(),           0, VK_WHOLE_SIZE },   // 3 meshlets
-        { m_TreeMeshletRangeBuffer->GetHandle(),  0, VK_WHOLE_SIZE },   // 4 tree range
-        { m_VsmCasterPages->GetHandle(),          0, VK_WHOLE_SIZE },   // 5 caster pages (stage 1)
-        { pageList,                               0, VK_WHOLE_SIZE },   // 6 slot -> page
-        { indirect,                               0, VK_WHOLE_SIZE },   // 7 stage-1 indirect (pageCount)
-        { outCmd,                                 0, VK_WHOLE_SIZE },   // 8 out commands
-        { groupCnt,                               0, VK_WHOLE_SIZE },   // 9 group counter
-        { m_TreeGroupBuffer->GetHandle(),         0, VK_WHOLE_SIZE },   // 10 tree -> group
-        { m_GroupInfoBuffer->GetHandle(),         0, VK_WHOLE_SIZE },   // 11 group (base,cap)
-        { m_MeshletStats->GetHandle(),            0, VK_WHOLE_SIZE },   // 12 stats
-    };
-    VkDescriptorType t[13]; for (u32 i = 0; i < 13; ++i) t[i] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; t[1] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    VkWriteDescriptorSet w[13]{};
-    for (u32 i = 0; i < 13; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 13, w, 0, nullptr);
+    VK::DescriptorWriter(set)
+        .StorageBuffer(0,  m_TreeMetadataBuffer->GetHandle())      // meta
+        .UniformBuffer(1,  clipmapUBO)                             // VsmParams
+        .StorageBuffer(2,  m_TreeTransformsBuffer->GetHandle())    // xform
+        .StorageBuffer(3,  m_MeshletBuffer->GetHandle())           // meshlets
+        .StorageBuffer(4,  m_TreeMeshletRangeBuffer->GetHandle())  // tree range
+        .StorageBuffer(5,  m_VsmCasterPages->GetHandle())          // caster pages (stage 1)
+        .StorageBuffer(6,  pageList)                               // slot -> page
+        .StorageBuffer(7,  indirect)                               // stage-1 indirect (pageCount)
+        .StorageBuffer(8,  outCmd)                                 // out commands
+        .StorageBuffer(9,  groupCnt)                               // group counter
+        .StorageBuffer(10, m_TreeGroupBuffer->GetHandle())         // tree -> group
+        .StorageBuffer(11, m_GroupInfoBuffer->GetHandle())         // group (base,cap)
+        .StorageBuffer(12, m_MeshletStats->GetHandle())            // stats
+        .Flush();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_MeshletBinPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_MeshletBinLayout, 0, 1, &set, 0, nullptr);
@@ -1963,22 +1761,21 @@ void CTreeManager::VsmBin(VkCommandBuffer cmd, VkBuffer pageTable, VkBuffer slot
     // completeness only (the shader's write is mode-gated).
     VkBuffer rmask = VK::VSM::GetRMaskHandle();
     if (rmask == VK_NULL_HANDLE) rmask = pageTable;   // layout parity (mode 0 never reads it)
-    VkDescriptorBufferInfo bi[13] = {
-        { m_TreeMetadataBuffer->GetHandle(), 0, VK_WHOLE_SIZE }, { clipmapUBO,                     0, VK_WHOLE_SIZE },
-        { pageTable,                         0, VK_WHOLE_SIZE }, { m_VsmCasterPages->GetHandle(),  0, VK_WHOLE_SIZE },
-        { m_VsmIndirect->GetHandle(),        0, VK_WHOLE_SIZE }, { m_VsmStats->GetHandle(),        0, VK_WHOLE_SIZE },
-        { slotDirty,                         0, VK_WHOLE_SIZE },   // 6: STATIC-atlas dirty set (cache filter)
-        { dynUsed,                           0, VK_WHOLE_SIZE },   // 7: unused in mode 0
-        { m_VsmNearFlags[slot]->GetHandle(), 0, VK_WHOLE_SIZE },   // 8: near set
-        { pageMax,                           0, VK_WHOLE_SIZE },   // 9: shadow-HZB occluder max (r_vsm_hzb)
-        { pageTable,                         0, VK_WHOLE_SIZE },   // 10: staticPageTable — in the static call pageTable IS static (mode 0 ignores it)
-        { rmask,                             0, VK_WHOLE_SIZE },   // 11: receiver mask (mode 1 only — static must not partial-render)
-        { m_VsmTreeBits->GetHandle(),        0, VK_WHOLE_SIZE },   // 12: diag tree bitsets (dyn | static-accum)
-    };
-    VkDescriptorType t[13]; for (u32 i = 0; i < 13; ++i) t[i] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; t[1] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    VkWriteDescriptorSet w[13]{};
-    for (u32 i = 0; i < 13; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmBinSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 13, w, 0, nullptr);
+    VK::DescriptorWriter(m_VsmBinSet[slot])
+        .StorageBuffer(0,  m_TreeMetadataBuffer->GetHandle())
+        .UniformBuffer(1,  clipmapUBO)
+        .StorageBuffer(2,  pageTable)
+        .StorageBuffer(3,  m_VsmCasterPages->GetHandle())
+        .StorageBuffer(4,  m_VsmIndirect->GetHandle())
+        .StorageBuffer(5,  m_VsmStats->GetHandle())
+        .StorageBuffer(6,  slotDirty)                        // STATIC-atlas dirty set (cache filter)
+        .StorageBuffer(7,  dynUsed)                          // unused in mode 0
+        .StorageBuffer(8,  m_VsmNearFlags[slot]->GetHandle())// near set
+        .StorageBuffer(9,  pageMax)                          // shadow-HZB occluder max (r_vsm_hzb)
+        .StorageBuffer(10, pageTable)                        // staticPageTable — here pageTable IS static (mode 0 ignores it)
+        .StorageBuffer(11, rmask)                            // receiver mask (mode 1 only — static must not partial-render)
+        .StorageBuffer(12, m_VsmTreeBits->GetHandle())       // diag tree bitsets (dyn | static-accum)
+        .Flush();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VsmBinPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VsmBinLayout, 0, 1, &m_VsmBinSet[slot], 0, nullptr);
@@ -2006,22 +1803,21 @@ void CTreeManager::VsmBinDyn(VkCommandBuffer cmd, VkBuffer dynPageTable, VkBuffe
     VkBuffer rmask = VK::VSM::GetRMaskHandle();
     const bool rmaskOn = ps_r_vsm_rmask && rmask != VK_NULL_HANDLE;
     if (rmask == VK_NULL_HANDLE) rmask = dynPageTable;   // layout parity when off
-    VkDescriptorBufferInfo bi[13] = {
-        { m_TreeMetadataBuffer->GetHandle(), 0, VK_WHOLE_SIZE }, { clipmapUBO,                     0, VK_WHOLE_SIZE },
-        { dynPageTable,                      0, VK_WHOLE_SIZE }, { m_VsmCasterPages->GetHandle(),  0, VK_WHOLE_SIZE },
-        { m_VsmDynIndirect->GetHandle(),     0, VK_WHOLE_SIZE }, { m_VsmStats->GetHandle(),        0, VK_WHOLE_SIZE },
-        { dynUsed,                           0, VK_WHOLE_SIZE },   // 6: slotDirty slot — unused in mode 1, any valid buffer
-        { dynUsed,                           0, VK_WHOLE_SIZE },   // 7: dynUsed flags (resolve gate)
-        { m_VsmNearFlags[slot]->GetHandle(), 0, VK_WHOLE_SIZE },   // 8: near set
-        { pageMax,                           0, VK_WHOLE_SIZE },   // 9: STATIC occluder max (Option A)
-        { staticPageTable,                   0, VK_WHOLE_SIZE },   // 10: virtual -> STATIC slot (Option A)
-        { rmask,                             0, VK_WHOLE_SIZE },   // 11: receiver mask (r_vsm_rmask sub-page cull)
-        { m_VsmTreeBits->GetHandle(),        0, VK_WHOLE_SIZE },   // 12: diag tree bitsets (dyn | static-accum)
-    };
-    VkDescriptorType t[13]; for (u32 i = 0; i < 13; ++i) t[i] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; t[1] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    VkWriteDescriptorSet w[13]{};
-    for (u32 i = 0; i < 13; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmDynBinSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 13, w, 0, nullptr);
+    VK::DescriptorWriter(m_VsmDynBinSet[slot])
+        .StorageBuffer(0,  m_TreeMetadataBuffer->GetHandle())
+        .UniformBuffer(1,  clipmapUBO)
+        .StorageBuffer(2,  dynPageTable)
+        .StorageBuffer(3,  m_VsmCasterPages->GetHandle())
+        .StorageBuffer(4,  m_VsmDynIndirect->GetHandle())
+        .StorageBuffer(5,  m_VsmStats->GetHandle())
+        .StorageBuffer(6,  dynUsed)                          // slotDirty slot — unused in mode 1, any valid buffer
+        .StorageBuffer(7,  dynUsed)                          // dynUsed flags (resolve gate)
+        .StorageBuffer(8,  m_VsmNearFlags[slot]->GetHandle())// near set
+        .StorageBuffer(9,  pageMax)                          // STATIC occluder max (Option A)
+        .StorageBuffer(10, staticPageTable)                  // virtual -> STATIC slot (Option A)
+        .StorageBuffer(11, rmask)                            // receiver mask (r_vsm_rmask sub-page cull)
+        .StorageBuffer(12, m_VsmTreeBits->GetHandle())       // diag tree bitsets (dyn | static-accum)
+        .Flush();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VsmBinPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VsmBinLayout, 0, 1, &m_VsmDynBinSet[slot], 0, nullptr);
@@ -2159,15 +1955,11 @@ void CTreeManager::VsmRender(VkCommandBuffer cmd, VkBuffer pageList, VkBuffer cl
     if (pageList == VK_NULL_HANDLE || clipmapUBO == VK_NULL_HANDLE) return;
     const u32 slot = m_VsmSlot;
 
-    VkDescriptorBufferInfo bi[3] = {
-        { pageList,                      0, VK_WHOLE_SIZE },
-        { m_VsmCasterPages->GetHandle(), 0, VK_WHOLE_SIZE },
-        { clipmapUBO,                    0, VK_WHOLE_SIZE },
-    };
-    const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    VkWriteDescriptorSet w[3]{};
-    for (u32 i = 0; i < 3; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmPageSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+    VK::DescriptorWriter(m_VsmPageSet[slot])
+        .StorageBuffer(0, pageList)
+        .StorageBuffer(1, m_VsmCasterPages->GetHandle())
+        .UniformBuffer(2, clipmapUBO)
+        .Flush();
 
     // FAR crown-hull tier (r_vsm_tree_hull 2): distant foliage casts rigid opaque lobes
     // into the dirty static pages (its crown cmds were zeroed by vsm_hull_cmd) — the
@@ -2225,15 +2017,11 @@ void CTreeManager::VsmRenderDyn(VkCommandBuffer cmd, VkBuffer dynPageList, VkBuf
     if (dynPageList == VK_NULL_HANDLE || clipmapUBO == VK_NULL_HANDLE) return;
     const u32 slot = m_VsmSlot;
 
-    VkDescriptorBufferInfo bi[3] = {
-        { dynPageList,                   0, VK_WHOLE_SIZE },
-        { m_VsmCasterPages->GetHandle(), 0, VK_WHOLE_SIZE },
-        { clipmapUBO,                    0, VK_WHOLE_SIZE },
-    };
-    const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    VkWriteDescriptorSet w[3]{};
-    for (u32 i = 0; i < 3; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VsmDynPageSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+    VK::DescriptorWriter(m_VsmDynPageSet[slot])
+        .StorageBuffer(0, dynPageList)
+        .StorageBuffer(1, m_VsmCasterPages->GetHandle())
+        .UniformBuffer(2, clipmapUBO)
+        .Flush();
 
     // Crown-hull tier (r_vsm_tree_hull): draw the hull-tier trees FIRST (opaque low-poly
     // lobes, one multi-draw, no texture) — their crown cmds were zeroed by vsm_hull_cmd,
@@ -2416,43 +2204,24 @@ void CTreeManager::BuildImpostorAtlas(const xr_vector<vkFTreeVisual*>& trees,
       plci.setLayoutCount = 1; plci.pSetLayouts = &m_TexDescLayout; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
       vkCreatePipelineLayout(dev, &plci, nullptr, &bakeLayout); }
     VkPipeline bakePipe24 = VK_NULL_HANDLE, bakePipe28 = VK_NULL_HANDLE;
-    auto makeBake = [&](u32 tcOffset, VkPipeline& out) {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = bvs; ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = bfs; ss[1].pName = "main";
-        VkVertexInputBindingDescription vibd{ 0, 32, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via[2] = { { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 }, { 1, 0, VK_FORMAT_R16G16_SSCALED, tcOffset } };
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO }; vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO }; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO }; cb.attachmentCount = 1; cb.pAttachments = &cba;
-        VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO }; dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-        VkFormat colorFmt = VK_FORMAT_R8_UNORM;
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO }; prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss; pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
-        pi.pViewportState = &vp; pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = bakeLayout;
-        if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS) out = VK_NULL_HANDLE;
+    auto makeBake = [&](u32 tcOffset, VkPipeline& out) {   // colour-only — no depth state at all
+        out = VK::GfxPipelineBuilder(bakeLayout)
+            .Vert(bvs).Frag(bfs)
+            .Binding(0, 32)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+            .Cull(VK_CULL_MODE_NONE)
+            .Color(VK_FORMAT_R8_UNORM, VK_COLOR_COMPONENT_R_BIT)
+            .Build("Trees impostor bake (tcOff=%u)", tcOffset);
     };
     makeBake(24, bakePipe24); makeBake(28, bakePipe28);
 
     // ----- Bake: one-off command buffer, all cells in one dynamic-rendering pass.
     VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands();
     VK::ImageBarrier(cmd, m_ImpostorAtlas, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    VkRenderingAttachmentInfo cAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    cAtt.imageView = m_ImpostorAtlasView; cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE; cAtt.clearValue.color = { { 0.f, 0.f, 0.f, 0.f } };
-    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea = { { 0, 0 }, { W, H } }; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &cAtt;
-    vkCmdBeginRendering(cmd, &ri);
+    VK::RenderingBuilder(W, H)
+        .ColorClear(m_ImpostorAtlasView, VkClearColorValue{ { 0.f, 0.f, 0.f, 0.f } })
+        .Begin(cmd);
     for (u32 s = 0; s < m_ImpostorMeshCount; ++s) {
         const MeshKey& k = uniq[s];
         VkPipeline pipe = (k.tc == 24) ? bakePipe24 : bakePipe28;
@@ -2519,59 +2288,38 @@ void CTreeManager::CreateImpostorResources()
       if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_ImpostorSetL) != VK_SUCCESS) return;
       VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO }; dai.descriptorPool = m_ImpostorPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &m_ImpostorSetL;
       if (vkAllocateDescriptorSets(dev, &dai, &m_ImpostorSet) != VK_SUCCESS) return;
-      VkDescriptorBufferInfo mi{ m_TreeMetadataBuffer->GetHandle(), 0, VK_WHOLE_SIZE };
-      VkDescriptorBufferInfo si{ m_ImpostorSilIdx->GetHandle(),     0, VK_WHOLE_SIZE };
-      VkDescriptorImageInfo  ii{ m_ImpostorSampler, m_ImpostorAtlasView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-      VkWriteDescriptorSet w[3]{};
-      w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = m_ImpostorSet; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[0].pBufferInfo = &mi;
-      w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = m_ImpostorSet; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[1].pBufferInfo = &si;
-      w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = m_ImpostorSet; w[2].dstBinding = 2; w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[2].pImageInfo = &ii;
-      vkUpdateDescriptorSets(dev, 3, w, 0, nullptr);
+      VK::DescriptorWriter(m_ImpostorSet)
+          .StorageBuffer(0, m_TreeMetadataBuffer->GetHandle())
+          .StorageBuffer(1, m_ImpostorSilIdx->GetHandle())
+          .ImageSampler (2, m_ImpostorAtlasView, m_ImpostorSampler)
+          .Flush();
     }
 
     // Graphics pipeline: {set0 xform, set1 impostor, set2 page}, no vertex input (gl_VertexIndex quad).
-    { VkDescriptorSetLayout sets[3] = { m_XformDescLayout, m_ImpostorSetL, m_VsmPageSetL };
-      VkPushConstantRange gpcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80 };
-      VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO }; plci.setLayoutCount = 3; plci.pSetLayouts = sets; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &gpcr;
-      if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_ImpostorLayout) != VK_SUCCESS) return; }
-    { VkPipelineShaderStageCreateInfo ss[2]{};
-      ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-      ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-      VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-      VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO }; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-      VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO }; vp.viewportCount = 1; vp.scissorCount = 1;
-      VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-      rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f; rs.depthBiasEnable = VK_TRUE;
-      VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO }; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-      VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO }; ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-      VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-      VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-      VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO }; dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-      VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO }; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;
-      VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-      pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss; pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-      pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds; pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = m_ImpostorLayout;
-      if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &m_ImpostorPipe) != VK_SUCCESS) { Msg("![VK Trees] impostor pipeline create failed"); return; } }
+    m_ImpostorLayout = VK::MakePipelineLayout({ m_XformDescLayout, m_ImpostorSetL, m_VsmPageSetL }, 80,
+                                              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+    if (m_ImpostorLayout == VK_NULL_HANDLE) return;
+    m_ImpostorPipe = VK::GfxPipelineBuilder(m_ImpostorLayout)   // no vertex input — gl_VertexIndex quad
+        .Vert(vs).Frag(fs)
+        .Cull(VK_CULL_MODE_NONE)
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D16_UNORM)
+        .Build("Trees impostor");
+    if (m_ImpostorPipe == VK_NULL_HANDLE) return;
 
     // Indirect builder compute: set {0 src (dyn indirect), 1 dst (impostor indirect)}.
-    { VkDescriptorSetLayoutBinding b[2]{};
-      for (u32 i = 0; i < 2; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-      VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO }; lci.bindingCount = 2; lci.pBindings = b;
-      if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_ImpostorCmdSetL) != VK_SUCCESS) return;
-      VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO }; dai.descriptorPool = m_ImpostorPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &m_ImpostorCmdSetL;
-      if (vkAllocateDescriptorSets(dev, &dai, &m_ImpostorCmdSet) != VK_SUCCESS) return;
-      VkDescriptorBufferInfo srci{ m_VsmDynIndirect->GetHandle(),          0, VK_WHOLE_SIZE };
-      VkDescriptorBufferInfo dsti{ m_VsmImpostorDynIndirect->GetHandle(),  0, VK_WHOLE_SIZE };
-      VkWriteDescriptorSet w[2]{};
-      w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = m_ImpostorCmdSet; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &srci;
-      w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = m_ImpostorCmdSet; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &dsti;
-      vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
-      VkPushConstantRange cpcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(u32) };
-      VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO }; plci.setLayoutCount = 1; plci.pSetLayouts = &m_ImpostorCmdSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &cpcr;
-      if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_ImpostorCmdLayout) != VK_SUCCESS) return;
-      VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-      cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = m_ImpostorCmdLayout;
-      if (vkCreateComputePipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &cpci, nullptr, &m_ImpostorCmdPipe) != VK_SUCCESS) return; }
+    { m_ImpostorCmdSetL = VK::MakeSetLayout({ kSSBO, kSSBO }, VK_SHADER_STAGE_COMPUTE_BIT, "Trees.ImpostorCmd");
+      if (m_ImpostorCmdSetL == VK_NULL_HANDLE) return;
+      if (!VK::AllocSets(m_ImpostorPool, m_ImpostorCmdSetL, 1, &m_ImpostorCmdSet, "Trees.ImpostorCmd")) return;
+      VK::DescriptorWriter(m_ImpostorCmdSet)
+          .StorageBuffer(0, m_VsmDynIndirect->GetHandle())
+          .StorageBuffer(1, m_VsmImpostorDynIndirect->GetHandle())
+          .Flush();
+      m_ImpostorCmdLayout = VK::MakePipelineLayout({ m_ImpostorCmdSetL }, sizeof(u32));
+      if (m_ImpostorCmdLayout == VK_NULL_HANDLE) return;
+      m_ImpostorCmdPipe = VK::CreateComputePipeline(cs, m_ImpostorCmdLayout, "Trees.ImpostorCmd");
+      if (m_ImpostorCmdPipe == VK_NULL_HANDLE) return; }
 
     m_ImpostorReady = true;
     Msg("[VK Trees] impostor crown shadows ready (%u meshes, %u facets, scale %.2f)", m_ImpostorMeshCount, kImpFacets, ps_r_vsm_tree_impostor_scale);
@@ -2638,7 +2386,6 @@ void CTreeManager::CreateHullResources()
     VkShaderModule fs  = g_ShaderManager->Load("tree_vsm_hull.frag.spv");
     VkShaderModule cs  = g_ShaderManager->Load("vsm_hull_cmd.comp.spv");
     if (!vs || !vsS || !fs || !cs) { Msg("![VK Trees] crown-hull shaders missing — r_vsm_tree_hull disabled"); return; }
-    VkDevice dev = VulkanHW.m_Device;
     const u32 N = VK_FRAMES_IN_FLIGHT;
 
     // TRANSFER_DST: joins the lazy-init zero fill (recycled-VRAM garbage in an indirect
@@ -2670,71 +2417,33 @@ void CTreeManager::CreateHullResources()
     }
 
     // Own pool (never resize the shared VSM pool — the regression-prone class of change).
-    VkDescriptorPoolSize ps[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 9 } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 1; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(dev, &pci, nullptr, &m_HullCmdPool) != VK_SUCCESS) return;
-
     // Cmd-swap compute: {0 dyn crown RW, 1 hullInfo, 2 nearFlags (per-frame ring),
     //                    3 dyn hull W, 4 STATIC crown RW, 5 static hull W,
     //                    6 vox choice (ring), 7 dyn vox W, 8 static vox W}.
     {
-        VkDescriptorSetLayoutBinding b[9]{};
-        for (u32 i = 0; i < 9; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 9; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_HullCmdSetL) != VK_SUCCESS) return;
-        VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_HullCmdSetL;
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = m_HullCmdPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-        if (vkAllocateDescriptorSets(dev, &dai, m_HullCmdSet) != VK_SUCCESS) return;
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(u32) };
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &m_HullCmdSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(dev, &plci, nullptr, &m_HullCmdLayout) != VK_SUCCESS) return;
-        VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = m_HullCmdLayout;
-        if (vkCreateComputePipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &cpci, nullptr, &m_HullCmdPipe) != VK_SUCCESS) return;
+        if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                    N, m_HullCmdSetL, m_HullCmdPool, m_HullCmdSet,
+                                    VK_SHADER_STAGE_COMPUTE_BIT, "Trees.HullCmd"))
+            return;
+        m_HullCmdLayout = VK::MakePipelineLayout({ m_HullCmdSetL }, 3 * sizeof(u32));
+        if (m_HullCmdLayout == VK_NULL_HANDLE) return;
+        m_HullCmdPipe = VK::CreateComputePipeline(cs, m_HullCmdLayout, "Trees.HullCmd");
+        if (m_HullCmdPipe == VK_NULL_HANDLE) return;
     }
 
     // Opaque depth-only hull raster ×2 (dyn/static atlas VS variants). Reuses
     // m_VsmPageLayout (set1 diffuse unused by the shader — stays bound from the crown
     // draws, layout-compatible). Tight vec3 VB.
     auto createHullPipe = [&](VkShaderModule hvs, VkPipeline& out) {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = hvs; ss[0].pName = "main";
-        ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-        VkVertexInputBindingDescription vibd{ 0, 12, VK_VERTEX_INPUT_RATE_VERTEX };
-        VkVertexInputAttributeDescription via{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-        vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &via;
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // VSM atlas format
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = m_VsmPageLayout;
-        if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS) {
-            Msg("![VK Trees] crown-hull pipeline create failed"); out = VK_NULL_HANDLE;
-        }
+        out = VK::GfxPipelineBuilder(m_VsmPageLayout)
+            .Vert(hvs).Frag(fs)
+            .Binding(0, 12)
+            .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+            .Cull(VK_CULL_MODE_NONE)
+            .DynamicDepthBias()
+            .Depth(true, true)
+            .DepthTarget(VK_FORMAT_D16_UNORM)   // VSM atlas format
+            .Build("Trees crown-hull");
     };
     createHullPipe(vs,  m_VsmHullPipe);    // dyn atlas (wind push)
     createHullPipe(vsS, m_VsmHullPipeS);   // static atlas (rigid)
@@ -2775,65 +2484,29 @@ void CTreeManager::CreateHullResources()
             }
         }
         {
-            VkDescriptorSetLayoutBinding b[3]{};
-            for (u32 i = 0; i < 3; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT; }
-            VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            lci.bindingCount = 3; lci.pBindings = b;
-            if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &m_VoxCasterSetL) != VK_SUCCESS) break;
-            VkDescriptorPoolSize vps[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 3 } };
-            VkDescriptorPoolCreateInfo vpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            vpci.maxSets = N; vpci.poolSizeCount = 1; vpci.pPoolSizes = vps;
-            if (vkCreateDescriptorPool(dev, &vpci, nullptr, &m_VoxCasterPool) != VK_SUCCESS) break;
-            VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) ls[i] = m_VoxCasterSetL;
-            VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            dai.descriptorPool = m_VoxCasterPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-            if (vkAllocateDescriptorSets(dev, &dai, m_VoxCasterSet) != VK_SUCCESS) break;
-            for (u32 i = 0; i < N; ++i) {   // handles are fixed → write once
-                VkDescriptorBufferInfo vbi[3] = {
-                    { m_BrickVB->GetHandle(),         0, VK_WHOLE_SIZE },
-                    { m_VoxChoiceBuf[i]->GetHandle(), 0, VK_WHOLE_SIZE },
-                    { m_VoxCullList->GetHandle(),     0, VK_WHOLE_SIZE },
-                };
-                VkWriteDescriptorSet vw[3]{};
-                for (u32 j = 0; j < 3; ++j) { vw[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; vw[j].dstSet = m_VoxCasterSet[i]; vw[j].dstBinding = j; vw[j].descriptorCount = 1; vw[j].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; vw[j].pBufferInfo = &vbi[j]; }
-                vkUpdateDescriptorSets(dev, 3, vw, 0, nullptr);
-            }
-            VkDescriptorSetLayout sets4[4] = { m_XformDescLayout, m_TexDescLayout, m_VsmPageSetL, m_VoxCasterSetL };
-            VkPushConstantRange pcr4{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64 };
-            VkPipelineLayoutCreateInfo plci4{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            plci4.setLayoutCount = 4; plci4.pSetLayouts = sets4; plci4.pushConstantRangeCount = 1; plci4.pPushConstantRanges = &pcr4;
-            if (vkCreatePipelineLayout(dev, &plci4, nullptr, &m_VoxCasterLayout) != VK_SUCCESS) break;
+            if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO }, N,
+                                        m_VoxCasterSetL, m_VoxCasterPool, m_VoxCasterSet,
+                                        VK_SHADER_STAGE_VERTEX_BIT, "Trees.VoxCaster"))
+                break;
+            for (u32 i = 0; i < N; ++i)     // handles are fixed → write once
+                VK::DescriptorWriter(m_VoxCasterSet[i])
+                    .StorageBuffer(0, m_BrickVB->GetHandle())
+                    .StorageBuffer(1, m_VoxChoiceBuf[i]->GetHandle())
+                    .StorageBuffer(2, m_VoxCullList->GetHandle())
+                    .Flush();
+            m_VoxCasterLayout = VK::MakePipelineLayout(
+                { m_XformDescLayout, m_TexDescLayout, m_VsmPageSetL, m_VoxCasterSetL }, 64,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+            if (m_VoxCasterLayout == VK_NULL_HANDLE) break;
         }
         auto createVoxPipe = [&](VkShaderModule mvs, VkPipeline& out) {
-            VkPipelineShaderStageCreateInfo ss[2]{};
-            ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = mvs; ss[0].pName = "main";
-            ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = vfs; ss[1].pName = "main";
-            VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };   // no vertex input
-            VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-            vp.viewportCount = 1; vp.scissorCount = 1;
-            VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-            rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-            rs.depthBiasEnable = VK_TRUE;
-            VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-            VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-            ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-            VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-            VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-            VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-            prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // VSM atlas format
-            VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-            pi.pNext = &prci; pi.stageCount = 2; pi.pStages = ss;
-            pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-            pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-            pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = m_VoxCasterLayout;
-            if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &out) != VK_SUCCESS) {
-                Msg("![VK Trees] voxel caster pipeline create failed"); out = VK_NULL_HANDLE;
-            }
+            out = VK::GfxPipelineBuilder(m_VoxCasterLayout)   // no vertex input
+                .Vert(mvs).Frag(vfs)
+                .Cull(VK_CULL_MODE_NONE)
+                .DynamicDepthBias()
+                .Depth(true, true)
+                .DepthTarget(VK_FORMAT_D16_UNORM)   // VSM atlas format
+                .Build("Trees voxel caster");
         };
         createVoxPipe(vvs,  m_VsmVoxPipe);
         createVoxPipe(vvsS, m_VsmVoxPipeS);
@@ -2843,30 +2516,18 @@ void CTreeManager::CreateHullResources()
         do {
             VkShaderModule cs = g_ShaderManager->Load("vsm_vox_cull.comp.spv");
             if (!cs) { Msg("![VK Trees] vsm_vox_cull.comp.spv missing — un-culled brick path"); break; }
-            VkDescriptorSetLayoutBinding cb[17]{};
-            for (u32 i = 0; i < 17; ++i) { cb[i].binding = i; cb[i].descriptorType = (i == 8) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cb[i].descriptorCount = 1; cb[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-            VkDescriptorSetLayoutCreateInfo clci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            clci.bindingCount = 17; clci.pBindings = cb;
-            if (vkCreateDescriptorSetLayout(dev, &clci, nullptr, &m_VoxCullSetL) != VK_SUCCESS) break;
-            VkDescriptorPoolSize cps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 16 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N } };
-            VkDescriptorPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            cpci.maxSets = N; cpci.poolSizeCount = 2; cpci.pPoolSizes = cps;
-            if (vkCreateDescriptorPool(dev, &cpci, nullptr, &m_VoxCullPool) != VK_SUCCESS) break;
-            VkDescriptorSetLayout cls[VK_FRAMES_IN_FLIGHT]; for (u32 i = 0; i < N; ++i) cls[i] = m_VoxCullSetL;
-            VkDescriptorSetAllocateInfo cdai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            cdai.descriptorPool = m_VoxCullPool; cdai.descriptorSetCount = N; cdai.pSetLayouts = cls;
-            if (vkAllocateDescriptorSets(dev, &cdai, m_VoxCullSet) != VK_SUCCESS) break;
-            VkPushConstantRange cpr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 32 };   // count, mode, cmdCap, listCap, slop, hzbOn, margin, rmaskOn
-            VkPipelineLayoutCreateInfo cplci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            cplci.setLayoutCount = 1; cplci.pSetLayouts = &m_VoxCullSetL;
-            cplci.pushConstantRangeCount = 1; cplci.pPushConstantRanges = &cpr;
-            if (vkCreatePipelineLayout(dev, &cplci, nullptr, &m_VoxCullLayout) != VK_SUCCESS) break;
-            VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-            cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-            cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = cs; cpi.stage.pName = "main";
-            cpi.layout = m_VoxCullLayout;
-            if (vkCreateComputePipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &cpi, nullptr, &m_VoxCullPipe) != VK_SUCCESS) {
-                Msg("![VK Trees] vox-cull pipeline create failed — un-culled brick path"); m_VoxCullPipe = VK_NULL_HANDLE; break;
+            if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO,
+                                          kUBO,                                        // 8 = clipmap UBO
+                                          kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                        N, m_VoxCullSetL, m_VoxCullPool, m_VoxCullSet,
+                                        VK_SHADER_STAGE_COMPUTE_BIT, "Trees.VoxCull"))
+                break;
+            // push (32 B): count, mode, cmdCap, listCap, slop, hzbOn, margin, rmaskOn
+            m_VoxCullLayout = VK::MakePipelineLayout({ m_VoxCullSetL }, 32);
+            if (m_VoxCullLayout == VK_NULL_HANDLE) break;
+            m_VoxCullPipe = VK::CreateComputePipeline(cs, m_VoxCullLayout, "Trees.VoxCull");
+            if (m_VoxCullPipe == VK_NULL_HANDLE) {
+                Msg("![VK Trees] vox-cull pipeline create failed — un-culled brick path"); break;
             }
             m_VoxCullReady = true;
         } while (false);
@@ -2880,46 +2541,15 @@ void CTreeManager::CreateHullResources()
         VkShaderModule dvs = g_ShaderManager->Load("tree_hull_debug.vert.spv");
         VkShaderModule dfs = g_ShaderManager->Load("tree_hull_debug.frag.spv");
         if (dvs && dfs) {
-            VkPipelineShaderStageCreateInfo ss[2]{};
-            ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = dvs; ss[0].pName = "main";
-            ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = dfs; ss[1].pName = "main";
-            VkVertexInputBindingDescription vibd{ 0, 12, VK_VERTEX_INPUT_RATE_VERTEX };
-            VkVertexInputAttributeDescription via{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-            VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-            vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-            vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &via;
-            VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-            vp.viewportCount = 1; vp.scissorCount = 1;
-            VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-            rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-            VkPipelineMultisampleStateCreateInfo ms2{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-            ms2.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-            VkPipelineDepthStencilStateCreateInfo ds2{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-            ds2.depthTestEnable = VK_TRUE; ds2.depthWriteEnable = VK_FALSE; ds2.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-            VkPipelineColorBlendAttachmentState ba{};
-            ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-            ba.blendEnable = VK_TRUE;
-            ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; ba.colorBlendOp = VK_BLEND_OP_ADD;
-            ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;       ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;                ba.alphaBlendOp = VK_BLEND_OP_ADD;
-            VkPipelineColorBlendStateCreateInfo cb2{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            cb2.attachmentCount = 1; cb2.pAttachments = &ba;
-            VkDynamicState dyn2[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-            VkPipelineDynamicStateCreateInfo dynState2{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            dynState2.dynamicStateCount = 2; dynState2.pDynamicStates = dyn2;
-            VkFormat colorFmt = VK::SceneColor::Format();
-            VkPipelineRenderingCreateInfo prci2{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-            prci2.colorAttachmentCount = 1; prci2.pColorAttachmentFormats = &colorFmt;
-            prci2.depthAttachmentFormat = Swapchain.m_DepthFormat;
-            VkGraphicsPipelineCreateInfo pi2{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-            pi2.pNext = &prci2; pi2.stageCount = 2; pi2.pStages = ss;
-            pi2.pVertexInputState = &vi; pi2.pInputAssemblyState = &ia; pi2.pViewportState = &vp;
-            pi2.pRasterizationState = &rs; pi2.pMultisampleState = &ms2; pi2.pDepthStencilState = &ds2;
-            pi2.pColorBlendState = &cb2; pi2.pDynamicState = &dynState2; pi2.layout = m_GfxPipelineLayout;
-            if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi2, nullptr, &m_HullDebugPipe) != VK_SUCCESS) {
-                Msg("![VK Trees] crown-hull debug pipeline create failed"); m_HullDebugPipe = VK_NULL_HANDLE;
-            }
+            m_HullDebugPipe = VK::GfxPipelineBuilder(m_GfxPipelineLayout)
+                .Vert(dvs).Frag(dfs)
+                .Binding(0, 12)
+                .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+                .Cull(VK_CULL_MODE_NONE)
+                .Depth(true, false)
+                .Color(VK::SceneColor::Format()).BlendAlpha()
+                .DepthTarget(Swapchain.m_DepthFormat)
+                .Build("Trees crown-hull debug");
         }
 
         // Voxel-CLOUD viewmode pipeline (tree_voxel_debug.{vert,frag}) — individual colored
@@ -2930,45 +2560,16 @@ void CTreeManager::CreateHullResources()
         VkShaderModule vvs = g_ShaderManager->Load("tree_voxel_debug.vert.spv");
         VkShaderModule vfs = g_ShaderManager->Load("tree_voxel_debug.frag.spv");
         if (vvs && vfs) {
-            VkPipelineShaderStageCreateInfo ss[2]{};
-            ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vvs; ss[0].pName = "main";
-            ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = vfs; ss[1].pName = "main";
-            VkVertexInputBindingDescription vibd{ 0, sizeof(GpuTreeVoxel), VK_VERTEX_INPUT_RATE_INSTANCE };
-            VkVertexInputAttributeDescription via[2]{};
-            via[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };    // aCenter
-            via[1] = { 1, 0, VK_FORMAT_R32_UINT,        12 };    // aColor
-            VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-            vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vibd;
-            vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
-            VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-            vp.viewportCount = 1; vp.scissorCount = 1;
-            VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-            rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-            VkPipelineMultisampleStateCreateInfo ms3{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-            ms3.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-            VkPipelineDepthStencilStateCreateInfo ds3{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-            ds3.depthTestEnable = VK_TRUE; ds3.depthWriteEnable = VK_TRUE; ds3.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-            VkPipelineColorBlendAttachmentState ba3{};
-            ba3.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-            VkPipelineColorBlendStateCreateInfo cb3{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            cb3.attachmentCount = 1; cb3.pAttachments = &ba3;
-            VkDynamicState dyn3[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-            VkPipelineDynamicStateCreateInfo dynState3{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            dynState3.dynamicStateCount = 2; dynState3.pDynamicStates = dyn3;
-            VkFormat colorFmt3 = VK::SceneColor::Format();
-            VkPipelineRenderingCreateInfo prci3{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-            prci3.colorAttachmentCount = 1; prci3.pColorAttachmentFormats = &colorFmt3;
-            prci3.depthAttachmentFormat = Swapchain.m_DepthFormat;
-            VkGraphicsPipelineCreateInfo pi3{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-            pi3.pNext = &prci3; pi3.stageCount = 2; pi3.pStages = ss;
-            pi3.pVertexInputState = &vi; pi3.pInputAssemblyState = &ia; pi3.pViewportState = &vp;
-            pi3.pRasterizationState = &rs; pi3.pMultisampleState = &ms3; pi3.pDepthStencilState = &ds3;
-            pi3.pColorBlendState = &cb3; pi3.pDynamicState = &dynState3; pi3.layout = m_GfxPipelineLayout;
-            if (vkCreateGraphicsPipelines(dev, VK::PipelineCache::GetCacheObject(), 1, &pi3, nullptr, &m_VoxDebugPipe) != VK_SUCCESS) {
-                Msg("![VK Trees] crown voxel-cloud pipeline create failed"); m_VoxDebugPipe = VK_NULL_HANDLE;
-            }
+            m_VoxDebugPipe = VK::GfxPipelineBuilder(m_GfxPipelineLayout)
+                .Vert(vvs).Frag(vfs)
+                .Binding(0, (u32)sizeof(GpuTreeVoxel), VK_VERTEX_INPUT_RATE_INSTANCE)
+                .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)    // aCenter
+                .Attr(1, 0, VK_FORMAT_R32_UINT,        12)    // aColor
+                .Cull(VK_CULL_MODE_NONE)
+                .Depth(true, true)
+                .Color(VK::SceneColor::Format())
+                .DepthTarget(Swapchain.m_DepthFormat)
+                .Build("Trees crown voxel-cloud");
         }
     }
 
@@ -2992,20 +2593,17 @@ void CTreeManager::DispatchHullCmd(VkCommandBuffer cmd)
                         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
-    VkDescriptorBufferInfo bi[9] = {
-        { m_VsmDynIndirect->GetHandle(),     0, VK_WHOLE_SIZE },
-        { m_HullInfoBuffer->GetHandle(),     0, VK_WHOLE_SIZE },
-        { m_VsmNearFlags[slot]->GetHandle(), 0, VK_WHOLE_SIZE },
-        { m_VsmHullIndirect->GetHandle(),    0, VK_WHOLE_SIZE },
-        { m_VsmIndirect->GetHandle(),        0, VK_WHOLE_SIZE },   // 4: STATIC crown cmds (far tier)
-        { m_VsmHullIndirectS->GetHandle(),   0, VK_WHOLE_SIZE },   // 5: static hull cmds
-        { m_VoxChoiceBuf[slot]->GetHandle(), 0, VK_WHOLE_SIZE },   // 6: voxel choice (ring)
-        { m_VsmVoxIndirect->GetHandle(),     0, VK_WHOLE_SIZE },   // 7: dyn voxel cmds
-        { m_VsmVoxIndirectS->GetHandle(),    0, VK_WHOLE_SIZE },   // 8: static voxel cmds
-    };
-    VkWriteDescriptorSet w[9]{};
-    for (u32 i = 0; i < 9; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_HullCmdSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 9, w, 0, nullptr);
+    VK::DescriptorWriter(m_HullCmdSet[slot])
+        .StorageBuffer(0, m_VsmDynIndirect->GetHandle())
+        .StorageBuffer(1, m_HullInfoBuffer->GetHandle())
+        .StorageBuffer(2, m_VsmNearFlags[slot]->GetHandle())
+        .StorageBuffer(3, m_VsmHullIndirect->GetHandle())
+        .StorageBuffer(4, m_VsmIndirect->GetHandle())          // STATIC crown cmds (far tier)
+        .StorageBuffer(5, m_VsmHullIndirectS->GetHandle())     // static hull cmds
+        .StorageBuffer(6, m_VoxChoiceBuf[slot]->GetHandle())   // voxel choice (ring)
+        .StorageBuffer(7, m_VsmVoxIndirect->GetHandle())       // dyn voxel cmds
+        .StorageBuffer(8, m_VsmVoxIndirectS->GetHandle())      // static voxel cmds
+        .Flush();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_HullCmdPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_HullCmdLayout, 0, 1, &m_HullCmdSet[slot], 0, nullptr);
     const bool voxCast = ps_r_vsm_tree_hull_vox > 0 && m_VsmVoxPipe != VK_NULL_HANDLE && m_BrickTotal > 0;
@@ -3042,28 +2640,25 @@ void CTreeManager::DispatchVoxCull(VkCommandBuffer cmd, VkBuffer pageListDyn, Vk
     VkBuffer rmask = VK::VSM::GetRMaskHandle();
     const bool rmaskOn = ps_r_vsm_rmask && rmask != VK_NULL_HANDLE;
     if (rmask == VK_NULL_HANDLE) rmask = m_VoxCullStats->GetHandle();   // layout parity when off
-    VkDescriptorBufferInfo bi[17] = {
-        { m_VsmVoxIndirect->GetHandle(),       0, VK_WHOLE_SIZE },
-        { m_VsmVoxIndirectS->GetHandle(),      0, VK_WHOLE_SIZE },
-        { m_VoxChoiceBuf[slot]->GetHandle(),   0, VK_WHOLE_SIZE },
-        { m_BrickVB->GetHandle(),              0, VK_WHOLE_SIZE },
-        { m_TreeTransformsBuffer->GetHandle(), 0, VK_WHOLE_SIZE },
-        { m_VsmCasterPages->GetHandle(),       0, VK_WHOLE_SIZE },
-        { pageListDyn,                         0, VK_WHOLE_SIZE },
-        { pageListStatic,                      0, VK_WHOLE_SIZE },
-        { clipmapUBO,                          0, VK_WHOLE_SIZE },   // 8: UBO
-        { m_VoxCullCmdD->GetHandle(),          0, VK_WHOLE_SIZE },
-        { m_VoxCullCmdS->GetHandle(),          0, VK_WHOLE_SIZE },
-        { m_VoxCullList->GetHandle(),          0, VK_WHOLE_SIZE },
-        { m_VoxCullStats->GetHandle(),         0, VK_WHOLE_SIZE },
-        { pageMaxBlk,                          0, VK_WHOLE_SIZE },   // 13: shadow-HZB block maxes
-        { staticPT,                            0, VK_WHOLE_SIZE },   // 14: virtual page -> static slot
-        { rmask,                               0, VK_WHOLE_SIZE },   // 15: receiver mask (r_vsm_rmask, dyn tier)
-        { m_VoxCullTreeList[slot]->GetHandle(), 0, VK_WHOLE_SIZE },  // 16: compact tree list (this frame's ring slot)
-    };
-    VkWriteDescriptorSet w[17]{};
-    for (u32 i = 0; i < 17; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = m_VoxCullSet[slot]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = (i == 8) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 17, w, 0, nullptr);
+    VK::DescriptorWriter(m_VoxCullSet[slot])
+        .StorageBuffer(0,  m_VsmVoxIndirect->GetHandle())
+        .StorageBuffer(1,  m_VsmVoxIndirectS->GetHandle())
+        .StorageBuffer(2,  m_VoxChoiceBuf[slot]->GetHandle())
+        .StorageBuffer(3,  m_BrickVB->GetHandle())
+        .StorageBuffer(4,  m_TreeTransformsBuffer->GetHandle())
+        .StorageBuffer(5,  m_VsmCasterPages->GetHandle())
+        .StorageBuffer(6,  pageListDyn)
+        .StorageBuffer(7,  pageListStatic)
+        .UniformBuffer(8,  clipmapUBO)
+        .StorageBuffer(9,  m_VoxCullCmdD->GetHandle())
+        .StorageBuffer(10, m_VoxCullCmdS->GetHandle())
+        .StorageBuffer(11, m_VoxCullList->GetHandle())
+        .StorageBuffer(12, m_VoxCullStats->GetHandle())
+        .StorageBuffer(13, pageMaxBlk)                            // shadow-HZB block maxes
+        .StorageBuffer(14, staticPT)                              // virtual page -> static slot
+        .StorageBuffer(15, rmask)                                 // receiver mask (r_vsm_rmask, dyn tier)
+        .StorageBuffer(16, m_VoxCullTreeList[slot]->GetHandle())  // compact tree list (this frame's ring slot)
+        .Flush();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VoxCullPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_VoxCullLayout, 0, 1, &m_VoxCullSet[slot], 0, nullptr);
     // count = LIST length (one workgroup per listed tree), not the level's tree count.

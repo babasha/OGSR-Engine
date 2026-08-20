@@ -34,4 +34,8 @@ VkPipelineLayout MakePipelineLayout(std::initializer_list<VkDescriptorSetLayout>
 // `tag` names the pipeline in the failure log. Does NOT take ownership of `cs`.
 VkPipeline CreateComputePipeline(VkShaderModule cs, VkPipelineLayout layout, const char* tag = "compute");
 
+// Same, but loads the module by SPIR-V name through g_ShaderManager first — the
+// load+create pair every pass repeated by hand. `tag` defaults to the shader name.
+VkPipeline CreateComputePipeline(const char* spv, VkPipelineLayout layout, const char* tag = nullptr);
+
 } // namespace VK

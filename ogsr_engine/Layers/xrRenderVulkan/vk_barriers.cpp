@@ -107,6 +107,44 @@ void ImageBarrier(VkCommandBuffer cmd, VkImage image,
 }
 
 // ---------------------------------------------------------------------------
+// ImageBarrier — explicit stage/access (no derivation)
+// ---------------------------------------------------------------------------
+void ImageBarrier(VkCommandBuffer cmd, VkImage image,
+    VkImageLayout oldLayout, VkImageLayout newLayout,
+    VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+    VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
+    VkImageAspectFlags aspect, u32 mipLevels, u32 layerCount)
+{
+    VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+    barrier.srcStageMask  = srcStage;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstStageMask  = dstStage;
+    barrier.dstAccessMask = dstAccess;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = { aspect, 0, mipLevels, 0, layerCount };
+
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &barrier;
+
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+// ---------------------------------------------------------------------------
+// ComputeBarrier — compute->compute visibility, no layout change
+// ---------------------------------------------------------------------------
+void ComputeBarrier(VkCommandBuffer cmd)
+{
+    MemoryBarrier(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+}
+
+// ---------------------------------------------------------------------------
 // ImageBarriers (batch)
 // ---------------------------------------------------------------------------
 void ImageBarriers(VkCommandBuffer cmd, u32 count, const VkImage* images,
@@ -259,6 +297,41 @@ void ImageState::Require(VkCommandBuffer cmd, VkImageLayout lay,
     vkCmdPipelineBarrier2(cmd, &di);
 
     layout = lay; stage = stg; access = acc;
+}
+
+// ---------------------------------------------------------------------------
+// BufferState::Require — the same rule without a layout.
+// ---------------------------------------------------------------------------
+// A buffer has no layout, so "did the state change" reduces entirely to the
+// write question: read-after-read needs nothing, everything else needs a
+// barrier. HOST_WRITE is included because the ring allocator's persistently
+// mapped writes are a real producer here, not a theoretical one.
+static constexpr VkAccessFlags2 kBufWriteMask =
+      VK_ACCESS_2_SHADER_WRITE_BIT
+    | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+    | VK_ACCESS_2_TRANSFER_WRITE_BIT
+    | VK_ACCESS_2_HOST_WRITE_BIT
+    | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
+void BufferState::Require(VkCommandBuffer cmd, VkPipelineStageFlags2 stg, VkAccessFlags2 acc,
+                          VkDeviceSize offset, VkDeviceSize size)
+{
+    if (buffer == VK_NULL_HANDLE) return;
+
+    const bool isWrite  = (acc    & kBufWriteMask) != 0;
+    const bool wasWrite = (access & kBufWriteMask) != 0;
+
+    // Pure read-after-read: nothing to order. Remember this reader so a later
+    // write waits on the union of everyone who read since the last barrier.
+    if (!isWrite && !wasWrite)
+    {
+        stage  |= stg;
+        access |= acc;
+        return;
+    }
+
+    BufferBarrier(cmd, buffer, stage, access, stg, acc, offset, size);
+    stage = stg; access = acc;
 }
 
 } // namespace VK

@@ -60,7 +60,15 @@ void DumpCheckpoints(const char* why);   // call on device loss / fence timeout 
 // ---------------------------------------------------------------------------
 // Phase 1 — per-frame GPU/CPU zones
 // ---------------------------------------------------------------------------
-constexpr u32 kMaxZones    = 64;   // top-level passes + sub-zones (World/*, Shadow/*, Deform, VSM/*, Bins/*) + headroom
+// ⚠This is a HARD ceiling, and hitting it used to corrupt attribution silently:
+// InternZone saturated onto the LAST slot, so every zone opened after the 64th
+// reported its time under the 64th zone's NAME. Measured 2026-08-13 — with the
+// Bins/* sub-zones on, the table filled exactly, and `Bins/VoxCull` spent a whole
+// A/B session masquerading as `Bins/Meshlet` (which read ~0.7 ms even with
+// r_vsm_meshlet 0, because it was never Meshlet's number). Overflow is now
+// refused and logged instead of aliased; 128 gives real headroom for the
+// per-dispatch sub-zones at r_profiler 2.
+constexpr u32 kMaxZones    = 128;  // top-level passes + sub-zones (World/*, Shadow/*, Deform, VSM/*, Bins/*) + headroom
 constexpr u32 kHistory     = 96;   // samples kept per zone (avg/min/max + graph)
 
 // Called by ExecutePasses. FrameBegin reads back the previous occupant of this

@@ -28,6 +28,7 @@
 
 #include <unordered_map>
 #include <functional>
+#include <atomic>
 #include <vector>
 #include <utility>
 #include <deque>
@@ -102,6 +103,10 @@ public:
     // be presentable first. Call BEFORE SetStreamable(tex, false).
     void EnsureMinResidency(CVulkanTexture* tex, u32 minDim);
 
+    // Same order for a whole set, with ONE transfer wait for all of them (the
+    // per-texture form waits once each — 65 tree materials cost 73 ms of load).
+    void EnsureMinResidencyBatch(CVulkanTexture* const* texs, size_t count, u32 minDim);
+
     // --- Load-time residency decision ---------------------------------------
     // How many top mips to drop when first creating a texture of these dimensions.
     // Combines the manual `texture_lod` lever (WorldDiffuse only) with an automatic
@@ -109,6 +114,18 @@ public:
     // skip count clamped so the base never falls below kMinResidentDim.
     u32 PlanLoadMipSkip(u32 fullW, u32 fullH, u32 fullMips, VkFormat fmt,
                         TexStreamClass klass) const;
+    // The decision itself; PlanLoadMipSkip wraps it to book the bytes.
+    u32 PlanSkipUnaccounted(u32 fullW, u32 fullH, u32 fullMips, VkFormat fmt,
+                            TexStreamClass klass) const;
+
+    // Bytes this level will spend on things that are NOT textures -- geometry above
+    // all -- which the live VRAM figure cannot see yet because they are allocated
+    // after the textures are. Set by the loader from the size of level.geom.
+    // Without it the load-time budget fit plans against a nearly empty card: with
+    // r_tex_materialize the textures are built by workers that run AHEAD of the
+    // geometry, and the measured result was 0 demotions and 3144 MB of textures on
+    // a 6256 MB budget, which the streamer then evicted 16 a tick once play started.
+    void SetLoadNonTexReserve(VkDeviceSize bytes) { m_LoadNonTexReserve = bytes; }
 
     // --- Level load bracketing (DeferredLoad / ResourcesDeferredUpload) ------
     void BeginLevelLoad();
@@ -236,6 +253,11 @@ private:
     std::unordered_map<CVulkanTexture*, StreamTexture> m_Tex;
     VkDeviceSize m_TrackedBytes = 0;    // sum of residentBytes over m_Tex
     bool         m_InLevelLoad  = false;
+    VkDeviceSize m_LoadNonTexReserve = 0;   // see SetLoadNonTexReserve
+    VkDeviceSize m_LoadBaseUsage     = 0;   // credited VRAM sampled at BeginLevelLoad
+    // Everything PlanLoadMipSkip has committed this load. Sixteen workers write it,
+    // and the plan is a const method, so: mutable atomic.
+    mutable std::atomic<VkDeviceSize> m_PlannedTexBytes{0};
     u32          m_LoadCapCount = 0;    // textures the load-time cap demoted this level
     u32          m_LastStreamFrame = 0;
 
@@ -277,5 +299,16 @@ private:
     static constexpr u32 kMaxDemotesPerTick  = 16;
     static constexpr u32 kMaxRescuesPerTick  = 24;   // rescue images are ~90 KB each
 };
+
+// Split of the LAST ApplyResidencyPlan, for the load-time callers that print it:
+// rebuilding the images (DDS re-read + create + staged copy, serial) vs the one
+// transfer wait vs the handle swap. See vk_texture_stream.cpp.
+extern float g_lastResidencyBuildMs, g_lastResidencyFlushMs, g_lastResidencySwapMs;
+extern u32   g_lastResidencyBuilt;
+// Inside the rebuild, from the per-texture load profiler: is it the .dds read or
+// the image create/upload? Different answers, different fixes.
+extern float g_lastResidencyOpenMs, g_lastResidencyRepackMs,
+             g_lastResidencyCreateMs, g_lastResidencyUploadMs, g_lastResidencyCloseMs;
+extern float g_lastResidencyReadMs;   // the parallel pre-read, when r_tex_residency_threads > 0
 
 } // namespace VK

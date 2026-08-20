@@ -11,18 +11,9 @@
 layout(location = 0) in vec3 aPos;   // hull VB — tight vec3
 layout(location = 0) out vec3 vWorld;
 
-struct TreeInstance { mat4 xform; float c_scale_hemi; float c_bias_hemi; uint _p0; uint _p1; };
-layout(set = 0, binding = 0, std430) readonly buffer XformBuf { TreeInstance inst[]; };
+#include "tree_instance.glsl"   // TreeInstance + XformBuf (set 0 b0) — matches VK::GpuTreeInstance
 
-layout(push_constant) uniform PC {
-    mat4  mViewProj;
-    float uvScale; float alphaRef; float _pad0; float _pad1;
-    vec4  vSunColor;
-    vec4  vHemiColor;
-    vec4  wind_params;
-    vec4  wsetup_trees;
-    vec4  wind_anim;
-} pc;
+#include "tree_gfx_push.glsl"   // TreeGfxPush (160 B) — matches VK::TreeGfxPush
 
 #include "ssfx_tree_wind.glsl"
 
@@ -32,12 +23,8 @@ void main()
     vec4 worldPos = t.xform * vec4(aPos, 1.0);
     float baseY = t.xform[3].y;
     float H     = worldPos.y - baseY;
-    float r     = -pc.wind_params.x + 1.57079;
-    vec2  wdir  = vec2(cos(r), sin(r));
-    float spd   = max(pc.wsetup_trees.w, clamp(pc.wind_params.y * 0.001, 0.0, 1.0));
-    worldPos.xyz += ssfxTreeWind(t._p0, worldPos.xyz, H, 0.35, wdir, spd, baseY,
-                                 pc.wind_anim.xyz, pc.wsetup_trees.x, pc.wsetup_trees.y,
-                                 pc.wsetup_trees.z, pc.wind_anim.w, pc.wind_params.w);
+    worldPos.xyz += ssfxTreeWindWorld(worldPos.xyz, H, 0.35, t._p0, baseY,
+                                      pc.wind_params, pc.wsetup_trees, pc.wind_anim);
     vWorld      = worldPos.xyz;   // face-shading normal from screen-space derivatives (FS)
     gl_Position = pc.mViewProj * worldPos;
 }

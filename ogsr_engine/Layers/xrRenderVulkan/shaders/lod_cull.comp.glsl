@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // GPU LOD-imposter cull (r_lods_gpu) — replaces the CPU per-frame FLOD walk in
 // CLODManager::Render. One thread per FLOD: distance gate (close = full mesh) →
 // 6-plane frustum → Hi-Z occlusion (shared grass/world pyramid; same conservative
@@ -8,6 +9,7 @@
 // SSBO (lod_imposter_gpu.vert), so no per-frame CPU vertex building at all.
 //
 // LodEntry layout MUST match GpuLodEntry in vk_LODManager.cpp (784 B, std430).
+#include "hzb_test.glsl"       // HZB_SphereOccluded — shared with world_cull_hzb / tree_cull
 layout(local_size_x = 256) in;
 
 struct LodFacet {
@@ -54,40 +56,14 @@ void main()
     for (int i = 0; i < 6; ++i)
         if (dot(pc.frustumPlanes[i].xyz, c) + pc.frustumPlanes[i].w < -r) return;
 
-    // ---- Hi-Z occlusion cull — same conservative math as world_cull_hzb.comp:
-    // UV from the sphere CENTRE, compared depth from the sphere NEAR face, mip by
-    // TRUE screen footprint (focal-corrected), grid-aligned 2x2 block MAX.
-    vec4 clipC = pc.viewProj * vec4(c, 1.0);
-    if (pc.hzbOn != 0u && clipC.w > 0.0) {
-        vec2 ndc = clipC.xy / clipC.w;
-        // Y flip: the colour/depth viewport uses negative height → HZB Y is inverted.
-        vec2 uv  = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-            vec4 clipN = pc.viewProj * vec4(c - (d / dist) * r, 1.0);   // near face (toward camera)
-            if (clipN.w > 0.0) {
-                float instanceDepth = clipN.z / clipN.w;   // NDC z ∈ [0,1] = depth-buffer space
-
-                ivec2 hzbSize      = textureSize(u_HZB, 0);
-                float screenTexels = r * pc.hzbParams.x * float(hzbSize.y) / clipC.w;
-                float mipLevel     = ceil(log2(max(1.0, screenTexels)));
-
-                int   mi = int(mipLevel);
-                vec2  ts = vec2(textureSize(u_HZB, mi));
-                float uvRadius = 0.5 * r * pc.hzbParams.x / clipC.w;
-                ivec2 tmax = ivec2(ts) - 1;
-                ivec2 t0 = clamp(ivec2(floor((uv - vec2(uvRadius)) * ts)), ivec2(0), tmax);
-                ivec2 t1 = clamp(ivec2(floor((uv + vec2(uvRadius)) * ts)), ivec2(0), tmax);
-                float d0 = texelFetch(u_HZB, ivec2(t0.x, t0.y), mi).r;
-                float d1 = texelFetch(u_HZB, ivec2(t1.x, t0.y), mi).r;
-                float d2 = texelFetch(u_HZB, ivec2(t0.x, t1.y), mi).r;
-                float d3 = texelFetch(u_HZB, ivec2(t1.x, t1.y), mi).r;
-                float hzbDepth = max(max(d0, d1), max(d2, d3));
-
-                if (instanceDepth > hzbDepth && hzbDepth > 0.0)
-                    return;   // fully behind the farthest surface in its footprint
-            }
-        }
-    }
+    // ---- Hi-Z occlusion cull (shared test, hzb_test.glsl) ----
+    // Imposters are the far half of the tree set, so this is where occlusion has
+    // the most to remove — and also where the unclamped mip used to bite: an
+    // imposter close to kImposterMinDist with a big crown sphere drove the mip
+    // past the end of the pyramid (undefined texelFetch).
+    if (pc.hzbOn != 0u
+        && HZB_SphereOccluded(u_HZB, pc.viewProj, c, r, pc.cameraPos.xyz, pc.hzbParams.x))
+        return;   // fully behind the farthest surface in its footprint
 
     // ---- Best-facing facet: max dot(camera→object, facet normal) ----
     vec3 Ldir = d / max(dist, 1e-3);

@@ -10,6 +10,32 @@
 #include "HW_Vulkan.h"
 #include "vk_async.h"          // VK::Async::GetGraphicsWait — async-compute timeline wait
 #include "vk_profiler.h"       // VK::Prof::Checkpoint / DumpCheckpoints — GPU-hang post-mortem
+#include "vk_texture.h"         // VK::TexPrefetch::t_TexWorker — who is filling the ring
+#include <emmintrin.h>         // SSE2 streaming stores — RingCopy into write-combined staging
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <functional>          // VK::FarmRun body — the pool takes work, not just copies
+
+// Console cvars used below. Global scope on purpose: a namespace-scope extern
+// mangles differently and silently fails to bind (see the SSAO lesson).
+extern int ps_r_upload_wc_copy;
+extern int ps_r_upload_cached;
+extern int ps_r_upload_copy_threads;
+
+// Defined next to the copy helpers further down; Destroy joins them.
+namespace VK { void UploadCopyFarmShutdown(); }
+
+// Upload accounting, defined further down (next to the ring code it measures) but
+// written to from EnsureUploadCmdOpen, which sits above it.
+namespace VK { namespace UploadProf {
+extern float s_wrapWaitMs, s_copyMs, s_recordMs, s_reopenWaitMs, s_flushMs;
+extern u32   s_wraps, s_stagings, s_reopens, s_flushes;
+extern u64   s_copyBytes;
+void Dump();
+}}
+
+
 
 // Глобальный экземпляр
 CVulkanCommandManager CommandManager;
@@ -83,8 +109,9 @@ void CVulkanCommandManager::Create()
         ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         ai.commandPool = m_UploadPool;
         ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ai.commandBufferCount = 1;
-        VK_CHECK_CRITICAL(vkAllocateCommandBuffers(VulkanHW.m_Device, &ai, &m_UploadCmd));
+        ai.commandBufferCount = kUploadCmds;
+        VK_CHECK_CRITICAL(vkAllocateCommandBuffers(VulkanHW.m_Device, &ai, m_UploadCmds));
+        m_UploadCmd = m_UploadCmds[0];
 
         VkSemaphoreTypeCreateInfo tci = {};
         tci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -96,6 +123,10 @@ void CVulkanCommandManager::Create()
         VK_CHECK_CRITICAL(vkCreateSemaphore(VulkanHW.m_Device, &sci, nullptr, &m_UploadTimeline));
         m_UploadValue = 0;
 
+        // Graphics frame timeline (async compute ordering) — same type, own counter.
+        VK_CHECK_CRITICAL(vkCreateSemaphore(VulkanHW.m_Device, &sci, nullptr, &m_FrameTimeline));
+        m_FrameValue = 0;
+
         m_StagingSize = (VkDeviceSize)64 * 1024 * 1024;   // 64 MB host-visible ring
         VkBufferCreateInfo bci = {};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -104,12 +135,38 @@ void CVulkanCommandManager::Create()
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;       // CPU-written, transfer-read only
         VmaAllocationCreateInfo aci = {};
         aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        // SEQUENTIAL_WRITE asks VMA for the classic upload-staging memory: host
+        // visible, not host cached, i.e. mapped WRITE-COMBINING. That is the textbook
+        // choice — and measured here it fills at only ~2.1 GB/s even with streaming
+        // stores, which turns 4.2 GB of level-load staging into two seconds of pure
+        // memcpy. RANDOM asks for HOST_CACHED instead: the CPU writes at cache speed
+        // and the transfer queue's DMA snoops. Which one actually wins is a property
+        // of the machine, so it is a switch, decided by measurement (r_upload_cached).
+        aci.flags = (ps_r_upload_cached ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                                        : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT)
+                  | VMA_ALLOCATION_CREATE_MAPPED_BIT;
         VmaAllocationInfo si = {};
+
         VK_CHECK_CRITICAL(VK::Vram::CreateBuffer(VulkanHW.m_Allocator, &bci, &aci, &m_StagingBuf, &m_StagingAlloc, &si));
         m_StagingPtr  = (u8*)si.pMappedData;
         m_StagingHead = 0;
         if (m_StagingAlloc) vmaSetAllocationName(VulkanHW.m_Allocator, m_StagingAlloc, "buf:upload-ring");
+
+        // WHERE the ring landed decides what a staging memcpy costs. VMA's
+        // AUTO_PREFER_HOST is a preference, not a guarantee: on a ReBAR system it can
+        // still pick DEVICE_LOCAL|HOST_VISIBLE, and then every byte the loader stages
+        // crosses PCIe as an uncached write — measured at ~2 GB/s against 10+ for
+        // plain system RAM, which is most of what a level load calls "upload".
+        if (m_StagingAlloc) {
+            VkMemoryPropertyFlags mp = 0;
+            vmaGetAllocationMemoryProperties(VulkanHW.m_Allocator, m_StagingAlloc, &mp);
+            Msg("[Vulkan] upload ring: %u MB, memory flags 0x%X (%s%s%s%s)", (u32)(m_StagingSize >> 20), mp,
+                (mp & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)  ? "DEVICE_LOCAL " : "",
+                (mp & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)  ? "HOST_VISIBLE " : "",
+                (mp & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "HOST_COHERENT " : "",
+                (mp & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)   ? "HOST_CACHED" : "");
+        }
+
     }
 
     Msg("[Vulkan] Command pools and buffers created (3 frames in flight + 1 immediate + async uploader, transfer family %u)",
@@ -119,12 +176,19 @@ void CVulkanCommandManager::Create()
 // Уничтожение
 void CVulkanCommandManager::Destroy()
 {
+    VK::UploadCopyFarmShutdown();   // before the early-out: the helpers outlive a null device
+
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
 
     // Async uploader teardown (device already idle when Destroy runs).
     if (m_StagingBuf != VK_NULL_HANDLE) {
         VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, m_StagingBuf, m_StagingAlloc);
         m_StagingBuf = VK_NULL_HANDLE; m_StagingAlloc = VK_NULL_HANDLE; m_StagingPtr = nullptr;
+    }
+    if (m_FrameTimeline != VK_NULL_HANDLE) {
+        vkDestroySemaphore(VulkanHW.m_Device, m_FrameTimeline, nullptr);
+        m_FrameTimeline = VK_NULL_HANDLE;
+        m_FrameValue = 0;
     }
     if (m_UploadTimeline != VK_NULL_HANDLE) {
         vkDestroySemaphore(VulkanHW.m_Device, m_UploadTimeline, nullptr);
@@ -133,6 +197,7 @@ void CVulkanCommandManager::Destroy()
     if (m_UploadPool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(VulkanHW.m_Device, m_UploadPool, nullptr);
         m_UploadPool = VK_NULL_HANDLE; m_UploadCmd = VK_NULL_HANDLE;
+        for (u32 i = 0; i < kUploadCmds; ++i) { m_UploadCmds[i] = VK_NULL_HANDLE; m_UploadCmdValue[i] = 0; }
     }
 
     if (m_ImmediateFence != VK_NULL_HANDLE) {
@@ -269,15 +334,31 @@ bool CVulkanCommandManager::Submit(VkCommandBuffer cmd, VkSemaphore waitSemaphor
         nWait++;
     }
 
-    u64 signalVal = 0;  // renderFinished is binary — value ignored
+    // Signal list: the caller's binary renderFinished (when given) PLUS the frame
+    // timeline, bumped by every graphics submit. The async compute submit waits on
+    // the value read at frame start, which is how it stays behind the previous
+    // frame's reads of the volumes it overwrites.
+    VkSemaphore signalSems[2];
+    u64         signalVals[2];
+    u32 nSignal = 0;
+    if (signalSemaphore != VK_NULL_HANDLE) {
+        signalSems[nSignal] = signalSemaphore;
+        signalVals[nSignal] = 0;              // binary — value ignored
+        nSignal++;
+    }
+    if (m_FrameTimeline != VK_NULL_HANDLE) {
+        signalSems[nSignal] = m_FrameTimeline;
+        signalVals[nSignal] = ++m_FrameValue;
+        nSignal++;
+    }
 
-    const bool useTimeline = waitUpload || waitAsync;   // any timeline semaphore in the wait list
+    const bool useTimeline = waitUpload || waitAsync || m_FrameTimeline != VK_NULL_HANDLE;
     VkTimelineSemaphoreSubmitInfo tl = {};
     tl.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     tl.waitSemaphoreValueCount   = nWait;
     tl.pWaitSemaphoreValues      = waitVals;
-    tl.signalSemaphoreValueCount = signalSemaphore != VK_NULL_HANDLE ? 1 : 0;
-    tl.pSignalSemaphoreValues    = &signalVal;
+    tl.signalSemaphoreValueCount = nSignal;
+    tl.pSignalSemaphoreValues    = signalVals;
 
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -287,8 +368,8 @@ bool CVulkanCommandManager::Submit(VkCommandBuffer cmd, VkSemaphore waitSemaphor
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    submitInfo.signalSemaphoreCount = signalSemaphore != VK_NULL_HANDLE ? 1 : 0;
-    submitInfo.pSignalSemaphores = &signalSemaphore;
+    submitInfo.signalSemaphoreCount = nSignal;
+    submitInfo.pSignalSemaphores = signalSems;
 
     VkResult res = vkQueueSubmit(VulkanHW.m_GraphicsQueue, 1, &submitInfo, fence);
     if (res != VK_SUCCESS) {
@@ -366,23 +447,37 @@ void CVulkanCommandManager::EnsureUploadCmdOpen()
 {
     if (m_UploadOpen) return;
 
-    // m_UploadCmd is a single buffer reused across batches and submitted ASYNC.
-    // Before resetting it we must know the GPU finished its previous submission —
-    // the timeline reaching m_UploadValue proves that. Effectively free: a whole
-    // frame passes between flushes, so the small transfer is long done (and after
-    // FlushUploadsAndWait this returns immediately).
-    if (m_UploadTimeline != VK_NULL_HANDLE && m_UploadValue > 0) {
+    // "Effectively free" (below) holds per frame, but a level load stages 4 GB
+    // through here and every reopen after a flush blocks on the transfer queue —
+    // time that lands in the caller's "upload" bucket without being visible in it.
+    // Measured, not assumed: see the upload split line.
+    CTimer _tReopen; _tReopen.Start();
+    struct _reopenScope {
+        CTimer& t;
+        ~_reopenScope() { VK::UploadProf::s_reopenWaitMs += t.GetElapsed_ms_total(); ++VK::UploadProf::s_reopens; }
+    } _rs{ _tReopen };
+
+
+    // Rotate to the next buffer -- the one that has had the most time to finish --
+    // and wait only for ITS submission. Waiting for the newest value instead (what
+    // a single reused buffer forced) is a full drain: during a level load it cost
+    // 0.75 ms per reopen and ate exactly what finer ring segments had just saved.
+    m_UploadCmdCur = (m_UploadCmdCur + 1) % kUploadCmds;
+    m_UploadCmd    = m_UploadCmds[m_UploadCmdCur];
+    const u64 mine = m_UploadCmdValue[m_UploadCmdCur];
+
+    if (m_UploadTimeline != VK_NULL_HANDLE && mine > 0) {
         VkSemaphoreWaitInfo wi = {};
         wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
         wi.semaphoreCount = 1;
         wi.pSemaphores    = &m_UploadTimeline;
-        wi.pValues        = &m_UploadValue;
+        wi.pValues        = &mine;
         VkResult wr = vkWaitSemaphores(VulkanHW.m_Device, &wi, 2000000000ULL);
         if (wr != VK_SUCCESS) {
             // Resetting m_UploadCmd below while the transfer queue still owns it is
             // UB that cascades into a device loss — make the real culprit visible.
             Msg("!Vulkan EnsureUploadCmdOpen: upload timeline wait %s (%d, value %llu)",
-                wr == VK_TIMEOUT ? "TIMEOUT" : "error", wr, m_UploadValue);
+                wr == VK_TIMEOUT ? "TIMEOUT" : "error", wr, (unsigned long long)mine);
             VK::Prof::DumpCheckpoints("UploadTimelineWait");
         }
     }
@@ -395,6 +490,258 @@ void CVulkanCommandManager::EnsureUploadCmdOpen()
     m_UploadOpen = true;
 }
 
+// ---------------------------------------------------------------------------
+// Upload accounting. With the level-texture reads moved off the loader thread
+// (VK::TexPrefetch), `upload` became the largest single item left in the texture
+// phase — and it is three unrelated costs in one number: the ring-wrap drain
+// (CPU blocked on the GPU), the host memcpy into the ring, and command recording.
+// Only the first is a structural problem, so split them before touching anything.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Copy into the upload ring.
+//
+// The ring is HOST_VISIBLE|HOST_COHERENT and NOT HOST_CACHED — i.e. mapped
+// write-combining. The CRT memcpy (ERMSB `rep movsb`) is tuned for cached
+// destinations and measured 1.97 GB/s into this buffer, which made the staging
+// copy 2150 of the load's ~2500 ms of "upload". Streaming stores in whole
+// 64-byte groups keep every write-combine buffer full, which is the entire
+// difference. SSE2 (not AVX) on purpose: it is baseline on x64, so no CPU
+// feature test and no /arch: change.
+//
+// The ring hands out 64-byte-aligned offsets (StageBytes) so `dst` is aligned for
+// MOVNTDQ and each group covers exactly one WC buffer.
+// ---------------------------------------------------------------------------
+
+
+namespace {
+
+// One thread's share of the copy. No fence here -- the fence belongs to whoever
+// finishes a whole piece (see CWorkFarm::Drain / RingCopy).
+void StreamBlock(u8* dst, const u8* src, size_t n)
+{
+    if (!ps_r_upload_wc_copy) { memcpy(dst, src, n); return; }
+
+    size_t i = 0;
+    if ((((uintptr_t)dst) & 15) == 0) {
+        for (; i + 64 <= n; i += 64) {
+            const __m128i a = _mm_loadu_si128((const __m128i*)(src + i +  0));
+            const __m128i b = _mm_loadu_si128((const __m128i*)(src + i + 16));
+            const __m128i c = _mm_loadu_si128((const __m128i*)(src + i + 32));
+            const __m128i d = _mm_loadu_si128((const __m128i*)(src + i + 48));
+            _mm_stream_si128((__m128i*)(dst + i +  0), a);
+            _mm_stream_si128((__m128i*)(dst + i + 16), b);
+            _mm_stream_si128((__m128i*)(dst + i + 32), c);
+            _mm_stream_si128((__m128i*)(dst + i + 48), d);
+        }
+    }
+    if (i < n) memcpy(dst + i, src + i, n - i);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for the big copies (r_upload_copy_threads).
+//
+// level.geom pushes 1869 MB through this ring in ~1 MB pieces and measures 2.8
+// GB/s doing it, against 5.7 GB/s for the same ring fed from hot heap bytes: one
+// core reading cold page-cache pages while writing write-combined memory is the
+// ceiling, and it is not the ring's. The pieces are independent, so split each
+// one across a few helpers and leave everything else -- ring offsets, segment
+// waits, command recording -- on the calling thread, which is the part with the
+// history of races (see the recursive mutex in the header).
+//
+// Helpers spin before sleeping: during a load the next piece arrives a few
+// microseconds later and a futex round trip per piece would eat the win. They
+// idle on a condition variable afterwards, so a pool left alive costs nothing.
+//
+// The payload is a chunk INDEX and a body, not a (dst, src) pair: the same pool
+// serves the ring copy and the DDS repack, and a load that spawns a fresh set of
+// threads per texture pays more in thread creation than the split ever wins
+// back (561 repacks x ~1 ms). VK::FarmRun (vk_parallel.h) is the door in.
+// ---------------------------------------------------------------------------
+class CWorkFarm
+{
+public:
+    using Body = std::function<void(u32)>;
+
+    ~CWorkFarm() { Shutdown(); }
+
+    // Runs body(i) for i in [0, chunks) on up to `helpers` threads plus the
+    // caller, and returns when every chunk has finished.
+    void Run(u32 chunks, u32 helpers, const Body& body);
+    void Shutdown();
+
+private:
+    static constexpr u32 kSpin = 2000;   // pause iterations before a helper sleeps
+
+    void Drain(const Body& body, u32 chunks);
+    void WorkerLoop();
+
+    // One job at a time, whatever thread asks. The chunk cursor and the job
+    // descriptor are single-slot, so two callers would deal each other's chunks
+    // -- the texture streamer can promote an image from its own thread while the
+    // loader is filling the ring.
+    std::mutex              m_caller;
+
+    std::mutex              m_mx;
+    std::condition_variable m_cvJob, m_cvIdle;
+    xr_vector<std::thread>  m_pool;
+    std::atomic<bool>       m_quit{false};
+
+    // Job descriptor: written AND read under m_mx -- a helper that wakes late must
+    // never see half of one job and half of the next.
+    const Body*      m_body   = nullptr;
+    u32              m_chunks = 0;
+    std::atomic<u32> m_gen{0};      // one bump per job
+    std::atomic<u32> m_next{0};     // next chunk to claim
+    std::atomic<u32> m_done{0};     // chunks finished
+    std::atomic<u32> m_active{0};   // helpers inside a job -- the next job waits for zero
+};
+
+void CWorkFarm::Drain(const Body& body, u32 chunks)
+{
+    for (;;) {
+        const u32 i = m_next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= chunks) break;
+        body(i);
+        m_done.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void CWorkFarm::WorkerLoop()
+{
+    u32 seen = 0;
+    for (;;) {
+        const Body* body; u32 chunks;
+        {
+            for (u32 s = 0; s < kSpin && m_gen.load(std::memory_order_acquire) == seen
+                                      && !m_quit.load(std::memory_order_relaxed); ++s)
+                _mm_pause();
+
+            std::unique_lock<std::mutex> lk(m_mx);
+            m_cvJob.wait(lk, [&] { return m_quit.load(std::memory_order_relaxed)
+                                       || m_gen.load(std::memory_order_relaxed) != seen; });
+            if (m_quit.load(std::memory_order_relaxed)) return;
+            seen   = m_gen.load(std::memory_order_relaxed);
+            body   = m_body; chunks = m_chunks;
+            m_active.fetch_add(1, std::memory_order_relaxed);
+        }
+        Drain(*body, chunks);
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            if (m_active.fetch_sub(1, std::memory_order_acq_rel) == 1) m_cvIdle.notify_one();
+        }
+    }
+}
+
+void CWorkFarm::Run(u32 chunks, u32 helpers, const Body& body)
+{
+    if (chunks == 0) return;
+    if (helpers == 0 || chunks == 1) {
+        for (u32 i = 0; i < chunks; ++i) body(i);
+        return;
+    }
+
+    std::lock_guard<std::mutex> one(m_caller);
+    {
+        std::unique_lock<std::mutex> lk(m_mx);
+        while (m_pool.size() < helpers) m_pool.emplace_back([this] { WorkerLoop(); });
+        // Nobody may still be inside the previous job: a helper claiming late would
+        // take one of THIS job's chunk indices with the previous job's body.
+        m_cvIdle.wait(lk, [this] { return m_active.load(std::memory_order_relaxed) == 0; });
+        m_body = &body; m_chunks = chunks;
+        m_next.store(0, std::memory_order_relaxed);
+        m_done.store(0, std::memory_order_relaxed);
+        m_gen.fetch_add(1, std::memory_order_release);
+    }
+    m_cvJob.notify_all();
+
+    Drain(body, chunks);
+    // Return only when every chunk is finished -- `body` lives on the caller's
+    // stack and the helpers are still holding a pointer to it.
+    while (m_done.load(std::memory_order_acquire) < chunks) _mm_pause();
+}
+
+void CWorkFarm::Shutdown()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_quit.store(true, std::memory_order_relaxed);
+    }
+    m_cvJob.notify_all();
+    // A joinable std::thread left over at process exit calls std::terminate.
+    for (auto& th : m_pool) if (th.joinable()) th.join();
+    m_pool.clear();
+}
+
+CWorkFarm s_workFarm;
+
+constexpr size_t kCopyGrain    = 64 * 1024;    // claim unit; keeps every dst 64-byte aligned
+constexpr size_t kCopyMinSplit = 256 * 1024;   // below this the handshake costs more than the copy
+
+void RingCopy(u8* dst, const u8* src, size_t n)
+{
+    u32 helpers = ps_r_upload_copy_threads < 0 ? 0u : (u32)ps_r_upload_copy_threads;
+    if (helpers > 15) helpers = 15;
+    // ⚠ Do NOT drop the split for a caller that is itself one of many threads (the
+    // r_tex_materialize workers looked like an obvious case). This copy is bound by
+    // page faults on the SOURCE, not by the store, so the split is what makes it
+    // fast: measured 18.5 GB/s with four helpers, 6.4 with them fighting sixteen
+    // busy workers for cores, and 3.9 GB/s single-threaded.
+
+    if (helpers == 0 || n < kCopyMinSplit) { StreamBlock(dst, src, n); _mm_sfence(); return; }
+
+    const u32 chunks = u32((n + kCopyGrain - 1) / kCopyGrain);
+    s_workFarm.Run(chunks, helpers, [dst, src, n](u32 i) {
+        const size_t off = size_t(i) * kCopyGrain;
+        StreamBlock(dst + off, src + off, _min(kCopyGrain, n - off));
+        // Streaming stores are weakly ordered and a release store does NOT order
+        // them: fence before publishing the chunk, not once at the end.
+        _mm_sfence();
+    });
+}
+}   // anonymous namespace
+
+// The pool, for anything else in the load that splits into independent chunks
+// (see vk_parallel.h). Same contract as above: returns when every chunk is done.
+namespace VK {
+void FarmRun(u32 chunks, u32 helpers, const std::function<void(u32)>& body)
+{
+    s_workFarm.Run(chunks, helpers, body);
+}
+}   // namespace VK
+
+// Joined from CVulkanCommandManager::Destroy so the helpers die with the device.
+namespace VK { void UploadCopyFarmShutdown() { s_workFarm.Shutdown(); } }
+
+namespace VK { namespace UploadProf {
+
+float s_wrapWaitMs = 0.f, s_copyMs = 0.f, s_recordMs = 0.f, s_reopenWaitMs = 0.f;
+// End+submit of the accumulated batch. Called on every segment entry (that is the
+// point -- see upload-ring-is-pcie-bound), so a load pays it a few hundred times
+// and it was the last untimed thing between "upload" and the sum of its parts.
+float s_flushMs = 0.f;
+u32   s_flushes = 0;
+u32   s_wraps = 0, s_stagings = 0, s_reopens = 0, s_segSubmits = 0;
+u32   s_segEnters = 0, s_waits = 0, s_bigStagings = 0;   // where the ring wait actually goes
+u64   s_bigBytes = 0;
+u64   s_copyBytes = 0;
+
+void Dump()
+{
+    Msg("[load step]   upload split: %u stagings (%llu MB) = ring wait %.0f ms (%u rewinds, %u segment submits) + cmd-reopen wait %.0f ms (%u reopens) + host memcpy %.0f ms (%.0f MB/s) + record %.0f ms",
+        s_stagings, (unsigned long long)(s_copyBytes >> 20), s_wrapWaitMs, s_wraps, s_segSubmits, s_reopenWaitMs, s_reopens, s_copyMs,
+        s_copyMs > 0.f ? (double)(s_copyBytes >> 20) * 1000.0 / s_copyMs : 0.0, s_recordMs);
+    Msg("[load step]   upload ring: %u segment enters, %u blocking waits, %u stagings >= 1 segment (%llu MB of %llu) | end+submit %.0f ms (%u batches)",
+        s_segEnters, s_waits, s_bigStagings, (unsigned long long)(s_bigBytes >> 20), (unsigned long long)(s_copyBytes >> 20),
+        s_flushMs, s_flushes);
+    s_wrapWaitMs = s_copyMs = s_recordMs = s_reopenWaitMs = 0.f;
+    s_wraps = s_stagings = s_reopens = s_segSubmits = 0;
+    s_segEnters = s_waits = s_bigStagings = 0;
+    s_bigBytes = 0;
+    s_copyBytes = 0;
+    s_flushMs = 0.f; s_flushes = 0;
+}
+}}   // namespace VK::UploadProf
+
 VkDeviceSize CVulkanCommandManager::StageBytes(const void* data, VkDeviceSize size)
 {
     if (size > m_StagingSize) return UINT64_MAX;            // caller handles oversize
@@ -404,17 +751,76 @@ VkDeviceSize CVulkanCommandManager::StageBytes(const void* data, VkDeviceSize si
     // BGRA8) AND — on a transfer-only queue — a multiple of 4. A 16-aligned base
     // keeps every tightly-packed mip offset (base + k*blockSize) compliant. Buffers
     // don't need it but the ≤15-byte waste is irrelevant.
-    VkDeviceSize off = (m_StagingHead + 15) & ~VkDeviceSize(15);
-    if (off + size > m_StagingSize) {       // wrap: drain in-flight copies, rewind to base (0, already aligned)
-        FlushUploadsAndWait();
+    // 64, not 16: the ≤63-byte waste buys a destination aligned to a whole
+    // write-combine buffer for RingCopy's streaming stores. Every texel block size
+    // in play (4/8/16) divides 64, so the copy-region offsets stay legal.
+    VkDeviceSize off = (m_StagingHead + 63) & ~VkDeviceSize(63);
+
+    if (off + size > m_StagingSize) {       // rewind to base (0, already aligned)
         off = 0;
+        ++VK::UploadProf::s_wraps;
     }
-    EnsureUploadCmdOpen();
-    memcpy(m_StagingPtr + off, data, (size_t)size);
+
+    // Reusing bytes means waiting for whoever read them last -- but ONLY when the
+    // head ENTERS a segment. Appending inside the segment we already own touches
+    // fresh bytes and needs no wait at all; checking per staging instead of per
+    // crossing submitted and drained on every single upload (measured: 3424
+    // reopens, ring wait 388 -> 1087 ms). See kStagingSegments in the header.
+    {
+        const VkDeviceSize segSize = m_StagingSize / kStagingSegments;
+        const u32 firstSeg = (u32)(off / segSize);
+        const u32 lastSeg  = (u32)_min((VkDeviceSize)(kStagingSegments - 1), (off + size - 1) / segSize);
+
+        // Submit whenever this staging ENTERS a new segment -- including the case
+        // where it merely spills over the boundary (firstSeg == m_SegCur but
+        // lastSeg beyond it). Keying on firstSeg alone missed those: measured 533
+        // segment entries against only 105 submits, i.e. four out of five entries
+        // took the GPU nothing new to chew on.
+        if (firstSeg != m_SegCur || lastSeg != m_SegCur) {
+            FlushUploads();
+            ++VK::UploadProf::s_segSubmits;
+        }
+
+        if (lastSeg != firstSeg) { ++VK::UploadProf::s_bigStagings; VK::UploadProf::s_bigBytes += (u64)size; }
+        for (u32 sg = firstSeg; sg <= lastSeg; ++sg) {
+            if (sg == m_SegCur) continue;            // already ours on this pass round the ring
+            ++VK::UploadProf::s_segEnters;
+            const u64 v = m_SegValue[sg];
+            if (v) {
+                if (v > m_UploadValue) FlushUploads();   // its batch was still open
+                if (v <= m_UploadValue && m_UploadTimeline != VK_NULL_HANDLE) {
+                    CTimer _t; _t.Start();
+                    VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+                    wi.semaphoreCount = 1;
+                    wi.pSemaphores    = &m_UploadTimeline;
+                    wi.pValues        = &v;
+                    vkWaitSemaphores(VulkanHW.m_Device, &wi, 2000000000ULL);
+                    const float w = _t.GetElapsed_ms_total();
+                    VK::UploadProf::s_wrapWaitMs += w;
+                    if (w > 0.05f) ++VK::UploadProf::s_waits;
+                }
+            }
+        }
+        m_SegCur = lastSeg;
+        EnsureUploadCmdOpen();
+
+        // Mark on EVERY staging, not just on entry: an append can land in a later
+        // batch than the one that entered the segment (any FlushUploads in between
+        // opens a new one), and the next pass round the ring must wait for the
+        // NEWEST batch that reads these bytes, not the first.
+        for (u32 sg = firstSeg; sg <= lastSeg; ++sg) m_SegValue[sg] = m_UploadValue + 1;
+    }
+    CTimer _tc; _tc.Start();
+    RingCopy(m_StagingPtr + off, (const u8*)data, (size_t)size);
     vmaFlushAllocation(VulkanHW.m_Allocator, m_StagingAlloc, off, size);  // no-op if HOST_COHERENT
+
+    VK::UploadProf::s_copyMs += _tc.GetElapsed_ms_total();
+    VK::UploadProf::s_copyBytes += (u64)size;
+    ++VK::UploadProf::s_stagings;
     m_StagingHead = off + size;
     return off;
 }
+
 
 void CVulkanCommandManager::UploadBuffer(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size)
 {
@@ -490,9 +896,12 @@ void CVulkanCommandManager::UploadImage(VkImage dst, const void* data, VkDeviceS
         off = StageBytes(data, size);       // opens cmd, rebases below
     }
 
+    CTimer _tRec; _tRec.Start();
+
     // Rebase the caller's copy regions (offsets are relative to `data`) into the
     // ring (one-off buffer keeps them as-is: off = 0).
     xr_vector<VkBufferImageCopy> r(regions, regions + regionCount);
+
     for (auto& reg : r) reg.bufferOffset += off;
 
     VkImageSubresourceRange range = {};
@@ -537,12 +946,19 @@ void CVulkanCommandManager::UploadImage(VkImage dst, const void* data, VkDeviceS
         FlushUploadsAndWait();              // submit + wait so the one-off staging is safe to free
         VK::Vram::DestroyBuffer(VulkanHW.m_Allocator, tmpBuf, tmpAlloc);
     }
+    VK::UploadProf::s_recordMs += _tRec.GetElapsed_ms_total();
 }
+
 
 void CVulkanCommandManager::FlushUploads()
 {
     std::lock_guard<std::recursive_mutex> lock(m_UploadMutex);   // shared upload cmd/ring — see header
     if (g_bDeviceLost || !m_UploadOpen) return;
+    CTimer _tFlush; _tFlush.Start();
+    struct _flushScope {
+        CTimer& t;
+        ~_flushScope() { VK::UploadProf::s_flushMs += t.GetElapsed_ms_total(); ++VK::UploadProf::s_flushes; }
+    } _fs{ _tFlush };
     vkEndCommandBuffer(m_UploadCmd);
     m_UploadOpen = false;
 
@@ -561,12 +977,14 @@ void CVulkanCommandManager::FlushUploads()
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores    = &m_UploadTimeline;
 
+    m_UploadCmdValue[m_UploadCmdCur] = signalVal;   // this buffer is busy until the timeline reaches it
     VkResult res = vkQueueSubmit(VulkanHW.m_TransferQueue, 1, &si, VK_NULL_HANDLE);
     if (res != VK_SUCCESS) {
         // m_UploadValue was already incremented but will never be signaled now —
         // every later graphics frame waiting on it would wedge the queue. Roll the
         // counter back so waits target the last value that actually signals.
         Msg("!Vulkan FlushUploads: transfer submit error %d (rolling timeline back to %llu)", res, m_UploadValue - 1);
+        m_UploadCmdValue[m_UploadCmdCur] = 0;   // never signalled -- do not wait for it
         --m_UploadValue;
         if (res == VK_ERROR_DEVICE_LOST) VK::Prof::DumpCheckpoints("FlushUploads");
     }

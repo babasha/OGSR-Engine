@@ -15,11 +15,56 @@
 #include "vk_UIPipeline.h"   // g_VkUI_FrameCmd
 #include "vk_render_queue.h" // RenderQueue / DrawItem (phase-3 submission)
 #include "vk_world_material.h"  // WorldMaterialCache (phase-5)
+#include "vk_clk.h"          // rdtsc counters — CTimer truncates at this sample count
+
+// r_vis_triage — see vk_console_min.cpp. Global scope on purpose: a namespace-scope
+// extern mangles differently and silently fails to bind (see the SSAO lesson).
+extern int ps_r_vis_triage;
 
 #include <string>
+#include <atomic>            // g_visualDtors — destruction counter read by VK::VisualGuard
 #include <unordered_set>     // glass triage dedup (LoadTexture)
 #include <unordered_map>     // fan clustering (vk_ComputeSynthBeams)
 #include <algorithm>         // std::clamp/min/max (vk_BeamFromPoints)
+
+// ============================================================================
+// Visual-load profiling (Stage 0, pairs with load_steps in rvk_loader.cpp)
+// ============================================================================
+// Measured on pripyat_full: MT_NORMAL costs 76 us per visual (95248 of them =
+// 7.2 s) while MT_TREE_ST costs 0.8 us - through the SAME three calls. So the
+// cost is data-dependent, not path-dependent, and guessing which of the four
+// parts owns it has already been wrong once. Split it and let the log say.
+// ============================================================================
+namespace VK { namespace VisualProf {
+
+// In ticks, not milliseconds: each of these four fires once per visual, so at
+// 450k visuals a truncating timer hides up to half a microsecond per sample --
+// which is exactly how "header 0 ms" used to be printed for work that costs
+// hundreds. See vk_clk.h.
+u64   s_headerClk = 0, s_textureClk = 0, s_geomClk = 0, s_fastClk = 0;
+u32   s_calls = 0;
+
+// Inside LoadTexture, which owns most of the phase. Three parts of it run for
+// every visual whether the visual has anything to say or not: the OGF texture
+// chunk probe, the glass/glow triage (a diagnostic for bugs long since fixed —
+// it lowercases names into a heap string per visual), and the cache call that
+// the real work hangs off.
+u64   s_texOgfClk = 0, s_texTriageClk = 0, s_texCacheClk = 0;
+
+void Dump()
+{
+    const float k = VK::ClkToMs();
+    Msg("[load step]   visual Load split: header %.0f ms | texture %.0f ms | geometry %.0f ms | fastpath %.0f ms  (%u visuals)",
+        k * float(s_headerClk), k * float(s_textureClk), k * float(s_geomClk), k * float(s_fastClk), s_calls);
+    Msg("[load step]     LoadTexture split: ogf chunk %.0f | triage %.0f | cache call %.0f | rest %.0f ms",
+        k * float(s_texOgfClk), k * float(s_texTriageClk), k * float(s_texCacheClk),
+        k * float(s_textureClk - s_texOgfClk - s_texTriageClk - s_texCacheClk));
+    s_headerClk = s_textureClk = s_geomClk = s_fastClk = 0;
+    s_texOgfClk = s_texTriageClk = s_texCacheClk = 0;
+    s_calls = 0;
+}
+
+}}
 
 // ============================================================================
 // VK_Render_Mesh implementation
@@ -69,19 +114,33 @@ vkRender_Visual::vkRender_Visual()
     skinning = -1;
 }
 
+// Destruction counter. A repeat level load intermittently finds a visual in
+// Visuals[] whose memory is gone, and the render side never deletes one outside
+// level_Unload — so the question "is somebody destroying these while the level is
+// still loading?" has to be answerable, and cheaply. Read by VK::VisualGuard.
+namespace VK { std::atomic<u32> g_visualDtors{0}; }
+
 vkRender_Visual::~vkRender_Visual()
 {
+    VK::g_visualDtors.fetch_add(1, std::memory_order_relaxed);
+    Type = 0xDEAD0000u;   // a freed visual that is still referenced now says so
 }
+
 
 void vkRender_Visual::Load(const char* name, IReader* data, u32 flags)
 {
     dbg_name = name;
 
+    u64 _c = CPU::GetCLK();
+
     // Load header (required)
     LoadHeader(data);
+    { const u64 c = CPU::GetCLK(); VK::VisualProf::s_headerClk += c - _c; _c = c; }
+    VK::VisualProf::s_calls++;
 
     // Load texture/shader info (optional)
     LoadTexture(data);
+    VK::VisualProf::s_textureClk += CPU::GetCLK() - _c;
 }
 
 void vkRender_Visual::Release()
@@ -145,6 +204,8 @@ void vkRender_Visual::LoadHeader(IReader* data)
 
 void vkRender_Visual::LoadTexture(IReader* data)
 {
+    const u64 _cOgf0 = CPU::GetCLK();
+
     // Per-model diffuse from the OGF_TEXTURE chunk (dynamic models: NPCs, weapons,
     // items). Level statics have no OGF_TEXTURE — they resolve via shader_id below.
     string256 ogf_diffuse;
@@ -253,6 +314,8 @@ void vkRender_Visual::LoadTexture(IReader* data)
         }
     }
 
+    VK::VisualProf::s_texOgfClk += CPU::GetCLK() - _cOgf0;
+
     // Fallback: if no OGF_TEXTURE chunk (level geometry), use shader_id from header
     if (!m_pMaterial && RImplementation.Shaders.size() > 0)
     {
@@ -278,6 +341,7 @@ void vkRender_Visual::LoadTexture(IReader* data)
     bool wmark = false;
     bool glass = m_bModelGlass;   // OGF "glass" shader (model/lamp panes)
     bool emis  = m_bEmissiveAdd;  // OGF selflight/reddot parts (world-path rigid models)
+    bool water = false;           // level `effects\water*` bodies (Pass_Water)
     if (shader_id < (u16)RImplementation.Shaders.size()) {
         VK::CVulkanShader* pShader = RImplementation.Shaders[shader_id];
         if (pShader) {
@@ -287,6 +351,7 @@ void vkRender_Visual::LoadTexture(IReader* data)
             if (!ogf_diffuse[0]) {
                 glass |= pShader->m_bGlass;      // level windows (def_trans + glas\/wnd)
                 emis  |= pShader->m_bEmissive;   // level glow billboards (effects\glow — lamp halos)
+                water |= pShader->m_bWater;      // level water bodies (effects\water)
             }
         }
     }
@@ -310,10 +375,21 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // LIT-BLEND (aref = -4): lightplanes light beams — R4 model_def_lq verbatim
     // (lit colour, srcalpha blend, alpha = tex.a·fog²). Late flush like glass.
     if (m_bLitBlend) { wmark = true; m_fAlphaRef = -4.0f; }
+    // WATER (aref = -5): level ponds/rivers. wmark keeps it out of the depth
+    // prepass and the shadow-caster bins (a water plane must not occlude the
+    // bottom it is supposed to show through, nor shadow it); the actual draw is
+    // Pass_Water's, with its own pipeline — see vk_pass_water.cpp.
+    if (water) { wmark = true; m_fAlphaRef = -5.0f; }
+    const u64 _cTriage0 = CPU::GetCLK();
+    // The three probes below (glass / cabinet / glow) are DIAGNOSTICS for bugs that
+    // are long fixed, and they are not free: each one lowercases names into a heap
+    // string per visual, 450k times a load, to decide whether to print a line that
+    // is capped at 128 of them. r_vis_triage brings them back when a new routing
+    // question needs answering.
     // Glass triage: log every glass-candidate visual (glassy texture OR flagged)
     // with the exact shader/texture names + the routing decision — one in-game run
     // then tells which shader the visible-but-wrong panes actually use.
-    if (diffuse_name) {
+    if (ps_r_vis_triage && diffuse_name) {
         xr_string dl = diffuse_name;
         std::transform(dl.begin(), dl.end(), dl.begin(), ::tolower);
         if (glass || dl.find("glas") != xr_string::npos || dl.find("wnd") != xr_string::npos ||
@@ -334,12 +410,12 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // Targeted probe: EVERY leaf of the village cabinet (no dedup) — the pane
     // ignored r_glass_opacity, so either it has no glass leaf (pane painted in
     // the wood texture) or the leaf routes somewhere unexpected.
-    if (strstr(dbg_name.c_str() ? dbg_name.c_str() : "", "cabinet"))
+    if (ps_r_vis_triage && strstr(dbg_name.c_str() ? dbg_name.c_str() : "", "cabinet"))
         Msg("[VK Cabinet] leaf='%s' ogf_shader='%s' lvl_shader_id=%u tex='%s' aref=%.2f glass=%d",
             dbg_name.c_str(), ogf_shader, (u32)shader_id, diffuse_name ? diffuse_name : "-", m_fAlphaRef, glass ? 1 : 0);
     // Glow probe: every visual touching a glow texture/shader — the headlight's
     // orange disc didn't route to the emissive path, find where it goes instead.
-    {
+    if (ps_r_vis_triage) {
         const char* lvl_shader = "";
         if (!ogf_diffuse[0] && shader_id < (u16)RImplementation.Shaders.size() && RImplementation.Shaders[shader_id])
             lvl_shader = RImplementation.Shaders[shader_id]->m_Name.c_str() ? RImplementation.Shaders[shader_id]->m_Name.c_str() : "";
@@ -348,6 +424,8 @@ void vkRender_Visual::LoadTexture(IReader* data)
                 dbg_name.c_str() ? dbg_name.c_str() : "(null)", ogf_shader, lvl_shader,
                 diffuse_name ? diffuse_name : "-", (u32)Type, m_fAlphaRef, emis ? 1 : 0);
     }
+    VK::VisualProf::s_texTriageClk += CPU::GetCLK() - _cTriage0;
+
     // Level-shader name rides along for terrain materials: mask-less maps
     // regionalize terrain by SHADER (pripyat_asfalt/earth/grass), and the cache
     // synthesizes the one-hot splat mask from it (see GetOrCreate).
@@ -365,7 +443,9 @@ void vkRender_Visual::LoadTexture(IReader* data)
     // four-way blur.
     if ((!lvl_shader_name || !lvl_shader_name[0]) && ogf_shader && ogf_shader[0])
         lvl_shader_name = ogf_shader;
+    const u64 _cCache0 = CPU::GetCLK();
     m_pWorldMaterial = VK::WorldMaterialCache::GetOrCreate(diffuse_name, lmap_name, m_fAlphaRef, wmark, lvl_shader_name);
+    VK::VisualProf::s_texCacheClk += CPU::GetCLK() - _cCache0;
 }
 
 // ============================================================================
@@ -386,11 +466,15 @@ void vkFVisual::Load(const char* name, IReader* data, u32 flags)
     // Load base class data
     vkRender_Visual::Load(name, data, flags);
 
+    u64 _c = CPU::GetCLK();
+
     // Load geometry (pass flags for VLOAD_NOVERTICES support)
     LoadGeometry(data, flags);
+    { const u64 c = CPU::GetCLK(); VK::VisualProf::s_geomClk += c - _c; _c = c; }
 
     // Load fast-path (optional)
     LoadFastPath(data);
+    VK::VisualProf::s_fastClk += CPU::GetCLK() - _c;
 }
 
 void vkFVisual::Release()
@@ -450,6 +534,7 @@ void vkFVisual::Submit(VK::RenderQueue& q, const Fmatrix& xform, float LOD)
     it.xform     = xform;
     it.lod       = LOD;
     it.lateGlass = m_pWorldMaterial && (m_pWorldMaterial->isGlass || m_pWorldMaterial->isEmisAdd || m_pWorldMaterial->isLitBlend);
+    it.lateWater = m_pWorldMaterial && m_pWorldMaterial->isWater;
     it.sortKey = VK::makeSortKey(m_mesh.vStride, m_mesh.tcOffset,
                                  /*depthTest*/ true,
                                  m_pWorldMaterial,
@@ -957,6 +1042,7 @@ void vkFProgressive::Submit(VK::RenderQueue& q, const Fmatrix& xform, float LOD)
     it.xform          = xform;
     it.lod            = LOD;
     it.lateGlass      = m_pWorldMaterial && (m_pWorldMaterial->isGlass || m_pWorldMaterial->isEmisAdd || m_pWorldMaterial->isLitBlend);
+    it.lateWater      = m_pWorldMaterial && m_pWorldMaterial->isWater;
     it.iBaseOverride  = m_mesh.iBase + sw_offsets[lod_idx];
     it.iCountOverride = sw_counts[lod_idx];
     it.sortKey        = VK::makeSortKey(m_mesh.vStride, m_mesh.tcOffset,

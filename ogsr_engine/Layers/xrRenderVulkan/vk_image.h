@@ -36,6 +36,18 @@ struct ImageDesc
     VkSampleCountFlagBits samples  = VK_SAMPLE_COUNT_1_BIT;
     VmaMemoryUsage        memUsage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     const char*           name     = nullptr;   // debug label (VK::Prof::NameImage), optional
+
+    // Touched by BOTH the graphics and the dedicated compute queue (async compute,
+    // r_async): an image written on one family and read on the other keeps its
+    // contents only under CONCURRENT sharing or an explicit queue-family ownership
+    // transfer. We take CONCURRENT — the transfer path would need a release/acquire
+    // pair every frame in both directions. Applied ONLY when the families actually
+    // differ (on a shared-compute GPU the flag is a no-op), mirroring the
+    // graphics+transfer rule in vk_texture.cpp / vk_buffer.cpp.
+    // ⚠️Do NOT set this on graphics render targets that rely on framebuffer
+    // compression (depth, colour attachments): CONCURRENT can cost that compression
+    // on some drivers. It is meant for compute-owned images the other queue samples.
+    bool                  computeShared = false;
 };
 
 // Create a VkImage + VMA allocation. On failure logs "![VK] image '<name>' ..."

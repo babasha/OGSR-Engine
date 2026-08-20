@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // GPU-driven shadow caster culling. ONE dispatch per target over ALL opaque
 // static casters: each invocation tests its caster's sphere vs the target's 6
 // light-frustum planes and, if visible, atomically appends a
@@ -18,7 +19,7 @@ struct Meta {
     uint indexCount; uint ibFirst; uint firstVertex; uint group;
     uint lodFirst;   uint lodCount; uint _pad0; uint _pad1;   // coarse LOD slice
 };
-struct Cmd  { uint indexCount; uint instanceCount; uint firstIndex; int vertexOffset; uint firstInstance; };
+#include "draw_cmd.glsl"       // struct Cmd — matches VkDrawIndexedIndirectCommand
 
 layout(set = 0, binding = 0) readonly buffer Metas { Meta metas[]; };
 layout(set = 0, binding = 1)          buffer Cmds  { Cmd  cmds[];  };

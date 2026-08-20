@@ -6,6 +6,7 @@
 // form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
+#include "vk_rendering.h"          // VK::RenderingBuilder
 #include "vk_pass_world.h"
 #include "vk_pipeline_cache.h"
 #include "vk_render_queue.h"   // g_RenderQueue (phase 3)
@@ -27,7 +28,9 @@
 #include "vk_vsm.h"            // VK::VSM — virtual shadow maps page marking (WIP, r_vsm)
 #include "vk_clustered.h"      // VK::Clustered — clustered forward light cull (r_clustered)
 #include "vk_volumetrics.h"    // VK::Vol — froxel volumetric inject/integrate (r_vol)
+#include "vk_async.h"          // VK::Async — records the fog inject onto the compute queue
 #include "vk_terrain_cache.h"  // VK::TerrainCache — composite ground cache bake (r_terra_cache)
+#include "vk_pass_water.h"     // VK::Water_CaptureLidStatics — statics for the ripple lid map
 #include "vk_pass_particles.h" // VK::CollectSmokeParticles — Stage-1 smoke media inject
 #include "vk_DetailManager.h"  // RImplementation.Details — shared Hi-Z pyramid (r_hzb_cull)
 
@@ -41,6 +44,7 @@ extern int ps_r_gpu_world;   // GPU-driven static world forward path (A/B with 0
 extern int ps_r_clustered;   // clustered forward light cull (A/B with 0)
 extern int ps_r_clustered_debug; // clustered froxel light-count heatmap (also activates the cull)
 extern int ps_r_hzb_cull;    // Hi-Z occlusion cull of the GPU-driven static color pass (A/B with 0)
+extern int ps_r_tree_hzb;    // Hi-Z occlusion cull of the forward TREE set — the pyramid's other consumer
 extern int ps_r_cluster_debug; // cluster-LOD debug overlay: 1 = fill colors, 2 = wireframe (live)
 extern int ps_r_fg_coalesce; // framegraph: coalesce SSAO/VRS/VSM depth-read round-trips (A/B with 0)
 extern int ps_r_ssao_npc_normals;   // NPC normal G-buffer for GTAO (global scope: block-scope extern in namespace VK would mangle → LNK2001)
@@ -186,9 +190,18 @@ void Pass_World(FrameContext& ctx)
 
     VkCommandBuffer cmd = ctx.cmd;
 
-    // New frame: drop last frame's late-glass list (normally consumed by
-    // Pass_WorldGlass; this also covers frames where that pass didn't run).
-    g_RenderQueue.ClearGlass();
+    // ⭐⭐CPU probes that TILE this function. The 31-07 hitch hunt got exactly
+    // this far and stopped: the frames a player calls a stutter spend 40 ms of
+    // CPU in the World zone while World/Depth+Color+Statics sum to 6 ms and the
+    // GPU is idle-normal. The 34 ms lives in the gap BETWEEN the measured
+    // children — a gap no existing meter brackets. So probe every block and
+    // print W/all too: `W/all - (the named ones)` is then a number, not a
+    // shrug, and the next run cannot come back with "it is in the gap again".
+    VK_CPU_PROBE("W/all");
+
+    // (The late-glass and water lists are reset in CRender::Calculate now -- this
+    // pass returns early without a level, and that left the lists alive into the
+    // main menu pointing at deleted visuals. See the comment there.)
 
     // (The shared depth pipelines are baked for D32 — if the driver fell back to
     // another depth format, skip the prepass rather than mismatch formats.)
@@ -200,12 +213,19 @@ void Pass_World(FrameContext& ctx)
     // Only when the prepass will run: without it Execute never transitions the
     // fresh image out of UNDEFINED, and binding it would be invalid to sample.
     if (prepass)
+    {
+        VK_CPU_PROBE("W/pro/ssaotgt");
         SSAOPass::EnsureTargets(ctx.extent);
+    }
 
     // VSM (r_vsm): compute this frame's clipmap params + ensure the screen-space mask
     // target BEFORE EnvLight binds it on the receiver set (the actual mark/alloc/render/
     // resolve happen in the prepass below; this only sets up params + the mask image).
-    if (VK::VSM::Wanted()) VK::VSM::BeginFrame(Device.vCameraPosition, ctx.extent);
+    if (VK::VSM::Wanted())
+    {
+        VK_CPU_PROBE("W/pro/vsm");
+        VK::VSM::BeginFrame(Device.vCameraPosition, ctx.extent);
+    }
 
     // Terrain composite cache (r_terra_cache): probe the terrain uv affine /
     // re-bake the height+weights clipmap when the camera left the window.
@@ -214,12 +234,15 @@ void Pass_World(FrameContext& ctx)
     // frame sample the NEW image with the OLD transform (one-frame relief pop
     // every few metres of running). Compute, outside any render pass, before
     // the prepass — both terrain FS passes sample the frame-static result.
-    VK::TerrainCache::Update(cmd);
+    { VK_CPU_PROBE("W/pro/terra"); VK::TerrainCache::Update(cmd); }
 
     // Refresh this frame's env-lighting UBO (sun/hemi/ambient) once, before any
     // draw. RenderQueue::Flush binds the resulting set at set 1; Pass_Skinned
     // reuses the same set (at set 2). Fence-guarded slot → no in-flight write hazard.
-    EnvLight::Update(CommandManager.GetCurrentFrame());
+    // `cmd` here is what lets the sky-probe refresh ride this frame's command buffer
+    // instead of a blocking immediate submit: this point is outside any render pass and
+    // ahead of every sampler of bindings 26/31. See vk_ibl.h.
+    { VK_CPU_PROBE("W/pro/env"); EnvLight::Update(CommandManager.GetCurrentFrame(), cmd); }
 
     // Collect the static queue up front — the depth prepass and the color pass
     // below both consume it. With r_gpu_world the GPU draws the eligible static set
@@ -243,11 +266,13 @@ void Pass_World(FrameContext& ctx)
     static double s_qpcToMs = []{ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return 1000.0 / double(f.QuadPart); }();
     LARGE_INTEGER t_collA; QueryPerformanceCounter(&t_collA);
 
+    u32 cullTotal = 0, cullSkipped = 0;
+    {
+    VK_CPU_PROBE("W/pro/collect");
     Fmatrix identity;
     identity.identity();
     g_RenderQueue.Clear();
     const bool doCull = (ps_r_cull != 0);
-    u32 cullTotal = 0, cullSkipped = 0;
     if (gpuWorld) {
         // Only the small pre-built non-GPU static set (frustum-culled). The GPU set
         // is compute-culled + drawn by WorldGPU::Draw* (no CPU walk for it at all).
@@ -269,6 +294,7 @@ void Pass_World(FrameContext& ctx)
         }
     }
     g_RenderQueue.SortByKey();
+    }
     LARGE_INTEGER t_collB; QueryPerformanceCounter(&t_collB);
     const double cpuCollectMs = double(t_collB.QuadPart - t_collA.QuadPart) * s_qpcToMs;
     { static u32 s_log = 0; if (Device.dwTimeGlobal > s_log + 3000) { s_log = Device.dwTimeGlobal;
@@ -278,13 +304,17 @@ void Pass_World(FrameContext& ctx)
     // GPU-driven static world: compute-cull the GPU static set (outside any render
     // pass); DrawDepth/DrawColor below consume its indirect buffer in both passes.
     if (gpuWorld)
+    {
+        VK_CPU_PROBE("W/pro/wgpucull");
         WorldGPU::Cull(cmd, *ctx.viewProj);
+    }
 
     // Clustered forward: bin this frame's dynamic lights into the froxel grid
     // (compute, outside the render pass). EnvLight::Update above already uploaded
     // the light list to this slot's SSBO; the world/skinned color fragments read
     // the resulting per-cluster lists. (Init is lazy via EnvLight::Update.)
     if ((ps_r_clustered || ps_r_clustered_debug) && VK::Clustered::Ready()) {
+        VK_CPU_PROBE("W/pro/clustered");
         const VK::ProjTerms cpt = VK::DeriveProjTerms(*ctx.viewProj);
         VK::Clustered::Cull(cmd, cpt, Device.vCameraPosition, ctx.extent,
                             CommandManager.GetCurrentFrame(),
@@ -297,15 +327,40 @@ void Pass_World(FrameContext& ctx)
     // the earlier Pass_SunShadow already produced the sun cascade maps it samples.
     // The composite is folded into the tonemap pass (gated on r_vol).
     if (VK::Vol::Wanted() && VK::Vol::Ready()) {
+        VK_CPU_PROBE("W/pro/vol");
         const VK::ProjTerms vpt = VK::DeriveProjTerms(*ctx.viewProj);
         // Stage-1 VMS: gather this frame's alpha-smoke particles to inject as media.
         static xr_vector<VK::Vol::SmokeParticle> s_smoke;
         s_smoke.clear();
         if (ps_r_vol_smoke_inject > 0.0f)
+        {
+            VK_CPU_PROBE("W/pro/vol_smoke");
             VK::CollectSmokeParticles(s_smoke);
-        VK::Vol::Execute(cmd, vpt, CommandManager.GetCurrentFrame(),
+        }
+        // ASYNC COMPUTE (r_async): record the whole pass into the compute queue's own
+        // command buffer instead of this frame's graphics one, and submit it right
+        // away. It then runs CONCURRENTLY with everything the graphics queue does for
+        // the rest of this frame (prepass, shadows, colour) — that overlap IS the win.
+        // Its shadow source is the snapshot taken last frame (SnapshotShadows), and
+        // depth rejection is off there: the scene depth is being rewritten by this
+        // frame's prepass on the other queue, so there is no stable copy to read.
+        // r_async 0 → Begin() returns null and everything below is the old path.
+        // Graphics-only prerequisites (terrain-height render + canopy upload) FIRST,
+        // on the graphics buffer — they used to live inside Execute, which put a render
+        // pass onto the compute queue under async and killed the device.
+        VK::Vol::RecordGraphicsBakes(cmd);
+
+        VkCommandBuffer volCmd  = cmd;
+        bool            onAsync = false;
+        if (VK::Vol::AsyncInjectReady())
+            if (VkCommandBuffer ac = VK::Async::Begin()) { volCmd = ac; onAsync = true; }
+
+        VK::Vol::Execute(volCmd, vpt, CommandManager.GetCurrentFrame(),
                          s_smoke.empty() ? nullptr : s_smoke.data(), (u32)s_smoke.size(),
-                         ctx.depthView);   // prev-frame depth (prepass hasn't run yet) → froxel depth rejection
+                         onAsync ? VK_NULL_HANDLE : ctx.depthView,   // prev-frame depth → froxel depth rejection
+                         onAsync);
+
+        if (onAsync) VK::Async::Submit();
     }
 
     // Throttled average: static-collect CPU vs the whole-frame cpu — confirms the
@@ -327,21 +382,9 @@ void Pass_World(FrameContext& ctx)
     // color pass → identical coverage, no holes).
     if (prepass)
     {
+        VK_CPU_PROBE("W/depth");
         const int zDepth = VK::Prof::ZoneBegin(cmd, "World/Depth");
-        VkRenderingAttachmentInfo pdAtt{};
-        pdAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        pdAtt.imageView               = ctx.depthView;
-        pdAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        pdAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        pdAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-        pdAtt.clearValue.depthStencil = { 1.0f, 0 };
-
-        VkRenderingInfo pri{};
-        pri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        pri.renderArea.extent = ctx.extent;
-        pri.layerCount        = 1;
-        pri.pDepthAttachment  = &pdAtt;
-        vkCmdBeginRendering(cmd, &pri);
+        VK::RenderingBuilder(ctx.extent).Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_CLEAR).Begin(cmd);
 
         VkViewport pvp{ 0.f, (float)ctx.extent.height, (float)ctx.extent.width, -(float)ctx.extent.height, 0.f, 1.f };
         vkCmdSetViewport(cmd, 0, 1, &pvp);
@@ -360,7 +403,11 @@ void Pass_World(FrameContext& ctx)
             CFrustum f;
             Fmatrix fullT = *ctx.viewProj;   // CreateFromMatrix takes a non-const ref
             f.CreateFromMatrix(fullT, FRUSTUM_P_LRTB | FRUSTUM_P_FAR);
-            RImplementation.Trees->RenderDepth(cmd, *ctx.viewProj, -1, &f);
+            // flodCut = r_tree_dist: skip trees the FLOD billboard already draws
+            // out there. Only this call site passes it — shadow casters have no
+            // billboard stand-in, so their sets are untouched.
+            RImplementation.Trees->RenderDepth(cmd, *ctx.viewProj, -1, &f,
+                                               0.0f, 1e9f, VK::TreeFlodCutDist());
         }
 
         // NPCs too (alpha-tested) — GTAO contact darkening under characters +
@@ -392,29 +439,12 @@ void Pass_World(FrameContext& ctx)
             ImageBarrier(cmd, SSAOPass::GetNormalImage(), VK_IMAGE_LAYOUT_UNDEFINED,
                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-            VkRenderingAttachmentInfo nAtt{};
-            nAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            nAtt.imageView   = SSAOPass::GetNormalView();
-            nAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            nAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;       // a=0 everywhere → GTAO fallback
-            nAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-            nAtt.clearValue.color = { { 0.f, 0.f, 0.f, 0.f } };
-
-            VkRenderingAttachmentInfo nDepth{};
-            nDepth.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            nDepth.imageView   = ctx.depthView;
-            nDepth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            nDepth.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;       // test the prepass depth
-            nDepth.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE; // pipeline has depthWrite off
-
-            VkRenderingInfo nri{};
-            nri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            nri.renderArea.extent    = ctx.extent;
-            nri.layerCount           = 1;
-            nri.colorAttachmentCount = 1;
-            nri.pColorAttachments    = &nAtt;
-            nri.pDepthAttachment     = &nDepth;
-            vkCmdBeginRendering(cmd, &nri);
+            // Colour CLEAR → a=0 everywhere = the GTAO fallback; depth LOADed to
+            // test the prepass z (the pipeline has depthWrite off, hence DONT_CARE).
+            VK::RenderingBuilder(ctx.extent)
+                .ColorClear(SSAOPass::GetNormalView(), VkClearColorValue{ { 0.f, 0.f, 0.f, 0.f } })
+                .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_DONT_CARE)
+                .Begin(cmd);
 
             VkViewport nvp{ 0.f, (float)ctx.extent.height, (float)ctx.extent.width, -(float)ctx.extent.height, 0.f, 1.f };
             vkCmdSetViewport(cmd, 0, 1, &nvp);
@@ -490,7 +520,7 @@ void Pass_World(FrameContext& ctx)
         // sun-shadow update (mark + atlas raster + resolve, ~1.7 ms) is pure waste. Skip
         // it and keep the last daylit mask — receivers multiply it by sun_color≈0, so
         // there is no visible change. Resumes automatically at dawn (NightFrozen() clears).
-        if (VK::VSM::Wanted() && !VK::VSM::NightFrozen()) {
+        if (VK::VSM::Wanted() && !VK::VSM::NightFrozen() && !VK::VSM::LoadScreenFrozen()) {
             const int zVSM = VK::Prof::ZoneBegin(cmd, "World/VSMmark");
             depthToRead();
             VK::VSM::MarkPages(cmd, ctx.depthView, ctx.extent, *ctx.viewProj);
@@ -530,55 +560,56 @@ void Pass_World(FrameContext& ctx)
     // pyramid: grass Render runs after Pass_World, so its BuildHZB no-ops (same-frame
     // stamp) and reuses this prepass-depth build. The depth prepass already drew the
     // full frustum set (it is the pyramid source), so this never over-culls.
+    // ⚠ The BUILD must not hide behind the world's own cvar. The Trees pass runs
+    // after this one and deliberately does NOT build the pyramid itself (it would
+    // only ever have LAST frame's = a stale camera, so r_tree_hzb self-disables on
+    // HZBBuiltThisFrame). With the build gated on r_hzb_cull, setting r_hzb_cull 0
+    // to A/B the static cull silently switched the TREE occlusion off as well —
+    // two features measured as one, the exact class of lying instrument this
+    // renderer has been bitten by before. Build when EITHER consumer wants it;
+    // cull the static colour set only under the static gate.
     bool worldOccluded = false;
-    if (prepass && gpuWorld && ps_r_hzb_cull && WorldGPU::OcclusionReady()
+    const bool hzbWorld = gpuWorld && ps_r_hzb_cull && WorldGPU::OcclusionReady();
+    const bool hzbTrees = ps_r_tree_hzb && RImplementation.Trees && RImplementation.Trees->IsReady();
+    if (prepass && (hzbWorld || hzbTrees)
         && RImplementation.Details && RImplementation.Details->HZBReady())
     {
-        const int zHZB = VK::Prof::ZoneBegin(cmd, "World/HZBcull");
+        VK_CPU_PROBE("W/hzb");
+        // Separate zones: the pyramid build is paid by whoever asked for it, the
+        // cull only by the static set. Lumped into one number there was no way to
+        // read the build's own cost — the first thing any optimisation of it needs.
+        const int zBuild = VK::Prof::ZoneBegin(cmd, "World/HZBbuild");
         RImplementation.Details->BuildHZBForFrame(ctx);
-        WorldGPU::CullColor(cmd, *ctx.viewProj, Device.vCameraPosition,
-                            RImplementation.Details->HZBView(), RImplementation.Details->HZBSampler());
-        worldOccluded = true;
-        VK::Prof::ZoneEnd(cmd, zHZB);
+        VK::Prof::ZoneEnd(cmd, zBuild);
+
+        if (hzbWorld) {
+            const int zHZB = VK::Prof::ZoneBegin(cmd, "World/HZBcull");
+            WorldGPU::CullColor(cmd, *ctx.viewProj, Device.vCameraPosition,
+                                RImplementation.Details->HZBView(), RImplementation.Details->HZBSampler(),
+                                RImplementation.Details->HZBGeneration());
+            worldOccluded = true;
+            VK::Prof::ZoneEnd(cmd, zHZB);
+        }
     }
 
     // Targets travel in FrameContext; both are already in their attachment layout
     // (Begin set them, ExecutePasses ordered prior passes). No transition here.
 
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;   // preserve background clear
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType                       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView                   = ctx.depthView;
-    dAtt.imageLayout                 = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    // Prepass already laid the depth down — LOAD it so early-Z can reject;
-    // without a prepass keep the old CLEAR behaviour.
-    dAtt.loadOp                      = prepass ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    // STORE so Pass_Sky can run depth-test against world's z and only paint
-    // cleared pixels (z == 1.0).
-    dAtt.storeOp                     = VK_ATTACHMENT_STORE_OP_STORE;
-    dAtt.clearValue.depthStencil     = { 1.0f, 0 };
-
     VkRenderingFragmentShadingRateAttachmentInfoKHR sriAtt{ VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR };
 
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = &dAtt;
+    // Colour LOAD preserves the background clear. Depth: the prepass already laid
+    // it down — LOAD it so early-Z can reject; without a prepass keep the old
+    // CLEAR behaviour. STORE either way so Pass_Sky can depth-test against
+    // world's z and only paint cleared pixels (z == 1.0).
+    VK::RenderingBuilder rb(ctx.extent);
+    rb.Color(ctx.colorView)
+      .Depth(ctx.depthView, prepass ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR);
     // Attach the shading-rate image so distant tiles coarse-shade (built above).
     if (VK::VRS::Wanted() && VK::VRS::GetView() != VK_NULL_HANDLE) {
         sriAtt.imageView                      = VK::VRS::GetView();
         sriAtt.imageLayout                    = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
         sriAtt.shadingRateAttachmentTexelSize = VK::VRS::TexelSize();
-        ri.pNext = &sriAtt;
+        rb.Next(&sriAtt);
     }
     // Stage D compose: clone chunks' DEPTH — drawn HERE (after SSAO/VSM/Hi-Z have
     // consumed the home-only depth), so clones never pollute those home passes.
@@ -599,18 +630,8 @@ void Pass_World(FrameContext& ctx)
             Compose::ChunkView(c, *ctx.viewProj, cvp, camL);
             WorldGPU::Cull(cmd, cvp, camL, Device.vCameraDirection);
 
-            VkRenderingAttachmentInfo cdAtt{};
-            cdAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            cdAtt.imageView   = ctx.depthView;
-            cdAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            cdAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;    // append to the home depth
-            cdAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo cri{};
-            cri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            cri.renderArea.extent = ctx.extent;
-            cri.layerCount        = 1;
-            cri.pDepthAttachment  = &cdAtt;
-            vkCmdBeginRendering(cmd, &cri);
+            // depth LOAD — append to the home depth.
+            VK::RenderingBuilder(ctx.extent).Depth(ctx.depthView).Begin(cmd);
             VkViewport cvpv{ 0.f, (float)ctx.extent.height, (float)ctx.extent.width, -(float)ctx.extent.height, 0.f, 1.f };
             vkCmdSetViewport(cmd, 0, 1, &cvpv);
             VkRect2D csc{ {}, ctx.extent };
@@ -636,6 +657,7 @@ void Pass_World(FrameContext& ctx)
     if (prepass && gpuWorld && !worldOccluded && Compose::CloneCount())
         WorldGPU::Cull(cmd, *ctx.viewProj);
 
+    VK_CPU_PROBE("W/color");   // runs to the end of the pass — closes the tiling against W/all
     const int zColor = VK::Prof::ZoneBegin(cmd, "World/Color");
     // VRS diag: FS-invocation count for THIS pass ([VK VRS] world-color FS
     // invocations). r_vrs_force 1 = stats only (rate stays 1x1) for a baseline.
@@ -646,7 +668,7 @@ void Pass_World(FrameContext& ctx)
         VK::VRS::SubStatsReset(cmd, CommandManager.GetCurrentFrame());   // reset must stay outside the rendering scope
     else if (VulkanHW.m_bVRSSupported && (ps_r_vrs > 0 || ps_r_vrs_force > 0))
         VK::VRS::StatsBegin(cmd, CommandManager.GetCurrentFrame());
-    vkCmdBeginRendering(cmd, &ri);
+    rb.Begin(cmd);
     // VRS: no vkCmdSetFragmentShadingRateKHR here — world pipelines carry a STATIC
     // {1x1, KEEP, REPLACE} FSR state (SRI attachment wins when bound). A dynamic
     // rate proved unusable: any bind of a non-FSR-dynamic pipeline invalidates it
@@ -761,6 +783,11 @@ void Pass_World(FrameContext& ctx)
     // CKinematics recurse into children inside Submit. Skinned leaves with no VB
     // (index-only stopgap) self-skip in Submit until the skinned path is ported.
     if (fsSplit) VK::VRS::SubStatsBegin(cmd, fsFrame, 3);
+    // The water pass runs much later and needs the STATICS to build its lid map
+    // (which surface lies directly over each patch of water — the one thing that
+    // tells a puddle from the same sheet running under the floor). Grab them here,
+    // while the queue still holds them and before the dynamic pass reuses it.
+    VK::Water_CaptureLidStatics();
     if (!g_DynamicVisuals.empty()) {
         g_RenderQueue.Clear();
         for (const DynVisual& d : g_DynamicVisuals) {
@@ -804,6 +831,8 @@ void Pass_World(FrameContext& ctx)
             if (s_prewarmCd) --s_prewarmCd;                                          // let the dry set build first
             else if (!PipelineCache::PrewarmWeatherVariants(1)) s_prewarmDone = true; // 1 pipeline/frame
         }
+        // r_prewarm_async: the worker hands its pipelines back here.
+        PipelineCache::PrewarmDrain();
     }
 
     // Stage D compose: clone chunks' COLOR. Own cull → LOAD color+depth pass per
@@ -828,8 +857,8 @@ void Pass_World(FrameContext& ctx)
             Compose::ChunkView(c, *ctx.viewProj, cvp, camL);
             WorldGPU::Cull(cmd, cvp, camL, Device.vCameraDirection);
 
-            dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;     // never re-clear over the home scene
-            vkCmdBeginRendering(cmd, &ri);                // same attachments (cAtt LOAD / dAtt LOAD / VRS static state)
+            rb.SetDepthLoad(VK_ATTACHMENT_LOAD_OP_LOAD);  // never re-clear over the home scene
+            rb.Begin(cmd);                                // same attachments (colour LOAD / depth LOAD / VRS static state)
             vkCmdSetViewport(cmd, 0, 1, &vp);
             vkCmdSetScissor(cmd, 0, 1, &sc);
             WorldGPU::DrawColor(cmd, cvp, EnvLight::GetCurrentSet(), false /*frustum set*/);
@@ -870,8 +899,9 @@ void Pass_EditorDynamics(FrameContext& ctx)
 
     // Per-frame sun/hemi/ambient UBO (set 1). Pass_World normally calls this; it is
     // skipped with no level, so drive it here. Runs BEFORE the render pass begins —
-    // it may record uploads/barriers, which must be outside dynamic rendering.
-    EnvLight::Update(CommandManager.GetCurrentFrame());
+    // it may record uploads/barriers, which must be outside dynamic rendering — so it
+    // can carry the sky-probe refresh too.
+    EnvLight::Update(CommandManager.GetCurrentFrame(), cmd);
 
     // Volumetric fog (froxel inject + integrate). Its only other call site is inside
     // Pass_World, so with no level the volume was never integrated and held
@@ -882,6 +912,9 @@ void Pass_EditorDynamics(FrameContext& ctx)
     // before the prepass and outside any render pass — same placement as Pass_World.
     if (VK::Vol::Wanted() && VK::Vol::Ready()) {
         const VK::ProjTerms vpt = VK::DeriveProjTerms(*ctx.viewProj);
+        // Editor path stays fully on the graphics queue; the bakes it needs are the
+        // same ones Pass_World records (they moved out of Execute — see there).
+        VK::Vol::RecordGraphicsBakes(cmd);
         // No smoke particles in an editor scene — the host pushes static models only.
         VK::Vol::Execute(cmd, vpt, CommandManager.GetCurrentFrame(), nullptr, 0);
     }
@@ -890,6 +923,7 @@ void Pass_EditorDynamics(FrameContext& ctx)
     // the glass list was never reset in the editor: panes from deleted or replaced
     // host objects kept drawing until some other visual displaced them.
     g_RenderQueue.ClearGlass();
+    g_RenderQueue.ClearWater();
 
     // Instanced host scene (vk_instance_gpu): compute-cull against the camera into
     // the TGT_COLOR region. MUST precede BeginRendering — it is compute. Also does
@@ -919,20 +953,8 @@ void Pass_EditorDynamics(FrameContext& ctx)
     {
         const int zDepth = VK::Prof::ZoneBegin(cmd, "EditorDepth");
 
-        VkRenderingAttachmentInfo pdAtt{};
-        pdAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        pdAtt.imageView               = ctx.depthView;
-        pdAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        pdAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        pdAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;   // the colour pass LOADs it
-        pdAtt.clearValue.depthStencil = { 1.0f, 0 };
-
-        VkRenderingInfo pri{};
-        pri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        pri.renderArea.extent = ctx.extent;
-        pri.layerCount        = 1;
-        pri.pDepthAttachment  = &pdAtt;
-        vkCmdBeginRendering(cmd, &pri);
+        // CLEAR + STORE — the colour pass LOADs it.
+        VK::RenderingBuilder(ctx.extent).Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_CLEAR).Begin(cmd);
 
         VkViewport pvp{ 0.f, (float)ctx.extent.height, (float)ctx.extent.width, -(float)ctx.extent.height, 0.f, 1.f };
         vkCmdSetViewport(cmd, 0, 1, &pvp);

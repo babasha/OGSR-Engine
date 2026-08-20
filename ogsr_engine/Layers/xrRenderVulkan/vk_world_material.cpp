@@ -9,6 +9,8 @@
 #include "vk_world_material.h"
 #include "vk_texture.h"
 #include "vk_texture_stream.h"   // TextureStreamer rebind hook (dynamic streaming)
+#include "vk_descriptors.h"      // VK::DescriptorWriter
+#include "vk_clk.h"              // rdtsc counters - 388k calls per load, CTimer truncates
 #include "HW_Vulkan.h"
 
 #include "../xrRender/ETextureParams.h"   // STextureParams::Load + flDiffuseDetail flag
@@ -17,12 +19,20 @@
 // the cvar gates VRAM cost and not just shading (see the load site below).
 extern float ps_r_bump;
 
+// r_thm_cache -- see vk_console_min.cpp. Global scope: a namespace-scope extern
+// mangles differently and silently fails to bind.
+extern int ps_r_thm_cache;
+
 #include <unordered_map>
 #include <string>
 #include <array>
 #include <set>
+#include <unordered_set>   // prefetch base/lmap dedup
+
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 // An EXTRA texture search root, set by an editor host. The editor's content lives in ITS
 // own gamedata, not the engine's: a level authored against other assets (a ported map, a
@@ -199,24 +209,84 @@ namespace {
                   VkImageView detailView, VkImageView lmapView, VkImageView bumpxView,
                   VkImageView bumpnView)
     {
-        VkDescriptorImageInfo ii[5]{};
-        VkImageView views[5] = { baseView, detailView, lmapView, bumpxView, bumpnView };
-        for (int i = 0; i < 5; ++i) {
-            ii[i].sampler     = s_Sampler;
-            ii[i].imageView   = views[i];
-            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const VkImageView views[5] = { baseView, detailView, lmapView, bumpxView, bumpnView };
+        VK::DescriptorWriter w(set);
+        for (u32 i = 0; i < 5; ++i) w.ImageSampler(i, views[i], s_Sampler);
+        w.Flush();
+    }
+
+    // ---- One load protocol for every texture cache ---------------------------
+    // The five loaders below used to be five copies of "look in my map, else build
+    // it", each on the loading thread and each unsynchronised. Both halves stopped
+    // being true: prefetch workers now build textures ahead of the walk
+    // (r_tex_materialize), so the maps are shared, and a file already being built
+    // elsewhere must be WAITED for instead of built twice. The wait is the point --
+    // it is what lets a worker do the walk's work before the walk gets there.
+    //
+    // The lock closes an older hole too: spawns create visuals (and so materials)
+    // from the secondary thread, and these maps never had one.
+    std::mutex                                    s_texMx;
+    std::condition_variable                       s_texCv;
+    std::set<std::pair<const void*, std::string>> s_texInflight;   // (cache, key) under construction
+    std::atomic<u32>                              s_texWaits{0};   // callers that waited on another thread
+    std::atomic<u64>                              s_texWaitClk{0};
+    std::atomic<u32>                              s_texBuilt{0};   // textures actually built through here
+
+    // GetOrCreate's miss path reported one number (`create`), and it is not one
+    // thing: five texture loads, a .thm lookup, a terrain residency heal that can
+    // REBUILD an image, two per-material log lines, and the descriptor set. 2028
+    // misses a load, and which of those owns the milliseconds decides whether
+    // moving texture building off this thread is worth anything at all.
+    std::atomic<u64> s_mkDiffuseClk{0}, s_mkTerrainClk{0}, s_mkThmClk{0}, s_mkBumpxClk{0},
+                     s_mkBumpnClk{0}, s_mkLmapClk{0}, s_mkDiagClk{0}, s_mkSetClk{0};
+
+    CVulkanTexture* FindInCache(std::unordered_map<std::string, CVulkanTexture*>& cache,
+                                const std::string& key)
+    {
+        std::lock_guard<std::mutex> lk(s_texMx);
+        auto it = cache.find(key);
+        return it != cache.end() ? it->second : nullptr;
+    }
+
+    // `full == nullptr` means "the file does not exist" -- the fallback is cached
+    // under the key exactly as the old inline miss-path did, so nothing re-stats it.
+    CVulkanTexture* LoadIntoCache(std::unordered_map<std::string, CVulkanTexture*>& cache,
+                                  std::string key, const char* full, CVulkanTexture* fallback,
+                                  TexStreamClass klass, TexColorSpace colorSpace, bool alphaOnly)
+    {
+        const auto id = std::make_pair((const void*)&cache, key);
+        {
+            std::unique_lock<std::mutex> lk(s_texMx);
+            for (;;) {
+                auto it = cache.find(key);
+                if (it != cache.end()) return it->second;
+                if (s_texInflight.insert(id).second) break;   // claimed: ours to build
+                const u64 _w0 = CPU::GetCLK();
+                s_texCv.wait(lk);
+                s_texWaitClk += CPU::GetCLK() - _w0;
+                s_texWaits.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
-        VkWriteDescriptorSet w[5]{};
-        for (int i = 0; i < 5; ++i) {
-            w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet          = set;
-            w[i].dstBinding      = (u32)i;
-            w[i].descriptorCount = 1;
-            w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w[i].pImageInfo      = &ii[i];
+        CVulkanTexture* out = fallback;
+        if (full && full[0]) {
+            auto* tex = xr_new<CVulkanTexture>();
+            tex->SetAlphaOnly(alphaOnly);
+            if (tex->LoadDDS(full, /*applyBCSwizzle*/ false, klass, colorSpace)) {
+                out = tex;
+                s_texBuilt.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+                xr_delete(tex);
         }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 5, w, 0, nullptr);
+
+        {
+            std::lock_guard<std::mutex> lk(s_texMx);
+            cache.emplace(std::move(key), out);
+            s_texInflight.erase(id);
+        }
+        s_texCv.notify_all();
+        return out;
     }
 
     CVulkanTexture* GetOrLoadLmapTex(const char* lmap_name)
@@ -228,8 +298,7 @@ namespace {
         std::string key(s_LevelTag);
         key.push_back('|');
         key.append(lmap_name);
-        auto it = s_LmapTexCache.find(key);
-        if (it != s_LmapTexCache.end()) return it->second;
+        if (CVulkanTexture* hit = FindInCache(s_LmapTexCache, key)) return hit;
 
         // Lightmaps live alongside the level data ($level$/<lmap>.dds).
         string_path leaf;
@@ -238,20 +307,12 @@ namespace {
         FS.update_path(full, "$level$", leaf);
         if (!FS.exist(full)) {
             FS.update_path(full, "$game_textures$", leaf);
-            if (!FS.exist(full)) {
-                s_LmapTexCache.emplace(std::move(key), s_WhiteLmap);
-                return s_WhiteLmap;
-            }
+            if (!FS.exist(full))
+                return LoadIntoCache(s_LmapTexCache, std::move(key), nullptr, s_WhiteLmap,
+                                     TexStreamClass::Lmap, TexColorSpace::Data, false);
         }
-
-        auto* tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::Lmap)) {
-            xr_delete(tex);
-            s_LmapTexCache.emplace(std::move(key), s_WhiteLmap);
-            return s_WhiteLmap;
-        }
-        s_LmapTexCache.emplace(std::move(key), tex);
-        return tex;
+        return LoadIntoCache(s_LmapTexCache, std::move(key), full, s_WhiteLmap,
+                             TexStreamClass::Lmap, TexColorSpace::Data, false);
     }
 
     // Everything we pull out of a diffuse's `<base>.thm`: the R4 detail
@@ -269,7 +330,15 @@ namespace {
     // Looks up `<base>.thm` in $game_textures$ (then $level$, then an editor host's
     // own texture store) and fills `out`. Returns false when the .thm is
     // missing/unreadable — caller falls back to the grey detail / flat bump samplers.
-    bool LookupTHM(const char* base_name, THMInfo& out)
+    // Counter + cache, see r_thm_cache. Both call sites (the prefetch expansion on
+    // 16 workers and the walk's material creation on the loading thread) ask for the
+    // SAME base names, so this is read twice per material by construction.
+    std::mutex                                  s_thmMx;
+    std::unordered_map<std::string, std::pair<THMInfo, bool>> s_thmCache;
+    std::atomic<u64> s_thmClk{0};
+    std::atomic<u32> s_thmCalls{0}, s_thmHits{0};
+
+    bool LookupTHM_Read(const char* base_name, THMInfo& out)
     {
         if (!base_name || !base_name[0]) return false;
 
@@ -328,32 +397,61 @@ namespace {
         return true;
     }
 
+    bool LookupTHM(const char* base_name, THMInfo& out)
+    {
+        if (!base_name || !base_name[0]) return false;
+        const u64 _c0 = CPU::GetCLK();
+        s_thmCalls.fetch_add(1, std::memory_order_relaxed);
+
+        if (!ps_r_thm_cache) {
+            const bool ok = LookupTHM_Read(base_name, out);
+            s_thmClk.fetch_add(CPU::GetCLK() - _c0, std::memory_order_relaxed);
+            return ok;
+        }
+
+        std::string key(base_name);
+        for (char& c : key) c = (char)tolower((unsigned char)c);
+        key.push_back('|');
+        key.append(s_LevelTag);   // a .thm can resolve out of $level$
+
+        {
+            std::lock_guard<std::mutex> lk(s_thmMx);
+            auto it = s_thmCache.find(key);
+            if (it != s_thmCache.end()) {
+                s_thmHits.fetch_add(1, std::memory_order_relaxed);
+                out = it->second.first;
+                s_thmClk.fetch_add(CPU::GetCLK() - _c0, std::memory_order_relaxed);
+                return it->second.second;
+            }
+        }
+
+        // Read outside the lock: two workers racing on the same base do the work
+        // twice and agree on the answer, which is cheaper than serialising 2400 reads.
+        THMInfo parsed{};
+        const bool ok = LookupTHM_Read(base_name, parsed);
+        {
+            std::lock_guard<std::mutex> lk(s_thmMx);
+            s_thmCache.emplace(std::move(key), std::make_pair(parsed, ok));
+        }
+        out = parsed;
+        s_thmClk.fetch_add(CPU::GetCLK() - _c0, std::memory_order_relaxed);
+        return ok;
+    }
+
     CVulkanTexture* GetOrLoadDetailTex(const std::string& detail_name)
     {
         if (detail_name.empty()) return s_GreyDetail;
 
-        auto it = s_DetailTexCache.find(detail_name);
-        if (it != s_DetailTexCache.end()) return it->second;
+        if (CVulkanTexture* hit = FindInCache(s_DetailTexCache, detail_name)) return hit;
 
         // Detail textures live next to base diffuses under $game_textures$.
         string_path leaf;
         xr_sprintf(leaf, "%s.dds", detail_name.c_str());
         string_path full;
         FS.update_path(full, "$game_textures$", leaf);
-        if (!FS.exist(full)) {
-            // Cache the miss so we don't keep stat'ing the FS.
-            s_DetailTexCache.emplace(detail_name, s_GreyDetail);
-            return s_GreyDetail;
-        }
-
-        auto* tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::Detail)) {
-            xr_delete(tex);
-            s_DetailTexCache.emplace(detail_name, s_GreyDetail);
-            return s_GreyDetail;
-        }
-        s_DetailTexCache.emplace(detail_name, tex);
-        return tex;
+        // A miss is cached under the key as well, so nothing keeps stat'ing the FS.
+        return LoadIntoCache(s_DetailTexCache, detail_name, FS.exist(full) ? full : nullptr,
+                             s_GreyDetail, TexStreamClass::Detail, TexColorSpace::Data, false);
     }
 
     // Generic cached loader for a named .dds in $game_textures$ (then $level$).
@@ -370,30 +468,22 @@ namespace {
     {
         if (!name || !name[0]) return fallback;
         std::string key(name);
-        auto it = cache.find(key);
-        if (it != cache.end()) return it->second;
+        if (CVulkanTexture* hit = FindInCache(cache, key)) return hit;
 
         string_path leaf, full;
         xr_sprintf(leaf, "%s.dds", name);
         FS.update_path(full, "$game_textures$", leaf);
         if (!FS.exist(full)) {
             FS.update_path(full, "$level$", leaf);
-            if (!FS.exist(full)) { cache.emplace(std::move(key), fallback); return fallback; }
+            if (!FS.exist(full))
+                return LoadIntoCache(cache, std::move(key), nullptr, fallback, klass, colorSpace, alphaOnly);
         }
-        auto* tex = xr_new<CVulkanTexture>();
         // Shared loader for terrain detail/normal/height + mask + bump maps. The CLASS
         // decides residency policy: Terrain = tracked, budget-fit only, never streamed
         // (a handful of tiled textures); Bump = mip-streamed like base diffuse, because
         // there is one per MATERIAL and a big level has thousands (Pripyat: 1591).
         // alphaOnly = "we sample .a and nothing else" → the loader may halve it to BC4.
-        tex->SetAlphaOnly(alphaOnly);
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, klass, colorSpace)) {
-            xr_delete(tex);
-            cache.emplace(std::move(key), fallback);
-            return fallback;
-        }
-        cache.emplace(std::move(key), tex);
-        return tex;
+        return LoadIntoCache(cache, std::move(key), full, fallback, klass, colorSpace, alphaOnly);
     }
 
     // Local mirror of CBlender_DESC's on-disk layout (the real header drags in the
@@ -516,20 +606,9 @@ namespace {
     // dh_r..dh_a (the 4 <detail>_height maps for SSFX-style terrain POM).
     void WriteTerrainSet(VkDescriptorSet set, const VkImageView v[15])
     {
-        VkDescriptorImageInfo ii[15]{};
-        VkWriteDescriptorSet  w[15]{};
-        for (int i = 0; i < 15; ++i) {
-            ii[i].sampler     = s_Sampler;
-            ii[i].imageView   = v[i];
-            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet          = set;
-            w[i].dstBinding      = (u32)i;
-            w[i].descriptorCount = 1;
-            w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w[i].pImageInfo      = &ii[i];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 15, w, 0, nullptr);
+        VK::DescriptorWriter w(set);
+        for (u32 i = 0; i < 15; ++i) w.ImageSampler(i, v[i], s_Sampler);
+        w.Flush();
     }
 
     WorldMaterial* CreateDefaultWhite()
@@ -568,15 +647,7 @@ void RebindTerrainMasks(VkImageView view)
     for (auto& kv : s_Cache) {
         WorldMaterial* m = kv.second;
         if (!m || !m->isTerrain || m->terrainChannel == 255 || m->terrainSet == VK_NULL_HANDLE) continue;
-        VkDescriptorImageInfo ii{ s_Sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = m->terrainSet;
-        w.dstBinding      = 1;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo      = &ii;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(m->terrainSet).ImageSampler(1, view, s_Sampler).Flush();
         ++n;
     }
     Msg("[VK Terrain] baked splat mask bound to %u mask-less terrain material(s)", n);
@@ -1040,8 +1111,224 @@ void Destroy()
 
 void SetLevelTag(const char* tag)
 {
+    {   // level-local .thm files make the cache level-scoped
+        std::lock_guard<std::mutex> lk(s_thmMx);
+        s_thmCache.clear();
+    }
+    s_thmCalls = s_thmHits = 0;
+    s_thmClk = 0;
     s_LevelTag = (tag && tag[0]) ? tag : "";
     Msg("[VK WorldMaterial] level tag: '%s'", s_LevelTag.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Stage 0 profiling. LoadTexture owns 6721 of the 7447 ms visuals phase, and
+// this call is the only non-trivial thing it does per visual - so split the
+// call itself: the terrain mask probe runs BEFORE the cache lookup and hits the
+// filesystem, which would make the cache useless for terrain materials. Numbers
+// decide, not the reading.
+// ---------------------------------------------------------------------------
+namespace {
+// In ticks: 388k calls a load, and the two inner scopes fire almost as often.
+// A microsecond-truncating timer loses half a microsecond per sample, which at
+// this count is hundreds of milliseconds reported as someone else's cost.
+u64   s_profTotalClk = 0, s_profProbeClk = 0, s_profFindClk = 0;
+u32   s_profCalls = 0, s_profHits = 0, s_profTerrain = 0;
+
+using prof_scope = VK::ClkScope;
+}
+
+// ---------------------------------------------------------------------------
+// Parallel texture prefetch (see the header). Two halves: `ExpandDiffusePaths`
+// turns one shader-table base into the files that base pulls in, and
+// `StartTexturePrefetch` hands the whole table to the worker pool.
+//
+// The resolution rules below MIRROR the loaders further down this file — that
+// duplication is deliberate and cheap to be wrong about: this side decides only
+// WHICH FILES TO OPEN EARLY. A path that no loader ever asks for is one wasted
+// read; a path this misses just loads the old way. Nothing here can change what
+// the level ends up with.
+// ---------------------------------------------------------------------------
+namespace {
+
+// $game_textures$ then $level$ — the GetOrLoadGameTex rule (bump, height, mask).
+// The KEY that cache uses is the name, not the path, so the job carries both:
+// a worker publishing a finished texture must file it where the walk will look.
+void PushGameTexJob(const char* name, TexRole role, xr_vector<TexJob>& out)
+{
+    if (!name || !name[0]) return;
+    string_path leaf, p;
+    xr_sprintf(leaf, "%s.dds", name);
+    FS.update_path(p, "$game_textures$", leaf);
+    if (!FS.exist(p)) {
+        FS.update_path(p, "$level$", leaf);
+        if (!FS.exist(p)) return;
+    }
+    out.push_back(TexJob{ std::string(p), std::string(name), role });
+}
+
+void ExpandDiffuseJobs(const char* diffuse_name, xr_vector<TexJob>& out)
+{
+    if (!diffuse_name || !diffuse_name[0]) return;
+
+    string_path full;
+    // s_DiffuseTexCache is keyed by the RESOLVED path (several materials share one
+    // diffuse), so here the key and the path are the same string.
+    if (ResolveTexturePath(diffuse_name, full))
+        out.push_back(TexJob{ std::string(full), std::string(full), TexRole::Diffuse });
+
+    // Everything else a material pulls in is declared by the diffuse's .thm.
+    THMInfo thm{};
+    if (LookupTHM(diffuse_name, thm)) {
+        if (thm.has_detail && !thm.detail_name.empty()) {
+            // GetOrLoadDetailTex looks in $game_textures$ and nowhere else, and keys
+            // on the bare detail name.
+            string_path leaf, p;
+            xr_sprintf(leaf, "%s.dds", thm.detail_name.c_str());
+            FS.update_path(p, "$game_textures$", leaf);
+            if (FS.exist(p))
+                out.push_back(TexJob{ std::string(p), thm.detail_name, TexRole::Detail });
+        }
+        if (thm.has_bump && !thm.bump_name.empty()) {
+            // Normal+gloss is behind r_bump — that cvar is a MEMORY gate, not just
+            // a shading one (GetOrCreate skips the load entirely at 0), so honour it
+            // here too instead of reading 563 MB nothing will ask for.
+            if (ps_r_bump > 0.0f) PushGameTexJob(thm.bump_name.c_str(), TexRole::Bump, out);
+            std::string height = thm.bump_name + "#";
+            PushGameTexJob(height.c_str(), TexRole::Height, out);
+        }
+    }
+
+    // Terrain splat mask (`<diffuse>_mask`) — mask-less maps fall back to a
+    // synthesized one-hot, and then this simply resolves to nothing.
+    if (strstr(diffuse_name, "terrain\\") == diffuse_name ||
+        strstr(diffuse_name, "terrain/")  == diffuse_name) {
+        string_path mask_name;
+        xr_sprintf(mask_name, "%s_mask", diffuse_name);
+        PushGameTexJob(mask_name, TexRole::Mask, out);
+    }
+}
+
+// Finish one job on a prefetch worker: build the image and file it in the cache the
+// walk will look in, so the walk's own call finds it instead of doing all of this on
+// the thread the level is waiting for. The per-role parameters MUST match the loader
+// that owns the cache (right above) — a mismatch would hand the walk a texture in the
+// wrong colour space or stream class, which is why they sit next to the resolution
+// rules they mirror.
+void MaterializeJob(const TexJob& job)
+{
+    switch (job.role) {
+    case TexRole::Diffuse:
+        LoadIntoCache(s_DiffuseTexCache, job.key, job.path.c_str(), nullptr,
+                      TexStreamClass::WorldDiffuse, TexColorSpace::Color, false);
+        break;
+    case TexRole::Detail:
+        LoadIntoCache(s_DetailTexCache, job.key, job.path.c_str(), s_GreyDetail,
+                      TexStreamClass::Detail, TexColorSpace::Data, false);
+        break;
+    case TexRole::Bump:
+        LoadIntoCache(s_BumpNTexCache, job.key, job.path.c_str(), s_FlatBumpN,
+                      TexStreamClass::Bump, TexColorSpace::Data, false);
+        break;
+    case TexRole::Height:
+        LoadIntoCache(s_BumpTexCache, job.key, job.path.c_str(), s_FlatBump,
+                      TexStreamClass::Terrain, TexColorSpace::Data, /*alphaOnly*/ true);
+        break;
+    case TexRole::Mask:
+        LoadIntoCache(s_TerrainDetCache, job.key, job.path.c_str(), s_WhiteMask,
+                      TexStreamClass::Terrain, TexColorSpace::Data, false);
+        break;
+    case TexRole::Lmap:
+        LoadIntoCache(s_LmapTexCache, job.key, job.path.c_str(), s_WhiteLmap,
+                      TexStreamClass::Lmap, TexColorSpace::Data, false);
+        break;
+    }
+}
+}   // anonymous namespace
+
+void StartTexturePrefetch(xr_vector<shared_str>&& diffuseNames, xr_vector<shared_str>&& lmapNames,
+                          const char* leadFile)
+{
+    // The shader table repeats a diffuse across regions (pripyat_asfalt/earth/grass
+    // share one base), and expanding it twice would read its .thm twice.
+    std::unordered_set<std::string> seen;
+    xr_vector<shared_str> bases;
+    bases.reserve(diffuseNames.size());
+    u32 alreadyLoaded = 0;
+    for (const shared_str& n : diffuseNames) {
+        if (n.size() == 0) continue;
+        if (!seen.insert(std::string(n.c_str())).second) continue;
+        // This cache deliberately SURVIVES a level change (persistent visuals hold
+        // raw WorldMaterial*), so re-entering a level the session already visited
+        // means GetOrCreate hits everything and opens no file at all. Measured on a
+        // second load: 1114 files / 1025 MB prefetched, zero claimed. Filtering here
+        // and not in the worker on purpose — the caches belong to the loading thread,
+        // and at this point in the load nothing is touching them yet.
+        string_path full;
+        if (ResolveTexturePath(n.c_str(), full) &&
+            FindInCache(s_DiffuseTexCache, std::string(full)) != nullptr) {
+            ++alreadyLoaded;
+            continue;
+        }
+        bases.push_back(n);
+    }
+    if (alreadyLoaded)
+        Msg("[VK TexPrefetch] %u of %u shader bases already resident from an earlier level — not prefetched",
+            alreadyLoaded, (u32)seen.size());
+
+
+    // Lightmaps resolve $level$-first (GetOrLoadLmapTex) — the opposite order from
+    // everything else, because an lmap name is level-local by construction.
+    std::unordered_set<std::string> seenLmap;
+    xr_vector<TexJob> direct;
+    direct.reserve(lmapNames.size());
+    for (const shared_str& n : lmapNames) {
+        if (n.size() == 0) continue;
+        if (!seenLmap.insert(std::string(n.c_str())).second) continue;
+        // Same "already resident" skip as the bases above. Lightmap keys carry the
+        // level tag, so this only ever matches a level visited before. The key is
+        // kept: it is what GetOrLoadLmapTex looks under, so a worker needs it to file
+        // the finished texture there.
+        std::string key(s_LevelTag);
+        key.push_back('|');
+        key.append(n.c_str());
+        if (FindInCache(s_LmapTexCache, key) != nullptr) continue;
+
+        string_path leaf, p;
+        xr_sprintf(leaf, "%s.dds", n.c_str());
+        FS.update_path(p, "$level$", leaf);
+        if (!FS.exist(p)) {
+            FS.update_path(p, "$game_textures$", leaf);
+            if (!FS.exist(p)) continue;
+        }
+        direct.push_back(TexJob{ std::string(p), std::move(key), TexRole::Lmap });
+    }
+
+    VK::TexPrefetch::Start(std::move(bases), std::move(direct), &ExpandDiffuseJobs,
+                           &MaterializeJob, leadFile);
+}
+
+void ProfDump()
+{
+    const float k = VK::ClkToMs();
+    Msg("[load step]   LookupTHM: %u calls (%u cache hits) | %.0f ms of wall across every caller",
+        s_thmCalls.load(), s_thmHits.load(), k * float(s_thmClk.load()));
+    // Who built the level's textures, and what the walk paid to let workers do it:
+    // a wait here is the walk arriving at a file a worker had already started.
+    Msg("[load step]   texture caches: %u built | %u waits for another thread (%.0f ms)",
+        s_texBuilt.load(), s_texWaits.load(), k * float(s_texWaitClk.load()));
+    Msg("[load step]   GetOrCreate miss split: diffuse %.0f | terrain heal %.0f | thm+detail %.0f | bumpX %.0f | bumpN %.0f | lmap %.0f | diag Msg %.0f | material+set %.0f ms",
+        k * float(s_mkDiffuseClk.load()), k * float(s_mkTerrainClk.load()), k * float(s_mkThmClk.load()),
+        k * float(s_mkBumpxClk.load()), k * float(s_mkBumpnClk.load()), k * float(s_mkLmapClk.load()),
+        k * float(s_mkDiagClk.load()), k * float(s_mkSetClk.load()));
+    s_texBuilt = 0; s_texWaits = 0; s_texWaitClk = 0;
+    s_mkDiffuseClk = s_mkTerrainClk = s_mkThmClk = s_mkBumpxClk = 0;
+    s_mkBumpnClk = s_mkLmapClk = s_mkDiagClk = s_mkSetClk = 0;
+    Msg("[load step]   GetOrCreate: %u calls (%u hits, %u terrain-probed) | total %.0f ms = probe %.0f + find %.0f + create %.0f",
+        s_profCalls, s_profHits, s_profTerrain, k * float(s_profTotalClk), k * float(s_profProbeClk),
+        k * float(s_profFindClk), k * float(s_profTotalClk - s_profProbeClk - s_profFindClk));
+    s_profTotalClk = s_profProbeClk = s_profFindClk = 0;
+    s_profCalls = s_profHits = s_profTerrain = 0;
 }
 
 WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, float alphaRef, bool wmark,
@@ -1049,6 +1336,9 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
 {
     if (!s_SetLayout || !s_Default) return s_Default;
     if (!diffuse_name || !diffuse_name[0]) return s_Default;
+
+    prof_scope _profAll(s_profTotalClk);
+    ++s_profCalls;
 
     const bool is_terrain = (strstr(diffuse_name, "terrain\\") == diffuse_name ||
                              strstr(diffuse_name, "terrain/")  == diffuse_name);
@@ -1058,6 +1348,8 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // one material, real mask, no shader keying.
     bool terrain_maskless = false;
     if (is_terrain) {
+        prof_scope _profProbe(s_profProbeClk);
+        ++s_profTerrain;
         string_path mask_leaf, mask_full;
         xr_sprintf(mask_leaf, "%s_mask", diffuse_name);
         terrain_maskless = !ResolveTexturePath(mask_leaf, mask_full);
@@ -1074,19 +1366,25 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // shader IS the region (pripyat_asfalt/earth/grass share one diffuse+lmap
     // but must get different synthesized splat masks — one key would collapse
     // them into a single material).
+    const u64 _profFindC0 = CPU::GetCLK();
+
     std::string key(diffuse_name);
     key.push_back('|');
     if (lmap_name && lmap_name[0]) { key.append(lmap_name); key.push_back('|'); key.append(s_LevelTag); }
     if (terrain_maskless && shader_name && shader_name[0]) { key.push_back('|'); key.append(shader_name); }
 
     auto it = s_Cache.find(key);
+    s_profFindClk += CPU::GetCLK() - _profFindC0;
+
     if (it != s_Cache.end()) {
+        ++s_profHits;
         // Materials are shared by texture pair — if ANY user is a wallmark
         // shader, the whole material renders as a decal (textures are
         // decal-dedicated in practice). Same upgrade for glass (aref == -2).
         if (wmark && it->second != s_Default) {
             it->second->isWmark = true;
-            if (alphaRef < -3.5f)      it->second->isLitBlend = true;
+            if (alphaRef < -4.5f)      it->second->isWater    = true;
+            else if (alphaRef < -3.5f) it->second->isLitBlend = true;
             else if (alphaRef < -2.5f) it->second->isEmisAdd  = true;
             else if (alphaRef < -1.5f) it->second->isGlass    = true;
         }
@@ -1112,18 +1410,13 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // — vk_Visual.cpp), so this one call site covers essentially all lit albedo.
     // Keyed by resolved path (NOT by the material key): several materials sharing a
     // diffuse must share the image — see s_DiffuseTexCache.
-    CVulkanTexture* tex = nullptr;
-    if (auto dit = s_DiffuseTexCache.find(full); dit != s_DiffuseTexCache.end()) {
-        tex = dit->second;
-    } else {
-        tex = xr_new<CVulkanTexture>();
-        if (!tex->LoadDDS(full, /*applyBCSwizzle*/ false, TexStreamClass::WorldDiffuse,
-                          TexColorSpace::Color)) {
-            xr_delete(tex);
-            s_Cache.emplace(std::move(key), s_Default);
-            return s_Default;
-        }
-        s_DiffuseTexCache.emplace(full, tex);
+    const u64 _mk0 = CPU::GetCLK();
+    CVulkanTexture* tex = LoadIntoCache(s_DiffuseTexCache, std::string(full), full, nullptr,
+                                        TexStreamClass::WorldDiffuse, TexColorSpace::Color, false);
+    s_mkDiffuseClk += CPU::GetCLK() - _mk0;
+    if (!tex) {   // present but unreadable; cached as a known failure, not retried
+        s_Cache.emplace(std::move(key), s_Default);
+        return s_Default;
     }
 
     // Terrain bases opt out of dynamic streaming (vk_terrain_cache captures the
@@ -1132,16 +1425,23 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // captures this texture's view (the ground is the one surface that is always
     // on screen — a frozen 256px terrain base reads as "каша", seen on Pripyat).
     if (is_terrain) {
+        const u64 _c0 = CPU::GetCLK();
         VK::TextureStreamer::Instance().EnsureMinResidency(tex, 16384);   // = full chain
         VK::TextureStreamer::Instance().SetStreamable(tex, false);
+        s_mkTerrainClk += CPU::GetCLK() - _c0;
     }
 
     // .thm lookup: R4 detail descriptor (texture + scale) and the bump
     // association. Materials with no detail association get the grey fallback
     // so the shader's `2 * base * detail` reduces to `base`.
     THMInfo         thm{};
-    LookupTHM(diffuse_name, thm);
-    CVulkanTexture* detail_tex = thm.has_detail ? GetOrLoadDetailTex(thm.detail_name) : s_GreyDetail;
+    CVulkanTexture* detail_tex = nullptr;
+    {
+        const u64 _c0 = CPU::GetCLK();
+        LookupTHM(diffuse_name, thm);
+        detail_tex = thm.has_detail ? GetOrLoadDetailTex(thm.detail_name) : s_GreyDetail;
+        s_mkThmClk += CPU::GetCLK() - _c0;
+    }
 
     // R4 TESS_HM gate: a bump association whose `<bump>#.dds` (alpha = height)
     // actually loads. shaders.xr TessMethod is NO_TESS across stock content,
@@ -1149,6 +1449,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // decal materials stay flat — their coverage must match the depth prepass.
     CVulkanTexture* bumpx_tex = s_FlatBump;
     if (!wmark && alphaRef < 0.0f && thm.has_bump) {
+        const u64 _c0 = CPU::GetCLK();
         std::string bumpx_name = thm.bump_name + "#";
         // alphaOnly: every sampler of uTexBumpX reads `.a` (POM march, the flat-material
         // early-out, the TES displacement) — the colour blocks are a measured neutral
@@ -1161,6 +1462,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
         Msg("[VK Tess] '%s': bump '%s' -> %s ('%s#')", diffuse_name, thm.bump_name.c_str(),
             (bumpx_tex != s_FlatBump) ? "TESSELLATED (height loaded)" : "NO height tex, stays flat",
             thm.bump_name.c_str());
+        s_mkBumpxClk += CPU::GetCLK() - _c0;
     }
 
     // Material NORMAL + GLOSS (`<bump>.dds`). Deliberately NOT behind the tess gate
@@ -1181,8 +1483,10 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // level reload.
     CVulkanTexture* bumpn_tex = s_FlatBumpN;
     if (thm.has_bump && ps_r_bump > 0.0f) {
+        const u64 _c0 = CPU::GetCLK();
         bumpn_tex = GetOrLoadGameTex(s_BumpNTexCache, thm.bump_name.c_str(), s_FlatBumpN,
                                      TexColorSpace::Data, TexStreamClass::Bump);
+        s_mkBumpnClk += CPU::GetCLK() - _c0;
         // Tie it to this material's diffuse so the streamer can manage it: a normal
         // map gets no GPU feedback of its own, so it inherits the wanted resolution of
         // the surface it is painted on. Without the link the whole Bump class can only
@@ -1198,6 +1502,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     // for the process (this cache is never reset per level, by design), so the last
     // line in the log carries the running totals.
     {
+        const u64 _c0 = CPU::GetCLK();
         static u32 s_bumpOk = 0, s_bumpNone = 0, s_bumpMiss = 0;
         if (!thm.has_bump)                    ++s_bumpNone;
         else if (bumpn_tex == s_FlatBumpN)    ++s_bumpMiss;
@@ -1207,12 +1512,16 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
             thm.has_bump ? thm.bump_name.c_str() : "",
             thm.has_bump ? (bumpn_tex != s_FlatBumpN ? "' -> LOADED" : "' -> MISSING .dds") : "",
             s_bumpOk, s_bumpNone, s_bumpMiss);
+        s_mkDiagClk += CPU::GetCLK() - _c0;
     }
 
     // Lightmap from the level shader's 3rd texture slot. Vert-lit / non-
     // lightmapped materials pass null here → white fallback (no-op multiply).
+    const u64 _mkLmap0 = CPU::GetCLK();
     CVulkanTexture* lmap_tex = GetOrLoadLmapTex(lmap_name);
+    s_mkLmapClk += CPU::GetCLK() - _mkLmap0;
 
+    const u64 _mkSet0 = CPU::GetCLK();
     auto* m = xr_new<WorldMaterial>();
     m->tex          = tex;
     m->view         = tex->GetView();
@@ -1222,7 +1531,8 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
     m->view_lmap    = lmap_tex   ? lmap_tex->GetView()   : s_WhiteLmap->GetView();
     m->alphaRef     = alphaRef;
     m->isWmark      = wmark;
-    m->isLitBlend   = wmark && alphaRef < -3.5f;                       // -4 = lit-blend (lightplanes)
+    m->isWater      = wmark && alphaRef < -4.5f;                       // -5 = water body (Pass_Water)
+    m->isLitBlend   = wmark && alphaRef < -3.5f && alphaRef > -4.5f;   // -4 = lit-blend (lightplanes)
     m->isEmisAdd    = wmark && alphaRef < -2.5f && alphaRef > -3.5f;   // -3 = emissive-additive marker
     m->isGlass      = wmark && alphaRef < -1.5f && alphaRef > -2.5f;   // -2 = the glass marker (vk_Visual LoadTexture)
     m->name         = diffuse_name;
@@ -1244,6 +1554,7 @@ WorldMaterial* GetOrCreate(const char* diffuse_name, const char* lmap_name, floa
         return s_Default;
     }
     WriteSet(m->set, m->view, m->view_detail, m->view_lmap, bumpx_tex->GetView(), bumpn_tex->GetView());
+    s_mkSetClk += CPU::GetCLK() - _mkSet0;
 
     // ----- Terrain splatting: diffuse under "terrain\" gets the 7-binding set.
     // Mask = "<diffuse>_mask"; details = the 4 channel defaults; detail UV

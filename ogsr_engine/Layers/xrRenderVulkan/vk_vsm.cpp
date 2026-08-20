@@ -9,14 +9,19 @@
 // PHASE 1A: clipmap params + page MARKING compute + a diagnostic visible-page count.
 
 #include "stdafx.h"
+#include "vk_rendering.h"          // VK::RenderingBuilder
 #include "vk_vsm.h"
 #include "HW_Vulkan.h"
 #include "vk_shaders.h"           // g_ShaderManager (vsm_mark.comp.spv)
+#include "vk_compute_util.h"      // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"      // VK::GfxPipelineBuilder
+#include "vk_descriptors.h"       // VK::DescriptorWriter
 #include "vk_buffer.h"            // CVulkanBuffer
 #include "vk_shadow_gpu.h"        // ShadowGPU caster meta + groups (reused for VSM binning/render)
 #include "vk_world_gpu.h"         // WorldGPU cluster-LOD entries (Phase 3: r_vsm_cluster bin/render)
 #include "vk_cluster_stream.h"    // Stage B: page residency bits + slot bases (vsm_bin_cluster bindings)
 #include "vk_pass_skinned.h"      // Skinned_CollectCasters/GetBoneSet — NPC casters into the atlas
+#include "vk_env_light.h"         // EnvLight::SunDirVisual — the real sun, held through a thunderbolt
 #include "CRender_Vulkan.h"       // RImplementation.Details/Trees — grass + tree casters into the atlas
 #include "vk_DetailManager.h"     // CDetailManager VSM grass getters + DetailInstance/GPU_OUTPUT_CAPACITY
 #include "vk_TreeManager.h"       // CTreeManager VsmBin/VsmRender — tree casters into the atlas
@@ -35,6 +40,7 @@ extern int   ps_r_vsm_debug;
 extern int   ps_r_sun_night_freeze;   // freeze the sun-shadow update when the sun is below the horizon
 extern float ps_r_sun_night_lum;      // sun_color luminance below which it's "night" (secondary signal)
 extern float ps_r_sun_night_alt;      // to-sun.y below which the sun counts as below the horizon
+extern int   ps_r_vsm_load_freeze;   // freeze the sun-shadow update while the load screen is up
 extern int   ps_r_vsm_hzb;   // shadow-HZB: cull casters fully behind cached occluders (kills VSMrender overdraw)
 extern float ps_r_vsm_base;       // clipmap level-0 extent (m) → finest texel = base/4096 (live, settings-bound)
 extern float ps_r_vsm_bias;       // receiver depth-compare bias, STATIC atlas (live)
@@ -50,6 +56,7 @@ extern float ps_r_vsm_ta_clamp;        // (1) neighbourhood clamp: history bound
 extern float ps_r_vsm_ta_motion;       // (2) reprojected motion (px) at which history weight fades to the floor (live)
 extern float ps_r_vsm_ta_motion_floor; // (2) history weight at/after that motion (live)
 extern float ps_r_vsm_ta_blend_dlss;   // (3) history-weight scale when r_dlss on (DLSS also resolves the shadow → avoid double blur, live)
+extern float ps_r_vsm_ta_carry;        // (4) history weight where NO clipmap page is resident (deferred scroll-in) — 0 = old "resolve lit" flash (live)
 extern int   ps_r_vsm_soft;            // SOFT SHADOWS (stochastic PCSS): filter taps, 0 = legacy 3x3 PCF (live)
 extern int   ps_r_vsm_soft_search;     // blocker-search taps (live)
 extern float ps_r_vsm_soft_angle;      // sun cone half-angle in DEGREES (0.265 = physical; higher = cinematic) (live)
@@ -86,6 +93,13 @@ namespace VK { namespace VSM {
 
 namespace {
 
+// Shorthands for the set-layout type lists handed to VK::MakeDescriptorSets —
+// this file declares a dozen sets and the lists read as tables of bindings.
+constexpr VkDescriptorType kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+constexpr VkDescriptorType kUBO  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+constexpr VkDescriptorType kTex  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+constexpr VkDescriptorType kImg  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
 // Clipmap geometry — MUST match shaders/vsm_common.glsl.
 constexpr u32   kLevels      = 6;
 constexpr u32   kVirtualRes  = 4096;
@@ -121,8 +135,12 @@ constexpr u32   kAtlasW      = 64;                              // DYNAMIC atlas
 constexpr u32   kAtlasH      = 32;                              // DYNAMIC atlas pages down  (MUST match VSM_ATLAS_H)
 constexpr u32   kAtlasW_S    = 64;                              // STATIC atlas pages across (MUST match VSM_ATLAS_W_S) -> 8192 x 12288
 constexpr u32   kAtlasH_S    = 96;                              // STATIC atlas pages down   (MUST match VSM_ATLAS_H_S)
-constexpr float kZNear       = -1000.0f;                         // light-space depth range
+constexpr float kZNear       = -1000.0f;                         // light-space depth range (RELATIVE to the window centre below)
 constexpr float kZFar        =  1000.0f;
+// ⚠The window is 2000 m DEEP but it is not anchored at the world origin — see the
+// zCentre note in BeginFrame. Snapping the centre to this lattice keeps the depth
+// encoding (and with it every cached page) stable while the camera walks.
+constexpr float kZSnap       =  256.0f;
 constexpr u32   kSkinnedCap  = 256;                              // max atlas pages a skinned leaf bins into (across all clipmap levels; log showed ~155-188 for close NPCs)
 constexpr u32   kMaxSkinned  = 256;                              // max skinned leaves rasterized per frame
 
@@ -205,6 +223,7 @@ VkShaderModule        s_clearVS     = VK_NULL_HANDLE;
 
 Fvector s_prevSunDir = { 0.f, -1.f, 0.f };   // last frame's sun dir (round-robin enable)
 bool    s_sunMoving   = false;                // sun rotated since last frame (drives round-robin refresh)
+float   s_zCentre     = 0.f;                  // light-space centre of the depth window, snapped to kZSnap (see BeginFrame)
 
 // Throttle (r_vsm_throttle) — the UE5 VirtualShadowMapThrottle idea: feed last frame's
 // measured VSM render cost back into a clipmap LOD bias. Over budget → mark coarser
@@ -225,6 +244,38 @@ u32   s_thBiasHist[3] = {};                   // frames spent at bias 0 / 1 / >=
 u64   s_wrongSum = 0, s_dirtySum = 0, s_deferSum = 0, s_gazeSum = 0;
 u32   s_wrongMax = 0, s_dirtyMax = 0, s_gazeMax = 0, s_rbFrames = 0;
 u32   s_thLastLogMs = 0;
+// WHY the wrong-tile bursts happen. A page goes wrong-tile when the world tile its
+// toroidal slot holds is no longer the tile it must show — i.e. when the light-space
+// window SCROLLED. Two drivers, and the log has to tell them apart: the camera walking
+// (a page or two per frame, harmless) and the SUN turning (the whole lattice pivots about
+// the world origin, so far from origin one env keyframe step can move the window by
+// hundreds of pages = every page wrong at once). Third column: full-cache invalidations,
+// which make every page wrong by definition.
+float s_sunStepMax = 0.f;                     // biggest single-frame sun rotation in the window (deg)
+u32   s_snapMax = 0;                          // biggest single-frame window scroll (pages, max over levels)
+u32   s_invalN = 0;                           // InvalidateCache() calls in the window
+// Frames left of UNTHROTTLED wrong-tile re-render after a full invalidation. See
+// the prime note in MarkPages: without it the level-load invalidation drains at
+// r_vsm_dirty_budget pages/frame and the atlas serves stale depth for seconds.
+u32   s_primeFrames = 0;
+constexpr u32 kPrimeFrames = 8;
+// Post-load convergence trace. A level-load InvalidateCache() empties the physical-tile
+// table, so until a page re-renders it reads EMPTY = fully shadowed = BLACK ground —
+// the intermittent "black tiles for the first seconds" report. The prime above is spent
+// on RENDERED frames, and the load screen renders ~180 of them before the player sees
+// anything, so the prime may well be gone before the world is ever shown.
+// ⚠The `[VK VSM] throttle` summary cannot answer this: its counters only accumulate
+// under r_vsm_debug / r_profiler, so on a normal run it prints zeros that mean
+// "not measured", not "nothing wrong". This trace is deliberately UNGATED: ~48 lines
+// once per level load, and it makes an intermittent defect self-reporting.
+u32   s_primeTraceLeft = 0;
+u32   s_primeTraceIdx  = 0;
+u32   s_primeTraceQuiet = 0;                  // consecutive drained frames after the reveal
+constexpr u32 kPrimeTraceFrames = 400;        // must outlive the ~180-frame load screen
+constexpr u32 kPrimeTraceQuiet  = 10;         // stop once the backlog is gone and the world is up
+u32   s_boltHeldN = 0;                        // frames the thunderbolt's fake sun was held off (see BeginFrame)
+s32   s_pbPrev[kLevels][2] = {};              // previous frame's window page base (scroll diag)
+bool  s_pbPrevOk = false;
 
 // std430 push for vsm_resid.comp: per-level window page-base packed as ivec4[3] +
 // up to 4 invalidation circles (light-space xy, radius; [0].w = L0 page width in m) —
@@ -460,7 +511,7 @@ struct ResolveParams {
     float   params[4];         // x = alpha, y = reject tol, z = historyValid, w = dyn-gate
     float   params2[4];        // x = clamp tol, y = motion ref px, z = motion-floor weight, w = static bias const
     float   params3[4];        // SOFT: x = filter taps (0 = legacy 3x3 PCF), y = search taps, z = tan(sun half-angle), w = max blocker search dist (m)
-    float   params4[4];        // x = frame noise phase, yzw = reserved
+    float   params4[4];        // x = frame noise phase, y = no-page history carry (r_vsm_ta_carry), zw = reserved
 };
 
 void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
@@ -477,30 +528,10 @@ bool CreatePipeline()
     VkShaderModule cs = g_ShaderManager->Load("vsm_mark.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_mark.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[6]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;   // receiver mask (r_vsm_rmask)
-    b[5].binding = 5; b[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;   // page hits (r_vsm_gaze)
-    for (u32 i = 0; i < 6; ++i) { b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 6; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL) != VK_SUCCESS) return false;
-
-    VkDescriptorPoolSize ps[3] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, N },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         N },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         N * 4 },
-    };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout layouts[N]; for (u32 i = 0; i < N; ++i) layouts[i] = s_setL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = N; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_set) != VK_SUCCESS) return false;
+    // 0 depth, 1 ubo, 2 pageTable, 3 stats, 4 receiver mask (r_vsm_rmask), 5 page hits (r_vsm_gaze)
+    if (!VK::MakeDescriptorSets({ kTex, kUBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                N, s_setL, s_pool, s_set, VK_SHADER_STAGE_COMPUTE_BIT, "VSM.Mark"))
+        return false;
 
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -508,20 +539,11 @@ bool CreatePipeline()
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (vkCreateSampler(VulkanHW.m_Device, &si, nullptr, &s_depthSampler) != VK_SUCCESS) return false;
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MarkPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_setL;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_layout) != VK_SUCCESS) return false;
+    s_layout = VK::MakePipelineLayout({ s_setL }, sizeof(MarkPush));
+    if (!s_layout) return false;
 
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs;
-    cpci.stage.pName  = "main";
-    cpci.layout       = s_layout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_pipe) != VK_SUCCESS) return false;
-    return true;
+    s_pipe = VK::CreateComputePipeline(cs, s_layout, "VSM.Mark");
+    return s_pipe != VK_NULL_HANDLE;
 }
 
 // Allocation pipeline: 4 SSBOs (needed, pageTable, pageList, allocInfo). Serves the
@@ -532,32 +554,16 @@ bool CreateAllocPipeline()
     VkShaderModule cs = g_ShaderManager->Load("vsm_alloc.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_alloc.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[4]{};
-    for (u32 i = 0; i < 4; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 4; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_allocSetL) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO }, 1,
+                                s_allocSetL, s_allocPool, &s_dynAllocSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.Alloc"))
+        return false;
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_allocPool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_allocPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_allocSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_dynAllocSet) != VK_SUCCESS) return false;
+    s_allocLayout = VK::MakePipelineLayout({ s_allocSetL });
+    if (!s_allocLayout) return false;
 
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_allocSetL;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_allocLayout) != VK_SUCCESS) return false;
-
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs;
-    cpci.stage.pName  = "main";
-    cpci.layout       = s_allocLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_allocPipe) != VK_SUCCESS) return false;
-    return true;
+    s_allocPipe = VK::CreateComputePipeline(cs, s_allocLayout, "VSM.Alloc");
+    return s_allocPipe != VK_NULL_HANDLE;
 }
 
 // Binning pipeline: 5 SSBOs (meta, pageTable, count, casters, stats) + 1 UBO. Per-frame
@@ -567,43 +573,20 @@ bool CreateBinPipeline()
     VkShaderModule cs = g_ShaderManager->Load("vsm_bin.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_bin.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[8]{};
-    const VkDescriptorType types[8] = {
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,   // meta, ubo
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,   // pageTable, casterPages
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,   // indirect, groupCount
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,   // stats, slotDirty (Phase 1b)
-    };
-    for (u32 i = 0; i < 8; ++i) { b[i].binding = i; b[i].descriptorType = types[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 8; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_binSetL) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kSSBO, kUBO,    // meta, ubo
+                                  kSSBO, kSSBO,   // pageTable, casterPages
+                                  kSSBO, kSSBO,   // indirect, groupCount
+                                  kSSBO, kSSBO }, // stats, slotDirty (Phase 1b)
+                                N, s_binSetL, s_binPool, s_binSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.Bin"))
+        return false;
 
-    VkDescriptorPoolSize ps[2] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 7 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N },
-    };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_binPool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout layouts[N]; for (u32 i = 0; i < N; ++i) layouts[i] = s_binSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_binPool; dai.descriptorSetCount = N; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_binSet) != VK_SUCCESS) return false;
+    // push: casterCount, groupStride, camXYZ, lodDist
+    s_binLayout = VK::MakePipelineLayout({ s_binSetL }, 2 * sizeof(u32) + 4 * sizeof(float));
+    if (!s_binLayout) return false;
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(u32) + 4 * sizeof(float) };   // casterCount, groupStride, camXYZ, lodDist
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_binSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_binLayout) != VK_SUCCESS) return false;
-
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs;
-    cpci.stage.pName  = "main";
-    cpci.layout       = s_binLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_binPipe) != VK_SUCCESS) return false;
-    return true;
+    s_binPipe = VK::CreateComputePipeline(cs, s_binLayout, "VSM.Bin");
+    return s_binPipe != VK_NULL_HANDLE;
 }
 
 // Phase 3 cluster-bin pipeline (vsm_bin_cluster.comp): same shape as the bin
@@ -617,41 +600,19 @@ bool CreateBinClusterPipeline()
 
     // 0-8 as before; Stage B: 9 = cluster-stream bits, 10 = page slot bases;
     // at-scale: 11 = candidate list ((combo<<20)|entry).
-    VkDescriptorSetLayoutBinding b[12]{};
-    for (u32 i = 0; i < 12; ++i) {
-        b[i].binding = i;
-        b[i].descriptorType = (i == 1) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 12; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_binClSetL) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kSSBO, kUBO,  kSSBO, kSSBO,
+                                  kSSBO, kSSBO, kSSBO, kSSBO,
+                                  kSSBO, kSSBO, kSSBO, kSSBO },
+                                N, s_binClSetL, s_binClPool, s_binClSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.BinCluster"))
+        return false;
 
-    VkDescriptorPoolSize ps[2] = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 11 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N },
-    };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_binClPool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout layouts[N]; for (u32 i = 0; i < N; ++i) layouts[i] = s_binClSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_binClPool; dai.descriptorSetCount = N; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_binClSet) != VK_SUCCESS) return false;
+    // push: candCount, arenaSlots, errK
+    s_binClLayout = VK::MakePipelineLayout({ s_binClSetL }, 2 * sizeof(u32) + sizeof(float));
+    if (!s_binClLayout) return false;
 
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(u32) + sizeof(float) };   // candCount, arenaSlots, errK
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_binClSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_binClLayout) != VK_SUCCESS) return false;
-
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs;
-    cpci.stage.pName  = "main";
-    cpci.layout       = s_binClLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_binClPipe) != VK_SUCCESS) return false;
-    return true;
+    s_binClPipe = VK::CreateComputePipeline(cs, s_binClLayout, "VSM.BinCluster");
+    return s_binClPipe != VK_NULL_HANDLE;
 }
 
 // Toroidal residency compute: 7 SSBOs (needed, pageTable, pageList, physTile, slotDirty,
@@ -660,27 +621,15 @@ bool CreateResidPipeline()
 {
     VkShaderModule cs = g_ShaderManager->Load("vsm_resid.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_resid.comp.spv load failed"); return false; }
-    VkDescriptorSetLayoutBinding b[9]{};   // +7 priorValid (shadow-HZB), +8 pageHits (r_vsm_gaze)
-    for (u32 i = 0; i < 9; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 9; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_residSetL) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9 };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_residPool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_residPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_residSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_residSet) != VK_SUCCESS) return false;
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ResidPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_residSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_residLayout) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = s_residLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_residPipe) != VK_SUCCESS) return false;
-    return true;
+    // 0-6 as in the header comment, +7 priorValid (shadow-HZB), +8 pageHits (r_vsm_gaze)
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                1, s_residSetL, s_residPool, &s_residSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.Resid"))
+        return false;
+    s_residLayout = VK::MakePipelineLayout({ s_residSetL }, sizeof(ResidPush));
+    if (!s_residLayout) return false;
+    s_residPipe = VK::CreateComputePipeline(cs, s_residLayout, "VSM.Resid");
+    return s_residPipe != VK_NULL_HANDLE;
 }
 
 // shadow-HZB reduce pipeline (r_vsm_hzb): set = {atlas sampler, prevDirty, priorValid, pageMax, pageMaxBlk}.
@@ -693,38 +642,22 @@ bool CreateHzbReducePipeline()
 {
     VkShaderModule cs = g_ShaderManager->Load("vsm_hzb_reduce.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_hzb_reduce.comp.spv load failed - shadow-HZB disabled"); return false; }
-    VkDescriptorSetLayoutBinding b[5]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    for (u32 i = 1; i < 5; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 5; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_hzbSetL) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_hzbPool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_hzbPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_hzbSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_hzbSet) != VK_SUCCESS) return false;
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_hzbSetL;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_hzbLayout) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = s_hzbLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_hzbPipe) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kTex, kSSBO, kSSBO, kSSBO, kSSBO }, 1,
+                                s_hzbSetL, s_hzbPool, &s_hzbSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.HZBReduce"))
+        return false;
+    s_hzbLayout = VK::MakePipelineLayout({ s_hzbSetL });
+    if (!s_hzbLayout) return false;
+    s_hzbPipe = VK::CreateComputePipeline(cs, s_hzbLayout, "VSM.HZBReduce");
+    if (!s_hzbPipe) return false;
 
-    VkDescriptorImageInfo ii{ s_atlasSampler, s_atlasView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorBufferInfo bufi[4] = {
-        { s_slotDirtyPrev->GetHandle(), 0, VK_WHOLE_SIZE },   // binding 1 = LAST frame's dirty set
-        { s_priorValid->GetHandle(),    0, VK_WHOLE_SIZE },
-        { s_pageMax->GetHandle(),       0, VK_WHOLE_SIZE },
-        { s_pageMaxBlk->GetHandle(),    0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet w[5]{};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = s_hzbSet; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &ii;
-    for (u32 i = 0; i < 4; ++i) { w[i + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i + 1].dstSet = s_hzbSet; w[i + 1].dstBinding = i + 1; w[i + 1].descriptorCount = 1; w[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i + 1].pBufferInfo = &bufi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 5, w, 0, nullptr);
+    VK::DescriptorWriter(s_hzbSet)
+        .ImageSampler (0, s_atlasView, s_atlasSampler)
+        .StorageBuffer(1, s_slotDirtyPrev->GetHandle())   // LAST frame's dirty set
+        .StorageBuffer(2, s_priorValid->GetHandle())
+        .StorageBuffer(3, s_pageMax->GetHandle())
+        .StorageBuffer(4, s_pageMaxBlk->GetHandle())
+        .Flush();
     return true;
 }
 
@@ -734,57 +667,29 @@ bool CreateClearPipeline()
 {
     s_clearVS = g_ShaderManager->Load("vsm_clear.vert.spv");
     if (!s_clearVS) { Msg("![VK VSM] vsm_clear.vert.spv load failed"); return false; }
-    VkDescriptorSetLayoutBinding b{}; b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 1; lci.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_clearSetL) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_clearPool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_clearPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_clearSetL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_clearSet) != VK_SUCCESS) return false;
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_clearSetL;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_clearLayout) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kSSBO }, 1, s_clearSetL, s_clearPool, &s_clearSet,
+                                VK_SHADER_STAGE_VERTEX_BIT, "VSM.Clear"))
+        return false;
+    s_clearLayout = VK::MakePipelineLayout({ s_clearSetL });
+    if (!s_clearLayout) return false;
 
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    stage.stage = VK_SHADER_STAGE_VERTEX_BIT; stage.module = s_clearVS; stage.pName = "main";
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 0;
     // DEPTH_BIAS is declared dynamic even though this pipeline biases nothing
-    // (depthBiasEnable stays FALSE). Binding a pipeline APPLIES every state it does
-    // NOT declare dynamic, so a clear pipeline carrying a static zero bias wipes the
+    // (depthBiasEnable stays FALSE — hence the raw Dynamic() rather than
+    // DynamicDepthBias()). Binding a pipeline APPLIES every state it does NOT
+    // declare dynamic, so a clear pipeline carrying a static zero bias wipes the
     // vkCmdSetDepthBias that beginAtlas issued three lines earlier — and every caster
     // drawn after it rasterizes into the static atlas with NO write-side bias. That
     // was the terrain shadow-acne banding (25-07): the receiver constant
     // r_vsm_bias_min is sized on the assumption that this write bias exists, so
     // losing it silently disables BOTH halves of the anti-acne scheme at once.
     // Same class as the VRS dynamic-state loss ([[vulkan-vrs-saga]], VUID-07834).
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // D16 atlas (see CreateRenderResources)
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci; pi.stageCount = 1; pi.pStages = &stage;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_clearLayout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &s_clearPipe) != VK_SUCCESS) return false;
-    return true;
+    s_clearPipe = VK::GfxPipelineBuilder(s_clearLayout)
+        .Vert(s_clearVS)
+        .Dynamic(VK_DYNAMIC_STATE_DEPTH_BIAS)
+        .Depth(true, true, VK_COMPARE_OP_ALWAYS)
+        .DepthTarget(VK_FORMAT_D16_UNORM)   // D16 atlas (see CreateRenderResources)
+        .Build("VSM clear");
+    return s_clearPipe != VK_NULL_HANDLE;
 }
 
 // Atlas image + sampler + the page render descriptor/layout + vsm_page.vert (per-stride
@@ -836,24 +741,12 @@ bool CreateRenderResources()
     if (vkCreateSampler(VulkanHW.m_Device, &sci, nullptr, &s_atlasSampler) != VK_SUCCESS) return false;
 
     // Render set: pageList(SSBO) + casterPages(SSBO) + VSM UBO, all VERTEX stage.
-    VkDescriptorSetLayoutBinding rb[3]{};
-    const VkDescriptorType rtypes[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    for (u32 i = 0; i < 3; ++i) { rb[i].binding = i; rb[i].descriptorType = rtypes[i]; rb[i].descriptorCount = 1; rb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT; }
-    VkDescriptorSetLayoutCreateInfo rlci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    rlci.bindingCount = 3; rlci.pBindings = rb;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &rlci, nullptr, &s_renderSetL) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize rps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 2 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N } };
-    VkDescriptorPoolCreateInfo rpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    rpci.maxSets = N; rpci.poolSizeCount = 2; rpci.pPoolSizes = rps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &rpci, nullptr, &s_renderPool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout rl[N]; for (u32 i = 0; i < N; ++i) rl[i] = s_renderSetL;
-    VkDescriptorSetAllocateInfo rdai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    rdai.descriptorPool = s_renderPool; rdai.descriptorSetCount = N; rdai.pSetLayouts = rl;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &rdai, s_renderSet) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kUBO }, N, s_renderSetL, s_renderPool, s_renderSet,
+                                VK_SHADER_STAGE_VERTEX_BIT, "VSM.Page"))
+        return false;
 
-    VkPipelineLayoutCreateInfo rplci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    rplci.setLayoutCount = 1; rplci.pSetLayouts = &s_renderSetL;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &rplci, nullptr, &s_renderLayout) != VK_SUCCESS) return false;
+    s_renderLayout = VK::MakePipelineLayout({ s_renderSetL });
+    if (!s_renderLayout) return false;
 
     s_pageVS = g_ShaderManager->Load("vsm_page.vert.spv");
     if (!s_pageVS) { Msg("![VK VSM] vsm_page.vert.spv load failed"); return false; }
@@ -867,39 +760,14 @@ VkPipeline GetPagePipeline(u32 stride)
     auto it = s_pagePipes.find(stride);
     if (it != s_pagePipes.end()) return it->second;
 
-    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };   // pos @ offset 0, all strides
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &binding;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &attr;
-    VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    stage.stage = VK_SHADER_STAGE_VERTEX_BIT; stage.module = s_pageVS; stage.pName = "main";
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 0;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // D16 atlas (see CreateRenderResources)
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci; pi.stageCount = 1; pi.pStages = &stage;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_renderLayout;
-    VkPipeline h = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &h) != VK_SUCCESS)
-        Msg("![VK VSM] page pipeline create failed (stride=%u)", stride);
+    VkPipeline h = VK::GfxPipelineBuilder(s_renderLayout)
+        .Vert(s_pageVS)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)   // pos @ offset 0, all strides
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D16_UNORM)            // D16 atlas (see CreateRenderResources)
+        .Build("VSM page stride=%u", stride);
     s_pagePipes.emplace(stride, h);
     return h;
 }
@@ -922,13 +790,9 @@ bool EnsurePageATResources()
         s_pageATFailed = true;   // definitive (missing file won't appear mid-session)
         return false;
     }
-    VkDescriptorSetLayout sets[2] = { s_renderSetL, matL };
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PageATPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 2; plci.pSetLayouts = sets;
-    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_renderATLayout) != VK_SUCCESS) {
-        Msg("![VK VSM] AT page layout create failed");
+    s_renderATLayout = VK::MakePipelineLayout({ s_renderSetL, matL }, sizeof(PageATPush),
+                                              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+    if (s_renderATLayout == VK_NULL_HANDLE) {
         s_pageATFailed = true;
         return false;
     }
@@ -945,45 +809,15 @@ VkPipeline GetPageATPipeline(u32 stride, u32 tcOffset)
     if (it != s_pageATPipes.end()) return it->second;
     if (!EnsurePageATResources()) return VK_NULL_HANDLE;
 
-    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attrs[2] = {
-        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 },
-        { 1, 0, VK_FORMAT_R16G16_SSCALED, tcOffset },
-    };
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &binding;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs;
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_pageATVS; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_pageATFS; stages[1].pName = "main";
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 0;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // D16 atlas
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = stages;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_renderATLayout;
-    VkPipeline h = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &h) != VK_SUCCESS)
-        Msg("![VK VSM] AT page pipeline create failed (stride=%u tc=%u)", stride, tcOffset);
+    VkPipeline h = VK::GfxPipelineBuilder(s_renderATLayout)
+        .Vert(s_pageATVS).Frag(s_pageATFS)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Attr(1, 0, VK_FORMAT_R16G16_SSCALED, tcOffset)
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D16_UNORM)   // D16 atlas
+        .Build("VSM AT page stride=%u tc=%u", stride, tcOffset);
     s_pageATPipes.emplace(key, h);
     return h;
 }
@@ -995,46 +829,22 @@ bool CreateResolvePipeline()
     VkShaderModule cs = g_ShaderManager->Load("vsm_resolve.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_resolve.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[10]{};
-    const VkDescriptorType types[10] = {
-        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,  // depth, static atlas
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          // static pageTable, clipmap UBO
-        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           // history, output mask
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,                                                     // resolve UBO
-        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,                                             // dynamic atlas
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,                                                     // dynamic pageTable
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,                                                     // dynUsed (skip empty dyn pages)
-    };
-    for (u32 i = 0; i < 10; ++i) { b[i].binding = i; b[i].descriptorType = types[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 10; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_resolveSetL) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ kTex,  kTex,    // depth, static atlas
+                                  kSSBO, kUBO,    // static pageTable, clipmap UBO
+                                  kTex,  kImg,    // history, output mask
+                                  kUBO,           // resolve UBO
+                                  kTex,           // dynamic atlas
+                                  kSSBO,          // dynamic pageTable
+                                  kSSBO },        // dynUsed (skip empty dyn pages)
+                                N, s_resolveSetL, s_resolvePool, s_resolveSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.Resolve"))
+        return false;
 
-    VkDescriptorPoolSize ps[4] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, N * 4 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         N * 3 },
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         N * 2 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          N },
-    };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_resolvePool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout layouts[N]; for (u32 i = 0; i < N; ++i) layouts[i] = s_resolveSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_resolvePool; dai.descriptorSetCount = N; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_resolveSet) != VK_SUCCESS) return false;
+    s_resolveLayout = VK::MakePipelineLayout({ s_resolveSetL });
+    if (!s_resolveLayout) return false;
 
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_resolveSetL;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_resolveLayout) != VK_SUCCESS) return false;
-
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs;
-    cpci.stage.pName  = "main";
-    cpci.layout       = s_resolveLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_resolvePipe) != VK_SUCCESS) return false;
+    s_resolvePipe = VK::CreateComputePipeline(cs, s_resolveLayout, "VSM.Resolve");
+    if (!s_resolvePipe) return false;
 
     // History/receiver sampler: LINEAR clamp-to-edge (gentle 1:1 read; edge clamp on reproject).
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -1094,34 +904,14 @@ bool CreateSkinnedBinPipeline()
 {
     VkShaderModule cs = g_ShaderManager->Load("vsm_skinned_bin.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_skinned_bin.comp.spv load failed"); return false; }
-    VkDescriptorSetLayoutBinding b[7]{};
-    const VkDescriptorType t[7] = {
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-    };
-    for (u32 i = 0; i < 7; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 7; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_skinBinSetL) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 6 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_skinBinPool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout ls[N]; for (u32 i = 0; i < N; ++i) ls[i] = s_skinBinSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_skinBinPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_skinBinSet) != VK_SUCCESS) return false;
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(u32) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_skinBinSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_skinBinLayout) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = s_skinBinLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_skinBinPipe) != VK_SUCCESS) return false;
-    return true;
+    if (!VK::MakeDescriptorSets({ kSSBO, kUBO,  kSSBO, kSSBO, kSSBO, kSSBO, kSSBO },
+                                N, s_skinBinSetL, s_skinBinPool, s_skinBinSet,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "VSM.SkinBin"))
+        return false;
+    s_skinBinLayout = VK::MakePipelineLayout({ s_skinBinSetL }, 2 * sizeof(u32));
+    if (!s_skinBinLayout) return false;
+    s_skinBinPipe = VK::CreateComputePipeline(cs, s_skinBinLayout, "VSM.SkinBin");
+    return s_skinBinPipe != VK_NULL_HANDLE;
 }
 
 // Skinned-page pipeline resources are LAZY: the layout needs Skinned's bone-set layout,
@@ -1131,26 +921,13 @@ bool EnsureSkinnedPageResources()
     if (s_skinPageLayout != VK_NULL_HANDLE) return true;
     VkDescriptorSetLayout boneL = VK::Skinned_GetBoneSetLayout();
     if (boneL == VK_NULL_HANDLE) return false;   // skinned not ready yet
-    VkDescriptorSetLayoutBinding b[3]{};
-    const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    for (u32 i = 0; i < 3; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 3; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_skinPageSetL) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 2 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_skinPagePool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout ls[N]; for (u32 i = 0; i < N; ++i) ls[i] = s_skinPageSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_skinPagePool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_skinPageSet) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout sets[2] = { boneL, s_skinPageSetL };   // set0 = bones (shared), set1 = page data
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, 4 * sizeof(u32) };   // skinMode, baseBone, boneCount, pad
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 2; plci.pSetLayouts = sets; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_skinPageLayout) != VK_SUCCESS) return false;
-    return true;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kUBO }, N, s_skinPageSetL, s_skinPagePool, s_skinPageSet,
+                                VK_SHADER_STAGE_VERTEX_BIT, "VSM.SkinPage"))
+        return false;
+    // set0 = bones (shared), set1 = page data; push: skinMode, baseBone, boneCount, pad
+    s_skinPageLayout = VK::MakePipelineLayout({ boneL, s_skinPageSetL }, 4 * sizeof(u32),
+                                              VK_SHADER_STAGE_VERTEX_BIT);
+    return s_skinPageLayout != VK_NULL_HANDLE;
 }
 
 VkPipeline GetSkinnedPagePipeline(u32 stride)
@@ -1160,37 +937,13 @@ VkPipeline GetSkinnedPagePipeline(u32 stride)
     VkVertexInputBindingDescription binding{};
     VkVertexInputAttributeDescription attrs[6]{};
     VK::Skinned_BuildVertexInput(stride, binding, attrs);
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &binding;
-    vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
-    VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    stage.stage = VK_SHADER_STAGE_VERTEX_BIT; stage.module = s_skinPageVS; stage.pName = "main";
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 0;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // D16 atlas (see CreateRenderResources)
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci; pi.stageCount = 1; pi.pStages = &stage;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_skinPageLayout;
-    VkPipeline h = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &h) != VK_SUCCESS)
-        Msg("![VK VSM] skinned page pipeline create failed (stride=%u)", stride);
+    VkPipeline h = VK::GfxPipelineBuilder(s_skinPageLayout)
+        .Vert(s_skinPageVS)
+        .Bindings(&binding, 1).Attrs(attrs, 6)
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D16_UNORM)   // D16 atlas (see CreateRenderResources)
+        .Build("VSM skinned page stride=%u", stride);
     s_skinPagePipes.emplace(stride, h);
     return h;
 }
@@ -1219,24 +972,15 @@ void CollectSkinned(u32 cur)
 void DispatchSkinnedBin(VkCommandBuffer cmd, u32 cur)
 {
     if (s_skinCount == 0 || s_skinBinPipe == VK_NULL_HANDLE) return;
-    VkDescriptorBufferInfo bi[7] = {
-        { s_skinMeta[cur]->GetHandle(),   0, VK_WHOLE_SIZE },
-        { s_ubo[cur]->GetHandle(),        0, VK_WHOLE_SIZE },
-        { s_dynPageTable->GetHandle(),    0, VK_WHOLE_SIZE },   // DYNAMIC table (NPC atlas)
-        { s_skinCasterPages->GetHandle(), 0, VK_WHOLE_SIZE },
-        { s_skinIndirect->GetHandle(),    0, VK_WHOLE_SIZE },
-        { s_skinStats->GetHandle(),       0, VK_WHOLE_SIZE },
-        { s_dynPageUsed->GetHandle(),     0, VK_WHOLE_SIZE },   // dyn slot -> has-caster flag (resolve skip)
-    };
-    const VkDescriptorType t[7] = {
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-    };
-    VkWriteDescriptorSet w[7]{};
-    for (u32 i = 0; i < 7; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_skinBinSet[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 7, w, 0, nullptr);
+    VK::DescriptorWriter(s_skinBinSet[cur])
+        .StorageBuffer(0, s_skinMeta[cur]->GetHandle())
+        .UniformBuffer(1, s_ubo[cur]->GetHandle())
+        .StorageBuffer(2, s_dynPageTable->GetHandle())      // DYNAMIC table (NPC atlas)
+        .StorageBuffer(3, s_skinCasterPages->GetHandle())
+        .StorageBuffer(4, s_skinIndirect->GetHandle())
+        .StorageBuffer(5, s_skinStats->GetHandle())
+        .StorageBuffer(6, s_dynPageUsed->GetHandle())       // dyn slot -> has-caster flag (resolve skip)
+        .Flush();
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_skinBinPipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_skinBinLayout, 0, 1, &s_skinBinSet[cur], 0, nullptr);
     const u32 push[2] = { s_skinCount, kSkinnedCap };
@@ -1254,15 +998,11 @@ void RenderSkinnedCasters(VkCommandBuffer cmd, u32 cur)
     VkDescriptorSet boneSet = VK::Skinned_GetBoneSet();
     if (boneSet == VK_NULL_HANDLE) return;
 
-    VkDescriptorBufferInfo bi[3] = {
-        { s_dynPageList->GetHandle(),     0, VK_WHOLE_SIZE },   // DYNAMIC list (NPC atlas)
-        { s_skinCasterPages->GetHandle(), 0, VK_WHOLE_SIZE },
-        { s_ubo[cur]->GetHandle(),        0, VK_WHOLE_SIZE },
-    };
-    const VkDescriptorType t[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    VkWriteDescriptorSet w[3]{};
-    for (u32 i = 0; i < 3; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_skinPageSet[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+    VK::DescriptorWriter(s_skinPageSet[cur])
+        .StorageBuffer(0, s_dynPageList->GetHandle())       // DYNAMIC list (NPC atlas)
+        .StorageBuffer(1, s_skinCasterPages->GetHandle())
+        .UniformBuffer(2, s_ubo[cur]->GetHandle())
+        .Flush();
 
     VkPipeline lastPipe = VK_NULL_HANDLE;
     for (u32 c = 0; c < s_skinCount; ++c) {
@@ -1291,57 +1031,31 @@ bool CreateGrassBinPipeline()
 {
     VkShaderModule cs = g_ShaderManager->Load("vsm_grass_bin.comp.spv");
     if (!cs) { Msg("![VK VSM] vsm_grass_bin.comp.spv load failed"); return false; }
-    VkDescriptorSetLayoutBinding b[8]{};
-    const VkDescriptorType t[8] = {
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-    };
-    for (u32 i = 0; i < 8; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 8; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_grassBinSetL) != VK_SUCCESS) return false;
     // ×2 sets per frame slot: one for the DYN dispatch, one for the STATIC (hybrid) one.
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 14 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N * 2 } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N * 2; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_grassBinPool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout ls[N]; for (u32 i = 0; i < N; ++i) ls[i] = s_grassBinSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_grassBinPool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_grassBinSet) != VK_SUCCESS) return false;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_grassBinSetS) != VK_SUCCESS) return false;
-    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GrassBinPush) };
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &s_grassBinSetL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_grassBinLayout) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = s_grassBinLayout;
-    if (vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_grassBinPipe) != VK_SUCCESS) return false;
-    return true;
+    const std::initializer_list<VkDescriptorType> binTypes =
+        { kSSBO, kSSBO, kUBO, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO };
+    s_grassBinSetL = VK::MakeSetLayout(binTypes, VK_SHADER_STAGE_COMPUTE_BIT, "VSM.GrassBin");
+    s_grassBinPool = VK::MakeDescriptorPool(binTypes, N * 2, "VSM.GrassBin");
+    if (!s_grassBinSetL || !s_grassBinPool) return false;
+    if (!VK::AllocSets(s_grassBinPool, s_grassBinSetL, N, s_grassBinSet,  "VSM.GrassBin.dyn")) return false;
+    if (!VK::AllocSets(s_grassBinPool, s_grassBinSetL, N, s_grassBinSetS, "VSM.GrassBin.static")) return false;
+    s_grassBinLayout = VK::MakePipelineLayout({ s_grassBinSetL }, sizeof(GrassBinPush));
+    if (!s_grassBinLayout) return false;
+    s_grassBinPipe = VK::CreateComputePipeline(cs, s_grassBinLayout, "VSM.GrassBin");
+    return s_grassBinPipe != VK_NULL_HANDLE;
 }
 
 // Grass-page set layout (pair arena, pageList, clipmap UBO, VisibleSSBO) + pipeline
 // layout + the VS. The graphics pipeline itself is lazy (needs the grass mesh vertex stride).
 bool CreateGrassPageResources()
 {
-    VkDescriptorSetLayoutBinding b[4]{};
-    const VkDescriptorType t[4] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
-    for (u32 i = 0; i < 4; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT; }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 4; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_grassPageSetL) != VK_SUCCESS) return false;
     // ×2 sets per frame slot: dyn-atlas draw + static-atlas (hybrid) draw.
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * 6 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N * 2 } };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = N * 2; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_grassPagePool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout ls[N]; for (u32 i = 0; i < N; ++i) ls[i] = s_grassPageSetL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_grassPagePool; dai.descriptorSetCount = N; dai.pSetLayouts = ls;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_grassPageSet) != VK_SUCCESS) return false;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_grassPageSetS) != VK_SUCCESS) return false;
+    const std::initializer_list<VkDescriptorType> pageTypes = { kSSBO, kSSBO, kUBO, kSSBO };
+    s_grassPageSetL = VK::MakeSetLayout(pageTypes, VK_SHADER_STAGE_VERTEX_BIT, "VSM.GrassPage");
+    s_grassPagePool = VK::MakeDescriptorPool(pageTypes, N * 2, "VSM.GrassPage");
+    if (!s_grassPageSetL || !s_grassPagePool) return false;
+    if (!VK::AllocSets(s_grassPagePool, s_grassPageSetL, N, s_grassPageSet,  "VSM.GrassPage.dyn")) return false;
+    if (!VK::AllocSets(s_grassPagePool, s_grassPageSetL, N, s_grassPageSetS, "VSM.GrassPage.static")) return false;
     s_grassPageVS  = g_ShaderManager->Load("vsm_grass_page.vert.spv");
     s_grassPageVSS = g_ShaderManager->Load("vsm_grass_page_s.vert.spv");   // static-atlas variant (rigid, _S grid)
     s_grassPageFS  = g_ShaderManager->Load("vsm_grass_page.frag.spv");   // alpha test (blade cutout, not solid quad)
@@ -1361,54 +1075,24 @@ VkPipeline EnsureGrassPagePipelineFor(VkPipeline& pipe, VkShaderModule vs, u32 v
         CDetailManager* dm = RImplementation.Details;
         VkDescriptorSetLayout diffuseL = dm ? dm->Vsm_GfxSetLayout() : VK_NULL_HANDLE;
         if (diffuseL == VK_NULL_HANDLE) return VK_NULL_HANDLE;
-        VkDescriptorSetLayout sets[2] = { s_grassPageSetL, diffuseL };   // set0 = page data (VS), set1 = diffuse (FS) + s_waves (VS)
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GrassPagePush) };   // wind + instanceBase
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 2; plci.pSetLayouts = sets; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_grassPageLayout) != VK_SUCCESS) return VK_NULL_HANDLE;
+        // set0 = page data (VS), set1 = diffuse (FS) + s_waves (VS); push = wind + instanceBase
+        s_grassPageLayout = VK::MakePipelineLayout({ s_grassPageSetL, diffuseL }, sizeof(GrassPagePush),
+                                                   VK_SHADER_STAGE_VERTEX_BIT);
+        if (s_grassPageLayout == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     }
     // Mesh vertices only — the instance transform is PULLED from the VisibleSSBO by the
     // pair's local index (set 0 binding 3); a compacted pair list can't ride instance-rate
     // attributes (firstInstance can't remap non-contiguous instances).
-    VkVertexInputBindingDescription vibd[1] = {
-        { 0, vstride, VK_VERTEX_INPUT_RATE_VERTEX },
-    };
-    VkVertexInputAttributeDescription via[3] = {
-        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT,    0  },// aPos (binding 0)
-        { 1, 0, VK_FORMAT_R32G32_SFLOAT,       12 },// aUV  (binding 0) — alpha test
-        { 2, 0, VK_FORMAT_R32_SFLOAT,          20 },// aHeight (binding 0) — wind stiffness
-    };
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = vibd;
-    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = via;
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = vs; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_grassPageFS; stages[1].pName = "main";
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 0;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D16_UNORM;   // D16 atlas (see CreateRenderResources)
-    VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pi.pNext = &prci; pi.stageCount = 2; pi.pStages = stages;
-    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-    pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_grassPageLayout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &pipe) != VK_SUCCESS)
-        Msg("![VK VSM] grass page pipeline create failed (stride=%u)", vstride);
+    pipe = VK::GfxPipelineBuilder(s_grassPageLayout)
+        .Vert(vs).Frag(s_grassPageFS)
+        .Binding(0, vstride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)    // aPos
+        .Attr(1, 0, VK_FORMAT_R32G32_SFLOAT,    12)   // aUV — alpha test
+        .Attr(2, 0, VK_FORMAT_R32_SFLOAT,       20)   // aHeight — wind stiffness
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D16_UNORM)   // D16 atlas (see CreateRenderResources)
+        .Build("VSM grass page stride=%u", vstride);
     return pipe;
 }
 VkPipeline EnsureGrassPagePipeline(u32 vstride)  { return EnsureGrassPagePipelineFor(s_grassPagePipe,  s_grassPageVS,  vstride); }
@@ -1468,24 +1152,30 @@ void DispatchGrassBin(VkCommandBuffer cmd, u32 cur, bool dyn)
     GrassBinPush gp{}; gp.sectionSize = section; gp.typeCount = types;
     gp.camRange[0] = Device.vCameraPosition.x; gp.camRange[1] = Device.vCameraPosition.y; gp.camRange[2] = Device.vCameraPosition.z;
     gp.camRange[3] = ps_r_vsm_grass_dist;
-    const VkDescriptorType t[8] = {
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+    // Both dispatches drive the same 8-binding layout; only the page table, the
+    // pair buffer/counters and binding 6 differ between the dyn atlas and the
+    // static cache half.
+    auto bindGrassBin = [&](VkDescriptorSet set, VkBuffer table, VkBuffer pairs,
+                            VkBuffer b6, VkBuffer pairCnt) {
+        VK::DescriptorWriter(set)
+            .StorageBuffer(0, vis)
+            .StorageBuffer(1, ind)
+            .UniformBuffer(2, s_ubo[cur]->GetHandle())
+            .StorageBuffer(3, table)
+            .StorageBuffer(4, pairs)
+            .StorageBuffer(5, s_grassStats->GetHandle())
+            .StorageBuffer(6, b6)
+            .StorageBuffer(7, pairCnt)
+            .Flush();
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_grassBinPipe);
 
     if (dyn) {   // DYN dispatch: L0 (hybrid) or L0..L2 (fallback) into the dyn atlas
-        VkDescriptorBufferInfo bi[8] = {
-            { vis,                       0, VK_WHOLE_SIZE }, { ind,                     0, VK_WHOLE_SIZE },
-            { s_ubo[cur]->GetHandle(),   0, VK_WHOLE_SIZE }, { s_dynPageTable->GetHandle(),0, VK_WHOLE_SIZE },  // DYNAMIC table
-            { s_grassPairs->GetHandle(), 0, VK_WHOLE_SIZE }, { s_grassStats->GetHandle(),0, VK_WHOLE_SIZE },
-            { s_dynPageUsed->GetHandle(),0, VK_WHOLE_SIZE },   // dyn slot -> has-caster flag (resolve skip)
-            { s_grassPairCnt->GetHandle(),0, VK_WHOLE_SIZE },  // per-type pair append counters
-        };
-        VkWriteDescriptorSet w[8]{};
-        for (u32 i = 0; i < 8; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_grassBinSet[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 8, w, 0, nullptr);
+        bindGrassBin(s_grassBinSet[cur],
+                     s_dynPageTable->GetHandle(),    // DYNAMIC table
+                     s_grassPairs->GetHandle(),
+                     s_dynPageUsed->GetHandle(),     // dyn slot -> has-caster flag (resolve skip)
+                     s_grassPairCnt->GetHandle());   // per-type pair append counters
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_grassBinLayout, 0, 1, &s_grassBinSet[cur], 0, nullptr);
         gp.pairSection = s_grassPairSection; gp.mode = hybrid ? 0u : 2u;
         vkCmdPushConstants(cmd, s_grassBinLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gp), &gp);
@@ -1493,16 +1183,11 @@ void DispatchGrassBin(VkCommandBuffer cmd, u32 cur, bool dyn)
     }
 
     if (hybrid) {   // STATIC dispatch: L1/L2 into DIRTY static pages (rigid cache half)
-        VkDescriptorBufferInfo bi[8] = {
-            { vis,                        0, VK_WHOLE_SIZE }, { ind,                     0, VK_WHOLE_SIZE },
-            { s_ubo[cur]->GetHandle(),    0, VK_WHOLE_SIZE }, { s_pageTable->GetHandle(),   0, VK_WHOLE_SIZE },  // STATIC table
-            { s_grassPairsS->GetHandle(), 0, VK_WHOLE_SIZE }, { s_grassStats->GetHandle(),0, VK_WHOLE_SIZE },
-            { s_slotDirty->GetHandle(),   0, VK_WHOLE_SIZE },   // binding 6 = slotDirty in mode 1 (dirty filter)
-            { s_grassPairCntS->GetHandle(),0, VK_WHOLE_SIZE },
-        };
-        VkWriteDescriptorSet w[8]{};
-        for (u32 i = 0; i < 8; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_grassBinSetS[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 8, w, 0, nullptr);
+        bindGrassBin(s_grassBinSetS[cur],
+                     s_pageTable->GetHandle(),       // STATIC table
+                     s_grassPairsS->GetHandle(),
+                     s_slotDirty->GetHandle(),       // binding 6 = slotDirty in mode 1 (dirty filter)
+                     s_grassPairCntS->GetHandle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_grassBinLayout, 0, 1, &s_grassBinSetS[cur], 0, nullptr);
         gp.pairSection = s_grassPairSectionS; gp.mode = 1u;
         vkCmdPushConstants(cmd, s_grassBinLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gp), &gp);
@@ -1521,16 +1206,12 @@ void RenderGrassCastersFor(VkCommandBuffer cmd, u32 cur, VkPipeline pipe, VkDesc
     VkBuffer vis = dm->Vsm_VisibleSSBO();
     if (vis == VK_NULL_HANDLE || !pairs || !pairInd || pipe == VK_NULL_HANDLE || pairSection == 0) return;
 
-    VkDescriptorBufferInfo bi[4] = {
-        { pairs->GetHandle(),      0, VK_WHOLE_SIZE },
-        { pageList->GetHandle(),   0, VK_WHOLE_SIZE },   // dyn or static list per variant
-        { s_ubo[cur]->GetHandle(), 0, VK_WHOLE_SIZE },
-        { vis,                     0, VK_WHOLE_SIZE },   // instance rows, pulled by pair local idx
-    };
-    const VkDescriptorType t[4] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
-    VkWriteDescriptorSet w[4]{};
-    for (u32 i = 0; i < 4; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = sets[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = t[i]; w[i].pBufferInfo = &bi[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+    VK::DescriptorWriter(sets[cur])
+        .StorageBuffer(0, pairs->GetHandle())
+        .StorageBuffer(1, pageList->GetHandle())        // dyn or static list per variant
+        .UniformBuffer(2, s_ubo[cur]->GetHandle())
+        .StorageBuffer(3, vis)                          // instance rows, pulled by pair local idx
+        .Flush();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_grassPageLayout, 0, 1, &sets[cur], 0, nullptr);
@@ -1678,20 +1359,17 @@ bool Init()
     if (!CreateResidPipeline()) { Msg("![VK VSM] resid pipeline failed - VSM disabled"); s_dead = true; return false; }
     if (!CreateClearPipeline()) { Msg("![VK VSM] clear pipeline failed - VSM disabled"); s_dead = true; return false; }
     {
-        VkDescriptorBufferInfo bi[9] = {
-            { s_needed->GetHandle(),    0, VK_WHOLE_SIZE }, { s_pageTable->GetHandle(), 0, VK_WHOLE_SIZE },
-            { s_pageList->GetHandle(),  0, VK_WHOLE_SIZE }, { s_physTile->GetHandle(),  0, VK_WHOLE_SIZE },
-            { s_slotDirty->GetHandle(), 0, VK_WHOLE_SIZE }, { s_dirtyList->GetHandle(), 0, VK_WHOLE_SIZE },
-            { s_drawClear->GetHandle(), 0, VK_WHOLE_SIZE }, { s_priorValid->GetHandle(), 0, VK_WHOLE_SIZE },
-            { s_pageHits->GetHandle(),  0, VK_WHOLE_SIZE },
+        VkBuffer resid[9] = {
+            s_needed->GetHandle(),    s_pageTable->GetHandle(),
+            s_pageList->GetHandle(),  s_physTile->GetHandle(),
+            s_slotDirty->GetHandle(), s_dirtyList->GetHandle(),
+            s_drawClear->GetHandle(), s_priorValid->GetHandle(),
+            s_pageHits->GetHandle(),
         };
-        VkWriteDescriptorSet w[9]{};
-        for (u32 i = 0; i < 9; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_residSet; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i]; }
-        VkDescriptorBufferInfo cb{ s_dirtyList->GetHandle(), 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet cw{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        cw.dstSet = s_clearSet; cw.dstBinding = 0; cw.descriptorCount = 1; cw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; cw.pBufferInfo = &cb;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 9, w, 0, nullptr);
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &cw, 0, nullptr);
+        VK::DescriptorWriter rw(s_residSet);
+        for (u32 i = 0; i < 9; ++i) rw.StorageBuffer(i, resid[i]);
+        rw.Flush();
+        VK::DescriptorWriter(s_clearSet).StorageBuffer(0, s_dirtyList->GetHandle()).Flush();
     }
 
     // Binning + draw-build buffers + pipeline.
@@ -1793,15 +1471,12 @@ bool Init()
     // Dynamic alloc descriptor set (all buffers fixed) — written once. Reads needed[],
     // writes the dynamic page table / list / info.
     {
-        VkDescriptorBufferInfo bd[4] = {
-            { s_needed->GetHandle(),       0, VK_WHOLE_SIZE },
-            { s_dynPageTable->GetHandle(), 0, VK_WHOLE_SIZE },
-            { s_dynPageList->GetHandle(),  0, VK_WHOLE_SIZE },
-            { s_dynAllocInfo->GetHandle(), 0, VK_WHOLE_SIZE },
-        };
-        VkWriteDescriptorSet w[4]{};
-        for (u32 i = 0; i < 4; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_dynAllocSet; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bd[i]; }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+        VK::DescriptorWriter(s_dynAllocSet)
+            .StorageBuffer(0, s_needed->GetHandle())
+            .StorageBuffer(1, s_dynPageTable->GetHandle())
+            .StorageBuffer(2, s_dynPageList->GetHandle())
+            .StorageBuffer(3, s_dynAllocInfo->GetHandle())
+            .Flush();
     }
 
     Prof::NameBuffer(s_needed->GetHandle(),    "VSM.PageNeeded");
@@ -1823,6 +1498,13 @@ bool Enabled() { return Ready() && ps_r_vsm; }
 // sun_color≈0 → invisible, so freezing is free of visible change.
 bool NightFrozen() { return s_sunDown && AtlasReady() && MaskReady(); }
 
+// LOAD-SCREEN FREEZE. Every precache frame draws the world behind an opaque load
+// screen, from a camera the countdown spins through a full turn; the VSM half of
+// that frame (mark + atlas raster + resolve) is 21 of its 40 ms and not one page of
+// it is ever seen. Freeze it, and let the prime fill the atlas for the view the
+// player actually spawns into — which is also the direction the sweep never ends on.
+bool LoadScreenFrozen() { return ps_r_vsm_load_freeze != 0 && Device.dwPrecacheFrame != 0; }
+
 void BeginFrame(const Fvector& camPos, VkExtent2D screen)
 {
     VK::Vram::Scope _vram_scope("VSM");
@@ -1831,6 +1513,17 @@ void BeginFrame(const Fvector& camPos, VkExtent2D screen)
 
     EnsureMaskTargets(screen);   // screen-space mask (create/resize) — before EnvLight binds it
     s_curCamPos = camPos;
+
+    // The load screen just came down, and THIS is the first frame the player sees.
+    // Re-arm the prime here so its unlimited-budget frames land on the spawn view
+    // instead of being spent behind the screen, which is where they went before the
+    // freeze existed (primeLeft counted down to 0 while loadscreen=1 in every trace).
+    {
+        static bool s_wasBehindLoadScreen = false;
+        const bool  behind = ps_r_vsm_load_freeze != 0 && Device.dwPrecacheFrame != 0;
+        if (s_wasBehindLoadScreen && !behind) s_primeFrames = kPrimeFrames;
+        s_wasBehindLoadScreen = behind;
+    }
 
     // Write-side raster bias changed (live A/B) → cached static pages hold depth
     // rendered with the OLD bias — drop them so the flip is crisp, not a seconds-long
@@ -1934,6 +1627,26 @@ void BeginFrame(const Fvector& camPos, VkExtent2D screen)
             sunDir = E->sun_dir;
             sunLum = E->sun_color.x * 0.299f + E->sun_color.y * 0.587f + E->sun_color.z * 0.114f;
         }
+    // LIGHTNING HOLD — the same trap the cascades already dodge (vk_pass_shadow.cpp,
+    // s_stableSunDir): a thunderbolt OVERWRITES CurrentEnv->sun_dir with the direction
+    // of the strike for its whole life (thunderbolt.cpp OnFrame), and the flash is spent
+    // as sky light here anyway (vk_env_light.cpp, CEnvironment::ThunderboltFlash).
+    // For a WORLD-ANCHORED clipmap that fake sun is far worse than a swinging cascade:
+    // the light-space page lattice pivots about the WORLD ORIGIN, so a few hundred metres
+    // out EVERY page's absolute tile changes at once. Measured in the 14-08 log: bolts
+    // stepped the sun 8..34° in a single frame, sliding the window 52..193 pages and
+    // turning 500-570 pages wrong-tile in that one frame — which the dirty budget then
+    // rationed 128/frame, i.e. hundreds of pages with no resident shadow for several
+    // frames (the "shadows blink for a frame while running" report). Hold the last real
+    // direction for the strike; the sun is back where it was when it ends, so the cache
+    // stays valid across the whole flash instead of being thrown away twice.
+    // EnvLight::SunDirVisual() is the renderer's existing authority for "the real sun"
+    // (the sky disc and the volumetric beam already hold to it so a clap doesn't paint
+    // two suns) — use it rather than keeping a private copy of the same rule.
+    if (g_pGamePersistent) {
+        if (g_pGamePersistent->Environment().IsThunderboltActive()) s_boltHeldN++;
+        sunDir = VK::EnvLight::SunDirVisual();
+    }
     {
         Fvector sdn = sunDir; if (sdn.magnitude() > 1e-4f) sdn.normalize(); else sdn.set(0.f, -1.f, 0.f);
         const float toSunY = -sdn.y;   // sun altitude proxy (>0 above horizon, <0 below)
@@ -1976,6 +1689,16 @@ void BeginFrame(const Fvector& camPos, VkExtent2D screen)
     // only gates the EMA history blend in the resolve). Sun motion since last frame drives
     // the round-robin refresh (paused sun → 0 refresh → full cache).
     s_sunMoving  = (sd.x != s_prevSunDir.x) || (sd.y != s_prevSunDir.y) || (sd.z != s_prevSunDir.z);
+    // DIAG (telemetry line): how far the sun turned THIS frame. Smooth drift is a
+    // hundredth of a degree; an env keyframe step is degrees, and a degree of pivot at
+    // 600 m from the world origin slides the light-space window by ~10 m = 14 pages at
+    // L0 — that is what turns a whole screen of pages wrong in one frame.
+    if (s_pbPrevOk) {
+        float dp = sd.dotproduct(s_prevSunDir);
+        dp = dp > 1.f ? 1.f : (dp < -1.f ? -1.f : dp);
+        const float stepDeg = acosf(dp) * 57.29578f;
+        if (stepDeg > s_sunStepMax) s_sunStepMax = stepDeg;
+    }
     s_prevSunDir = sd;
 
     VsmParams params{};
@@ -1994,7 +1717,40 @@ void BeginFrame(const Fvector& camPos, VkExtent2D screen)
         params.level[L][2] = ext;
         params.level[L][3] = 0.f;
     }
-    params.zparams[0] = kZNear;
+    // DIAG: this frame's window scroll in pages (worst level). 0-1 = the ordinary walk;
+    // tens/hundreds = a pivot (sun step) or a teleport, and every scrolled-in page is a
+    // wrong-tile redraw request that the dirty budget then has to ration.
+    if (s_pbPrevOk) {
+        u32 mx = 0;
+        for (u32 L = 0; L < kLevels; ++L) {
+            const u32 d = (u32)(_abs(s_pageBase[L][0] - s_pbPrev[L][0]) + _abs(s_pageBase[L][1] - s_pbPrev[L][1]));
+            if (d > mx) mx = d;
+        }
+        if (mx > s_snapMax) s_snapMax = mx;
+    }
+    for (u32 L = 0; L < kLevels; ++L) { s_pbPrev[L][0] = s_pageBase[L][0]; s_pbPrev[L][1] = s_pageBase[L][1]; }
+    s_pbPrevOk = true;
+    // ---- Light-space DEPTH window. The eye above sits at the WORLD ORIGIN on purpose
+    // (light XY, and with it the page lattice, must be camera-independent to stay
+    // cacheable) — but the depth range was left anchored there too, a fixed ±1000 m
+    // slab through (0,0,0). That holds only while the action happens near the origin.
+    // Put the camera 1600 m out (pripyat_full: x≈1290, z≈-1000) and drop the sun toward
+    // the horizon, and that horizontal offset projects onto the LIGHT Z axis:
+    // lp.z = dot(wp, sunDir) walks past -1000 and the whole scene leaves the slab.
+    // Both halves then fail at once, which is exactly what the capture showed —
+    // casters clip out of the atlas (pages keep the 1.0 clear value) and receivers
+    // compute a negative zHere — so the mask resolves SUN-LIT everywhere and every
+    // sun shadow disappears the moment r_vsm goes on. Follow the camera in z, snapped
+    // to kZSnap so the encoding changes rarely; SPAN is untouched, so D16 precision and
+    // the normalized bias units (zparams.z/w) keep the values they were tuned at.
+    const float zCentre = floorf(camL.z / kZSnap) * kZSnap;
+    if (zCentre != s_zCentre) {
+        // The depth ENCODING just moved: every cached page holds values written under
+        // the old mapping. Re-render them rather than compare across two encodings.
+        s_zCentre = zCentre;
+        InvalidateCache();
+    }
+    params.zparams[0] = zCentre + kZNear;
     params.zparams[1] = 1.0f / (kZFar - kZNear);
     params.zparams[2] = ps_r_vsm_bias;       // STATIC-atlas receiver bias (live, r_vsm_bias) — terrain acne
     params.zparams[3] = ps_r_vsm_bias_dyn;   // DYNAMIC-atlas receiver bias (live, r_vsm_bias_dyn) — casters only,
@@ -2208,21 +1964,14 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
     if (!s_dynSkip) CollectSkinned(cur);
 
     // ---- Descriptor set for this frame.
-    VkDescriptorImageInfo di{ s_depthSampler, sceneDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorBufferInfo ui{ s_ubo[cur]->GetHandle(), 0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo ni{ s_needed->GetHandle(),   0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo ci{ s_counter->GetHandle(),  0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo ri{ s_rmask->GetHandle(),    0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo hi{ s_pageHits->GetHandle(), 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w[6]{};
-    for (u32 i = 0; i < 6; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; }
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo  = &di;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         w[1].pBufferInfo = &ui;
-    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[2].pBufferInfo = &ni;
-    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[3].pBufferInfo = &ci;
-    w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[4].pBufferInfo = &ri;
-    w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[5].pBufferInfo = &hi;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+    VK::DescriptorWriter(s_set[cur])
+        .ImageSampler (0, sceneDepth, s_depthSampler)
+        .UniformBuffer(1, s_ubo[cur]->GetHandle())
+        .StorageBuffer(2, s_needed->GetHandle())
+        .StorageBuffer(3, s_counter->GetHandle())
+        .StorageBuffer(4, s_rmask->GetHandle())
+        .StorageBuffer(5, s_pageHits->GetHandle())
+        .Flush();
 
     // ---- Clear per-frame flags/counters, then MARK, then RESIDENCY (static) + ALLOC (dynamic).
     // physTile is PERSISTENT (the toroidal cache) — filled to EMPTY only once after create.
@@ -2258,8 +2007,17 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
     }
     vkCmdFillBuffer(cmd, s_slotDirty->GetHandle(),       0, VK_WHOLE_SIZE, 0u);            // dirty set reset
     if (ps_r_vsm_hzb) vkCmdFillBuffer(cmd, s_priorValid->GetHandle(), 0, VK_WHOLE_SIZE, 0u);   // shadow-HZB: priorValid==1 means resident+valid THIS frame
-    vkCmdFillBuffer(cmd, s_drawClear->GetHandle(),       0, VK_WHOLE_SIZE, 0u);            // clear draw: instanceCount=0,...
-    vkCmdFillBuffer(cmd, s_drawClear->GetHandle(),       0, sizeof(u32),  6u);            // ...vertexCount=6 (the quad)
+    // Clear draw = { vertexCount=6 (the quad), instanceCount=0, first*=0 }.
+    // Written as two DISJOINT fills. It used to be "zero the whole buffer, then
+    // re-write word 0 with 6", and those two fills OVERLAP on the first word:
+    // vkCmdFillBuffer is a transfer operation and two of them are not implicitly
+    // ordered, so that is a genuine write-after-write race, not a style nit.
+    // Sync validation (once actually enabled — see vk_core.cpp) reported it 820×
+    // in a 144 s run as SYNC-HAZARD-WRITE-AFTER-WRITE in VSM/Mark.
+    // Disjoint ranges cannot race, so this needs no barrier between them —
+    // strictly better than inserting one.
+    vkCmdFillBuffer(cmd, s_drawClear->GetHandle(),       0, sizeof(u32),  6u);            // [0..4)  vertexCount = 6
+    vkCmdFillBuffer(cmd, s_drawClear->GetHandle(), sizeof(u32), VK_WHOLE_SIZE, 0u);       // [4..end) instanceCount/first* = 0
     vkCmdFillBuffer(cmd, s_dirtyList->GetHandle(), (VkDeviceSize)kMaxPhysS * sizeof(u32), 2 * sizeof(u32), 0u);   // tail = wrong-tile + gaze counters reset
     if (!s_physInit) { vkCmdFillBuffer(cmd, s_physTile->GetHandle(), 0, VK_WHOLE_SIZE, 0xFFFFFFFFu); s_physInit = true; }   // toroidal cache starts empty
     // Grass pair counters/templates + tree bin stats/meshlet counters — batched into
@@ -2308,7 +2066,21 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
     // Tree wind-hybrid transitions → invalidation circles: static pages a boundary-crossing
     // tree overlaps re-render THIS frame (its rigid shadow appears/disappears without ghosts).
     rp.inval[3] = ps_r_vsm_base / float(kPagesAxis);   // L0 page width (m); pw(L) = this * 2^L
-    rp.inval[7] = (float)(ps_r_vsm_dirty_budget < 0 ? 0 : ps_r_vsm_dirty_budget);   // [1].w = wrong-tile budget/frame (0 = unlimited)
+    // PRIME AFTER A FULL INVALIDATION. InvalidateCache()'s own comment promised
+    // "one full atlas re-render on the first frame, exactly like a fresh start" —
+    // but r_vsm_dirty_budget (128) throttles wrong-tile pages, so that re-render is
+    // spread over hundreds of frames instead. Measured on a pripyat_full spawn
+    // (18-08): window scrolls 2249 pages, deferred peaks at 1357, and `wrong` only
+    // reaches 0 about SIX SECONDS in — a page that has not re-rendered yet still
+    // serves the previous content, which is the "dark squares flickering for a few
+    // seconds after loading" report. So honour the original intent: run the budget
+    // unlimited for the first frames after an invalidation. Cost is bounded and
+    // known — the r_vsm_cache 0 A/B in that same log rendered ~830 pages/frame for
+    // 3.1-3.5 ms, so the whole backlog is a couple of ~10 ms frames at spawn, where
+    // a hitch is far less visible than flickering geometry.
+    const int wrongBudget = (s_primeFrames > 0) ? 0 : ps_r_vsm_dirty_budget;
+    if (s_primeFrames > 0) --s_primeFrames;
+    rp.inval[7] = (float)(wrongBudget < 0 ? 0 : wrongBudget);   // [1].w = wrong-tile budget/frame (0 = unlimited)
     rp.inval[11] = (ps_r_vsm_gaze && ps_r_vsm_cache) ? (float)_max(0, ps_r_vsm_gaze_pages) : 0.f;   // [2].w = gaze budget (0 = off)
     rp.inval[15] = (float)_max(1, ps_r_vsm_gaze_px);                                                // [3].w = full-rate hits threshold
     // Near-set + static↔dyn transition circles: freeze on dyn-skip so no tree flips
@@ -2380,28 +2152,20 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
     const u32      groupN  = VK::ShadowGPU::GroupCount();
     const int zbWorld = binSub ? VK::Prof::ZoneBegin(cmd, "Bins/World") : -1;
     if (s_clusterFrame) {
-        VkDescriptorBufferInfo bi[12] = {
-            { WorldGPU::MetaBuffer(),               0, VK_WHOLE_SIZE },
-            { s_ubo[cur]->GetHandle(),              0, VK_WHOLE_SIZE },
-            { s_pageTable->GetHandle(),             0, VK_WHOLE_SIZE },
-            { s_casterPages->GetHandle(),           0, VK_WHOLE_SIZE },
-            { s_clIndirect->GetHandle(),            0, VK_WHOLE_SIZE },   // cluster path's own cmd stream
-            { s_clCount->GetHandle(),               0, VK_WHOLE_SIZE },   // per-combo cmd counts
-            { s_binStats->GetHandle(),              0, VK_WHOLE_SIZE },
-            { s_slotDirty->GetHandle(),             0, VK_WHOLE_SIZE },
-            { s_clComboBase->GetHandle(),           0, VK_WHOLE_SIZE },   // per-combo cmd-region bases
-            { ClusterStream::BitsBuffer(),          0, VK_WHOLE_SIZE },   // Stage B residency
-            { ClusterStream::SlotBaseBuffer(),      0, VK_WHOLE_SIZE },
-            { s_clCandIdx->GetHandle(),             0, VK_WHOLE_SIZE },   // (combo<<20)|entry
-        };
-        VkWriteDescriptorSet bw[12]{};
-        for (u32 i = 0; i < 12; ++i) {
-            bw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; bw[i].dstSet = s_binClSet[cur]; bw[i].dstBinding = i;
-            bw[i].descriptorCount = 1;
-            bw[i].descriptorType = (i == 1) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            bw[i].pBufferInfo = &bi[i];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 12, bw, 0, nullptr);
+        VK::DescriptorWriter(s_binClSet[cur])
+            .StorageBuffer(0,  WorldGPU::MetaBuffer())
+            .UniformBuffer(1,  s_ubo[cur]->GetHandle())
+            .StorageBuffer(2,  s_pageTable->GetHandle())
+            .StorageBuffer(3,  s_casterPages->GetHandle())
+            .StorageBuffer(4,  s_clIndirect->GetHandle())          // cluster path's own cmd stream
+            .StorageBuffer(5,  s_clCount->GetHandle())             // per-combo cmd counts
+            .StorageBuffer(6,  s_binStats->GetHandle())
+            .StorageBuffer(7,  s_slotDirty->GetHandle())
+            .StorageBuffer(8,  s_clComboBase->GetHandle())         // per-combo cmd-region bases
+            .StorageBuffer(9,  ClusterStream::BitsBuffer())        // Stage B residency
+            .StorageBuffer(10, ClusterStream::SlotBaseBuffer())
+            .StorageBuffer(11, s_clCandIdx->GetHandle())           // (combo<<20)|entry
+            .Flush();
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_binClPipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_binClLayout, 0, 1, &s_binClSet[cur], 0, nullptr);
@@ -2411,25 +2175,16 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
     }
     else if (metaBuf != VK_NULL_HANDLE && casterN > 0 && groupN > 0 && groupN <= kMaxGroups) {
         if (casterN > kMaxCasters) casterN = kMaxCasters;   // clamp to casterPages capacity
-        VkDescriptorBufferInfo bi[8] = {
-            { metaBuf,                         0, VK_WHOLE_SIZE },
-            { s_ubo[cur]->GetHandle(),         0, VK_WHOLE_SIZE },
-            { s_pageTable->GetHandle(),        0, VK_WHOLE_SIZE },
-            { s_casterPages->GetHandle(),      0, VK_WHOLE_SIZE },
-            { s_vsmIndirect->GetHandle(),      0, VK_WHOLE_SIZE },
-            { s_vsmGroupCount->GetHandle(),    0, VK_WHOLE_SIZE },
-            { s_binStats->GetHandle(),         0, VK_WHOLE_SIZE },
-            { s_slotDirty->GetHandle(),        0, VK_WHOLE_SIZE },
-        };
-        const VkDescriptorType bt[8] = {
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        };
-        VkWriteDescriptorSet bw[8]{};
-        for (u32 i = 0; i < 8; ++i) { bw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; bw[i].dstSet = s_binSet[cur]; bw[i].dstBinding = i; bw[i].descriptorCount = 1; bw[i].descriptorType = bt[i]; bw[i].pBufferInfo = &bi[i]; }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 8, bw, 0, nullptr);
+        VK::DescriptorWriter(s_binSet[cur])
+            .StorageBuffer(0, metaBuf)
+            .UniformBuffer(1, s_ubo[cur]->GetHandle())
+            .StorageBuffer(2, s_pageTable->GetHandle())
+            .StorageBuffer(3, s_casterPages->GetHandle())
+            .StorageBuffer(4, s_vsmIndirect->GetHandle())
+            .StorageBuffer(5, s_vsmGroupCount->GetHandle())
+            .StorageBuffer(6, s_binStats->GetHandle())
+            .StorageBuffer(7, s_slotDirty->GetHandle())
+            .Flush();
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_binPipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_binLayout, 0, 1, &s_binSet[cur], 0, nullptr);
@@ -2547,6 +2302,25 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
         }
     }
 
+    // ---- Post-load convergence trace (ungated, see kPrimeTraceFrames). Answers one
+    // question per level load: are the prime frames spent while the LOAD SCREEN is still
+    // up, and how many frames does `wrong` take to reach 0 after the world is shown?
+    if (s_primeTraceLeft && s_residPtr) {
+        --s_primeTraceLeft;
+        const u32  dirtyN = s_residPtr[0], wrongN = s_residPtr[2];
+        const bool onScreen = !load_screen_renderer.b_registered;
+        Msg("[VSM prime] f=%u primeLeft=%u wrong=%u dirty=%u budget=%d loadscreen=%d",
+            s_primeTraceIdx++, s_primeFrames, wrongN, dirtyN, ps_r_vsm_dirty_budget,
+            onScreen ? 0 : 1);
+        // Stop once the world is actually visible AND the backlog has drained — the
+        // point of the trace is the gap between those two, not steady state.
+        s_primeTraceQuiet = (onScreen && dirtyN == 0) ? s_primeTraceQuiet + 1 : 0;
+        if (s_primeTraceQuiet >= kPrimeTraceQuiet) {
+            Msg("[VSM prime] drained: world visible and dirty==0 by frame %u", s_primeTraceIdx);
+            s_primeTraceLeft = 0;
+        }
+    }
+
     // ---- Throttle/dirty TELEMETRY (r_vsm_debug or r_profiler). Per-frame accumulate from
     // the resid readback (stale by the in-flight depth — fine for windows), then a 3-second
     // summary line: cost (avg/max/over-budget%), time share per bias level, dirty/wrong page
@@ -2568,7 +2342,7 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
             // pagesSeen = pages visible pixels sampled this frame (the mark counter) — the
             // "how much shadow the eye actually sees" anchor every other count compares to:
             // dirty/gaze are re-RENDERED subsets of it, everything else stays cached.
-            Msg("[VK VSM] throttle[%s]: VSMrender avg=%.2f max=%.2f ms, over-budget %u%% (budget=%.1f) | ctl=%.2f bias=%u, time L+0=%u%% L+1=%u%% L+2+=%u%% | pagesSeen=%u | dirty avg=%u max=%u | wrong avg=%u max=%u deferred=%u (budget=%d%s) | gaze avg=%u max=%u (budget=%d)",
+            Msg("[VK VSM] throttle[%s]: VSMrender avg=%.2f max=%.2f ms, over-budget %u%% (budget=%.1f) | ctl=%.2f bias=%u, time L+0=%u%% L+1=%u%% L+2+=%u%% | pagesSeen=%u | dirty avg=%u max=%u | wrong avg=%u max=%u deferred=%u (budget=%d%s) | gaze avg=%u max=%u (budget=%d) | scroll: sunStep max=%.2f deg, window max=%u pg, invalidations=%u boltHeld=%u fr | carry=%.2f",
                 ps_r_vsm_throttle ? "ON" : "OFF",
                 s_thCostSum / (float)tf, s_thCostMax, s_thOver * 100u / tf, ps_r_vsm_throttle_budget,
                 s_throttleVal, s_lodBias,
@@ -2576,10 +2350,12 @@ void MarkPages(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen, c
                 s_readPtr ? s_readPtr[0] : 0u,
                 (u32)(s_dirtySum / rf), s_dirtyMax, (u32)(s_wrongSum / rf), s_wrongMax, (u32)s_deferSum,
                 ps_r_vsm_dirty_budget, ps_r_vsm_dirty_budget ? "" : "=OFF",
-                (u32)(s_gazeSum / rf), s_gazeMax, ps_r_vsm_gaze ? ps_r_vsm_gaze_pages : 0);
+                (u32)(s_gazeSum / rf), s_gazeMax, ps_r_vsm_gaze ? ps_r_vsm_gaze_pages : 0,
+                s_sunStepMax, s_snapMax, s_invalN, s_boltHeldN, ps_r_vsm_ta_carry);
             s_thCostSum = 0.f; s_thCostMax = 0.f; s_thFrames = 0; s_thOver = 0;
             s_thBiasHist[0] = s_thBiasHist[1] = s_thBiasHist[2] = 0;
             s_wrongSum = s_dirtySum = s_deferSum = 0; s_wrongMax = s_dirtyMax = 0; s_gazeSum = 0; s_gazeMax = 0; s_rbFrames = 0;
+            s_sunStepMax = 0.f; s_snapMax = 0; s_invalN = 0; s_boltHeldN = 0;
         }
     }
 
@@ -2675,17 +2451,7 @@ void RenderAtlas(VkCommandBuffer cmd)
     // routing via gl_Position). loadOp LOAD preserves the toroidal cache; CLEAR for the dynamic
     // atlas (and the static atlas's very first frame).
     auto beginAtlas = [&](VkImageView view, VkAttachmentLoadOp loadOp, u32 w, u32 h) {
-        VkRenderingAttachmentInfo dAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-        dAtt.imageView = view; dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp = loadOp; dAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        dAtt.clearValue.depthStencil = { 1.0f, 0 };
-        VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-        ri.renderArea.extent = { w, h }; ri.layerCount = 1; ri.colorAttachmentCount = 0; ri.pDepthAttachment = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-        VkViewport vp{ 0.f, 0.f, (float)w, (float)h, 0.f, 1.f };
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{ {0, 0}, { w, h } };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
+        VK::RenderingBuilder(w, h).Depth(view, loadOp).BeginPlain(cmd);
         // Write-side raster bias (r_vsm_raster_bias/_slope, D16 units ≈ 3 cm each).
         // Kept SMALL: every unit here is depth the sun can PUNCH THROUGH thin
         // geometry before any receiver even gets a vote (the old 1.5/2.5 ≈ 5+ cm
@@ -2722,15 +2488,11 @@ void RenderAtlas(VkCommandBuffer cmd)
     const VkAttachmentLoadOp sLoad = s_atlasFirst ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
     s_atlasFirst = false;
 
-    VkDescriptorBufferInfo ri3[3] = {
-        { s_pageList->GetHandle(),    0, VK_WHOLE_SIZE },
-        { s_casterPages->GetHandle(), 0, VK_WHOLE_SIZE },
-        { s_ubo[cur]->GetHandle(),    0, VK_WHOLE_SIZE },
-    };
-    const VkDescriptorType rt[3] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    VkWriteDescriptorSet rw[3]{};
-    for (u32 i = 0; i < 3; ++i) { rw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; rw[i].dstSet = s_renderSet[cur]; rw[i].dstBinding = i; rw[i].descriptorCount = 1; rw[i].descriptorType = rt[i]; rw[i].pBufferInfo = &ri3[i]; }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, rw, 0, nullptr);
+    VK::DescriptorWriter(s_renderSet[cur])
+        .StorageBuffer(0, s_pageList->GetHandle())
+        .StorageBuffer(1, s_casterPages->GetHandle())
+        .UniformBuffer(2, s_ubo[cur]->GetHandle())
+        .Flush();
 
     beginAtlas(s_atlasView, sLoad, sw, sh);
     // Clear dirty pages to 1.0 (depth-only instanced quad; instanceCount = dirty count, indirect).
@@ -2907,6 +2669,11 @@ void ResolveMask(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen,
     // needs to walk a decorrelated cycle, and an unbounded counter would lose
     // float precision long before the session ends.
     rp.params4[0] = (float)(s_resolveCount & 63u);
+    // (4) NO-PAGE CARRY. A receiver whose page is not resident this frame (its scroll-in
+    // redraw lost the r_vsm_dirty_budget lottery) used to resolve LIT — a burst of those
+    // blinks the shadows off for the few frames the budget needs to drain. Carry the
+    // reprojected history there instead; needs a valid history, so 0 while it is not.
+    rp.params4[1] = histOK ? ps_r_vsm_ta_carry : 0.f;
     // The neighbourhood clamp was tuned (0.24) against a DETERMINISTIC 3x3 PCF,
     // where any big frame-to-frame deviation was a real shadow change. Stochastic
     // taps deviate by ~1/sqrt(taps) on their own, so that clamp would pin the
@@ -2925,29 +2692,18 @@ void ResolveMask(VkCommandBuffer cmd, VkImageView sceneDepth, VkExtent2D screen,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     // ---- Descriptor set.
-    VkDescriptorImageInfo dDepth{ s_depthSampler, sceneDepth,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo dAtlas{ s_atlasSampler, s_atlasView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo dAtlasD{ s_atlasSampler, s_dynView,        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo dHist { s_maskSampler,  s_maskView[prev],  VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo dOut  { VK_NULL_HANDLE, s_maskView[cur],   VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorBufferInfo bPT{ s_pageTable->GetHandle(),       0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo bPTd{ s_dynPageTable->GetHandle(),   0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo bPU{ s_dynPageUsed->GetHandle(),     0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo bCM{ s_ubo[cur]->GetHandle(),      0, VK_WHOLE_SIZE };
-    VkDescriptorBufferInfo bRU{ s_resolveUbo[cur]->GetHandle(), 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w[10]{};
-    for (u32 i = 0; i < 10; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_resolveSet[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; }
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo  = &dDepth;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[1].pImageInfo  = &dAtlas;
-    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[2].pBufferInfo = &bPT;
-    w[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         w[3].pBufferInfo = &bCM;
-    w[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[4].pImageInfo  = &dHist;
-    w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          w[5].pImageInfo  = &dOut;
-    w[6].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         w[6].pBufferInfo = &bRU;
-    w[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[7].pImageInfo  = &dAtlasD;
-    w[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[8].pBufferInfo = &bPTd;
-    w[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         w[9].pBufferInfo = &bPU;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 10, w, 0, nullptr);
+    VK::DescriptorWriter(s_resolveSet[cur])
+        .ImageSampler (0, sceneDepth,       s_depthSampler)
+        .ImageSampler (1, s_atlasView,      s_atlasSampler)
+        .StorageBuffer(2, s_pageTable->GetHandle())
+        .UniformBuffer(3, s_ubo[cur]->GetHandle())
+        .ImageSampler (4, s_maskView[prev], s_maskSampler, VK_IMAGE_LAYOUT_GENERAL)   // history
+        .StorageImage (5, s_maskView[cur])                                            // output
+        .UniformBuffer(6, s_resolveUbo[cur]->GetHandle())
+        .ImageSampler (7, s_dynView,        s_atlasSampler)
+        .StorageBuffer(8, s_dynPageTable->GetHandle())
+        .StorageBuffer(9, s_dynPageUsed->GetHandle())
+        .Flush();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolvePipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, 1, &s_resolveSet[cur], 0, nullptr);
@@ -2973,6 +2729,13 @@ void InvalidateCache()
     // every page re-renders against the new level's casters. Cheap: one full
     // atlas re-render on the first frame, exactly like a fresh start.
     s_physInit = false;
+    s_invalN++;   // telemetry: a full invalidation makes EVERY page wrong-tile next frame
+    // ...and "every page wrong" is exactly the case r_vsm_dirty_budget must not
+    // throttle, or the atlas converges over seconds. See the prime note in MarkPages.
+    s_primeFrames = kPrimeFrames;
+    s_primeTraceLeft  = kPrimeTraceFrames;
+    s_primeTraceIdx   = 0;
+    s_primeTraceQuiet = 0;
 }
 
 void Destroy()

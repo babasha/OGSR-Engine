@@ -35,11 +35,14 @@ layout(set = 0, binding = 6) uniform Resolve {
     vec4 params;         // x = history weight (alpha), y = reject tolerance, z = historyValid, w = dyn-gate (1 = skip dyn pages with no casters, r_vsm_dyn_gate)
     vec4 params2;        // x = clamp tol (neighbourhood clamp, r_vsm_ta_clamp), y = motion ref px (r_vsm_ta_motion), z = motion-floor weight (r_vsm_ta_motion_floor), w = slope-bias min (r_vsm_bias_min, normalized; 0 = legacy constant bias)
     vec4 params3;        // SOFT SHADOWS: x = filter taps (0 = legacy 3x3 PCF), y = blocker-search taps, z = tan(sun cone half-angle), w = max blocker search distance (m)
-    vec4 params4;        // x = per-frame noise phase (decorrelates the stochastic discs so the EMA averages them), yzw = reserved
+    vec4 params4;        // x = per-frame noise phase (decorrelates the stochastic discs so the EMA averages them), y = no-page history carry (r_vsm_ta_carry; 0 = legacy "flash lit"), zw = reserved
 } R;
 
 // VSM atlas sample (3x3 PCF) — mirrors the page mapping vsm_page.vert rasterized with.
-// Returns lit factor 1 = lit .. 0 = shadowed; out of clipmap / unmapped page → lit.
+// Returns lit factor 1 = lit .. 0 = shadowed; out of clipmap → lit.
+// noPage (out) = the receiver IS inside the clipmap but no level holds a resident page
+// for it — MISSING DATA, not "no occluder". Returned lit like everything else, but
+// flagged so main() can carry the history instead of flashing the sun on (see there).
 // dynOcc (out) = fraction of taps occluded by the DYNAMIC atlas alone — only computed
 // under r_vsm_debug_dyn (prevCamPos.w), UNGATED by dynUsed: it shows the atlas truth,
 // so the tonemap's red overlay reveals NPC/grass shadows even if the gate drops them.
@@ -61,11 +64,12 @@ layout(set = 0, binding = 6) uniform Resolve {
 //   0.6 m — and even the round-1 slope-scaled bias with its 0.6 m cap — let sun
 //   punch through everything thinner than the slack (plank walls, roofs, corners).
 //   The remaining slope term is capped LOW (0.15 m): grazing acne rides the offset.
-float sampleVSM(vec3 wp, vec3 nrm, float tanT, out float dynOcc, out float dynHit, out float statLit)
+float sampleVSM(vec3 wp, vec3 nrm, float tanT, out float dynOcc, out float dynHit, out float statLit, out bool noPage)
 {
     dynOcc = 0.0;
     dynHit = 0.0;
     statLit = 1.0;
+    noPage = false;
     if (R.params2.w > 0.0 && dot(nrm, nrm) > 0.5) {
         vec3 lp0 = (vsmC.view * vec4(wp, 1.0)).xyz;
         vec2 uv0; ivec2 pg0;
@@ -83,6 +87,10 @@ float sampleVSM(vec3 wp, vec3 nrm, float tanT, out float dynOcc, out float dynHi
     // was deferred (r_vsm_dirty_budget) — sample the next coarser level instead of
     // falling out "lit". One 4-byte read per extra step; the un-throttled steady state
     // exits on the first iteration (identical to the old single lookup).
+    // ⚠ The walk only actually LANDS in the throttle case: the mark writes ONE level per
+    // pixel, so a coarser page over the near field is marked by nobody and is UNMAPPED
+    // too. For a deferred page the walk therefore falls through to "lit" — hence noPage
+    // and the history carry in main(); this loop is not a fallback we can lean on.
     uint slotS = VSM_UNMAPPED;
     for (; L < VSM_LEVELS; ++L) {
         vec2 t = (lp.xy - vsmC.level[L].xy) / vsmC.level[L].z;
@@ -90,7 +98,7 @@ float sampleVSM(vec3 wp, vec3 nrm, float tanT, out float dynOcc, out float dynHi
         slotS  = vsmPageTable[vsmPageIndex(L, page)];
         if (slotS < uint(VSM_MAX_PHYS_S)) { luv = t; break; }
     }
-    if (L >= VSM_LEVELS) return 1.0;   // mapped nowhere → lit (old policy)
+    if (L >= VSM_LEVELS) { noPage = true; return 1.0; }   // mapped nowhere → no data (main() carries history)
 
     int  idx   = vsmPageIndex(L, page);
     uint slotD = vsmPageTableDyn[idx];   // DYNAMIC atlas slot (demand-allocated; 2048 grid)
@@ -247,9 +255,9 @@ float vsmDepthD(uint slot, vec2 pl)
 // treats the two paths identically. `rnd` = (disc rotation, unused) from the
 // per-pixel/per-frame hash.
 float sampleVSMSoft(vec3 wp, vec3 nrm, float tanT, float rot,
-                    out float dynOcc, out float dynHit, out float statLit)
+                    out float dynOcc, out float dynHit, out float statLit, out bool noPage)
 {
-    dynOcc = 0.0; dynHit = 0.0; statLit = 1.0;
+    dynOcc = 0.0; dynHit = 0.0; statLit = 1.0; noPage = false;
     bool haveN = dot(nrm, nrm) > 0.5;
 
     vec3 lp = (vsmC.view * vec4(wp, 1.0)).xyz;
@@ -264,7 +272,7 @@ float sampleVSMSoft(vec3 wp, vec3 nrm, float tanT, float rot,
         ivec2 pg = ivec2(floor(t * float(VSM_PAGES_AXIS)));
         if (vsmPageTable[vsmPageIndex(L, pg)] < uint(VSM_MAX_PHYS_S)) break;
     }
-    if (L >= VSM_LEVELS) return 1.0;
+    if (L >= VSM_LEVELS) { noPage = true; return 1.0; }   // no resident page → main() carries history
 
     float texelW = vsmC.level[L].z / float(VSM_VIRTUAL_RES);   // metres per virtual texel at L
     float zScale = vsmC.zparams.y;                             // metres -> normalized depth
@@ -360,7 +368,7 @@ float sampleVSMSoft(vec3 wp, vec3 nrm, float tanT, float rot,
         lit  += sh  ? 0.0 : 1.0;
         litS += shS ? 0.0 : 1.0;
     }
-    if (taken < 0.5) return 1.0;   // whole disc landed on unmapped pages
+    if (taken < 0.5) { noPage = true; return 1.0; }   // whole disc landed on unmapped pages → no data
     float inv = 1.0 / taken;
     dynHit  = hitD   * inv;
     dynOcc  = occDbg * inv;
@@ -418,12 +426,13 @@ void main()
     }
 
     float dynOcc, dynHit, statLit;
+    bool  noPage;
     // Per-pixel + per-frame disc rotation. Both stochastic discs derive from this
     // one hash, so a pixel's search and filter stay coherent within a frame and
     // decorrelate across frames — which is what lets the EMA below average them.
     float rot  = vsmIGN(vec2(px), R.params4.x);
-    float cur  = softOn ? sampleVSMSoft(wp, nrm, tanT, rot, dynOcc, dynHit, statLit)
-                        : sampleVSM(wp, nrm, tanT, dynOcc, dynHit, statLit);
+    float cur  = softOn ? sampleVSMSoft(wp, nrm, tanT, rot, dynOcc, dynHit, statLit, noPage)
+                        : sampleVSM(wp, nrm, tanT, dynOcc, dynHit, statLit, noPage);
 
     // Debug refinement: a surface FACING AWAY from the sun gets no direct light — a dyn
     // shadow there changes nothing on screen (e.g. a ceiling under a roof hole crossed by
@@ -440,47 +449,73 @@ void main()
     }
     float dist = length(wp - R.curCamPos.xyz);   // stored for next frame's reject test
 
-    float outShadow = cur;
+    // ---- History fetch (reproject + disocclusion reject). Hoisted out of the blend
+    // below because the no-page carry needs the SAME sample and the SAME validity test.
+    vec4  hist     = vec4(0.0);
+    bool  histOK   = false;
+    float motionPx = 0.0;
     if (R.params.z > 0.5) {                       // history valid (not first frame / no resize)
         vec4 pc = R.prevViewProj * vec4(wp, 1.0);
         if (pc.w > 0.0) {
             vec2 puv = (pc.xy / pc.w) * vec2(0.5, -0.5) + 0.5;   // prev-frame screen UV (same y-flip)
             if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
-                vec4  hist = texture(uHistory, puv);             // (shadowPrev, distFromPrevCam, dbg, dynHitPrev)
+                hist = texture(uHistory, puv);                   // (shadowPrev, distFromPrevCam, dbg, dynHitPrev)
                 float expectPrev = length(wp - R.prevCamPos.xyz);
                 // Same static surface last frame → stored distance ≈ expected. Reject
                 // (use current only) on disocclusion so silhouettes don't ghost.
                 if (abs(hist.r) <= 1.0001 && abs(hist.g - expectPrev) <= R.params.y * expectPrev + 0.05) {
-                    // Dyn-atlas casters move every frame → their shadow edge is somewhere
-                    // ELSE each frame; the full EMA (tuned to average the static edge's
-                    // texel quantization) smears them into a trail. Where the dyn atlas
-                    // shadows this pixel now — or did last frame (hist.a covers the
-                    // trailing edge) — drop to the dyn history weight (r_vsm_ta_blend_dyn).
-                    float a = (dynHit > 0.0 || hist.a > 0.0) ? min(R.params.x, R.curCamPos.w) : R.params.x;
-
-                    // (2) MOTION-ADAPTIVE weight. The distance reject above only catches
-                    // DISocclusion (surface changed) — but high-frequency foliage shadows on
-                    // the SAME ground (same depth) pass it, and under camera motion the
-                    // bilinear history fetch at `puv` blurs a bit more each frame → the full
-                    // EMA accumulates that blur into "каша" (only while moving). Fade the
-                    // weight toward a floor by the reprojected screen motion (px): still
-                    // camera keeps the full EMA (clean coarse shadow + sub-texel detail),
-                    // moving camera stops compounding the blur.
-                    float motionPx = length((puv - uv) * R.screen.xy);
-                    float mfade = clamp(motionPx / max(R.params2.y, 1e-3), 0.0, 1.0);
-                    a = mix(a, min(a, R.params2.z), mfade);
-
-                    // (1) NEIGHBOURHOOD CLAMP (value space). Bound the history sample to the
-                    // current shadow ±tol before the blend so a stale value can't drag a
-                    // many-frame trail (the classic TAA anti-ghost, done per-pixel without
-                    // the extra sampleVSM taps a spatial min/max would cost): sub-texel
-                    // jitter within tol still averages (keeps the AA), a big deviation
-                    // (moved foliage edge) is clamped out (kills the smear).
-                    float hClamped = clamp(hist.r, cur - R.params2.x, cur + R.params2.x);
-                    outShadow = mix(cur, hClamped, a);
+                    histOK   = true;
+                    motionPx = length((puv - uv) * R.screen.xy);
                 }
             }
         }
+    }
+
+    float outShadow = cur;
+    if (noPage) {
+        // ---- NO RESIDENT PAGE = MISSING DATA, NOT "NO OCCLUDER".
+        // The old policy returned LIT here, which is the single worst value it could
+        // pick: the sun switches on across whatever the unmapped pages cover. And they
+        // go unmapped in BURSTS — vsm_resid defers every scrolled-in (wrong-tile) page
+        // over r_vsm_dirty_budget (128) to a later frame, and a sun step / window snap
+        // makes hundreds of pages wrong in ONE frame (measured: wrong max 487..736 per
+        // frame against ~480 pages the eye sees, deferred 950..4300 per 3 s window).
+        // ~400 pages then read "lit" for the few frames the budget needs to drain them.
+        // The EMA hid that while standing still (weight 0.9), but the motion-adaptive
+        // fade (r_vsm_ta_motion_floor 0.30) drops the history exactly when the camera
+        // moves — which is why the blink only showed up while RUNNING.
+        // Carry the reprojected history instead: the shadow goes a few frames stale
+        // (invisible) rather than vanishing (very visible). r_vsm_ta_carry < 1 decays a
+        // page that never comes back toward lit over ~a second instead of freezing its
+        // shadow forever; 0 = the old flash-lit behaviour for A/B.
+        outShadow = histOK ? mix(cur, hist.r, R.params4.y) : cur;
+    } else if (histOK) {
+        // Dyn-atlas casters move every frame → their shadow edge is somewhere
+        // ELSE each frame; the full EMA (tuned to average the static edge's
+        // texel quantization) smears them into a trail. Where the dyn atlas
+        // shadows this pixel now — or did last frame (hist.a covers the
+        // trailing edge) — drop to the dyn history weight (r_vsm_ta_blend_dyn).
+        float a = (dynHit > 0.0 || hist.a > 0.0) ? min(R.params.x, R.curCamPos.w) : R.params.x;
+
+        // (2) MOTION-ADAPTIVE weight. The distance reject above only catches
+        // DISocclusion (surface changed) — but high-frequency foliage shadows on
+        // the SAME ground (same depth) pass it, and under camera motion the
+        // bilinear history fetch at `puv` blurs a bit more each frame → the full
+        // EMA accumulates that blur into "каша" (only while moving). Fade the
+        // weight toward a floor by the reprojected screen motion (px): still
+        // camera keeps the full EMA (clean coarse shadow + sub-texel detail),
+        // moving camera stops compounding the blur.
+        float mfade = clamp(motionPx / max(R.params2.y, 1e-3), 0.0, 1.0);
+        a = mix(a, min(a, R.params2.z), mfade);
+
+        // (1) NEIGHBOURHOOD CLAMP (value space). Bound the history sample to the
+        // current shadow ±tol before the blend so a stale value can't drag a
+        // many-frame trail (the classic TAA anti-ghost, done per-pixel without
+        // the extra sampleVSM taps a spatial min/max would cost): sub-texel
+        // jitter within tol still averages (keeps the AA), a big deviation
+        // (moved foliage edge) is clamped out (kills the smear).
+        float hClamped = clamp(hist.r, cur - R.params2.x, cur + R.params2.x);
+        outShadow = mix(cur, hClamped, a);
     }
     // B = STATIC-only visibility — diagnostic channel (r_grass_debug 3; grass shading
     // now samples the atlases directly, see sampleVSM's statLit note). Raw, no EMA.

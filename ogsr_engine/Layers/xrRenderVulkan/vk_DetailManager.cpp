@@ -9,6 +9,11 @@
 // SSBO upload. See vk_DetailManager.h header notes.
 
 #include "stdafx.h"
+
+// Visual integrity guard (defined in rvk_loader.cpp) — bisecting a repeat-load
+// corruption that lands inside this function.
+namespace VK { namespace VisualGuard { void Check(const char* where); } }
+
 #include "vk_DetailManager.h"
 #include "HW_Vulkan.h"
 #include "vk_image.h"      // VK::CreateImage / CreateImage2D / CreateImageView
@@ -16,7 +21,8 @@
 #include "vk_swapchain.h"               // for color/depth formats in CreateGfxPipeline
 #include "vk_scene_color.h"             // HDR scene target format
 #include "vk_motionvec.h"               // VK::MotionVec::Format — RG16F MV target (grass MV overlay)
-#include "vk_pipeline_cache.h"          // VK::PipelineCache::GetCacheObject() — shared disk-backed cache
+#include "vk_gfx_pipeline.h"            // VK::GfxPipelineBuilder
+#include "vk_descriptors.h"             // VK::DescriptorWriter
 #include "vk_env_light.h"               // VK::EnvLight — set 1 (sun_vp + sun shadow map)
 #include "vk_shaders.h"                 // g_ShaderManager
 #include "vk_texture.h"                 // CVulkanTexture (LoadDDS)
@@ -26,6 +32,9 @@
 #include "../../xr_3da/IGame_Persistent.h"
 #include "../../xr_3da/IGame_Level.h"
 #include "../../xrCDB/xrCDB.h"           // CDB::TRI, CDB::MODEL
+#include <thread>       // ParallelRows — slot heal/pack over the detail grid
+#include <atomic>
+#include <functional>
 
 namespace VK
 {
@@ -168,18 +177,42 @@ void CDetailManager::Load()
     DS_empty.w_id(2, DetailSlot::ID_Empty);
     DS_empty.w_id(3, DetailSlot::ID_Empty);
 
+    // Sub-timers: this pass is 1.85 s of a 21 s pripyat_full load (18-08), and it
+    // mixes four unrelated kinds of work — a heightmap bake off the collision tris,
+    // SSBO uploads, texture loads and pipeline creation. Which one owns the time
+    // decides whether the answer is a cook, a prefetch or a pipeline cache, so
+    // measure before designing anything (twice today the obvious guess was wrong).
+    CTimer _t;
+    float msBake, msSlots, msObj, msBufs, msDummy, msHZB, msTex, msGenPipe, msGfxPipe;
+
     // GPU-side prep
-    BakeHeightmap();
-    UploadSlotData();
-    UploadObjInfo();
+    _t.Start(); BakeHeightmap();   msBake  = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/BakeHeightmap");
+    _t.Start(); UploadSlotData();  msSlots = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/UploadSlotData");
+    _t.Start(); UploadObjInfo();   msObj   = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/UploadObjInfo");
+
 
     // Session B: render-side resources
-    CreateGpuBuffers();
-    CreateDummyTextures();
-    CreateHZB(Swapchain.m_Extent.width, Swapchain.m_Extent.height);  // before gen pipeline → binding 6 picks real HZB
-    LoadDetailTextures();
-    CreateGpuGenPipeline();
-    CreateGfxPipeline();
+    _t.Start(); CreateGpuBuffers();    msBufs  = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/CreateGpuBuffers");
+    _t.Start(); CreateDummyTextures(); msDummy = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/CreateDummyTextures");
+
+    // before gen pipeline → binding 6 picks real HZB
+    _t.Start(); CreateHZB(Swapchain.m_Extent.width, Swapchain.m_Extent.height); msHZB = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/CreateHZB");
+    _t.Start(); LoadDetailTextures();  msTex     = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/LoadDetailTextures");
+    _t.Start(); CreateGpuGenPipeline(); msGenPipe = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/CreateGpuGenPipeline");
+    _t.Start(); CreateGfxPipeline();    msGfxPipe = _t.GetElapsed_ms_total();
+    VK::VisualGuard::Check("Details/CreateGfxPipeline");
+
+
+    Msg("[load step]   Details::Load: bake %.0f | slots %.0f | objinfo %.0f | bufs %.0f | dummy %.0f | hzb %.0f | textures %.0f | genPipe %.0f | gfxPipe %.0f ms",
+        msBake, msSlots, msObj, msBufs, msDummy, msHZB, msTex, msGenPipe, msGfxPipe);
 
     m_bCreated = true;
     Msg("[VK Grass] Loaded: %u objects, %ux%u slots, heightmap %ux%u",
@@ -236,6 +269,89 @@ void CDetailManager::Unload()
 // grass shouldn't grow on cliffs. Holes are filled with a 5×5 neighbour
 // average pass to avoid black spots.
 // ============================================================================
+// ============================================================================
+// Heightmap disk cache
+// ============================================================================
+// BakeHeightmap rasterizes the level's ENTIRE collision set (61.3M tris on
+// pripyat_full) into a 2048x2048 R32F map on the loading thread: measured 18-08
+// at 1523 ms of a 21 s load — 84% of Details::Load — and recomputed identically
+// every single time. Its only inputs are level.cform and level.details, so it
+// caches exactly like the CDB tile cache it sits next to: same directory
+// (app_data_root), same crc32(levelPath) naming, same "content key in the
+// header" validation (xr_area.cpp). A stale entry could only misplace grass
+// height, never crash, but the key still covers every input the bake reads —
+// both files' ages, the triangle count and the detail header.
+namespace {
+
+constexpr u32 kHMCacheMagic   = 0x314D4847u;   // "GHM1"
+constexpr u32 kHMCacheVersion = 1;
+
+struct HMCacheHeader
+{
+    u32 magic;
+    u32 version;
+    u64 key;
+    u32 w, h;
+};
+
+bool HeightmapCachePath(string_path& out)
+{
+    string_path levelPath;
+    FS.update_path(levelPath, "$level$", "");
+    string64 name;
+    xr_sprintf(name, "grasshm_%08x.ghm", crc32(levelPath, (u32)xr_strlen(levelPath)));
+    FS.update_path(out, "$app_data_root$", name);
+    return out[0] != 0;
+}
+
+u64 HeightmapCacheKey(u32 triCount, const DetailHeader& H)
+{
+    string_path fn;
+    FS.update_path(fn, "$level$", "level.cform");
+    const u32 ageCform = FS.get_file_age(fn);
+    FS.update_path(fn, "$level$", "level.details");
+    const u32 ageDetails = FS.get_file_age(fn);
+
+    struct Key
+    {
+        u32 tri, ageC, ageD, ver, obj, sx, sz;
+        int ox, oz;
+    } k{triCount, ageCform, ageDetails, H.version, H.object_count, H.size_x, H.size_z, H.offs_x, H.offs_z};
+
+    return ((u64)crc32(&k, sizeof(k)) << 32) | (u64)triCount;
+}
+
+bool HeightmapCacheLoad(const char* path, u64 key, u32 w, u32 h, xr_vector<float>& data)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f)
+        return false;
+
+    HMCacheHeader hdr{};
+    const bool ok = fread(&hdr, sizeof(hdr), 1, f) == 1 && hdr.magic == kHMCacheMagic &&
+                    hdr.version == kHMCacheVersion && hdr.key == key && hdr.w == w && hdr.h == h &&
+                    fread(data.data(), sizeof(float), size_t(w) * h, f) == size_t(w) * h;
+    fclose(f);
+    return ok;
+}
+
+void HeightmapCacheSave(const char* path, u64 key, u32 w, u32 h, const xr_vector<float>& data)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        Msg("![VK Grass] heightmap cache: cannot write '%s' — baking again next load", path);
+        return;
+    }
+    const HMCacheHeader hdr{kHMCacheMagic, kHMCacheVersion, key, w, h};
+    const bool ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
+                    fwrite(data.data(), sizeof(float), size_t(w) * h, f) == size_t(w) * h;
+    fclose(f);
+    if (!ok)
+        Msg("![VK Grass] heightmap cache: write to '%s' failed (disk full?)", path);
+}
+
+}   // namespace
+
 void CDetailManager::BakeHeightmap()
 {
     if (!g_pGameLevel) {
@@ -271,11 +387,24 @@ void CDetailManager::BakeHeightmap()
 
     xr_vector<float> heightData(m_HeightmapW * m_HeightmapH, 10000.0f);
 
-    Msg("[VK Grass] Baking heightmap %ux%u from %u tris (%.0fx%.0fm)…",
-        m_HeightmapW, m_HeightmapH, triCount, m_HMWorldSizeX, m_HMWorldSizeZ);
+    // Cache first — see the note above the helpers. On a HIT `heightData` is the
+    // finished map, so both passes below are skipped through their loop conditions
+    // (`hmMiss &&`) rather than by wrapping 80 lines in an `if`: the guard costs one
+    // predictable test per iteration on the miss path and keeps this diff readable.
+    string_path hmPath;
+    const bool  hmHavePath = HeightmapCachePath(hmPath);
+    const u64   hmKey      = HeightmapCacheKey(triCount, dtH);
+    CTimer      hmTimer;
+    hmTimer.Start();
+    const bool  hmMiss = !(hmHavePath && HeightmapCacheLoad(hmPath, hmKey, m_HeightmapW, m_HeightmapH, heightData));
+    if (!hmMiss)
+        Msg("[VK Grass] heightmap cache HIT '%s' — %u ms (bake skipped)", hmPath, hmTimer.GetElapsed_ms());
+    else
+        Msg("[VK Grass] Baking heightmap %ux%u from %u tris (%.0fx%.0fm)…",
+            m_HeightmapW, m_HeightmapH, triCount, m_HMWorldSizeX, m_HMWorldSizeZ);
 
     u32 rasterized = 0;
-    for (u32 t = 0; t < triCount; ++t) {
+    for (u32 t = 0; hmMiss && t < triCount; ++t) {
         CDB::TRI& T = tris[t];
         Fvector v0 = verts[T.verts[0]];
         Fvector v1 = verts[T.verts[1]];
@@ -335,7 +464,7 @@ void CDetailManager::BakeHeightmap()
     }
 
     // Hole fill: any sentinel-marked texel takes a 5×5 neighbour mean.
-    for (u32 z = 0; z < m_HeightmapH; ++z) {
+    for (u32 z = 0; hmMiss && z < m_HeightmapH; ++z) {
         for (u32 x = 0; x < m_HeightmapW; ++x) {
             const u32 idx = z * m_HeightmapW + x;
             if (heightData[idx] < 9999.0f) continue;
@@ -353,7 +482,11 @@ void CDetailManager::BakeHeightmap()
         }
     }
 
-    Msg("[VK Grass] Rasterized %u tris, uploading R32F image…", rasterized);
+    if (hmMiss) {
+        Msg("[VK Grass] Rasterized %u tris in %u ms, uploading R32F image…", rasterized, hmTimer.GetElapsed_ms());
+        if (hmHavePath)
+            HeightmapCacheSave(hmPath, hmKey, m_HeightmapW, m_HeightmapH, heightData);
+    }
 
     // Allocate device-local R32F image via VMA.
     if (!VK::CreateImage2D(VK_FORMAT_R32_SFLOAT, { m_HeightmapW, m_HeightmapH },
@@ -426,6 +559,26 @@ void CDetailManager::BakeHeightmap()
 // 32 B/slot. Lighting fields keep R4 quantisation (4-bit→16-bit fixed),
 // palette alphas widen 4-bit→8-bit (a*255/15). Compute shader bilerps.
 // ============================================================================
+// Row-parallel for. UploadSlotData walks the whole slot grid twice (a 7x7 heal and
+// the pack) and measured 232 ms of an 1.9 s post-visuals budget; rows are
+// independent and each output index is written by exactly one row, so this is a
+// plain split with no shared state.
+static void ParallelRows(int rows, const std::function<void(int, int)>& body)
+{
+    u32 nThr = std::thread::hardware_concurrency();
+    nThr = _min(_max(1u, nThr), 16u);
+    if (rows <= 64 || nThr <= 1) { body(0, rows); return; }
+    xr_vector<std::thread> pool;
+    pool.reserve(nThr);
+    const int chunk = (rows + int(nThr) - 1) / int(nThr);
+    for (u32 w = 0; w < nThr; ++w) {
+        const int lo = int(w) * chunk, hi = _min(lo + chunk, rows);
+        if (lo >= hi) break;
+        pool.emplace_back([&body, lo, hi] { body(lo, hi); });
+    }
+    for (auto& th : pool) th.join();
+}
+
 void CDetailManager::UploadSlotData()
 {
     if (!dtSlots) return;
@@ -440,12 +593,20 @@ void CDetailManager::UploadSlotData()
     // fill in with plausible shade; large legitimately dark areas (building
     // interiors) keep zero neighbours and stay dark. The SSFX 0.05 floor is
     // applied on top at pack time below.
+    // dtSlots is a VIEW INTO THE MAPPED level.details chunk, so this first read
+    // is where 3.7M slots get paged in — on one thread it hid ~10 ms of page
+    // faults inside the copy. Same split as the heal below.
     xr_vector<u8> hemiHealed(m_TotalSlots);
-    for (u32 i = 0; i < m_TotalSlots; ++i) hemiHealed[i] = u8(dtSlots[i].c_hemi);
+    ParallelRows(int(m_TotalSlots), [&](int i0, int i1) {
+        for (u32 i = u32(i0); i < u32(i1); ++i) hemiHealed[i] = u8(dtSlots[i].c_hemi);
+    });
     u32 healedCnt = 0;
     {
         const int W = int(dtH.size_x), H = int(dtH.size_z);
-        for (int z = 0; z < H; ++z)
+        std::atomic<u32> healedAtomic{ 0 };
+        ParallelRows(H, [&](int z0, int z1) {
+            u32 local = 0;
+            for (int z = z0; z < z1; ++z)
             for (int x = 0; x < W; ++x) {
                 const u32 i = u32(z) * u32(W) + u32(x);
                 if (dtSlots[i].c_hemi != 0) continue;
@@ -457,14 +618,20 @@ void CDetailManager::UploadSlotData()
                         const u32 v = dtSlots[u32(nz) * u32(W) + u32(nx)].c_hemi;
                         if (v > 0) { sum += v; ++cnt; }
                     }
-                if (cnt >= 3) { hemiHealed[i] = u8((sum + cnt / 2) / cnt); ++healedCnt; }
+                // Reads dtSlots (never written here) and writes only its own index,
+                // so neighbour rows handled by other threads stay consistent.
+                if (cnt >= 3) { hemiHealed[i] = u8((sum + cnt / 2) / cnt); ++local; }
             }
+            healedAtomic += local;
+        });
+        healedCnt = healedAtomic.load();
     }
     if (healedCnt)
         Msg("[VK Grass] healed %u bugged hemi==0 slots (of %u) from neighbours", healedCnt, m_TotalSlots);
 
     xr_vector<GpuSlotPacked> packed(m_TotalSlots);
-    for (u32 i = 0; i < m_TotalSlots; ++i) {
+    ParallelRows(int(m_TotalSlots), [&](int i0, int i1) {
+    for (u32 i = u32(i0); i < u32(i1); ++i) {
         DetailSlot& ds = dtSlots[i];
         GpuSlotPacked& p = packed[i];
         p.y_base   = ds.r_ybase();
@@ -490,6 +657,7 @@ void CDetailManager::UploadSlotData()
         p.palette2 = packPal(ds.palette[2]);
         p.palette3 = packPal(ds.palette[3]);
     }
+    });
 
     m_SlotDataSSBO = xr_new<VK::CVulkanBuffer>();
     m_SlotDataSSBO->Create(dataSize,
@@ -784,6 +952,12 @@ void CDetailManager::CreateHZB(u32 depthW, u32 depthH)
     // Full-mip sampled view (gen binding 6 + build source for HZB passes).
     m_HZBView = VK::CreateImageView(m_HZBImage, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D,
                                     VK_IMAGE_ASPECT_COLOR_BIT, 0, m_HZBMipCount);
+    // Bumped on every (re)creation so consumers caching a descriptor can tell
+    // "same pyramid" from "rebuilt pyramid". Comparing the raw VkImageView is not
+    // enough: after Destroy+Create the driver may hand back the SAME numeric
+    // handle, and a cache keyed on it would keep a descriptor pointing at the
+    // destroyed object. See vk_TreeManager_Render.cpp's binding-4 write.
+    ++m_HZBGeneration;
 
     // Per-mip single-level storage views (build destination).
     m_HZBMipViews.resize(m_HZBMipCount, VK_NULL_HANDLE);
@@ -830,34 +1004,13 @@ void CDetailManager::CreateHZB(u32 depthW, u32 depthH)
     // ----- Build compute pipeline + per-mip descriptor sets ----------------
     if (!g_ShaderManager) { Msg("![VK Grass] HZB: g_ShaderManager null — build disabled"); return; }
 
-    VkDescriptorSetLayoutBinding bnd[2]{};
-    bnd[0].binding = 0; bnd[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bnd[0].descriptorCount = 1; bnd[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bnd[1].binding = 1; bnd[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bnd[1].descriptorCount = 1; bnd[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo lci{};
-    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 2; lci.pBindings = bnd;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &m_HZBDescLayout) != VK_SUCCESS) {
-        Msg("![VK Grass] HZB DSL create failed"); return;
-    }
-
-    VkDescriptorPoolSize ps[2]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = m_HZBMipCount;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          ps[1].descriptorCount = m_HZBMipCount;
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = m_HZBMipCount; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &m_HZBDescPool);
-
+    // 0 = src mip (sampled), 1 = dst mip (storage). One set per mip.
     m_HZBDescSets.resize(m_HZBMipCount, VK_NULL_HANDLE);
-    xr_vector<VkDescriptorSetLayout> layouts(m_HZBMipCount, m_HZBDescLayout);
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = m_HZBDescPool; dai.descriptorSetCount = m_HZBMipCount;
-    dai.pSetLayouts = layouts.data();
-    vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, m_HZBDescSets.data());
+    if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+                                m_HZBMipCount, m_HZBDescLayout, m_HZBDescPool,
+                                m_HZBDescSets.data(), VK_SHADER_STAGE_COMPUTE_BIT, "Grass.HZBBuild"))
+        return;
 
     m_HZBPipelineLayout = VK::MakePipelineLayout({ m_HZBDescLayout }, sizeof(HZBBuildPush));
 
@@ -870,28 +1023,14 @@ void CDetailManager::CreateHZB(u32 depthW, u32 depthH)
     // Write the descriptor sets once — all views are stable for the HZB's life.
     // set[0]: src = depth (SHADER_READ_ONLY at sample time), dst = mip0.
     // set[i]: src = HZB full view (GENERAL),               dst = mip i.
-    xr_vector<VkDescriptorImageInfo> srcInfo(m_HZBMipCount);
-    xr_vector<VkDescriptorImageInfo> dstInfo(m_HZBMipCount);
-    xr_vector<VkWriteDescriptorSet>  writes(m_HZBMipCount * 2);
     for (u32 m = 0; m < m_HZBMipCount; ++m) {
-        srcInfo[m].sampler     = m_HZBSampler;
-        srcInfo[m].imageView   = (m == 0) ? m_DepthSampleView : m_HZBView;
-        srcInfo[m].imageLayout = (m == 0) ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                          : VK_IMAGE_LAYOUT_GENERAL;
-        dstInfo[m].imageView   = m_HZBMipViews[m];
-        dstInfo[m].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkWriteDescriptorSet& ws = writes[m * 2 + 0];
-        ws.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        ws.dstSet = m_HZBDescSets[m]; ws.dstBinding = 0; ws.descriptorCount = 1;
-        ws.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ws.pImageInfo = &srcInfo[m];
-
-        VkWriteDescriptorSet& wd = writes[m * 2 + 1];
-        wd.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wd.dstSet = m_HZBDescSets[m]; wd.dstBinding = 1; wd.descriptorCount = 1;
-        wd.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wd.pImageInfo = &dstInfo[m];
+        VK::DescriptorWriter(m_HZBDescSets[m])
+            .ImageSampler(0, (m == 0) ? m_DepthSampleView : m_HZBView, m_HZBSampler,
+                             (m == 0) ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                      : VK_IMAGE_LAYOUT_GENERAL)
+            .StorageImage(1, m_HZBMipViews[m])
+            .Flush();
     }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, (u32)writes.size(), writes.data(), 0, nullptr);
 
     Msg("[VK Grass] HZB ready: %ux%u, %u mips (depth %ux%u)",
         m_HZBWidth, m_HZBHeight, m_HZBMipCount, depthW, depthH);
@@ -1042,51 +1181,17 @@ void CDetailManager::CreateGpuGenPipeline()
     // 6: HZB         sampler       (1×1 white placeholder, R32F)
     // 7: GenUBO      uniform
     // 8: TrailMap    sampler       (1×1 black placeholder, R32F)
-    VkDescriptorSetLayoutBinding b[9]{};
-    auto fill = [&](u32 i, VkDescriptorType t) {
-        b[i].binding         = i;
-        b[i].descriptorType  = t;
-        b[i].descriptorCount = 1;
-        b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    };
-    fill(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    fill(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    fill(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    fill(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    fill(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    fill(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    fill(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    fill(7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-    fill(8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-
-    VkDescriptorSetLayoutCreateInfo lci{};
-    lci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 9;
-    lci.pBindings    = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &m_GenDescLayout) != VK_SUCCESS) {
-        Msg("![VK Grass] gen DSL create failed"); return;
-    }
-
     // ×2: the VISIBLE set + the shadow-CASTER set (same layout, caster
     // SSBO/atomics/indirect swapped in at bindings 3/4/5).
-    VkDescriptorPoolSize ps[3]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; ps[0].descriptorCount = 6;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         ps[1].descriptorCount = 10;
-    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         ps[2].descriptorCount = 2;
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets       = 2;
-    pci.poolSizeCount = 3;
-    pci.pPoolSizes    = ps;
-    vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &m_GenDescPool);
-
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool     = m_GenDescPool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts        = &m_GenDescLayout;
-    vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_GenDescSet);
-    vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &m_CasterDescSet);
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    constexpr auto kTex  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    const std::initializer_list<VkDescriptorType> genTypes =
+        { kTex, kSSBO, kSSBO, kSSBO, kSSBO, kSSBO, kTex, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kTex };
+    m_GenDescLayout = VK::MakeSetLayout(genTypes, VK_SHADER_STAGE_COMPUTE_BIT, "Grass.DetailGen");
+    m_GenDescPool   = VK::MakeDescriptorPool(genTypes, 2, "Grass.DetailGen");
+    if (!m_GenDescLayout || !m_GenDescPool) return;
+    if (!VK::AllocSets(m_GenDescPool, m_GenDescLayout, 1, &m_GenDescSet,    "Grass.DetailGen")) return;
+    if (!VK::AllocSets(m_GenDescPool, m_GenDescLayout, 1, &m_CasterDescSet, "Grass.DetailGen.caster")) return;
 
     // Pipeline layout: 1 set + 208 B push.
     DM_CheckPushSize("gen", sizeof(DetailGenPushConstants));
@@ -1131,52 +1236,26 @@ void CDetailManager::UpdateGenDescriptors()
     }
     VkDescriptorImageInfo trl{};  trl.sampler= m_DetailSampler;     trl.imageView= m_DummyTrailView; trl.imageLayout= VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkDescriptorBufferInfo bi[6]{};
-    bi[0] = { m_SlotDataSSBO->GetHandle(),  0, VK_WHOLE_SIZE };
-    bi[1] = { m_ObjInfoSSBO->GetHandle(),   0, VK_WHOLE_SIZE };
-    bi[2] = { m_VisibleSSBO->GetHandle(),   0, VK_WHOLE_SIZE };
-    bi[3] = { m_AtomicCounters->GetHandle(),0, VK_WHOLE_SIZE };
-    bi[4] = { m_IndirectCmdBuf->GetHandle(),0, VK_WHOLE_SIZE };
-    bi[5] = { m_GenUBO->GetHandle(),        0, VK_WHOLE_SIZE };
-    // Caster set variant: output/atomics/indirect swapped for the caster buffers.
-    VkDescriptorBufferInfo ci[3]{};
+    // The caster set is the same layout with output/atomics/indirect swapped for
+    // the caster buffers (bindings 3/4/5).
     const bool haveCaster = m_CasterDescSet != VK_NULL_HANDLE
         && m_CasterSSBO && m_CasterAtomic && m_CasterIndirectBuf;
-    if (haveCaster) {
-        ci[0] = { m_CasterSSBO->GetHandle(),        0, VK_WHOLE_SIZE };
-        ci[1] = { m_CasterAtomic->GetHandle(),      0, VK_WHOLE_SIZE };
-        ci[2] = { m_CasterIndirectBuf->GetHandle(), 0, VK_WHOLE_SIZE };
-    }
 
-    VkWriteDescriptorSet w[18]{};
-    u32 nW = 0;
-    auto setBuf = [&](VkDescriptorSet ds, u32 binding, VkDescriptorType t, const VkDescriptorBufferInfo* info) {
-        auto& x = w[nW++];
-        x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        x.dstSet = ds; x.dstBinding = binding; x.descriptorCount = 1;
-        x.descriptorType = t; x.pBufferInfo = info;
-    };
-    auto setImg = [&](VkDescriptorSet ds, u32 binding, const VkDescriptorImageInfo* info) {
-        auto& x = w[nW++];
-        x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        x.dstSet = ds; x.dstBinding = binding; x.descriptorCount = 1;
-        x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; x.pImageInfo = info;
-    };
     auto writeSet = [&](VkDescriptorSet ds, bool caster) {
-        setImg(ds, 0, &hm);
-        setBuf(ds, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[0]);
-        setBuf(ds, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &bi[1]);
-        setBuf(ds, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, caster ? &ci[0] : &bi[2]);
-        setBuf(ds, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, caster ? &ci[1] : &bi[3]);
-        setBuf(ds, 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, caster ? &ci[2] : &bi[4]);
-        setImg(ds, 6, &hzb);
-        setBuf(ds, 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &bi[5]);
-        setImg(ds, 8, &trl);
+        VK::DescriptorWriter(ds)
+            .Image        (0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, hm)
+            .StorageBuffer(1, m_SlotDataSSBO->GetHandle())
+            .StorageBuffer(2, m_ObjInfoSSBO->GetHandle())
+            .StorageBuffer(3, caster ? m_CasterSSBO->GetHandle()        : m_VisibleSSBO->GetHandle())
+            .StorageBuffer(4, caster ? m_CasterAtomic->GetHandle()      : m_AtomicCounters->GetHandle())
+            .StorageBuffer(5, caster ? m_CasterIndirectBuf->GetHandle() : m_IndirectCmdBuf->GetHandle())
+            .Image        (6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, hzb)
+            .UniformBuffer(7, m_GenUBO->GetHandle())
+            .Image        (8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, trl)
+            .Flush();
     };
     writeSet(m_GenDescSet, false);
     if (haveCaster) writeSet(m_CasterDescSet, true);
-
-    vkUpdateDescriptorSets(VulkanHW.m_Device, nW, w, 0, nullptr);
 }
 
 // ============================================================================
@@ -1220,25 +1299,13 @@ void CDetailManager::CreateGfxPipeline()
 
         // binding 0 = per-type diffuse (or dummy white); binding 1 = SSFX flow map
         // (shared; dummy white when absent → flat wind, never crashes).
-        VkDescriptorImageInfo ii[2]{};
-        ii[0].sampler     = m_DetailSampler;
-        ii[0].imageView   = (i < m_DetailTextures.size() && m_DetailTextures[i])
-                            ? m_DetailTextures[i]->GetView()
-                            : m_DummyHZBView;
-        ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        ii[1].sampler     = m_DetailSampler;
-        ii[1].imageView   = m_WaveTex ? m_WaveTex->GetView() : m_DummyHZBView;
-        ii[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkWriteDescriptorSet w[2]{};
-        for (u32 k = 0; k < 2; ++k) {
-            w[k].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[k].dstSet          = m_GfxDescSets[i];
-            w[k].dstBinding      = k;
-            w[k].descriptorCount = 1;
-            w[k].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w[k].pImageInfo      = &ii[k];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+        const VkImageView diffuse = (i < m_DetailTextures.size() && m_DetailTextures[i])
+                                    ? m_DetailTextures[i]->GetView()
+                                    : m_DummyHZBView;
+        VK::DescriptorWriter(m_GfxDescSets[i])
+            .ImageSampler(0, diffuse, m_DetailSampler)
+            .ImageSampler(1, m_WaveTex ? m_WaveTex->GetView() : m_DummyHZBView, m_DetailSampler)
+            .Flush();
     }
 
     // Pipeline layout: set0 = per-type diffuse, set1 = shared env lighting
@@ -1279,86 +1346,18 @@ void CDetailManager::CreateGfxPipeline()
     via[5] = { 5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32 };                   // aInstRow2
     via[6] = { 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 48 };                   // aInstColor
 
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 2;
-    vi.pVertexBindingDescriptions      = vibd;
-    vi.vertexAttributeDescriptionCount = 7;
-    vi.pVertexAttributeDescriptions    = via;
-
-    VkPipelineShaderStageCreateInfo ss[2]{};
-    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT; ss[0].module = vs; ss[0].pName = "main";
-    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode             = VK_POLYGON_MODE_FILL;
-    rs.cullMode                = VK_CULL_MODE_NONE;            // grass is double-sided
-    rs.frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth               = 1.0f;
-    rs.depthBiasEnable         = VK_TRUE;
-    rs.depthBiasConstantFactor = -2.0f;
-    rs.depthBiasSlopeFactor    = -1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable    = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1;
-    cb.pAttachments    = &ba;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2;
-    dynState.pDynamicStates    = dyn;
-
-    VkFormat colorFmt = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount    = 1;
-    prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = 2;
-    pi.pStages             = ss;
-    pi.pVertexInputState   = &vi;
-    pi.pInputAssemblyState = &ia;
-    pi.pViewportState      = &vp;
-    pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;
-    pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;
-    pi.pDynamicState       = &dynState;
-    pi.layout              = m_GfxPipelineLayout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &m_GfxPipeline) != VK_SUCCESS) {
-        Msg("![VK Grass] gfx pipeline create failed"); return;
-    }
+    // Grass is double-sided (cull NONE, the builder default) and sits on a baked
+    // negative bias so blades don't z-fight the terrain they grow out of.
+    m_GfxPipeline = VK::GfxPipelineBuilder(m_GfxPipelineLayout)
+        .Vert(vs).Frag(fs)
+        .Bindings(vibd, 2).Attrs(via, 7)
+        .DepthBias(-2.0f, -1.0f)
+        .Depth(true, true)
+        .Color(VK::SceneColor::Format())
+        .DepthTarget(Swapchain.m_DepthFormat)
+        .Build("Grass gfx");
+    if (m_GfxPipeline == VK_NULL_HANDLE)
+        return;
 
     Msg("[VK Grass] Gfx pipeline OK (1 set, 7 attrs, 208 B push)");
 }
@@ -1416,76 +1415,18 @@ void CDetailManager::CreateMotionPipeline()
     via[4] = { 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 16 };
     via[5] = { 5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32 };
     via[6] = { 6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 48 };
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 2; vi.pVertexBindingDescriptions   = vibd;
-    vi.vertexAttributeDescriptionCount = 7; vi.pVertexAttributeDescriptions = via;
-
-    VkPipelineShaderStageCreateInfo ss[2]{};
-    ss[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = vs; ss[0].pName = "main";
-    ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = fs; ss[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
     // Cull NONE + the SAME depth bias as the forward grass draw so depth bit-matches.
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode             = VK_POLYGON_MODE_FILL;
-    rs.cullMode                = VK_CULL_MODE_NONE;
-    rs.frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth               = 1.0f;
-    rs.depthBiasEnable         = VK_TRUE;
-    rs.depthBiasConstantFactor = -2.0f;
-    rs.depthBiasSlopeFactor    = -1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_FALSE;                  // scene depth already owns the surface
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;   // RG16F motion
-    ba.blendEnable    = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1; cb.pAttachments = &ba;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2; dynState.pDynamicStates = dyn;
-
-    VkFormat mvFmt = VK::MotionVec::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount    = 1;
-    prci.pColorAttachmentFormats = &mvFmt;
-    prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = 2;     pi.pStages             = ss;
-    pi.pVertexInputState   = &vi;   pi.pInputAssemblyState = &ia;
-    pi.pViewportState      = &vp;   pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;   pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;   pi.pDynamicState       = &dynState;
-    pi.layout              = m_MotionPipelineLayout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(), 1, &pi, nullptr, &m_MotionPipeline) != VK_SUCCESS) {
-        Msg("![VK Grass] MV pipeline create failed");
+    // Depth is tested but not written — the scene depth already owns the surface.
+    m_MotionPipeline = VK::GfxPipelineBuilder(m_MotionPipelineLayout)
+        .Vert(vs).Frag(fs)
+        .Bindings(vibd, 2).Attrs(via, 7)
+        .DepthBias(-2.0f, -1.0f)
+        .Depth(true, false)
+        .Color(VK::MotionVec::Format(),
+               VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT)   // RG16F motion
+        .DepthTarget(Swapchain.m_DepthFormat)
+        .Build("Grass MV overlay");
+    if (m_MotionPipeline == VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(VulkanHW.m_Device, m_MotionPipelineLayout, nullptr);
         m_MotionPipelineLayout = VK_NULL_HANDLE;
         return;

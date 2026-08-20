@@ -372,36 +372,7 @@ void Render(FrameContext& ctx)
 
     // Render over the scene: colour LOAD + depth LOAD (test, no write) — the
     // same contract as the particle pass.
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView   = ctx.depthView;
-    dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = &dAtt;
-    vkCmdBeginRendering(ctx.cmd, &ri);
-
-    VkViewport vpv{};
-    vpv.x = 0.0f; vpv.y = (float)ctx.extent.height;
-    vpv.width = (float)ctx.extent.width; vpv.height = -(float)ctx.extent.height;
-    vpv.minDepth = 0.0f; vpv.maxDepth = 1.0f;
-    vkCmdSetViewport(ctx.cmd, 0, 1, &vpv);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(ctx.cmd, 0, 1, &sc);
+    VK::BeginOverlayRendering(ctx.cmd, ctx, VK_ATTACHMENT_STORE_OP_DONT_CARE);
 
     vkCmdPushConstants(ctx.cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Fmatrix), ctx.viewProj);
     VkBuffer vbuf = ring.GetHandle();

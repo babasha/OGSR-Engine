@@ -88,6 +88,10 @@ void EnsureSize(VkExtent2D extent, u32 count)
     s_count = count;
     ++s_generation;
     Msg("[VK SceneColor] HDR target ready (%ux%u R16F x%u, %u mips, gen %u)", extent.width, extent.height, count, s_mips, s_generation);
+    // Handles printed to settle who the frame-start clear actually hits: validation
+    // names DLSS.Output for a clear that this module's images are the argument of.
+    for (u32 i = 0; i < s_count; ++i)
+        Msg("[VK SceneColor]   img[%u]=%p", i, (void*)s_image[i]);
 }
 
 void GenerateMips(VkCommandBuffer cmd, u32 index)

@@ -17,8 +17,9 @@
 
 #include "stdafx.h"
 #include "vk_shader.h"
-#include "vk_pipeline.h"
 #include "vk_material.h"
+#include <unordered_set>   // one-shot "mentions water but isn't ours" diagnostic
+#include <string>
 
 // Global instance
 VK::CVulkanShaderManager* g_VulkanShaderManager = nullptr;
@@ -38,14 +39,8 @@ CVulkanShader::CVulkanShader()
     , m_bWmark(false)
     , m_bAlphaRef(false)
     , m_bGlass(false)
+    , m_bWater(false)
 {
-    // Initialize default pipeline config
-    m_PipelineConfig.depthTest = true;
-    m_PipelineConfig.depthWrite = true;
-    m_PipelineConfig.depthCompareOp = VK_COMPARE_OP_LESS;
-    m_PipelineConfig.cullMode = VK_CULL_MODE_BACK_BIT;
-    m_PipelineConfig.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    m_PipelineConfig.blendEnable = false;
 }
 
 CVulkanShader::~CVulkanShader()
@@ -100,7 +95,6 @@ void CVulkanShader::Create(LPCSTR name, LPCSTR tex_diffuse)
         shader_lower.find("trans") != xr_string::npos) {
         // Alpha test shaders use discard in fragment shader (alphaRef > 0)
         m_bAlphaRef = true;
-        m_PipelineConfig.blendEnable = false;  // Will use shader discard for now
     }
 
     // Translucent GLASS: the engine "glass" shader (model/lamp panes), or a
@@ -123,14 +117,30 @@ void CVulkanShader::Create(LPCSTR name, LPCSTR tex_diffuse)
             m_bGlass = true;
     }
 
+    // WATER BODIES. Level water is `effects\water` (+ `effects\water_clear` and
+    // friends) — ordinary static geometry that, unflagged, rode the opaque
+    // vert-lit path and rendered BLACK everywhere: a water polygon carries no
+    // baked vertex light and no baked sky access, so albedo × light == 0. Give
+    // it its own class and Pass_Water draws it blended (vk_pass_water.cpp).
+    //
+    // Matched by PREFIX, not by substring: `models\water` is an ARTIFACT model
+    // shader (artefact_rusty_hairs), and routing a mesh prop into a horizontal
+    // water surface pass would be a spectacular way to lose an artifact.
+    if (shader_lower.rfind("effects\\water", 0) == 0 || shader_lower.rfind("effects/water", 0) == 0) {
+        m_bWater = true;
+    } else if (shader_lower.find("water") != xr_string::npos) {
+        // Everything else that merely mentions water — logged once per name so
+        // non-stock content using a different water shader is VISIBLE here
+        // rather than silently staying black.
+        static std::unordered_set<std::string> s_seenWater;
+        if (s_seenWater.size() < 64 && s_seenWater.insert(shader_lower.c_str()).second)
+            Msg("[VK Water] shader '%s' mentions water but is NOT `effects\\water*` -> stays on the ordinary path", name);
+    }
+
     // Check for additive shaders (effects, glows)
     if (shader_lower.find("add") != xr_string::npos ||
         shader_lower.find("glow") != xr_string::npos) {
         m_bEmissive = true;
-        m_PipelineConfig.blendEnable = true;
-        m_PipelineConfig.srcColorBlend = VK_BLEND_FACTOR_ONE;
-        m_PipelineConfig.dstColorBlend = VK_BLEND_FACTOR_ONE;  // Additive
-        m_PipelineConfig.depthWrite = false;  // No depth write for effects
     }
 
     // Check for distortion
@@ -152,10 +162,6 @@ void CVulkanShader::Create(LPCSTR name, LPCSTR tex_diffuse)
         shader_lower.find("wmark") != xr_string::npos ||
         shader_lower.find("decal") != xr_string::npos) {
         m_bWmark = true;
-        m_PipelineConfig.blendEnable = true;
-        m_PipelineConfig.srcColorBlend = VK_BLEND_FACTOR_SRC_ALPHA;
-        m_PipelineConfig.dstColorBlend = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        m_PipelineConfig.depthWrite = false;  // No depth write for decals
     }
 
     Msg("[Vulkan] Shader created: %s (diffuse: %s)", name, tex_diffuse);
@@ -178,17 +184,6 @@ VK::CMaterial* CVulkanShader::GetMaterial()
     }
 
     return m_Material;
-}
-
-VkPipeline CVulkanShader::GetPipeline()
-{
-    if (!g_PipelineManager) {
-        Msg("![Vulkan] Cannot get pipeline - PipelineManager not initialized");
-        return VK_NULL_HANDLE;
-    }
-
-    // Get or create pipeline from config
-    return g_PipelineManager->GetOrCreate(m_PipelineConfig);
 }
 
 // ============================================================================

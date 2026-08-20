@@ -16,6 +16,8 @@
 #include "vk_profiler.h"   // VK::Prof::RequestMark — the `vk_perf` MARK command
 #include "vk_texture_stream.h"   // VK::TextureStreamer — video_memory_stats / r_txstream_stats
 #include "vk_vram_stats.h"       // VK::Vram::DumpVmaJson — r_vram_dump
+#include "vk_water_ripple.h"     // VK::WaterRipple::Splat — the r_wtr_drop probe
+#include "vk_UIPipeline.h"       // VulkanUI::TraceUIPass — the `ui_pass_trace` command
 
 // DLSS preset enum values used in default initializers; pull them in directly
 // rather than depending on the Vulkan-side DLSS wrapper.
@@ -217,6 +219,29 @@ int   ps_r_dlss_sl_mv      = 0;     // r_dlss_sl_mv — 1 = negate mvecScale (SL
 int   ps_r_dlss_fg         = 0;     // r_dlss_fg — Stage C: DLSS Frame Generation (MFG); needs r_dlss 1 + r_dlss_sl 1 + Reflex (auto). 0 = off
 int   ps_r_dlss_fg_mult    = 2;     // r_dlss_fg_mult — frame multiplier 2..6 (2 = 1 interpolated frame; up to 6x if the GPU supports MFG)
 int   ps_r_dlss_fg_debug   = 0;     // r_dlss_fg_debug — 1 = periodic [VK SL FG] log of DLSS-G state (status/frames presented/VRAM) + Reflex state (low-latency avail/latency); 2 = every frame
+
+// ⭐r_dlss_avail — the NGX capability probe's answer, published as a console
+// entry so the OPTIONS SCREEN can ask it. The renderer already refuses to run
+// DLSS on hardware that cannot, but a settings row that toggles and changes
+// nothing is exactly the kind of placebo this pass exists to remove: the menu
+// hides the whole DLSS group when this is 0 (`data-need="r_dlss_avail"`).
+// ⚠Not savable — it describes THIS machine, and a value carried over from
+// another one would be a lie.
+// ⚠⚠THREE states, not two: -1 = the probe has not run yet. user.ltx is read
+// BEFORE the Vulkan device exists, so a two-state flag made every startup print
+// "DLSS unavailable on this GPU" while restoring a perfectly good DLSS setting
+// on a card that supports it — a false alarm in the log of every single run.
+// The menu reads this through GetBool, where -1 counts as "yes"; by the time a
+// menu exists the probe has always answered.
+int   ps_r_dlss_avail      = -1;
+
+// ⭐r_render_scale — internal resolution as a fraction of the display, for the
+// case DLSS cannot cover (no NGX, or the player wants it off). The renderer has
+// had a render-extent≠display-extent path since DLSS landed and every pass sizes
+// itself from it; the tonemap composites at display res and samples the smaller
+// buffers with normalised UVs, so this is a plain bilinear upscale of a cheaper
+// frame. 1 = native. Ignored while DLSS is upscaling — that owns the extent.
+float ps_r_render_scale    = 1.0f;
 int   ps_r_mv_debug        = 0;     // r_mv_debug       — false-colour overlay (verify sign/Y-flip/magnitude)
 int   ps_r_mv_trees        = 1;     // r_mv_trees       — tree wind-sway MV overlay on/off (A/B: is the sway MV better than none under DLSS?)
 int   ps_r_mv_grass        = 1;     // r_mv_grass       — grass wind-sway MV overlay on/off (same A/B)
@@ -230,6 +255,38 @@ float ps_r_wind_tree_trunk   = 0.15f; // r_wind_tree_trunk   — trunk anim spee
 float ps_r_wind_tree_flutter = 4.0f;  // r_wind_tree_flutter — crown/leaf flutter amplitude (our extra, SSFX has none)
 float ps_r_wind_tree_crown   = 4.0f;  // r_wind_tree_crown   — height (m) over which leaf flutter fades in from the tree base; 0 = off. (Dead until 2026-07-02 — pushed but never consumed by a shader.) Fixes the "sail": flutter amplitude is ABSOLUTE world metres, so without the gate a 2 m fir's foliage gets the same displacement as a 20 m crown and balloons. Tall crowns (above 4 m) are untouched.
 float ps_r_wind_shadow_dist  = 40.0f; // r_wind_shadow_dist  — radius (m) where tree SHADOWS sway (near=per-frame, far=cached); 0 = all static (cheapest)
+
+// Forward draw distance for trees that an FLOD container ALREADY draws as a
+// billboard past VK::kImposterMinDist (250 m). Until this existed the tree cull
+// had no distance term at all, so out there the full mesh and the imposter both
+// rendered — the same tree twice. Only billboard-backed trees are affected; the
+// rest keep their mesh at any range. 0 = off (restores the old double-draw).
+// Values below kImposterMinDist are floored to it — see TreeFlodCutDist().
+float ps_r_tree_dist         = 250.0f; // r_tree_dist
+
+// Hi-Z occlusion cull for the forward tree set — drops trees fully hidden behind
+// nearer geometry (hills, buildings). Shares the pyramid Pass_World builds from
+// this frame's prepass depth; if that build did not happen, the test self-disables
+// rather than sampling a stale (previous-frame) pyramid.
+int ps_r_tree_hzb            = 1;      // r_tree_hzb
+
+// Range past which tree.frag stops computing its SUBTLE per-pixel terms: the
+// screen-space SSIL bounce, the sky-cube canopy sheen, the dynamic point/spot
+// light walk and the shoreline wetness lookup. The sun, its shadow, ambient, AO,
+// snow and fog are NEVER dropped — those are the terms you can actually see at
+// range, and thinning them would read as trees changing colour as you approach.
+//
+// WHY THE FRAGMENT SHADER IS THE LEVER: the tree pass is FILL-bound, not
+// geometry-bound. That was measured, twice, the hard way — meshlet culling cut
+// caster vertices and moved the pass by zero, and the crown hull's whole point is
+// "no texture fetch / no discard". So what moves Trees is the cost of a fragment
+// that SURVIVED the alpha test, and out at 150 m a crown is a handful of pixels
+// each while there are hundreds of crowns — the far band is where the fill goes.
+//
+// Fades out over the last quarter of the band rather than switching, or the forest
+// grows a visible ring that slides as the camera moves. 0 = off (full shading at
+// every distance, the pre-2026-08-13 behaviour).
+float ps_r_tree_shade_dist   = 100.0f; // r_tree_shade_dist
 // r_vsm_tree_wind — near/far WIND HYBRID (UE5 WPO-disable-distance pattern): trees within
 // r_vsm_tree_wind_dist cast into the DYNAMIC atlas every frame WITH live wind → their
 // shadows sway smoothly (one time slice per frame); farther trees stay rigid in the
@@ -290,7 +347,13 @@ float ps_r_vsm_tree_impostor_scale = 1.0f;
 // 25 m one) and cuts the full-crown re-raster on dirty cache refreshes (sun-move spikes).
 // NOTE: flipping 2 on/off converts the static cache via invalidation circles (≤4/frame)
 // + the moving-sun round-robin — expect the far shadows to transition over ~10-30 s.
-int   ps_r_vsm_tree_hull      = 0;
+// DEFAULT ON since 12-08-2026, together with r_vsm: this is the whole point of
+// making VSM primary. Mode 1 = near DYNAMIC casters beyond _dist swap the alpha-
+// tested crown for the opaque hull — exactly the layer measured at 6.34 ms under
+// the cascades. Mode 2 additionally hulls the far/static foliage; left off for now
+// because flipping it re-converts the static cache over ~10-30 s (see above), so it
+// deserves its own A/B rather than riding in on this change.
+int   ps_r_vsm_tree_hull      = 1;
 float ps_r_vsm_tree_hull_dist = 18.0f;
 // Crown VOXELIZATION (baked at load → level reload to change): 0 = PCA ellipsoid LOBES
 // only (the original "AC Shadows" clusters). >0 bakes TWO things per crown, UE Nanite-
@@ -301,6 +364,15 @@ float ps_r_vsm_tree_hull_dist = 18.0f;
 // DOUBLING per level. The value = level-0 cells across the crown's largest axis
 // (64 ≈ 10–20 cm cubes on a full tree — the "Witcher 4 demo" look; higher = finer).
 int   ps_r_vsm_tree_hull_vox  = 64;
+// r_vsm_tree_vox_cloud — 1 = bake the VISUAL cube cloud even when its viewmode is
+// off, which is what the code did unconditionally. The cloud has exactly one
+// consumer (r_vsm_tree_hull_debug) and that viewmode needs a level reload anyway,
+// so it is now built only when something will read it. Skipping it drops a sweep
+// over every cell of every LOD of every species plus a 26-neighbour crowding
+// lookup per occupied cell — 777k cubes on pripyat_full, all of them discarded.
+// The SHADOW BRICKS out of the same occupancy grid are unaffected: the shipping
+// caster path reads those, and they are still baked.
+int   ps_r_vsm_tree_vox_cloud = 0;
 // LIVE coarseness bias for the voxel viewmode: added to the screen-size-picked LOD level
 // (0 = as graded; negative → force finer/smaller; positive → coarser/bigger). No rebake.
 int   ps_r_vsm_tree_hull_lod  = 0;
@@ -787,9 +859,20 @@ float ps_r_shadow_casc_sun   = 0.05f;
 // Virtual Shadow Maps (vk_vsm) — sun directional clipmap with sparse physical pages:
 // only pages sampled by visible pixels are rendered, and they're cached across
 // frames in world space. Smooth moving-sun shadows (only visible pages re-render)
-// + standing ≈ 0. WIP, default OFF; the cascade path above stays the shipped default
-// until VSM proves out. r_vsm_debug logs per-frame page mark/alloc counts.
-int   ps_r_vsm       = 0;
+// + standing ≈ 0. r_vsm_debug logs per-frame page mark/alloc counts.
+//
+// DEFAULT ON since 12-08-2026 — VSM is now the PRIMARY sun-shadow path. The reason
+// is measured, not aesthetic: under the classic cascades the per-frame near-tree
+// caster layer (Sh/TreeDyn0/1) cost 6.34 ms = 65% of the whole SunShadow budget,
+// and the cascade path has NO caster LOD for trees at all. Every tree caster-LOD
+// mechanism in this renderer (crown hulls, voxel clouds, impostors, meshlet+HZB
+// binning) lives on the VSM side, so the cheap fix and the shadow system are the
+// same decision. See [[vulkan-tree-forward-no-lod-double-draw]].
+// ⚠ The cascade path is NOT dead and must keep working — see the note at
+// `cascRaster` in vk_pass_shadow.cpp: it is the volumetric-fog occluder while the
+// VSM atlas warms up, and the froxel shader falls back to it for pages that are
+// not resident yet.
+int   ps_r_vsm       = 1;
 int   ps_r_vsm_debug = 0;
 // VSM receiver depth-compare bias (normalized clipmap Z, range ~2000 m). Larger =
 // less acne but more light-leak (small/thin caster shadows fade). Live-tunable.
@@ -855,25 +938,55 @@ float ps_r_vsm_ta_motion_floor = 0.30f;
 // (3) DLSS-aware — when r_dlss is on, DLSS ALSO temporally resolves the shadow (baked into
 //     the colour it upscales) → scale the VSM history weight down to avoid a double blur.
 float ps_r_vsm_ta_blend_dlss = 0.6f;
+// (4) NO-PAGE CARRY — weight of the reprojected history on pixels whose clipmap page is not
+//     resident this frame (a scroll-in redraw deferred over r_vsm_dirty_budget). Those used
+//     to resolve LIT, so a burst of deferrals BLINKED the shadows off for a few frames —
+//     visible only while moving, where the motion fade above has already dropped the EMA.
+//     Carrying keeps the (slightly stale) shadow until the page wins its redraw; < 1 so a
+//     page that never returns decays to lit over ~a second. 0 = the old flash-lit behaviour.
+float ps_r_vsm_ta_carry = 0.98f;
 // SOFT SHADOWS (stochastic PCSS) — replaces the fixed 3x3 PCF in vsm_resolve with a
 // blocker search + a filter disc sized by the blocker distance, so a shadow is HARD at
 // the contact point and softens with the caster's height. Both discs are Vogel spirals
 // rotated per pixel and per frame: the error lands as noise, which the temporal resolve
 // right below already exists to average away. r_vsm_soft = filter tap count (0 = the
 // legacy PCF path, byte-identical). See vsm_resolve.comp.glsl for the derivation.
-int   ps_r_vsm_soft        = 12;
-int   ps_r_vsm_soft_search = 8;
-// Sun cone HALF-angle in degrees. The sun's true value is 0.265 (a 0.53 deg disc) — at
-// that width the penumbra is ~1 cm per metre of caster height, i.e. physically right but
-// barely readable. Default is deliberately exaggerated for a cinematic look; drop to
-// 0.265 for the correct one.
-float ps_r_vsm_soft_angle  = 2.0f;
-// Max blocker search distance (m) = the widest penumbra we can resolve (angle * range).
-// A caster further than this softens no further — a graceful clamp, not a dropout.
-float ps_r_vsm_soft_range  = 30.0f;
+// ⭐Tap counts. Were 12/8 while the cone was 2 deg wide and the disc needed the coverage;
+// at the 0.2 deg below the filter disc is ~5 cm and 8/4 already sample it densely. Fewer
+// taps on a SMALLER disc is also cheaper twice over: less arithmetic, and the taps land
+// in the same texture cache lines instead of scattering across a metre.
+int   ps_r_vsm_soft        = 8;
+int   ps_r_vsm_soft_search = 4;
+// Sun cone HALF-angle in degrees — the ONE knob that sets penumbra width, linearly:
+// w = tan(angle) * blockerDistance, capped at tan(angle) * r_vsm_soft_range.
+//
+// ⚠⚠THIS DEFAULT WAS 2.0 AND THE SHADOWS WERE INVISIBLE. USER-REPORTED 19-08, confirmed
+// by A/B in one command (r_vsm_soft 0 → shadows snap back instantly). 2.0 deg is 7.5x the
+// real sun (0.265) and puts the cap at a 1.05 m RADIUS — a 2.1 m wide smear. Worse than
+// the width alone: 12 taps over a 1 m disc sit ~0.6 m apart, so the estimate is mostly
+// noise, and the temporal resolve below (blend 0.9, carry 0.98) grinds that into grey mush.
+// The blocker search averages over a disc of the same radius, so a trunk at 2 m and a
+// crown at 15 m end up in one number.
+//
+// 0.2 is a deliberate artistic choice — very slightly SHARPER than the true sun. It caps
+// the penumbra at ~5 cm with r_vsm_soft_range 15: contact shadows read as crisp, and the
+// softening stays where it belongs (crowns, distant roofs). Raise toward 0.6 for visibly
+// cinematic; 0.265 is the physical value. ⛔Do not go back above ~1.0 without re-checking
+// the tap count — the two are coupled through disc area.
+float ps_r_vsm_soft_angle  = 0.2f;
+// Max blocker search distance (m). Caps the widest penumbra (angle * range) AND sizes the
+// blocker-search disc, so lowering it both bounds the smear and keeps the blocker estimate
+// local. A caster further than this softens no further — a graceful clamp, not a dropout.
+// ⚠NOT a pure quality knob despite what rspec_vk_*.ltx does with it: it multiplies into
+// penumbra WIDTH, so moving it changes the look, not just the cost.
+float ps_r_vsm_soft_range  = 15.0f;
 // Neighbourhood clamp used INSTEAD of r_vsm_ta_clamp while soft is on: the 0.24 above was
 // tuned against deterministic taps and would pin the history to the stochastic noise.
-float ps_r_vsm_soft_clamp  = 0.55f;
+// ⭐Was 0.55, calibrated for the 2 deg disc's noise. On a 5 cm disc that much slack is pure
+// smear — 0.55 on a 0..1 shadow lets the history sit half the range away from the current
+// value without being clipped, which reads as a trail, not a penumbra. Tightening THIS is
+// what actually restored edge definition for the user — more than narrowing the cone did.
+float ps_r_vsm_soft_clamp  = 0.28f;
 // Grass casts VSM shadows (near + L0 only; reads the GPU-driven detail CASTER buffer
 // 1 frame stale). DEFAULT ON since 2026-07-03: the two blockers that parked it are gone —
 // dyn pages now resolve with the low adaptive history weight (r_vsm_ta_blend_dyn kills the
@@ -917,6 +1030,14 @@ float ps_r_vsm_throttle_max    = 2.0f;   // max bias in clipmap levels (2 = up t
 // 7+ ms VSMrender spikes. Excess pages defer (receivers fall back a level for a frame
 // or two via the vsm_resolve walk). Inval circles/refresh are NOT budgeted. 0 = off (A/B).
 int   ps_r_vsm_dirty_budget    = 128;
+// ⭐r_vsm_load_freeze — the sun-shadow update behind the LOAD SCREEN. Measured on a
+// pripyat_full load (18-08): the 60 precache frames cost 40 ms of GPU each, of which
+// VSM mark+atlas+resolve is 21 -- spent on a world nobody can see, for camera
+// directions the precache sweep invents and the player never looks at. Worse, the
+// 8-frame prime that exists so the first VISIBLE frames are not full of dark squares
+// burns behind that same screen. Freezing the update while the load screen is up and
+// re-arming the prime the moment the world appears spends both where they show.
+int   ps_r_vsm_load_freeze     = 1;
 // RECEIVER MASK (UE5 VSM): vsm_mark records per page an 8×8 bitmask of the 16-texel
 // cells visible receivers actually sample; the DYNAMIC tree bins (crown pass + voxel
 // bricks) drop (caster, page) pairs whose footprint misses every sampled cell — culls
@@ -999,6 +1120,14 @@ float ps_r_cluster_fade = 0.25f;
 // meshes stay on the per-mesh path. Takes effect on level (re)load; the DAG
 // disk cache is keyed on this flag.
 int   ps_r_cluster_merge = 1;
+
+// r_cluster_cache — 1 = use the on-disk cluster DAG cache, 0 = always full-rebake.
+// The rebake path is the only one that has ever corrupted memory during a load
+// (see the VisualGuard note in rvk_loader.cpp), and with the cache working it is
+// almost never taken — which also makes it almost impossible to reproduce. This
+// forces it.
+int   ps_r_cluster_cache = 1;
+
 
 // Clustered forward (Forward+, vk_clustered): a compute pass bins the active
 // dynamic lights into a 16x9x24 froxel grid; each fragment iterates only the
@@ -1498,12 +1627,9 @@ int   ps_r_vol_term      = 0;
 int   ps_r_vol_upsample  = 1;
 int   ps_r_vol_ta        = 1;       // temporal accumulation (jitter + reproject prev frame): smooths the froxel grid → clean dense fog
 float ps_r_vol_ta_blend  = 0.92f;   // history weight (EMA): higher = smoother but more ghosting on motion
-// TODO REMOVE (dead detour): the dedicated per-frame fog sun-shadow. Built to fix
-// the "trembling shafts", but the real bug was the temporal reprojection (now fixed),
-// so this is NOT needed. Kept OFF as an A/B toggle; safe to delete later along with
-// vk_shadow GetFogShadow*/ComputeFogShadowVP, the vk_pass_shadow fog render block,
-// vk_volumetrics binding 10 + sampleFogShadow, and gridParams.w mode 2.
-int   ps_r_vol_shadow    = 0;       // [deprecated] 0 = cascade/VSM path (the live one)
+// (r_vol_shadow and its dedicated per-frame fog sun-shadow map were REMOVED
+// 12-08-2026, per the TODO that stood here: the "trembling shafts" it was built for
+// were the temporal reprojection, fixed in vol_inject.)
 int   ps_r_vol_debug     = 0;       // view the raw integrated in-scatter
 
 // Dynamic-light terrain/static occlusion (vk_shadow ground-height map + a per-light
@@ -1740,6 +1866,321 @@ int   ps_r_water_iters  = 1;   // legacy (velocity sim runs 1 step/frame)
 // how much the surface ripples bend the view of the bottom.
 float ps_r_water_murk   = 1.2f;
 float ps_r_water_refract = 0.02f;
+
+// =========================================================================
+// WATER BODIES (vk_pass_water) — level ponds / rivers / flooded basements.
+// A DIFFERENT thing from the r_water_* family above (that one is the parked
+// puddle flow sim); hence the separate `r_wtr_*` prefix. Before this pass
+// existed, `effects\water` geometry rode the opaque vert-lit path and — with
+// zero baked vertex light and zero baked sky access on a water polygon —
+// rendered pure BLACK on every level.
+// =========================================================================
+int   ps_r_wtr        = 1;      // master enable
+int   ps_r_wtr_debug  = 0;      // 1 flat magenta (does the pass run), 2 column depth, 3 wave normal, 4 alpha, 5 Fresnel
+// Wave SLOPE amplitude (not height — the surface is a per-pixel normal field).
+// Scaled at runtime by wind velocity and the weather's own m_fWaterIntensity.
+float ps_r_wtr_wave   = 0.26f;
+// What a DEAD CALM still leaves of that wave. wind_velocity is zero for most of
+// this game's day, and the old implicit floor (0.35) took 0.19 m down to 0.071 —
+// measured, in the [VK Water] wind line. Water is never actually glass.
+float ps_r_wtr_calm   = 0.75f;
+float ps_r_wtr_scale  = 0.22f;  // base wave frequency (1/m) — lower = longer swells
+float ps_r_wtr_speed  = 1.0f;   // dispersion speed multiplier
+// Extinction per metre of water column (Beer-Lambert). The single biggest
+// "which game is this" knob: 0.2 = a clear mountain lake, 0.9 = the Zone's
+// green-brown murk where the bottom vanishes at knee depth.
+float ps_r_wtr_murk   = 0.9f;
+float ps_r_wtr_refl   = 1.0f;   // sky reflection strength
+float ps_r_wtr_glint  = 1.0f;   // sun glitter strength
+float ps_r_wtr_detail = 60.0f;  // distance (m) over which the short chop fades out (anti-shimmer LOD)
+float ps_r_wtr_rough  = 0.045f; // base specular roughness (grows with distance in the shader)
+// Murk colour — what the body scatters back. Green-brown by default: the
+// standing water of the Zone, not a swimming pool.
+Fvector3 ps_r_wtr_color{ 0.085f, 0.135f, 0.105f };
+// SHORELINE. Absorption alone leaves the water/terrain seam a hard cut, because
+// Fresnel puts a floor under the alpha (at a grazing angle even a millimetre of
+// water stays a mirror). r_wtr_shore fades the whole layer out over the last
+// centimetres of depth so the edge dissolves; the foam band then hides what is
+// left of it — a shore reads as a shore because of the scum line.
+float ps_r_wtr_shore  = 0.22f;   // fade-out depth (m)
+// SWASH: how far the waterline rides up and down with the passing wave. This is
+// what makes the water WASH OVER the sand instead of ending at a painted line.
+// A multiple of the wave height, so a calm pond barely moves and a rough one
+// visibly climbs the beach.
+// SWASH — the run-up. ⚠ These are METRES now, not a gain on the swell height.
+// The old meaning multiplied the wave and was added to a DEPTH to widen an alpha
+// fade, so 2.2 turned a 19 cm wave into 42 cm of "water" standing on the bank with
+// nothing on screen to account for it. The surge is its own function now (front,
+// fast up / slow drain, in sets) — see waterSwash in water_common.glsl.
+// ⛔ PARKED 05-08 with the whitewater, same call: the shore break is OFF by
+// default and the waterline is static again. Everything below still works and is
+// two numbers away — r_wtr_surf_h 0.30 brings the arriving crest back, and this
+// one the tongue that runs up the sand.
+float ps_r_wtr_swash  = 0.0f;    // metres the biggest surges climb above the still line
+float ps_r_wtr_swash_t = 6.0f;   // seconds between arriving crests
+// SHORE BREAK (water_shore.glsl). Phased by the still water DEPTH, not by the
+// wind — which is what makes a crest arrive parallel to the beach in every bay
+// without a shoreline being authored anywhere. Iso-depth lines are the shoreline.
+//
+// ⛔ PARKED 04-08 at the author's call: "пока что решил отключить, может потом
+// доделаю". The whitewater never looked right on this content — the run-up tongue
+// reads as white sheeting over grass rather than as surf, and the last round left
+// it plausible but not good. The MOTION it drives is kept (the waterline still
+// arrives and drains, and the wetness still follows it); only the white is off.
+// Turn it back on with r_wtr_surf 1 — nothing else needs changing.
+float ps_r_wtr_surf     = 0.0f;   // whitewater strength
+float ps_r_wtr_surf_h   = 0.0f;   // offshore height of the arriving wave (m) — PARKED
+float ps_r_wtr_surf_len = 11.0f;  // metres between crests
+// ⚠ Metres of water in the RUN-UP SHEET. A swash tongue is a couple of
+// centimetres deep and you see the sand through it; the run-up HEIGHT is how far
+// it climbs, not how much water is standing there. Feeding the height into the
+// depth fade put a 45 cm slab of opaque water on the bank with a vertical face.
+float ps_r_wtr_film     = 0.05f;
+// Foam the backwash leaves ON THE GROUND once the sheet has drained off it. Costs
+// no extra channel: the wetness map's decay already carries "how long ago", and an
+// exponent rescales that clock (see shoreFoam).
+//
+// ⛔ PARKED 04-08 with r_wtr_surf, same call and same reason. The mechanism is
+// sound and cheap; what it paints on this content is not. r_wtr_foam_land 0.55
+// brings it back.
+float ps_r_wtr_foam_land = 0.0f;
+float ps_r_wtr_foam_life = 2.5f;   // seconds it takes to dissolve
+float ps_r_wtr_foam   = 0.45f;   // foam strength (0 = off)
+float ps_r_wtr_foam_w = 0.45f;   // foam band depth (m)
+// MICRO-RIPPLE: short capillary waves, always present regardless of weather.
+// The swell dies with the wind; this does not — without it a windless hour
+// renders a mirror-flat sheet. Fades out over the first ~25 m (below a pixel
+// past that, and pure shimmer if kept).
+float ps_r_wtr_micro  = 0.012f;
+// How much the weather's wind moves the SWELL. 1 = calm ~0.45x, storm ~2.6x;
+// 0 = ignore the wind and always use r_wtr_wave as-is.
+float ps_r_wtr_wind   = 1.0f;
+// FETCH — how literally to take the SIZE of each body of water. The wave field
+// is a function of world position, so without this every puddle, cellar and
+// water butt got the same 28-metre open-water swell, complete with run-up and
+// a shoreline foam line. A wave needs room: octaves whose wavelength does not
+// fit in the surface's own bounding box several times over are dropped, which
+// leaves a small pool with nothing but capillary ripple and the interactive sim.
+// 1 = take the box at face value; >1 = pretend pools are larger (rougher);
+// 0 = off, every pool is open sea again (the old look, for comparison).
+float ps_r_wtr_fetch  = 1.0f;
+// ⚠ ...AND "the surface's own bounding box" is where that idea leaked. Level
+// water is not one mesh per pool: Cordon is ONE water visual, 1952 triangles,
+// 79.8 x 148.2 m, so the fetch above came out as 108 m for every drop of water on
+// the level — including the two-metre circle inside a well in the newbie village.
+// Measured there with r_wtr_audit (16-08): pool 2.9 m2, span 2.0 x 1.9 m, still
+// sheet at y=-19.98, and the wetness map holding marks up to -19.55. The drawn
+// surface was climbing 37 cm above its own level in 22 cm of water — over the
+// stone ring, out into the yard as a floating square, and soaking a ring of dirt
+// that dried and re-wetted with every crest.
+//
+// This gates the fix: a compute pass (water_fetch.comp) measures each column's
+// own body of water out of the POOL MASK, which knows where water ends at 12.5 cm,
+// and the consumers take the smaller of that and the box. It can only ever say
+// SMALLER — anything reaching the search radius is written as "no answer" and
+// keeps the box — so open water is untouched by construction.
+// 0 = back to the bounding box alone (the A/B).
+int   ps_r_wtr_fetch_local = 1;
+// SHELTER — the other half of the same problem: wind waves need WIND, and there
+// is none under a roof. Queried from the sky-occlusion map, hemispherically (a
+// pond under a pipe rack still catches wind from the sides, so a straight-up
+// test would stamp dead-calm blobs under every overhead object). Scales the
+// swell only: sheltered water keeps its capillary ripple and still takes rings
+// from a footstep, which is what standing water indoors actually looks like.
+// 0 = a roof does nothing, the old look.
+float ps_r_wtr_shelter = 1.0f;
+// Murk multiplier for sheltered water. A pond is flushed by rain, inflow and
+// wind mixing and stays comparatively clear; a flooded cellar has none of that,
+// so the silt stays in suspension and the bottom goes dim within centimetres.
+// Multiplies r_wtr_murk, scaled by the same shelter query. 1 = indoor water is
+// as clear as a pond (the old look).
+float ps_r_wtr_murk_still = 7.0f;
+
+// ---- SPECTRAL WAVES (vk_water_fft) ----------------------------------------
+// Tessendorf's FFT ocean: the sea built in the Fourier domain from the Phillips
+// spectrum, inverse-transformed to a displacement map on the GPU every frame.
+// It exists for ONE thing the nine-octave analytic swell cannot do at any
+// setting — the HORIZONTAL displacement that makes a crest sharp. A sum of
+// sines displaced along Y has round tops however tall you make it.
+int   ps_r_wtr_fft        = 1;
+// Largest cascade's tile, metres, and the shrink to the next one. 250 / 0.175
+// gives 250 m, 43.8 m and 7.7 m — each carrying only the band between its own
+// size and the next one down, so nothing is represented twice and the small
+// tile's repeat never shows.
+float ps_r_wtr_fft_size   = 250.f;
+float ps_r_wtr_fft_ratio  = 0.175f;
+// ⚠ A BASE wind speed in m/s, NOT a scale on the weather's. Measured, not
+// assumed: wind_velocity in this content is 0 for most of the day, and the
+// analytic swell was effectively dead for exactly that reason until it was
+// given a floor. The weather modulates around this (0.65x .. 1.55x); it cannot
+// zero it. This is the main knob for "how rough is the sea".
+// ⭐ 5 m/s, and the number was MEASURED, not picked. The Phillips peak sits at
+// lambda = 2*pi*sqrt(2)*V^2/g, so the wind speed is really a knob for WAVE
+// LENGTH: at 7 m/s the peak is a 44 m swell, which on a 60 m pond is not a wave
+// at all, it is the water level tilting. At 5 m/s the peak lands at ~23 m and
+// the 7.7..44 m cascade carries 7x the energy of the long one — waves you can
+// see across a pond. Height is then set independently by the amplitude below,
+// which is exactly why Phillips has both knobs.
+float ps_r_wtr_fft_wind   = 5.f;
+// Phillips A, in units of 1e-6. 28 puts the significant wave height at 0.29 m in
+// dead calm and 0.75 m in a storm — measured by summing the spectrum over the
+// same three cascade grids the shader uses. It has to be this large BECAUSE the
+// wind was lowered: energy in this spectrum goes as roughly V^4, so moving the
+// peak down to a useful wavelength costs a factor of ~30 in height.
+float ps_r_wtr_fft_amp    = 28.f;
+float ps_r_wtr_fft_chop   = 1.1f;    // lambda: how far a crest pulls water in sideways
+float ps_r_wtr_fft_depth  = 60.f;    // sea depth for the dispersion relation (m)
+// The whole field repeats EXACTLY this often: every wave's frequency is snapped
+// to a multiple of 2*pi/repeat, so nothing drifts out of phase over a long
+// session and the sea at minute 40 is the sea at minute 0.
+float ps_r_wtr_fft_repeat = 200.f;
+float ps_r_wtr_fft_small  = 0.06f;   // capillary cutoff (m) — kills the sub-centimetre noise
+float ps_r_wtr_fft_dir    = 2.f;     // how sharply the spectrum favours the wind direction
+float ps_r_wtr_fft_gain   = 1.f;     // how much of the transformed field to use (0 = none)
+float ps_r_wtr_fft_foam   = 0.7f;    // whitewater from the Jacobian (folded-over water)
+// The body span at which a cascade reaches full strength — the spectral field is
+// gated per band by the SAME fit test the analytic octaves use, so a 250 m
+// cascade is simply absent from a flooded cellar while the 8 m one still lives
+// there. This is what stops an open-sea model from putting surf in a basement.
+float ps_r_wtr_fft_fetch  = 60.f;
+float ps_r_wtr_fft_slope  = 1.f;     // shading response, independent of the displacement
+
+// ---- INTERACTIVE RIPPLES (vk_water_ripple) --------------------------------
+// A 2D wave-equation heightfield on a tile that follows the camera. The half of
+// "water" no analytic wave can fake: a sum of sines cannot propagate, reflect,
+// interfere — or REACT. Footsteps and rain drops write into this field and the
+// waves travel outward on their own.
+int   ps_r_wtr_sim        = 1;
+float ps_r_wtr_sim_size   = 64.f;    // tile edge (m); 512 texels -> 12.5 cm each
+// Velocity retention PER STEP at 60 Hz — the LIFETIME of a ripple. Damping
+// multiplies velocity, so an oscillating wave's amplitude decays as damp^30 per
+// second: 0.995 leaves 86% after a second, 0.97 only 40%.
+//
+// This knob spent two days doing a job that was never its own. "A splash in my
+// puddle shows up in the far ones" was fought here, by making waves die before
+// they could travel — and it worked, at the price of the thing the sim exists
+// for: at 0.97 a footstep ring was gone before the eye caught it. The two
+// demands are not reconcilable on one dial, because they are not the same
+// question. Lifetime is time; a puddle boundary is SPACE.
+//
+// The boundary now lives where it belongs — r_wtr_sim_lid, which asks the
+// collision model which water is roofed by a floor and therefore is not a puddle
+// at all. With the wave properly confined, lifetime is free to be generous
+// again, which is what this value is: rings that spread, reflect off the rim and
+// take a few seconds to fade.
+float ps_r_wtr_sim_damp   = 0.995f;
+float ps_r_wtr_sim_speed  = 0.35f;   // stiffness; the explicit scheme blows up past 0.5
+// POOL BOUNDARIES. The sim is one heightfield over a 64 m tile, so without a mask
+// of where the water actually IS, a splash in one puddle propagates across the dry
+// floor and surfaces in every other puddle in range. The mask (drawn each frame
+// from the water meshes, straight down) turns each body of water into its own
+// pool with reflecting rims. 0 = the old unbounded field.
+int   ps_r_wtr_sim_pools  = 1;
+// LID SOURCE. The mask says where the water IS; what separates puddles is where
+// the water can be SEEN, and that is decided by the FLOORS above it. Level water
+// is a couple of huge sheets that dive under the buildings, so a cellar's
+// "puddles" are one slab surfacing through an uneven floor — connected, and a
+// wave crossing between them is correct physics that no mask may forbid.
+//
+// The rasterized lid was meant to catch this and cannot: after pool compaction
+// the statics are drawn only by the GPU-driven paths, and the CPU queue it walks
+// held five leftovers ("lid map: 5 static(s)"). 1 = ask the COLLISION MODEL
+// instead — one short ray up from the surface per texel, immune to which path
+// draws the world. 0 = the old rasterizer.
+int   ps_r_wtr_sim_lid      = 1;
+// Ray budget per frame. A CDB trace is a couple of microseconds, so this is the
+// dial between "the lid lags behind a sprint" and "filling it hitches the frame".
+int   ps_r_wtr_sim_lid_rays = 1500;
+// SHALLOW WATER. The same sweep that finds the floor above also finds the bottom
+// below, which gives the water COLUMN — and a wave's speed is sqrt(g*h). Letting
+// the stiffness follow the depth makes a ripple slow down as the bottom rises,
+// turn to face the shore and bunch up on it, none of which a constant-speed field
+// can do. It also retires shoreAbsorb: a wave stops at the rim because it runs
+// out of depth, not because a multiplier was told to stop it.
+int   ps_r_wtr_sim_depth     = 1;
+// Depth at which the wave runs at the full r_wtr_sim_speed. Not a physical
+// constant: the grid's CFL limit caps the absolute speed well below sqrt(g*h) at
+// this texel size, so what is reproduced is the SHAPE of the relationship —
+// shallow is slower than deep by the right ratio — not the metres per second.
+// Set it from the profile of the BOTTOM, not from the mean: the lid reports 74%
+// of open water under 20 cm on this content, so a mean of 0.36 m (dragged up by
+// a deep minority) still ran three quarters of the pool slowed down. This is
+// puddle scale. Everything at or above it runs at full speed; below it the wave
+// shoals — so the value is really "where does the rim begin".
+float ps_r_wtr_sim_depth_ref = 0.15f;
+float ps_r_wtr_sim_bed       = 0.99f;   // per-step damping at zero depth (1 = none)
+// SHORE ABSORPTION, applied once per dry side of a texel per step. A rim that
+// merely reflects loses nothing: one splash bounces around the pool until the
+// whole sheet is standing waves — and since a cellar's "puddles" are one 20 x 13 m
+// slab surfacing in several places, that meant jumping in one of them rippled all
+// of them. Bleeding energy at the shore keeps the disturbance where it was made.
+// 1 = the old reflecting rim.
+float ps_r_wtr_sim_shore  = 0.90f;
+// REACH: metres of full-strength ripple around the player, fading to nothing at
+// twice that. The audit proved the far "puddles" are the SAME body of water as
+// the near one — a cellar floor is one 20 x 13 m slab surfacing in patches — so a
+// wave reaching them is physically correct and no boundary test can forbid it.
+// The eye still expects a splash to stay where it was made, so the disturbance is
+// bounded in space. 0 = unbounded (waves cross the whole sheet again).
+float ps_r_wtr_sim_reach  = 6.0f;
+float ps_r_wtr_sim_slope  = 1.0f;    // how much of the sim reaches the NORMAL
+float ps_r_wtr_sim_height = 1.0f;    // ...and the geometric DISPLACEMENT
+float ps_r_wtr_step       = 0.075f;  // dip a footstep punches into the surface (m)
+// BOW WAVE, as a multiple of the footstep dip. A body wading does not only make
+// holes, it displaces water forward — and every source in this sim was a
+// symmetric dip, so nothing was ever pushed. Scales with how fast you are moving.
+// 0 = off (waves only where the feet land, the old behaviour).
+float ps_r_wtr_bow        = 1.2f;
+// SHORE WETNESS. Water that touches a bank, a wall or a heap of rubble leaves it
+// dark and glossy, and it dries afterwards — until now every wet surface in this
+// renderer was wet because of RAIN, so a river ran past bone-dry ground. The
+// tile remembers CONTACT (see vk_water_ripple), which is what lets a receding
+// waterline leave a wet strip that fades instead of switching off.
+float ps_r_wtr_wet      = 1.0f;    // strength (0 = off)
+float ps_r_wtr_wet_dry  = 25.0f;   // seconds from soaked to dry
+// CAPILLARY RISE: metres of damp above the line the water actually TOUCHED.
+//
+// ⚠ It used to mean something much larger and much cruder — a flat band added to
+// the still waterline everywhere the sheet reached in plan view, which is a
+// contour line, not a shore: at 0.35 on a 1:10 beach it painted three and a half
+// metres of sand wet that no wave had been near, from the first frame, for ever.
+// The run-up strip is now measured (the wave that is drawn against the ground
+// that is there), so this went back to being what it says: the few centimetres
+// that soak UP a stem, a stone or a bank above the water's own line.
+float ps_r_wtr_wet_lift = 0.06f;
+
+// ---- TESSELLATION ---------------------------------------------------------
+// Stock water meshes are 4-7 METRES per triangle (see the [VK Water] census),
+// so there is nothing to displace until the surface is subdivided. tessMax is
+// spent quadratically toward the camera; past tess_far the surface is flat and
+// the wave is a normal again.
+// CEILING on the subdivision of one edge, not the factor itself — water.tesc
+// budgets by metres of surface per segment now, because a factor means something
+// quite different on a 2 m edge and on the 200 m ones this game's sheets have.
+// 64 is the hardware limit; below ~32 the long swell stops resolving at all.
+float ps_r_wtr_tess      = 64.f;
+float ps_r_wtr_tess_near = 8.f;
+float ps_r_wtr_tess_far  = 70.f;
+float ps_r_wtr_disp      = 1.0f;     // metres of displacement per unit wave height
+// NEAR-FIELD GRID: quads per side of the dense camera-locked water mesh (0 = off,
+// the level's own polygons only). ⚠ This is the piece that makes a wave possible
+// at all: stock water is a handful of triangles up to 200 m across, and hardware
+// tessellation caps at 64 per edge, i.e. ~3 m per segment — coarser than the waves
+// themselves. 128 over the 64 m ripple tile is 50 cm a quad.
+int   ps_r_wtr_grid      = 128;
+
+// ---- REFRACTION + CAUSTICS ------------------------------------------------
+// Until now the bottom arrived as the destination of the blend: correct, but a
+// blend cannot BEND what is behind it, so the riverbed sat dead straight under
+// a rippling surface. The pass now takes a half-res copy of the scene and
+// samples it itself — which also buys per-channel absorption (red dies first)
+// and a place to put the caustics.
+float ps_r_wtr_refract   = 0.035f;   // UV offset per unit surface slope
+// Caustics: the sunlight web on the bottom. Computed from the DIVERGENCE of the
+// same wave field (no texture, no photon pass) — where the surface is concave
+// the refracted rays bunch up.
+float ps_r_wtr_caustic   = 0.55f;
+float ps_r_wtr_caustic_p = 1.6f;     // exponent — higher = thinner, sharper web
 
 // Bent-normal specular occlusion of wet/puddle sky reflections (UE-style). 0 = off,
 // 1 = full; fades reflections in crevices / under overhangs where sky can't reach.
@@ -1992,6 +2433,175 @@ int psTextureLOD = 0;
 int ps_r_txstream          = 1;
 int ps_r_txstream_budget   = 0;
 int ps_r_txstream_headroom = 512;
+//  r_txstream_loadcap  — LOAD TIME, not VRAM: the largest base dimension a
+//                        budget-fit texture may arrive at DURING a level load
+//                        (0 = off). The existing budget-fit only demotes when the
+//                        card is full, so on an 8 GB card a level pulls in every
+//                        texture at full res: measured on pripyat_full 17-08,
+//                        2458 files = 3558 MB read + 2556 MB uploaded = 8.4 s of a
+//                        21 s load. Mip 0 alone is ~3/4 of a chain's bytes, so
+//                        arriving coarse and letting the feedback-driven promote
+//                        path (StreamStep) sharpen what is actually on screen buys
+//                        most of that back. Quality heals in seconds of play.
+// r_tex_prefetch — level texture prefetch (VK::TexPrefetch, vk_texture.cpp).
+// The loader opens ~2460 .dds one at a time; on pripyat_full that is 2860 of the
+// 6565 ms texture phase spent inside FS.r_open on ONE thread. The set is known
+// as soon as the level shader table is parsed, so workers open them ahead.
+// 0 = old serial behaviour (kept for A/B — the walk itself is unchanged).
+// r_tex_prefetch_mb caps the bytes parked ahead of the walk; workers stall at the
+// cap and resume as the walk consumes. Floor 64 MB.
+// r_upload_wc_copy — 1 = streaming (non-temporal) stores when filling the upload
+// staging ring, 0 = plain CRT memcpy. The ring is mapped WRITE-COMBINING, where
+// `rep movsb` measured 1.97 GB/s and made the staging copy the single largest item
+// left in a level load's texture phase. Kept as a switch because it is a CPU-level
+// micro-optimisation whose payoff is hardware-dependent — A/B it, don't assume.
+int ps_r_upload_wc_copy = 1;
+
+// r_upload_cached — 1 = allocate the upload staging ring in HOST_CACHED memory
+// instead of the usual write-combined one. Read ONCE, when the command manager
+// builds the ring, so it only takes effect from user.ltx / a restart.
+int ps_r_upload_cached = 0;
+
+// r_upload_copy_threads — extra threads that help fill the staging ring, 0 = the
+// caller copies alone. Only pieces of 256 KB and up are split. Measured on
+// pripyat_full's 1869 MB of geometry: 2 / 4 / 8 helpers all land within noise of
+// each other (432 / 406 / 420 ms) because the copy is bound by its SOURCE, not by
+// the writes. Helpers idle on a condition variable, so this costs nothing outside
+// a load.
+int ps_r_upload_copy_threads = 4;
+
+// r_geom_prefault — diagnostic for the geometry stage: 0 = off, 1 = touch every
+// page of the mapped window before copying it, 2 = PrefetchVirtualMemory over the
+// window. Both cost the same faults, but they time them apart from the copy.
+int ps_r_geom_prefault = 0;
+
+// r_geom_lead — 1 = stage level.geom out of the texture prefetch's whole-file view
+// (its pages are being faulted in by sixteen workers), 0 = out of the loader's own
+// sliding window, which faults every 4 KB on the loading thread. Here to A/B the
+// two in one binary; there is no reason to run with it off.
+int ps_r_geom_lead = 1;
+
+// r_vis_warm — 1 = sixteen workers fault the visuals blob in alongside the walk
+// that reads it (it is a span of the mapped level file, so every 4 KB otherwise
+// costs the loading thread a fault). Interleaved pairs: visual phase -46/-37/-86 ms.
+int ps_r_vis_warm = 1;
+
+// r_vis_walk_split — 1 = rdtsc split of that loop (open_chunk / header / Create+Load
+// / close). Four counters per visual, so it is off unless asked for.
+int ps_r_vis_walk_split = 0;
+
+// r_vis_triage — 1 = the per-visual glass/cabinet/glow probes in LoadTexture. They
+// answered "which shader does this pane use" once and have cost a lowercased heap
+// string per visual ever since. Off by default; turn it on when a NEW routing
+// question needs the map.
+int ps_r_vis_triage = 0;
+
+// r_vis_guard — 1 = the between-phases visual integrity sweep (VisualGuard). It
+// was written to name the phase that corrupted Visuals[] during the repeat-load
+// heap bug; that bug is fixed (the quadtree pool freed an uninitialized slot), so
+// what is left is a diagnostic that dereferences 450k scattered visuals SIXTEEN
+// times per load — every checkpoint is two passes over 3.6 MB of pointers plus a
+// cache miss per object. Off by default; turn it on when Visuals[] is suspect
+// again, and the sweep will name the first phase that broke it.
+int ps_r_vis_guard = 0;
+
+// r_tex_repack_threads — helpers for the BC3->BC4 lightmap gather (0 = the loading
+// thread alone). A level's hemi maps are 4096^2, and the gather is 16 bytes in / 8
+// out per block with nothing to synchronise, so it splits cleanly. Uses the
+// persistent staging-ring pool, not fresh threads per texture.
+// r_tex_prefetch_lmaps_first -- 1 = the prefetch parks the level's lightmaps
+// before the 2400 diffuse bases. The walk needs a lightmap in its first
+// milliseconds and used to miss all 27 of them (432 MB read twice).
+int ps_r_tex_prefetch_lmaps_first = 1;
+
+// r_prewarm_async -- 1 = the WET/SNOW weather pipeline variants are compiled on a
+// worker thread instead of one per precache frame, and the precache stops waiting
+// for them. Measured on pripyat_full: 28 precache frames become the 12-frame floor
+// (~12 ms a frame of load screen spent compiling variants nothing draws until it
+// rains). 0 = the old 1/frame pace on the render thread, for the A/B.
+int ps_r_prewarm_async = 1;
+
+// r_thm_cache -- 1 = remember what a texture's .thm said. The file is opened and
+// parsed TWICE per material: once by the prefetch worker expanding the base into
+// its file set, once by the walk creating the material. Keyed by base name + level
+// tag (a .thm can resolve level-locally). 0 = the old re-read, for the A/B.
+int ps_r_thm_cache = 1;
+
+// r_clpage_map -- 1 = the pinned cluster pages are uploaded straight out of a
+// mapping of the page cache file, with the pages faulted in by workers first.
+// The old path fseek/fread 336 MB of a 2.2 GB file into a scratch buffer on the
+// loading thread and then copied that into staging: two copies and a serial read.
+// 0 = the fread path, for the A/B.
+int ps_r_clpage_map = 1;
+
+// r_tex_residency_threads — helpers that read a residency plan's .dds files before
+// the images are built (0 = the old serial read inside each build). The tree path
+// raises 42 materials to a 1024 floor in one batch and measured read 45 of its
+// 57 ms: 42 archive entries LZO-decompressed one after another on the thread the
+// level is waiting on. The image create + staging copy stay serial.
+int ps_r_tex_residency_threads = 8;
+
+int ps_r_tex_repack_threads = 4;
+
+// r_tex_materialize - 1 = a prefetch worker takes a texture all the way (read,
+// parse, repack, image, upload, publish into the cache the walk looks in) instead
+// of reading the file and parking the bytes. Parking only ever moved the READ off
+// the loading thread: of the 451 ms the walk spent on textures, the read was 59 and
+// the other 392 (repack, image creation, staging copy) stayed on the one thread the
+// level waits for, while sixteen workers sat blocked on the parking budget.
+// 0 = the old park-and-hand-over path; 1 = build from the first job; 2 = read and
+// park during the geometry stage, then build once the walk starts.
+//
+// ⛔ DEFAULT 0 — MEASURED LOSS, kept as the instrument that proved it. The walk's
+// texture time does fall (538 -> 105 ms), and the load gets LONGER anyway:
+//   mode 1: geometry 352 -> 832 ms. Texture uploads mixed into the geometry stage
+//           drag the shared ring from 18.5 to 8.4 GB/s; geometry hands back every
+//           millisecond the walk saved (3182 vs 2972 ms total).
+//   mode 2: the walk keeps its texture time (596-656 vs 538). Sixteen workers each
+//           fill the ring single-file (one upload mutex) while the machine is busy,
+//           and the ring copy falls to 6.4 GB/s -- see RingCopy in vk_command_buffer.
+// The lesson: that 538 ms is not CPU work waiting for cores, it is a page-fault-
+// bound copy into one ring that ALREADY uses every core, one copy at a time.
+// What is still worth trying is the other split: workers parse/repack/create, the
+// walk keeps the upload (its measured ceiling is the 258 ms that is not upload).
+int ps_r_tex_materialize = 0;
+
+// r_tex_mat_threads - how many workers may be BUILDING a texture at once. The
+// pool is sixteen because reading is what it was sized for; building ends in the
+// upload ring, which is one mutex, and a machine with every core busy is a bad
+// place to fill it. 0 = no limit.
+int ps_r_tex_mat_threads = 0;
+
+// r_tex_repack_scratch — 1 = the gather writes into one buffer per thread, grown to
+// the largest image and kept, instead of a fresh xr_malloc per texture. Half a
+// gigabyte of destination per load is otherwise faulted in a page at a time and
+// handed straight back.
+int ps_r_tex_repack_scratch = 0;
+
+// r_tex_repack_verify — 1 = rebuild every gather with the plain per-block copy and
+// compare the two buffers. Doubles the repack cost, so it is a proof run, not a
+// setting.
+int ps_r_tex_repack_verify = 0;
+
+
+int ps_r_tex_prefetch    = 1;
+int ps_r_tex_prefetch_mb = 1024;
+
+int ps_r_txstream_loadcap  = 0;
+
+// r_txstream_plan_live - 1 restores the pre-19-08 load-time budget fit, which asked
+// the driver "how full is the card" once per texture. That answer is only right if
+// textures are created AFTER everything else the level allocates; it is what the
+// serial walk happened to do. Kept as the A/B lever for the arithmetic that replaced
+// it (base at load start + level.geom's share + what the plan has already committed).
+int ps_r_txstream_plan_live = 0;
+
+// r_vram_small_images - 1 routes sub-1MB images into the 8 MB-block small pools,
+// which costs a driver size probe (vkGetDeviceImageMemoryRequirements) in front of
+// EVERY non-dedicated image allocation. 0 skips both. The pools exist because small
+// long-lived allocations pinned 64 MB blocks (1740 MB of unreleasable slack on
+// Pripyat, 18-07); the knob is here to price the probe against that.
+int ps_r_vram_small_images = 1;
 //  r_txstream_reserve  — MB of device VRAM that must be FREE after a level finishes
 //                        loading. If less is free, the streamer trims the largest
 //                        world textures (at the load-end idle point) until it is.
@@ -2109,22 +2719,46 @@ class CCC_Preset : public CCC_Token
 public:
     CCC_Preset(LPCSTR N, u32* V, const xr_token* T) : CCC_Token(N, V, T){};
 
+    // ⚠⚠THE OLD FILE NAMES WERE THE PROBLEM, not the mechanism. `rspec_*.ltx`
+    // ships inside the mod's archives and was written for the DX renderer: the
+    // bulk of what it sets (r2_sun_quality, r__smap_cascade0_size,
+    // r4_enable_tessellation, r2_volumetric_lights …) is not read by a single
+    // line of Layers/xrRenderVulkan, so picking a preset moved a page of
+    // settings and changed no pixels — the same placebo the rest of this screen
+    // suffered from. A NEW name (rspec_vk_*) cannot be shadowed by an archive
+    // and says which renderer it belongs to.
+    //
+    // ⭐The file is content on purpose: what "High" means is a judgement about
+    // this renderer's costs, and it will keep moving. Editing five text files
+    // beats editing five arrays and rebuilding.
     virtual void Execute(LPCSTR args)
     {
         CCC_Token::Execute(args);
-        string_path _cfg;
-        string_path cmd;
+        string_path leaf;
 
         switch (*value)
         {
-        case 0: xr_strcpy(_cfg, "rspec_minimum.ltx"); break;
-        case 1: xr_strcpy(_cfg, "rspec_low.ltx"); break;
-        case 2: xr_strcpy(_cfg, "rspec_default.ltx"); break;
-        case 3: xr_strcpy(_cfg, "rspec_high.ltx"); break;
-        case 4: xr_strcpy(_cfg, "rspec_extreme.ltx"); break;
+        case 0: xr_strcpy(leaf, "rspec_vk_minimum.ltx"); break;
+        case 1: xr_strcpy(leaf, "rspec_vk_low.ltx"); break;
+        case 2: xr_strcpy(leaf, "rspec_vk_default.ltx"); break;
+        case 3: xr_strcpy(leaf, "rspec_vk_high.ltx"); break;
+        case 4: xr_strcpy(leaf, "rspec_vk_extreme.ltx"); break;
+        default: return;
         }
-        FS.update_path(_cfg, fsgame::game_configs, _cfg);
+
+        string_path _cfg;
+        FS.update_path(_cfg, fsgame::game_configs, leaf);
+        // ⚠A warning, not a refusal: `exist` answers from the file registry and
+        // the path here is absolute, so a false negative is possible — and
+        // refusing on it would break a preset that is actually there. cfg_load
+        // is harmless on a missing file (it opens nothing); this line is what
+        // explains the silence afterwards.
+        if (!FS.exist(_cfg))
+            Msg("! [VK preset] '%s' not found by the file registry — if nothing changes, that is why", _cfg);
+
+        string_path cmd;
         strconcat(sizeof(cmd), cmd, "cfg_load", " ", _cfg);
+        Msg("~ [VK preset] %s", leaf);
         Console->Execute(cmd);
     }
 };
@@ -2164,6 +2798,98 @@ class CCC_DumpResources : public IConsole_Command
 public:
     CCC_DumpResources(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; };
     virtual void Execute(LPCSTR /*args*/) { Msg("[VK] dump_resources — not implemented"); }
+};
+
+// Screenshot ON DEMAND. The renderer has always been able to capture the
+// swapchain (CRender::Screenshot, writes $screenshots$/ss_*.tga) but the only
+// trigger was a KEY BIND — useless to a scripted run, which has no keyboard.
+// With this, a harness driving the client through XROS_CLIENT_CONSOLE can look
+// at what it just built. `vk_shot <name>` writes that exact path instead.
+// Throw a stone in the pond from the console: a disturbance a few metres in
+// front of the camera. The one-line way to see whether the ripple sim is alive
+// without wading into water first.
+// r_wtr_audit — read the ripple mask + field back and report the CONNECTED
+// bodies of water around the camera. Answers "are these puddles one pool joined
+// off-screen?", which staring at the water cannot.
+class CCC_WtrAudit : public IConsole_Command
+{
+public:
+    CCC_WtrAudit(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; };
+    virtual void Execute(LPCSTR) { VK::WaterRipple::RequestAudit(); Msg("[VK Ripple] audit requested"); }
+};
+
+class CCC_WtrDrop : public IConsole_Command
+{
+public:
+    CCC_WtrDrop(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; };
+    virtual void Execute(LPCSTR args)
+    {
+        float dist = 4.f, str = 0.25f;
+        if (args && args[0]) sscanf_s(args, "%f %f", &dist, &str);
+        Fvector d = Device.vCameraDirection; d.y = 0.f;
+        if (d.square_magnitude() > 1e-4f) d.normalize(); else d.set(0.f, 0.f, 1.f);
+        const Fvector& c = Device.vCameraPosition;
+        // A deliberate probe: it should land wherever you aim it, so it opts out
+        // of the source-height test the same way rain does.
+        VK::WaterRipple::Splat(c.x + d.x * dist, c.z + d.z * dist, 1.0f, -str,
+                               VK::WaterRipple::kNoHeightTest);
+        Msg("[VK Ripple] drop at (%.1f, %.1f) r=1.0 s=%.2f", c.x + d.x * dist, c.z + d.z * dist, str);
+    }
+};
+
+class CCC_VkUiPassTrace : public IConsole_Command
+{
+public:
+    CCC_VkUiPassTrace(LPCSTR N) : IConsole_Command(N) {}
+    virtual void Execute(LPCSTR args)
+    {
+        u32 lines = 0;
+        if (!args || 1 != sscanf(args, "%u", &lines)) { InvalidSyntax(); return; }
+        VulkanUI::TraceUIPass(lines);
+        Msg("~ [VK UIpass] tracing the next %u transition(s)", lines);
+    }
+    virtual void Info(TInfo& I) { strcpy_s(I, "<lines> -- traces that many Vulkan UI render-pass transitions"); }
+};
+
+class CCC_VkShot : public IConsole_Command
+{
+public:
+    CCC_VkShot(LPCSTR N) : IConsole_Command(N) { bEmptyArgsHandled = TRUE; };
+    virtual void Execute(LPCSTR args)
+    {
+        if (!::Render) { Msg("![VK] vk_shot: no renderer"); return; }
+        ::Render->Screenshot(IRender_interface::SM_NORMAL, (args && args[0]) ? args : nullptr);
+    }
+};
+
+// An integer cvar that is NEVER written to user.ltx. Debug views are set for one
+// measurement and forgotten; the client saves the console on exit, so a savable
+// one strands the next launch in whatever the last experiment left behind (the
+// water pass shipped magenta this way once).
+class CCC_IntegerNoSave : public CCC_Integer
+{
+public:
+    CCC_IntegerNoSave(LPCSTR N, int* V, int _min, int _max) : CCC_Integer(N, V, _min, _max)
+    {
+        SetCanSave(FALSE);
+    }
+};
+
+// The same for a float, and for a second reason: a cvar that is really a TUNING
+// CONSTANT of some scheme (a damping factor, a stability limit) has its true home
+// in the source, next to the reasoning for the number. Make it savable and the
+// first value ever written to user.ltx outlives every later default silently —
+// the machine keeps running the old physics while the code, the comments and the
+// notes all describe the new. That cost a day: r_wtr_sim_damp was lowered
+// 0.9985 -> 0.97 to stop one footstep ringing a whole 20 x 13 m slab, and the
+// only machine it mattered on went on loading 0.9985 from its own config.
+class CCC_FloatNoSave : public CCC_Float
+{
+public:
+    CCC_FloatNoSave(LPCSTR N, float* V, float _min, float _max) : CCC_Float(N, V, _min, _max)
+    {
+        SetCanSave(FALSE);
+    }
 };
 
 class CCC_SunshaftsIntensity : public CCC_Float
@@ -2313,6 +3039,116 @@ public:
     }
 };
 
+// ============================================================ r_aa_mode ====
+//
+// ⚠⚠THE ROW THAT LIED. `r_aa_mode` was a token over ps_r_pp_aa_mode, offering
+// off / DLSS / FSR2 / TAA / SMAA — and NOT ONE LINE of the Vulkan renderer ever
+// read that variable. Picking "DLSS" in the options screen changed a number in
+// memory, saved it to user.ltx, and left the image untouched. (Two of the four
+// techniques it offered do not exist in this renderer at all.)
+//
+// What does work is a pair: `r_dlss` (master) and `r_dlss_quality`
+// (0=DLAA … 4=UltraPerf, i.e. how far below the display the scene renders).
+// A player has no business knowing that the second means nothing while the first
+// is off, so this command owns both and Status() derives the row back from them
+// — which is what keeps the menu honest after a cfg_load or a console poke.
+enum
+{
+    AA_OFF = 0,
+    AA_DLAA = 1,       // render == display, DLSS used purely as an antialiaser
+    AA_DLSS_Q = 2,
+    AA_DLSS_B = 3,
+    AA_DLSS_P = 4,
+    AA_DLSS_UP = 5,
+};
+constexpr xr_token aa_mode_token[] = {
+    {"st_opt_off", AA_OFF},
+    {"dlaa", AA_DLAA},
+    {"dlss_quality", AA_DLSS_Q},
+    {"dlss_balanced", AA_DLSS_B},
+    {"dlss_performance", AA_DLSS_P},
+    {"dlss_ultra_perf", AA_DLSS_UP},
+    {},
+};
+
+class CCC_AAMode : public CCC_Token
+{
+public:
+    CCC_AAMode(LPCSTR N, u32* V, const xr_token* T) : CCC_Token(N, V, T) {}
+
+    void Execute(LPCSTR args) override
+    {
+        // ⚠Every user.ltx in existence holds one of the OLD names (this install
+        // has `r_aa_mode st_opt_dlss`). Rejecting them would spray InvalidSyntax
+        // over every startup and, worse, leave the setting at whatever the
+        // default was. Map them instead: anything that used to mean "some kind of
+        // temporal AA is on" now means DLSS on, at the quality already stored.
+        u32 want = u32(-1);
+        for (const xr_token* t = aa_mode_token; t->name; ++t)
+            if (_stricmp(t->name, args) == 0)
+                want = (u32)t->id;
+
+        if (want == u32(-1))
+        {
+            if (_stricmp(args, "st_opt_dlss") == 0 || _stricmp(args, "st_opt_taa") == 0 || _stricmp(args, "st_opt_smaa") == 0 ||
+                _stricmp(args, "st_opt_fsr2") == 0)
+                want = (ps_r_dlss_quality <= 4) ? u32(ps_r_dlss_quality + 1) : u32(AA_DLAA);
+            else
+            {
+                InvalidSyntax();
+                return;
+            }
+        }
+
+        Apply(want);
+    }
+
+    // ⭐Derived, never stored. The two variables underneath are also plain
+    // console entries (r_dlss / r_dlss_quality are how the renderer was A/B'd
+    // for months and they stay), so anything that writes them directly must not
+    // be able to leave this row showing something else.
+    void Status(TStatus& S) override
+    {
+        u32 v = u32(AA_OFF);
+        if (ps_r_dlss)
+            v = (ps_r_dlss_quality <= 4) ? u32(ps_r_dlss_quality + 1) : u32(AA_DLAA);
+        *value = v;
+        for (const xr_token* t = aa_mode_token; t->name; ++t)
+            if ((u32)t->id == v)
+            {
+                xr_strcpy(S, t->name);
+                return;
+            }
+        xr_strcpy(S, "st_opt_off");
+    }
+
+private:
+    void Apply(u32 v)
+    {
+        *value = v;
+        if (v == AA_OFF)
+        {
+            ps_r_dlss = 0;
+        }
+        else
+        {
+            ps_r_dlss = 1;
+            ps_r_dlss_quality = v - 1; // AA_DLAA → 0 (native), … AA_DLSS_UP → 4
+            // ⚠DLSS is fed by the motion-vector pass; without it Dlss::Upscaling()
+            // stays false and the whole thing silently degrades to "nothing
+            // happened". Turning the prerequisite on with the feature is the
+            // difference between a setting and a riddle.
+            if (!ps_r_motion_vectors)
+            {
+                ps_r_motion_vectors = 1;
+                Msg("~ [VK AA] r_motion_vectors turned on — DLSS needs it");
+            }
+            if (ps_r_dlss_avail == 0) // 0 = probed and said no; -1 = not probed yet (startup)
+                Msg("~ [VK AA] DLSS requested, but NGX reports it unavailable on this GPU/driver — the renderer will keep it off");
+        }
+    }
+};
+
 void xrRender_initconsole()
 {
     if (!FS.path_exist(fsgame::game_weathers))
@@ -2324,6 +3160,15 @@ void xrRender_initconsole()
     CMD3(CCC_Preset, "_preset", &ps_preset, qpreset_token);
 
     CMD4(CCC_Integer, "rs_skeleton_update", &psSkeletonUpdate, 2, 128);
+
+    // ⚠vk_shot lives OUTSIDE the DEBUG block, and it used to sit inside it next
+    // to dump_resources -- the same trap fs_extract fell into. The command
+    // exists so a scripted run can look at what it built, and the builds worth
+    // looking at are RELEASE ones: that is where the mod's content is, and where
+    // a UI port is checked. Registered in DEBUG only, it was missing from every
+    // run that needed it and reported itself as "Unknown command".
+    CMD1(CCC_VkShot, "vk_shot");
+    CMD1(CCC_VkUiPassTrace, "ui_pass_trace");
 
 #ifdef DEBUG
     CMD1(CCC_DumpResources, "dump_resources");
@@ -2502,6 +3347,13 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_ssil_strength", &ps_r_ssil_strength, 0.f, 8.f);  // IL intensity multiplier
     CMD4(CCC_Float, "r_ssil_temporal", &ps_r_ssil_temporal, 0.f, 0.97f);  // GTAO temporal accumulation α (0=off; lets r_ssil ship clean)
     CMD4(CCC_Integer, "r_motion_vectors", &ps_r_motion_vectors, 0, 1);  // screen-space MV pass on/off (DLSS/FSR/PT foundation)
+    // Read-only in spirit: the NGX probe writes it, the options screen reads it.
+    // NoSave — it describes THIS GPU and must never travel in a config.
+    CMD4(CCC_IntegerNoSave, "r_dlss_avail", &ps_r_dlss_avail, -1, 1);
+    // Internal resolution as a fraction of the display, for when DLSS is off or
+    // absent. Floor 0.5 = quarter the pixels; below that the bilinear upscale
+    // stops being "cheaper" and starts being "broken".
+    CMD4(CCC_Float, "r_render_scale", &ps_r_render_scale, 0.5f, 1.0f);
     CMD4(CCC_Integer, "r_dlss", (int*)&ps_r_dlss, 0, 1);                 // DLSS Super Resolution; needs r_motion_vectors + NGX available
     CMD4(CCC_Integer, "r_dlss_quality", (int*)&ps_r_dlss_quality, 0, 4); // 0=DLAA 1=Quality 2=Balanced 3=Performance 4=UltraPerf (render<display upscale)
     CMD4(CCC_Integer, "r_dlss_preset", (int*)&ps_r_dlss_preset, 0, 15);  // DLSS model preset hint: 0=driver default, 6=F (CNN), 10=J, 11=K (transformer, default)
@@ -2526,6 +3378,9 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r_wind_tree_flutter", &ps_r_wind_tree_flutter, 0.f, 16.f); // crown/leaf flutter amplitude
     CMD4(CCC_Float, "r_wind_tree_crown", &ps_r_wind_tree_crown, 0.f, 30.f);     // height where leaf flutter fades in
     CMD4(CCC_Float, "r_wind_shadow_dist", &ps_r_wind_shadow_dist, 0.f, 160.f);  // tree shadow wind radius (0 = all static)
+    CMD4(CCC_Float, "r_tree_dist", &ps_r_tree_dist, 0.f, 5000.f);               // forward tree mesh range where an FLOD billboard takes over (0 = off, draws both)
+    CMD4(CCC_Integer, "r_tree_hzb", &ps_r_tree_hzb, 0, 1);                      // Hi-Z occlusion cull for the forward tree set
+    CMD4(CCC_Float, "r_tree_shade_dist", &ps_r_tree_shade_dist, 0.f, 5000.f);   // range past which tree.frag drops SSIL / sky sheen / dynamic lights / shore wetness (0 = off)
     CMD4(CCC_Integer, "r_vsm_tree_wind",      &ps_r_vsm_tree_wind,      0, 1);            // near/far hybrid: near trees sway in the dyn atlas
     CMD4(CCC_Integer, "r_vsm_meshlet",        &ps_r_vsm_meshlet,        0, 1);            // per-page meshlet cull of VSM tree casters (Phase B)
     CMD4(CCC_Integer, "r_vsm_hzb",            &ps_r_vsm_hzb,            0, 1);            // shadow-HZB occlusion cull of VSM casters (kills VSMrender overdraw)
@@ -2536,6 +3391,7 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_vsm_tree_hull",      &ps_r_vsm_tree_hull,      0, 2);                   // caster LOD: 1 = near trees beyond _dist cast the baked opaque crown hull; 2 = far/static foliage too (monotonic LOD)
     CMD4(CCC_Float,   "r_vsm_tree_hull_dist", &ps_r_vsm_tree_hull_dist, 4.0f, 200.0f);           // crown-mesh tier radius (m); the rest of the near set uses the hull
     CMD4(CCC_Integer, "r_vsm_tree_hull_vox",  &ps_r_vsm_tree_hull_vox,  0, 128);                 // crown voxelization: 0 = lobes only, >0 = level-0 voxel-cloud resolution (cells across the crown); baked → level reload
+    CMD4(CCC_Integer, "r_vsm_tree_vox_cloud", &ps_r_vsm_tree_vox_cloud, 0, 1);                   // bake the visual cube cloud even with its viewmode off (the old unconditional bake); baked → level reload
     CMD4(CCC_Integer, "r_vsm_tree_hull_lod",  &ps_r_vsm_tree_hull_lod, -4, 8);                   // LIVE LOD bias for the voxel viewmode (- = finer, + = coarser); no rebake
     CMD4(CCC_Float,   "r_vsm_tree_hull_vox_px", &ps_r_vsm_tree_hull_vox_px, 1.0f, 32.0f);        // target projected voxel size in px (Nanite screen-error LOD cut); live
     CMD4(CCC_Float,   "r_vsm_tree_hull_vox_far", &ps_r_vsm_tree_hull_vox_far, 0.0f, 32.0f);      // +px per 100m: far cubes visibly chunkier (0 = constant screen size); live
@@ -2675,6 +3531,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vsm_ta_motion",       &ps_r_vsm_ta_motion,       0.5f, 64.0f);  // (2) px of reproj motion to reach the floor
     CMD4(CCC_Float,   "r_vsm_ta_motion_floor", &ps_r_vsm_ta_motion_floor, 0.0f, 0.98f);  // (2) history weight at full motion
     CMD4(CCC_Float,   "r_vsm_ta_blend_dlss",   &ps_r_vsm_ta_blend_dlss,   0.0f, 1.0f);   // (3) history-weight scale when r_dlss on
+    CMD4(CCC_Float,   "r_vsm_ta_carry",        &ps_r_vsm_ta_carry,        0.0f, 1.0f);   // (4) history carry on non-resident pages (0 = old flash-lit)
     CMD4(CCC_Integer, "r_vsm_soft",        &ps_r_vsm_soft,        0, 32);        // stochastic PCSS filter taps (0 = legacy 3x3 PCF)
     CMD4(CCC_Integer, "r_vsm_soft_search", &ps_r_vsm_soft_search, 2, 16);        // blocker-search taps
     CMD4(CCC_Float,   "r_vsm_soft_angle",  &ps_r_vsm_soft_angle,  0.1f, 8.0f);   // sun cone HALF-angle, degrees (0.265 = physical)
@@ -2697,6 +3554,7 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vsm_throttle_budget", &ps_r_vsm_throttle_budget, 0.5f, 20.0f);   // target VSMrender ms
     CMD4(CCC_Float,   "r_vsm_throttle_max",    &ps_r_vsm_throttle_max, 0.0f, 4.0f);       // max bias (clipmap levels)
     CMD4(CCC_Integer, "r_vsm_dirty_budget",    &ps_r_vsm_dirty_budget, 0, 4096);          // wrong-tile pages/frame, 0 = off (A/B)
+    CMD4(CCC_Integer, "r_vsm_load_freeze",     &ps_r_vsm_load_freeze,  0, 1);             // freeze the sun-shadow update behind the load screen (A/B)
     CMD4(CCC_Integer, "r_vsm_rmask",           &ps_r_vsm_rmask, 0, 1);                    // receiver-mask sub-page cull (A/B)
     CMD4(CCC_Integer, "r_vsm_gaze",            &ps_r_vsm_gaze, 0, 1);                     // gaze refresh: looked-at pages re-render ∝ footprint (A/B)
     CMD4(CCC_Integer, "r_vsm_gaze_pages",      &ps_r_vsm_gaze_pages, 0, 1024);            // gaze budget, pages/frame
@@ -2708,6 +3566,8 @@ void xrRender_initconsole()
     // takes effect on level (re)load. r_cluster_tris = min mesh size to split.
     CMD4(CCC_Integer, "r_cluster",      &ps_r_cluster,      0, 1);
     CMD4(CCC_Integer, "r_cluster_tris", &ps_r_cluster_tris, 128, 65536);
+    CMD4(CCC_Integer, "r_cluster_cache", &ps_r_cluster_cache, 0, 1);   // 0 = always rebake the DAG (repro aid)
+
     // Cluster DAG LOD (Phase 2): px error threshold (live) + debug view (live).
     CMD4(CCC_Float,   "r_cluster_lod",   &ps_r_cluster_lod,   0.05f, 64.0f);
     CMD4(CCC_Integer, "r_cluster_debug", &ps_r_cluster_debug, 0, 4);   // 3 = path view (red plain / green per-mesh / blue component), 4 = LOD health (red = can never coarsen)
@@ -2852,7 +3712,6 @@ void xrRender_initconsole()
     CMD4(CCC_Float,   "r_vol_w_wet_force",   &ps_r_vol_w_wet_force,  -1.0f, 1.0f);   // test hook: -1 = real weather, 0..1 = pretend this wetness (see the rain fog without waiting for rain)
     CMD4(CCC_Integer, "r_vol_term",          &ps_r_vol_term,          0, 5);        // isolate one in-scatter source (1 sun 2 ambient 3 lights 4 atmo 5 smoke)
     CMD4(CCC_Float,   "r_vol_ta_blend",  &ps_r_vol_ta_blend,  0.0f, 0.98f);
-    CMD4(CCC_Integer, "r_vol_shadow",    &ps_r_vol_shadow,    0, 1);
     CMD4(CCC_Integer, "r_vol_debug",     &ps_r_vol_debug,     0, 4);   // 1 = raw in-scatter, 3 = froxel sun visibility, 4 = occlusion source (green VSM / red miss->skyVis / blue cascade)
 
     // Dynamic-light terrain/static occlusion (ground-height map + per-light march).
@@ -2922,6 +3781,112 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_water_iters", &ps_r_water_iters, 1, 6);         // sim relaxation steps per frame
     CMD4(CCC_Float, "r_water_murk", &ps_r_water_murk, 0.f, 8.f);         // volumetric absorption /m (deeper feel)
     CMD4(CCC_Float, "r_water_refract", &ps_r_water_refract, 0.f, 0.2f);  // bottom refraction strength
+
+    // Water BODIES (vk_pass_water) — see the ps_r_wtr_* block for the split
+    // between this and the r_water_* puddle sim above.
+    CMD4(CCC_Integer, "r_wtr",        &ps_r_wtr,        0, 1);
+    // NOT savable: a debug view is set for one measurement and the client writes
+    // user.ltx on exit — that is how a magenta-water build "randomly" survives a
+    // restart. Same rule as every other look-at-it-once cvar in this engine.
+    // ⚠ EXTEND THE RANGE WITH THE MODE. `r_wtr_debug 6` was silently REFUSED for
+    // a while because the range still said 0..5, and the screenshot that came
+    // back was an ordinary one — a debug view that lies about being on is worse
+    // than no debug view.
+    CMD4(CCC_IntegerNoSave, "r_wtr_debug", &ps_r_wtr_debug, 0, 9);   // 6 = fetch/shelter, 7 = pool mask, 8 = ripple field, 9 = spectral field
+    CMD4(CCC_Float,   "r_wtr_wave",   &ps_r_wtr_wave,   0.f,  1.5f);
+    CMD4(CCC_Float,   "r_wtr_calm",   &ps_r_wtr_calm,   0.f,  1.0f);
+    CMD4(CCC_Float,   "r_wtr_scale",  &ps_r_wtr_scale,  0.02f, 4.f);
+    CMD4(CCC_Float,   "r_wtr_speed",  &ps_r_wtr_speed,  0.f,  4.f);
+    CMD4(CCC_Float,   "r_wtr_murk",   &ps_r_wtr_murk,   0.f,  6.f);
+    CMD4(CCC_Float,   "r_wtr_refl",   &ps_r_wtr_refl,   0.f,  3.f);
+    CMD4(CCC_Float,   "r_wtr_glint",  &ps_r_wtr_glint,  0.f,  8.f);
+    CMD4(CCC_Float,   "r_wtr_detail", &ps_r_wtr_detail, 5.f,  400.f);
+    CMD4(CCC_Float,   "r_wtr_rough",  &ps_r_wtr_rough,  0.005f, 0.5f);
+    CMD4(CCC_Vector3, "r_wtr_color",  &ps_r_wtr_color,  (Fvector3{}), (Fvector3{ 1.f, 1.f, 1.f }));
+    CMD4(CCC_Float,   "r_wtr_shore",  &ps_r_wtr_shore,  0.f, 3.f);    // waterline fade-out depth (m)
+    CMD4(CCC_Float,   "r_wtr_foam",   &ps_r_wtr_foam,   0.f, 2.f);    // shore foam strength (0 = off)
+    CMD4(CCC_Float,   "r_wtr_foam_w", &ps_r_wtr_foam_w, 0.02f, 3.f);  // foam band depth (m)
+    CMD4(CCC_Float,   "r_wtr_micro",  &ps_r_wtr_micro,  0.f, 0.3f);   // capillary ripple, weather-independent
+    CMD4(CCC_Float,   "r_wtr_wind",   &ps_r_wtr_wind,   0.f, 3.f);    // how hard the weather's wind drives the swell
+    // Interactive ripple sim + tessellation.
+    CMD4(CCC_Integer, "r_wtr_sim",        &ps_r_wtr_sim,        0, 1);
+    CMD4(CCC_Float,   "r_wtr_sim_size",   &ps_r_wtr_sim_size,   16.f, 256.f);
+    // NOT savable, all four: these are the constants OF THE SCHEME, not settings.
+    // They decide whether a ripple stays in the puddle it was made in, and they get
+    // retuned in the source as the sim is understood better — so the source must
+    // win. A saved copy silently pins the machine to whatever number was current
+    // the first time it quit cleanly, which is exactly how "I walk in one puddle
+    // and every puddle ripples" came back after being fixed and measured.
+    CMD4(CCC_FloatNoSave, "r_wtr_sim_damp",  &ps_r_wtr_sim_damp,  0.9f, 0.9999f);
+    CMD4(CCC_FloatNoSave, "r_wtr_sim_speed", &ps_r_wtr_sim_speed, 0.01f, 0.5f);
+    CMD4(CCC_FloatNoSave, "r_wtr_sim_shore", &ps_r_wtr_sim_shore, 0.5f, 1.f);  // 1 = reflecting rim (waves fill the pool)
+    CMD4(CCC_FloatNoSave, "r_wtr_sim_reach", &ps_r_wtr_sim_reach, 0.f, 64.f);  // 0 = ripples cross the whole sheet
+    // A fallback gate, set once to answer "is the mask doing anything?" — same rule
+    // as every other look-at-it-once cvar.
+    CMD4(CCC_IntegerNoSave, "r_wtr_sim_pools", &ps_r_wtr_sim_pools, 0, 1);   // 0 = ripples cross between puddles again
+    CMD4(CCC_IntegerNoSave, "r_wtr_sim_lid",      &ps_r_wtr_sim_lid,      0, 1);      // 0 = old rasterized lid
+    CMD4(CCC_IntegerNoSave, "r_wtr_sim_lid_rays", &ps_r_wtr_sim_lid_rays, 0, 20000);
+    CMD4(CCC_IntegerNoSave, "r_wtr_sim_depth",     &ps_r_wtr_sim_depth,     0, 1);
+    CMD4(CCC_FloatNoSave,   "r_wtr_sim_depth_ref", &ps_r_wtr_sim_depth_ref, 0.05f, 8.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_sim_bed",       &ps_r_wtr_sim_bed,       0.5f, 1.f);
+    CMD4(CCC_Float,   "r_wtr_sim_slope",  &ps_r_wtr_sim_slope,  0.f, 4.f);
+    CMD4(CCC_Float,   "r_wtr_sim_height", &ps_r_wtr_sim_height, 0.f, 4.f);
+    CMD4(CCC_Float,   "r_wtr_step",       &ps_r_wtr_step,       0.f, 0.5f);
+    CMD4(CCC_FloatNoSave, "r_wtr_bow",    &ps_r_wtr_bow,        0.f, 6.f);
+    // NEGATIVE = debug view: the world, the grass and the foliage all paint
+    // shoreWetness() straight to the screen (red = wet). The only link in this
+    // chain that has never been observed is what the function RETURNS.
+    // -1 = debug view of the COMBINED wetness, -2 = the STATIC level map alone.
+    // -1 both halves, -2 the level map alone, -3 its raw contents, -4 the tile alone.
+    CMD4(CCC_FloatNoSave, "r_wtr_wet",      &ps_r_wtr_wet,      -4.f, 2.f);
+    CMD4(CCC_FloatNoSave, "r_wtr_wet_dry",  &ps_r_wtr_wet_dry,  0.f, 600.f);
+    CMD4(CCC_FloatNoSave, "r_wtr_wet_lift", &ps_r_wtr_wet_lift, 0.f, 0.5f);
+    CMD4(CCC_Integer, "r_wtr_grid",       &ps_r_wtr_grid,       0,   384);
+    CMD4(CCC_Float,   "r_wtr_tess",       &ps_r_wtr_tess,       0.f, 64.f);
+    CMD4(CCC_Float,   "r_wtr_tess_near",  &ps_r_wtr_tess_near,  1.f, 100.f);
+    CMD4(CCC_Float,   "r_wtr_tess_far",   &ps_r_wtr_tess_far,   5.f, 400.f);
+    CMD4(CCC_Float,   "r_wtr_disp",       &ps_r_wtr_disp,       0.f, 4.f);
+    CMD4(CCC_Float,   "r_wtr_swash",     &ps_r_wtr_swash,     0.f, 3.f);   // metres of run-up
+    CMD4(CCC_Float,   "r_wtr_swash_t",   &ps_r_wtr_swash_t,   1.f, 30.f);  // seconds between crests
+    CMD4(CCC_Float,   "r_wtr_surf",      &ps_r_wtr_surf,      0.f, 3.f);   // whitewater
+    CMD4(CCC_Float,   "r_wtr_surf_h",    &ps_r_wtr_surf_h,    0.f, 2.f);   // offshore wave height
+    CMD4(CCC_Float,   "r_wtr_surf_len",  &ps_r_wtr_surf_len,  2.f, 60.f);  // metres between crests
+    CMD4(CCC_Float,   "r_wtr_film",      &ps_r_wtr_film,      0.01f, 0.5f); // run-up sheet depth
+    CMD4(CCC_Float,   "r_wtr_foam_land", &ps_r_wtr_foam_land, 0.f, 2.f);
+    CMD4(CCC_Float,   "r_wtr_foam_life", &ps_r_wtr_foam_life, 0.2f, 20.f);
+    CMD4(CCC_Float,   "r_wtr_fetch",     &ps_r_wtr_fetch,     0.f, 8.f);   // 0 = every pool is open sea
+    // NoSave, like every other gate in this file: a stale 0 in user.ltx would put
+    // the well's swell back months from now and look like a fresh regression.
+    CMD4(CCC_IntegerNoSave, "r_wtr_fetch_local", &ps_r_wtr_fetch_local, 0, 1);
+    CMD4(CCC_Float,   "r_wtr_shelter",   &ps_r_wtr_shelter,   0.f, 1.f);   // 0 = a roof no longer calms the water
+    // ---- spectral waves (vk_water_fft) ------------------------------------
+    // NOT SAVABLE, the whole family. These are the constants OF A MODEL that is
+    // brand new and will be retuned in source as it is understood — the same
+    // rule the ripple sim's scheme constants live under, and for the same
+    // reason: a value pinned in user.ltx the first time the game quit cleanly
+    // silently outranks every later fix, and this project has lost days to
+    // exactly that (r_wtr_sim_damp, twice). They graduate to savable when the
+    // defaults stop moving.
+    CMD4(CCC_IntegerNoSave, "r_wtr_fft",        &ps_r_wtr_fft,        0, 1);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_size",   &ps_r_wtr_fft_size,   32.f, 2000.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_ratio",  &ps_r_wtr_fft_ratio,  0.05f, 0.6f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_wind",   &ps_r_wtr_fft_wind,   0.5f, 40.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_amp",    &ps_r_wtr_fft_amp,    0.f, 100.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_chop",   &ps_r_wtr_fft_chop,   0.f, 3.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_depth",  &ps_r_wtr_fft_depth,  0.5f, 500.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_repeat", &ps_r_wtr_fft_repeat, 10.f, 3600.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_small",  &ps_r_wtr_fft_small,  0.001f, 5.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_dir",    &ps_r_wtr_fft_dir,    0.f, 12.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_gain",   &ps_r_wtr_fft_gain,   0.f, 4.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_foam",   &ps_r_wtr_fft_foam,   0.f, 4.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_fetch",  &ps_r_wtr_fft_fetch,  1.f, 600.f);
+    CMD4(CCC_FloatNoSave,   "r_wtr_fft_slope",  &ps_r_wtr_fft_slope,  0.f, 4.f);
+    CMD4(CCC_Float,   "r_wtr_murk_still", &ps_r_wtr_murk_still, 1.f, 12.f); // murk multiplier for standing indoor water
+    CMD4(CCC_Float,   "r_wtr_refract",   &ps_r_wtr_refract,   0.f, 0.3f);
+    CMD4(CCC_Float,   "r_wtr_caustic",   &ps_r_wtr_caustic,   0.f, 4.f);
+    CMD4(CCC_Float,   "r_wtr_caustic_p", &ps_r_wtr_caustic_p, 0.2f, 6.f);
+    CMD1(CCC_WtrDrop, "r_wtr_drop");
+    CMD1(CCC_WtrAudit, "r_wtr_audit");
     CMD4(CCC_Float, "r_spec_occ", &ps_r_spec_occ, 0.f, 1.f);             // bent-normal spec occlusion of wet reflections
 
     CMD3(CCC_Mask64, "r4_enable_tessellation", &ps_r2_ls_flags_ext, R2FLAGEXT_ENABLE_TESSELLATION); // Need restart
@@ -2937,8 +3902,13 @@ void xrRender_initconsole()
     CMD4(CCC_Float, "r2_visor_refl_intensity", &ps_r2_visor_refl_intensity, 0.f, 1.f);
     CMD4(CCC_Float, "r2_visor_refl_radius", &ps_r2_visor_refl_radius, 0.3f, 0.6f);
 
-    CMD3(CCC_Token, "r_aa_mode", &ps_r_pp_aa_mode, pp_aa_mode_token);
-    //CMD3(CCC_Token, "r_aa_dlss_preset", &ps_r_dlss_preset, dlss_mode_token);
+    // ⭐The one antialiasing/upscaling row a player sees. See CCC_AAMode: it owns
+    // r_dlss + r_dlss_quality, both of which stay registered below for A/B work.
+    CMD3(CCC_AAMode, "r_aa_mode", &ps_r_pp_aa_mode, aa_mode_token);
+    // ⚠The captions the player reads are NOT these token ids — the options screen
+    // supplies them per row (`data-values` in main_menu.rml), the same way it does
+    // for the numeric entries like r_dlss_preset. Token ids stay machine-readable
+    // so a console line and a saved config keep meaning what they meant.
 
     CMD4(CCC_Float, "r_3dss_scale_factor", &ps_r_dlss_3dss_scale_factor, 1.f, 2.5f);
 
@@ -3077,6 +4047,33 @@ void xrRender_initconsole()
     CMD4(CCC_Integer, "r_txstream_budget",   &ps_r_txstream_budget,   0, 16384);
     CMD4(CCC_Integer, "r_txstream_headroom", &ps_r_txstream_headroom, 0, 4096);
     CMD4(CCC_Integer, "r_txstream_reserve",  &ps_r_txstream_reserve,  0, 8192);
+    CMD4(CCC_Integer, "r_txstream_loadcap",  &ps_r_txstream_loadcap,  0, 4096);
+    CMD4(CCC_Integer, "r_txstream_plan_live", &ps_r_txstream_plan_live, 0, 1);   // old live-VRAM load-time fit
+    CMD4(CCC_Integer, "r_vram_small_images",  &ps_r_vram_small_images,  0, 1);   // small-image pools + their size probe
+    CMD4(CCC_Integer, "r_tex_prefetch",      &ps_r_tex_prefetch,      0, 1);       // parallel level-texture prefetch
+    CMD4(CCC_Integer, "r_tex_prefetch_mb",   &ps_r_tex_prefetch_mb,   64, 4096);   // bytes parked ahead of the visual walk
+    CMD4(CCC_Integer, "r_upload_wc_copy",    &ps_r_upload_wc_copy,    0, 1);      // streaming stores into the write-combined staging ring
+    CMD4(CCC_Integer, "r_upload_cached",     &ps_r_upload_cached,     0, 1);      // HOST_CACHED staging ring (needs a restart)
+    CMD4(CCC_Integer, "r_upload_copy_threads", &ps_r_upload_copy_threads, 0, 15);  // helper threads for the big staging copies
+    CMD4(CCC_Integer, "r_geom_prefault",     &ps_r_geom_prefault,     0, 2);      // time the window faults apart from the geometry copy
+    CMD4(CCC_Integer, "r_geom_lead",         &ps_r_geom_lead,         0, 1);      // stage geometry out of the prefetch's already-faulted view
+    CMD4(CCC_Integer, "r_vis_warm",          &ps_r_vis_warm,          0, 1);      // prefault the visuals blob on workers before the walk
+    CMD4(CCC_Integer, "r_vis_walk_split",    &ps_r_vis_walk_split,    0, 1);      // rdtsc split of the visual walk loop
+    CMD4(CCC_Integer, "r_vis_triage",        &ps_r_vis_triage,        0, 1);      // per-visual glass/glow probes in LoadTexture
+    CMD4(CCC_Integer, "r_vis_guard",         &ps_r_vis_guard,         0, 1);      // between-phases sweep over Visuals[] (repeat-load corruption hunt)
+    CMD4(CCC_Integer, "r_tex_prefetch_lmaps_first", &ps_r_tex_prefetch_lmaps_first, 0, 1);  // lightmaps ahead of the diffuse bases
+    CMD4(CCC_Integer, "r_prewarm_async",     &ps_r_prewarm_async,     0, 1);      // weather variants off the render thread
+    CMD4(CCC_Integer, "r_thm_cache",         &ps_r_thm_cache,         0, 1);      // remember parsed .thm per base name
+    CMD4(CCC_Integer, "r_clpage_map",        &ps_r_clpage_map,        0, 1);      // pinned cluster pages upload from a mapping
+    CMD4(CCC_Integer, "r_tex_residency_threads", &ps_r_tex_residency_threads, 0, 16); // helpers that read a residency plan's .dds files
+    CMD4(CCC_Integer, "r_tex_repack_threads", &ps_r_tex_repack_threads, 0, 15);   // helpers for the BC3->BC4 lightmap gather
+    CMD4(CCC_Integer, "r_tex_materialize",    &ps_r_tex_materialize,    0, 2);    // 1 = workers build textures, 2 = only once the walk starts
+    CMD4(CCC_Integer, "r_tex_mat_threads",    &ps_r_tex_mat_threads,    0, 16);   // concurrent texture builders (0 = all)
+    CMD4(CCC_Integer, "r_tex_repack_scratch", &ps_r_tex_repack_scratch, 0, 1);    // reuse one gather destination per thread
+    CMD4(CCC_Integer, "r_tex_repack_verify",  &ps_r_tex_repack_verify,  0, 1);    // compare the gather against the plain copy
+
+
+
     CMD1(CCC_VideoMemoryStats, "r_txstream_stats");
     CMD1(CCC_VramDump,         "r_vram_dump");
 

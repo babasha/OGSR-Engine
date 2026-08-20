@@ -6,6 +6,7 @@
 // form must keep this notice and credit the author in-game (credits or splash).
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_pass_sky.h"
 #include "vk_color_space.h"   // ColorSpace::LinearizeRGB — sky/clouds/sun tints are authored sRGB
 #include "vk_swapchain.h"
@@ -16,7 +17,7 @@
 #include "vk_command_buffer.h"             // CommandManager.GetCurrentFrame() — in-flight slot
 #include "vk_clouds.h"                     // volumetric cloud noise volumes (bindings 5..7)
 #include "vk_buffer.h"                     // CVulkanBuffer — the params UBO
-#include "vk_pipeline_cache.h"             // PipelineCache::GetCacheObject() — shared disk-backed cache
+#include "vk_gfx_pipeline.h"               // VK::GfxPipelineBuilder
 
 #include "../../xr_3da/device.h"           // Device.vCameraPosition
 #include "../../xr_3da/IGame_Persistent.h" // g_pGamePersistent
@@ -256,53 +257,25 @@ namespace {
         const VkImageView views[4]    = { sky0, sky1, cloud0, cloud1 };
         const VkSampler    samplers[4] = { s_Sampler, s_Sampler, s_CloudSampler, s_CloudSampler };
 
-        VkDescriptorImageInfo ii[4]{};
-        VkWriteDescriptorSet  w[4]{};
-        for (int i = 0; i < 4; ++i) {
-            ii[i].sampler     = samplers[i];
-            ii[i].imageView   = views[i];
-            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-            w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet          = set;
-            w[i].dstBinding      = i;
-            w[i].descriptorCount = 1;
-            w[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w[i].pImageInfo      = &ii[i];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+        VK::DescriptorWriter w(set);
+        for (u32 i = 0; i < 4; ++i) w.ImageSampler(i, views[i], samplers[i]);
+        w.Flush();
     }
 
     // Bindings 4..7 never change once created: the params UBO slot for this frame
     // index, and the three baked cloud noise fields. Written once at init.
     void WriteStaticSet(u32 slot)
     {
-        VkDescriptorBufferInfo bi{ s_Ubo.GetHandle(), s_UboStride * slot, sizeof(SkyUBO) };
-        VkDescriptorBufferInfo di{ s_DbgBuf.GetHandle(), 0, VK_WHOLE_SIZE };
-        VkDescriptorImageInfo  ii[3]{};
         const VkImageView views[3] = { VK::Clouds::ShapeView(), VK::Clouds::DetailView(), VK::Clouds::WeatherView() };
-        VkSampler cs = VK::Clouds::Sampler();
-        VkWriteDescriptorSet w[5]{};
+        const VkSampler   cs       = VK::Clouds::Sampler();
 
-        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[0].dstSet = s_Set[slot]; w[0].dstBinding = 4; w[0].descriptorCount = 1;
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &bi;
-
-        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[1].dstSet = s_Set[slot]; w[1].dstBinding = 8; w[1].descriptorCount = 1;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &di;
-
-        u32 n = 2;
-        for (u32 i = 0; i < 3; ++i) {
-            if (views[i] == VK_NULL_HANDLE || cs == VK_NULL_HANDLE) continue;
-            ii[i].sampler = cs; ii[i].imageView = views[i];
-            ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[n].dstSet = s_Set[slot]; w[n].dstBinding = 5 + i; w[n].descriptorCount = 1;
-            w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[n].pImageInfo = &ii[i];
-            ++n;
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, n, w, 0, nullptr);
+        VK::DescriptorWriter w(s_Set[slot]);
+        w.UniformBuffer(4, s_Ubo.GetHandle(), sizeof(SkyUBO), s_UboStride * slot)
+         .StorageBuffer(8, s_DbgBuf.GetHandle());
+        for (u32 i = 0; i < 3; ++i)
+            if (views[i] != VK_NULL_HANDLE && cs != VK_NULL_HANDLE)
+                w.ImageSampler(5 + i, views[i], cs);
+        w.Flush();
     }
 
     // Fetch [name0, name1] for the active weather interval. Empty strings
@@ -549,85 +522,16 @@ bool Init()
         return false;
     }
 
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = s_VS; stages[0].pName = "main";
-    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = s_FS; stages[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1;
-    vp.scissorCount  = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode    = VK_CULL_MODE_NONE;
-    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth   = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_FALSE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable    = VK_FALSE;
-
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1;
-    cb.pAttachments    = &ba;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2;
-    dynState.pDynamicStates    = dyn;
-
-    VkFormat colorFormat = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount    = 1;
-    prci.pColorAttachmentFormats = &colorFormat;
-    prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = 2;
-    pi.pStages             = stages;
-    pi.pVertexInputState   = &vi;
-    pi.pInputAssemblyState = &ia;
-    pi.pViewportState      = &vp;
-    pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;
-    pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;
-    pi.pDynamicState       = &dynState;
-    pi.layout              = s_PipelineLayout;
-
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, PipelineCache::GetCacheObject(), 1, &pi, nullptr, &s_Pipeline) != VK_SUCCESS) {
-        Msg("![VK Sky] CreateGraphicsPipelines failed");
+    // Procedural dome: no vertex input, depth-tested against the world but never
+    // written to.
+    s_Pipeline = GfxPipelineBuilder(s_PipelineLayout)
+        .Vert(s_VS).Frag(s_FS)
+        .Depth(true, false)
+        .Color(VK::SceneColor::Format())
+        .DepthTarget(Swapchain.m_DepthFormat)
+        .Build("Sky");
+    if (s_Pipeline == VK_NULL_HANDLE)
         return false;
-    }
 
     Msg("[VK Sky] Init OK (two-cubemap blend, sky_rotation, sky_color tint)");
     return true;
@@ -724,39 +628,7 @@ void Pass_Sky(FrameContext& ctx)
                              0, 0, nullptr, 1, &bb, 0, nullptr);
     }
 
-    VkRenderingAttachmentInfo cAtt{};
-    cAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    cAtt.imageView   = ctx.colorView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-    VkRenderingAttachmentInfo dAtt{};
-    dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    dAtt.imageView   = ctx.depthView;
-    dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-    dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea.extent    = ctx.extent;
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &cAtt;
-    ri.pDepthAttachment     = &dAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{};
-    vp.x        = 0.0f;
-    vp.y        = (float)ctx.extent.height;
-    vp.width    = (float)ctx.extent.width;
-    vp.height   = -(float)ctx.extent.height;
-    vp.minDepth = 0.0f;
-    vp.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{ {}, ctx.extent };
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    VK::BeginOverlayRendering(cmd, ctx, VK_ATTACHMENT_STORE_OP_DONT_CARE);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,

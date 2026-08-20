@@ -11,6 +11,11 @@
 #include "vk_vram_stats.h"
 #include "HW_Vulkan.h"
 
+// r_vram_small_images — 0 skips the small-image pool path (and the driver probe in
+// front of it). Global scope on purpose: a namespace-scope extern mangles
+// differently and silently fails to bind.
+extern int ps_r_vram_small_images;
+
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -18,6 +23,13 @@
 
 namespace VK
 {
+// Counters shared with the texture-load profiler (vk_texture.cpp): the image
+// allocation is its `create` column, and this is what sits in front of it.
+namespace TexLoadProf {
+extern std::atomic<u64> s_createProbeClk;
+extern std::atomic<u32> s_createSmall;
+}
+
 namespace Vram
 {
 
@@ -200,12 +212,19 @@ VkResult CreateImage(VmaAllocator allocator, const VkImageCreateInfo* ici, const
     // Query the real allocation size WITHOUT creating the image (core 1.3) —
     // small textures (UI icons, prop maps at their streaming floor) pin shared
     // blocks exactly like small buffers do.
-    if (aci->pool == VK_NULL_HANDLE && !(aci->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
+    // The query is a driver call on EVERY image, and a level load makes ~2500 of
+    // them; it is timed apart from the allocation it precedes (see the `create
+    // split` line) so "create 130 ms" can be told apart from "the probe in front
+    // of it costs 130 ms". r_vram_small_images 0 skips the whole small-pool path.
+    if (ps_r_vram_small_images && aci->pool == VK_NULL_HANDLE && !(aci->flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT)) {
+        const u64 _p0 = CPU::GetCLK();
         VkDeviceImageMemoryRequirements dimr{ VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS };
         dimr.pCreateInfo = ici;
         VkMemoryRequirements2 mr2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
         vkGetDeviceImageMemoryRequirements(VulkanHW.m_Device, &dimr, &mr2);
+        VK::TexLoadProf::s_createProbeClk += CPU::GetCLK() - _p0;
         if (SmallEligible(mr2.memoryRequirements.size, aci)) {
+            ++VK::TexLoadProf::s_createSmall;
             u32 memType = 0;
             if (vmaFindMemoryTypeIndexForImageInfo(allocator, ici, aci, &memType) == VK_SUCCESS) {
                 if (VmaPool pool = SmallPoolFor(allocator, memType)) {

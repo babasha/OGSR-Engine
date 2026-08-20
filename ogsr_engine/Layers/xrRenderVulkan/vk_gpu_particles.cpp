@@ -9,6 +9,8 @@
 // (Source + Gravity + KillOld) simulated and drawn entirely on the GPU with a
 // resident pool + free-list. See gpu_particles_roadmap.md.
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
+#include "vk_rendering.h"     // VK::RenderingBuilder
 #include "vk_gpu_particles.h"
 #include <atomic>
 #include <mutex>
@@ -18,6 +20,8 @@
 #include "vk_command_buffer.h"
 #include "vk_barriers.h"
 #include "vk_pipeline_cache.h"
+#include "vk_compute_util.h"     // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"     // VK::GfxPipelineBuilder
 #include "vk_swapchain.h"
 #include "vk_scene_color.h"
 #include "vk_pass_particles.h"   // ParticlePass::GetTextureView — bindless sprite views
@@ -181,21 +185,6 @@ namespace {
         return m;
     }
 
-    VkPipeline CreateComputePipeline(VkShaderModule mod, VkPipelineLayout layout)
-    {
-        VkComputePipelineCreateInfo cp{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        cp.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cp.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        cp.stage.module = mod;
-        cp.stage.pName  = "main";
-        cp.layout       = layout;
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                     1, &cp, nullptr, &pipe) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
-        return pipe;
-    }
-
     // Shader-write → shader-read/write barrier between compute stages.
     void MemBarrier(VkCommandBuffer cmd)
     {
@@ -346,15 +335,11 @@ namespace {
         if (s_useTextures && td.name[0]) {
             VkImageView view = VK::ParticlePass::GetTextureView(td.name);
             if (view != VK_NULL_HANDLE) {
-                VkDescriptorImageInfo ii{ s_texSampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                w.dstSet          = s_texSet;
-                w.dstBinding      = 0;
-                w.dstArrayElement = idx;
-                w.descriptorCount = 1;
-                w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                w.pImageInfo      = &ii;
-                vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+                // Binding 0 is the bindless sprite table — write slot `idx` of it.
+                VK::DescriptorWriter(s_texSet)
+                    .Image(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              { s_texSampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }, idx)
+                    .Flush();
                 ti.layer = (s32)idx;
             } else {
                 Msg("~[VK GP] program #%u texture '%s' not loaded — procedural fallback", idx, td.name);
@@ -533,19 +518,13 @@ bool Init()
         }
         // Froxel probe set (set 2 = one sampler3D, fragment stage).
         if (s_useTextures) {
-            VkDescriptorSetLayoutBinding vb{};
-            vb.binding = 0; vb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            vb.descriptorCount = 1; vb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            VkDescriptorSetLayoutCreateInfo vlci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            vlci.bindingCount = 1; vlci.pBindings = &vb;
-            if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &vlci, nullptr, &s_volSetLayout) != VK_SUCCESS)
-            { Msg("![VK GP] vol set layout failed"); s_useTextures = false; }
+            s_volSetLayout = VK::MakeSetLayout({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },
+                                               VK_SHADER_STAGE_FRAGMENT_BIT, "GP.Vol");
+            if (s_volSetLayout == VK_NULL_HANDLE) s_useTextures = false;
         }
         if (s_useTextures) {
-            VkDescriptorSetAllocateInfo vai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            vai.descriptorPool = s_texPool; vai.descriptorSetCount = 1; vai.pSetLayouts = &s_volSetLayout;
-            if (vkAllocateDescriptorSets(VulkanHW.m_Device, &vai, &s_volSet) != VK_SUCCESS)
-            { Msg("![VK GP] vol set alloc failed"); s_useTextures = false; }
+            if (!VK::AllocSets(s_texPool, s_volSetLayout, 1, &s_volSet, "GP.Vol"))
+                s_useTextures = false;
         }
     }
     Msg("[VK GPUParticles] sprite textures: %s", s_useTextures ? "BINDLESS" : "procedural (no descriptor indexing)");
@@ -632,99 +611,36 @@ bool Init()
     if (!modInit || !modReset || !modEmit || !modSim || !modBuild || !modSortH || !modSortS || !modSortC || !modVS || !modFS)
     { s_failed = true; return false; }
 
-    s_pipeInit  = CreateComputePipeline(modInit,  s_compLayout);
-    s_pipeReset = CreateComputePipeline(modReset, s_compLayout);
-    s_pipeEmit  = CreateComputePipeline(modEmit,  s_compLayout);
-    s_pipeSim   = CreateComputePipeline(modSim,   s_compLayout);
-    s_pipeBuild = CreateComputePipeline(modBuild, s_compLayout);
-    s_pipeSortHist    = CreateComputePipeline(modSortH, s_compLayout);
-    s_pipeSortScan    = CreateComputePipeline(modSortS, s_compLayout);
-    s_pipeSortScatter = CreateComputePipeline(modSortC, s_compLayout);
+    s_pipeInit  = VK::CreateComputePipeline(modInit,  s_compLayout, "GP.Init");
+    s_pipeReset = VK::CreateComputePipeline(modReset, s_compLayout, "GP.Reset");
+    s_pipeEmit  = VK::CreateComputePipeline(modEmit,  s_compLayout, "GP.Emit");
+    s_pipeSim   = VK::CreateComputePipeline(modSim,   s_compLayout, "GP.Simulate");
+    s_pipeBuild = VK::CreateComputePipeline(modBuild, s_compLayout, "GP.Build");
+    s_pipeSortHist    = VK::CreateComputePipeline(modSortH, s_compLayout, "GP.Sort.Hist");
+    s_pipeSortScan    = VK::CreateComputePipeline(modSortS, s_compLayout, "GP.Sort.Scan");
+    s_pipeSortScatter = VK::CreateComputePipeline(modSortC, s_compLayout, "GP.Sort.Scatter");
     if (!s_pipeInit || !s_pipeReset || !s_pipeEmit || !s_pipeSim || !s_pipeBuild ||
         !s_pipeSortHist || !s_pipeSortScan || !s_pipeSortScatter)
     { Msg("![VK GP] compute pipeline creation failed"); s_failed = true; return false; }
 
     // ---- Graphics pipeline (additive-free alpha billboards) ----------------
     {
-        VkPipelineShaderStageCreateInfo ss[2]{};
-        ss[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;   ss[0].module = modVS; ss[0].pName = "main";
-        ss[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ss[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT; ss[1].module = modFS; ss[1].pName = "main";
-
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = 1; vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode    = VK_CULL_MODE_NONE;
-        rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth   = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-        ds.depthTestEnable  = VK_TRUE;
-        ds.depthWriteEnable = VK_FALSE;
-        ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.blendEnable         = VK_TRUE;
-        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        ba.colorBlendOp        = VK_BLEND_OP_ADD;
-        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
-        ba.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        cb.attachmentCount = 1;
-        cb.pAttachments    = &ba;
-
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dynState.dynamicStateCount = 2;
-        dynState.pDynamicStates    = dyn;
-
-        VkFormat colorFormat = VK::SceneColor::Format();
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        prci.colorAttachmentCount    = 1;
-        prci.pColorAttachmentFormats = &colorFormat;
-        prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
-
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext               = &prci;
-        pi.stageCount          = 2;
-        pi.pStages             = ss;
-        pi.pVertexInputState   = &vi;
-        pi.pInputAssemblyState = &ia;
-        pi.pViewportState      = &vp;
-        pi.pRasterizationState = &rs;
-        pi.pMultisampleState   = &ms;
-        pi.pDepthStencilState  = &ds;
-        pi.pColorBlendState    = &cb;
-        pi.pDynamicState       = &dynState;
-        pi.layout              = s_drawLayout;
-
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                      1, &pi, nullptr, &s_pipeDraw) != VK_SUCCESS)
-        { Msg("![VK GP] draw pipeline failed"); s_failed = true; return false; }
-
-        // Additive variant (fire/sparks/muzzle): SRC_ALPHA, ONE. Same shaders +
-        // state, only the destination colour factor differs. Additive is order-
-        // independent, so no sort needed for these.
-        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK::PipelineCache::GetCacheObject(),
-                                      1, &pi, nullptr, &s_pipeDrawAdd) != VK_SUCCESS)
-        { Msg("![VK GP] additive draw pipeline failed"); s_failed = true; return false; }
+        // Procedural billboards (no vertex input), depth-tested but not written.
+        // The additive variant (fire/sparks/muzzle) is the same pipeline with a
+        // different destination colour factor; additive is order-independent, so
+        // those need no sort.
+        auto makeDrawPipe = [&](bool additive) {
+            VK::GfxPipelineBuilder b(s_drawLayout);
+            b.Vert(modVS).Frag(modFS)
+             .Depth(true, false)
+             .Color(VK::SceneColor::Format());
+            (additive ? b.BlendAdd() : b.BlendAlpha());
+            return b.DepthTarget(Swapchain.m_DepthFormat)
+                    .Build("GP draw%s", additive ? " additive" : "");
+        };
+        s_pipeDraw    = makeDrawPipe(false);
+        s_pipeDrawAdd = makeDrawPipe(true);
+        if (!s_pipeDraw || !s_pipeDrawAdd) { s_failed = true; return false; }
     }
 
     // ---- Descriptor writes -------------------------------------------------
@@ -744,16 +660,10 @@ bool Init()
                 { s_sort->GetHandle(),       0, VK_WHOLE_SIZE },
                 { s_killReq[i]->GetHandle(), 0, VK_WHOLE_SIZE },
             };
-            VkWriteDescriptorSet w[kNumBindings]{};
-            for (u32 b = 0; b < kNumBindings; ++b) {
-                w[b].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                w[b].dstSet          = s_set[i];
-                w[b].dstBinding      = b;
-                w[b].descriptorCount = 1;
-                w[b].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                w[b].pBufferInfo     = &bi[b];
-            }
-            vkUpdateDescriptorSets(VulkanHW.m_Device, kNumBindings, w, 0, nullptr);
+            VK::DescriptorWriter w(s_set[i]);
+            for (u32 b = 0; b < kNumBindings; ++b)
+                w.Buffer(b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bi[b]);
+            w.Flush();
         }
     }
 
@@ -951,39 +861,17 @@ bool SplatMedia(VkCommandBuffer cmd, VkBuffer accumBuf, const MediaSplatPush& pu
     if (s_mediaPipe == VK_NULL_HANDLE) {
         auto fail = [&](const char* what) { Msg("![VK GP] media splat %s failed", what); s_mediaFailed = true; return false; };
 
-        VkDescriptorSetLayoutBinding b[4]{};
-        for (u32 i = 0; i < 4; ++i) {
-            b[i].binding         = i;
-            b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            b[i].descriptorCount = 1;
-            b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 4; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_mediaSetL) != VK_SUCCESS)
-            return fail("set layout");
+        constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO, kSSBO }, 1,
+                                    s_mediaSetL, s_mediaPool, &s_mediaSet,
+                                    VK_SHADER_STAGE_COMPUTE_BIT, "GP.MediaSplat"))
+            return fail("descriptors");
 
-        VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MediaSplatPush) };
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &s_mediaSetL;
-        plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_mediaLayout) != VK_SUCCESS)
-            return fail("pipeline layout");
+        s_mediaLayout = VK::MakePipelineLayout({ s_mediaSetL }, sizeof(MediaSplatPush));
+        if (s_mediaLayout == VK_NULL_HANDLE) return fail("pipeline layout");
 
-        VkShaderModule mod = LoadShader("gp_media_splat.comp.spv");
-        if (mod == VK_NULL_HANDLE) return fail("shader load");
-        s_mediaPipe = CreateComputePipeline(mod, s_mediaLayout);
+        s_mediaPipe = VK::CreateComputePipeline("gp_media_splat.comp.spv", s_mediaLayout, "GP.MediaSplat");
         if (s_mediaPipe == VK_NULL_HANDLE) return fail("pipeline");
-
-        VkDescriptorPoolSize psz{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
-        VkDescriptorPoolCreateInfo dpi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &psz;
-        if (vkCreateDescriptorPool(VulkanHW.m_Device, &dpi, nullptr, &s_mediaPool) != VK_SUCCESS)
-            return fail("descriptor pool");
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = s_mediaPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_mediaSetL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_mediaSet) != VK_SUCCESS)
-            return fail("set alloc");
 
         Msg("[VK GP] media splat ready — GPU smoke feeds the froxel fog directly");
     }
@@ -995,13 +883,9 @@ bool SplatMedia(VkCommandBuffer cmd, VkBuffer accumBuf, const MediaSplatPush& pu
             { s_aliveList->GetHandle(), 0, VK_WHOLE_SIZE },
             { accumBuf,                 0, VK_WHOLE_SIZE },
         };
-        VkWriteDescriptorSet w[4]{};
-        for (u32 i = 0; i < 4; ++i) {
-            w[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            w[i].dstSet = s_mediaSet; w[i].dstBinding = i; w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+        VK::DescriptorWriter w(s_mediaSet);
+        for (u32 i = 0; i < 4; ++i) w.Buffer(i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bi[i]);
+        w.Flush();
         s_mediaAccum = accumBuf;
     }
 
@@ -1251,24 +1135,9 @@ void DispatchComputeAndDraw(FrameContext& ctx)
         VkRect2D sc{ {}, ctx.extent };
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
-        VkRenderingAttachmentInfo cAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-        cAtt.imageView   = ctx.colorView;
-        cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        cAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-        VkRenderingAttachmentInfo dAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-        dAtt.imageView   = ctx.depthView;
-        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-
-        VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-        ri.renderArea.extent    = ctx.extent;
-        ri.layerCount           = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments    = &cAtt;
-        ri.pDepthAttachment     = &dAtt;
+        VK::RenderingBuilder rb(ctx.extent);
+        rb.Color(ctx.colorView)
+          .Depth(ctx.depthView, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_DONT_CARE);
 
         // ---- Froxel volumetric light-probe params (Stage-0 smoke lighting) --
         // Re-point set 2 at Vol's scatter volume when it (re)generates, then
@@ -1282,15 +1151,11 @@ void DispatchComputeAndDraw(FrameContext& ctx)
                 VkImageView sv = VK::Vol::GetScatterView();
                 VkSampler   ss = VK::Vol::GetSampler();
                 if (sv && ss) {
-                    VkDescriptorImageInfo ii{ ss, sv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                    VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                    w.dstSet = s_volSet; w.dstBinding = 0; w.descriptorCount = 1;
-                    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-                    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+                    VK::DescriptorWriter(s_volSet).ImageSampler(0, sv, ss).Flush();
                     s_volBoundGen = gen;
                 }
             }
-            if (s_volBoundGen == gen && VK::Vol::Wanted()) {
+            if (s_volBoundGen == gen && VK::Vol::Wanted() && VK::Vol::ProbeAvailableToGraphics()) {
                 const VK::Vol::GridZParams gz = VK::Vol::GetGridZ();
                 probeNear     = gz.nearZ;
                 probeLogFN    = gz.logFarNear;
@@ -1298,7 +1163,7 @@ void DispatchComputeAndDraw(FrameContext& ctx)
             }
         }
 
-        vkCmdBeginRendering(cmd, &ri);
+        rb.Begin(cmd);
 
         DrawPush dpush{};
         static_assert(sizeof(Fmatrix) == 64, "Fmatrix 64 B");

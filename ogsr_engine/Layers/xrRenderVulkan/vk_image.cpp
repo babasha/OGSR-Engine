@@ -31,6 +31,17 @@ bool CreateImage(const ImageDesc& desc, VkImage& outImage, VmaAllocation& outAll
     ici.usage         = desc.usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
+    // Cross-queue (graphics + dedicated compute) image — see ImageDesc::computeShared.
+    // Kept EXCLUSIVE when the compute family aliases graphics: there is no second
+    // family to share with, and CONCURRENT with one index is not legal.
+    const u32 csFamilies[2] = { VulkanHW.m_GraphicsFamily, VulkanHW.m_ComputeFamily };
+    if (desc.computeShared && VulkanHW.m_ComputeFamily != VulkanHW.m_GraphicsFamily)
+    {
+        ici.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+        ici.queueFamilyIndexCount = 2;
+        ici.pQueueFamilyIndices   = csFamilies;
+    }
+
     VmaAllocationCreateInfo aci{};
     aci.usage = desc.memUsage;
     // VK_EXT_memory_priority: images built through this shared helper are render

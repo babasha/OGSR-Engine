@@ -18,6 +18,25 @@ void ImageBarrier(VkCommandBuffer cmd, VkImage image,
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
     u32 layerCount = 1, u32 mipLevels = 1);
 
+// Image barrier with EXPLICIT stage/access. Needed wherever the layout does not
+// determine the synchronization: GENERAL->GENERAL between compute dispatches, a
+// storage-image write consumed by the vertex stage, a compute result sampled by
+// fragment — the derivation above answers "compute storage read|write" for every
+// GENERAL, which is right for none of those. Passes that hand-rolled their own
+// barrier helper did so for exactly this reason; this is that helper, once.
+// Same argument order as BufferBarrier/MemoryBarrier: src pair, then dst pair.
+void ImageBarrier(VkCommandBuffer cmd, VkImage image,
+    VkImageLayout oldLayout, VkImageLayout newLayout,
+    VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+    VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+    u32 mipLevels = 1, u32 layerCount = 1);
+
+// Compute->compute "everything written is visible" fence between dispatches that
+// share storage images/buffers and stay in GENERAL. The single most repeated
+// barrier in the renderer.
+void ComputeBarrier(VkCommandBuffer cmd);
+
 // Batch image barriers - same transition for multiple images.
 void ImageBarriers(VkCommandBuffer cmd, u32 count, const VkImage* images,
     VkImageLayout oldLayout, VkImageLayout newLayout,
@@ -64,11 +83,21 @@ struct ImageState
     VkImageLayout         layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkPipelineStageFlags2 stage  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
     VkAccessFlags2        access = 0;
+    // Queue family that currently OWNS the contents. VK_QUEUE_FAMILY_IGNORED =
+    // "never left the graphics queue", which is every resource today. It is a
+    // recorded property, NOT an automatic transfer: moving a resource between
+    // families needs a release barrier on the owning queue AND an acquire barrier
+    // on the destination queue, ordered by a semaphore between the two submits.
+    // Require() asserts rather than silently emitting a same-family barrier for a
+    // resource owned elsewhere — that is the bug class async compute introduces,
+    // and it must fail loudly instead of corrupting contents.
+    u32                   queueFamily = VK_QUEUE_FAMILY_IGNORED;
 
     // Record the state the image is already known to be in — no barrier emitted.
     void Seed(VkImage img, VkImageAspectFlags asp, VkImageLayout lay,
-              VkPipelineStageFlags2 stg, VkAccessFlags2 acc)
-    { image = img; aspect = asp; layout = lay; stage = stg; access = acc; }
+              VkPipelineStageFlags2 stg, VkAccessFlags2 acc,
+              u32 family = VK_QUEUE_FAMILY_IGNORED)
+    { image = img; aspect = asp; layout = lay; stage = stg; access = acc; queueFamily = family; }
 
     // Make the image usable as (lay, stg, acc). Emits vkCmdPipelineBarrier2 only
     // when the layout differs or a write hazard exists; a read-after-read at the
@@ -76,6 +105,42 @@ struct ImageState
     void Require(VkCommandBuffer cmd, VkImageLayout lay,
                  VkPipelineStageFlags2 stg, VkAccessFlags2 acc,
                  u32 mipLevels = 1, u32 layerCount = 1);
+
+    bool Valid() const { return image != VK_NULL_HANDLE; }
+};
+
+// ---------------------------------------------------------------------------
+// BufferState — the ImageState discipline for buffers.
+//
+// Images were tracked first because their LAYOUT makes a missing transition
+// visible (garbage on screen, a validation error). Buffers have no layout, so a
+// missing barrier is invisible until it is a race: the compute cull writes an
+// indirect/count buffer, the draw reads it, and on a busy GPU the draw wins.
+// That class of bug does not reproduce on demand, which is exactly why it wants
+// a tracker rather than 50 hand-placed calls.
+//
+// Same rule as ImageState: read-after-read accumulates, anything else emits.
+// This is what the VSM bin / world-cull / tree-cull SSBO hand-offs actually
+// need, and the async-compute split needs it BEFORE the images (the indirect
+// buffers are what crosses the queue boundary first).
+// ---------------------------------------------------------------------------
+struct BufferState
+{
+    VkBuffer              buffer = VK_NULL_HANDLE;
+    VkPipelineStageFlags2 stage  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    VkAccessFlags2        access = 0;
+    u32                   queueFamily = VK_QUEUE_FAMILY_IGNORED;   // see ImageState
+
+    void Seed(VkBuffer buf, VkPipelineStageFlags2 stg, VkAccessFlags2 acc,
+              u32 family = VK_QUEUE_FAMILY_IGNORED)
+    { buffer = buf; stage = stg; access = acc; queueFamily = family; }
+
+    // Make the buffer usable as (stg, acc). No-ops on read-after-read (the union
+    // of readers is remembered so the next write waits on all of them).
+    void Require(VkCommandBuffer cmd, VkPipelineStageFlags2 stg, VkAccessFlags2 acc,
+                 VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
+
+    bool Valid() const { return buffer != VK_NULL_HANDLE; }
 };
 
 } // namespace VK

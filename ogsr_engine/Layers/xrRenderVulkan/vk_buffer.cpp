@@ -28,7 +28,8 @@ CVulkanBuffer::~CVulkanBuffer()
 }
 
 // Создание буфера
-void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage, bool gpuOnly)
+void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memUsage, bool gpuOnly,
+                           bool computeShared, bool hostRead)
 {
     if (m_Buffer != VK_NULL_HANDLE) {
         Msg("![Vulkan] Buffer already created, call Destroy first");
@@ -74,6 +75,12 @@ void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemor
     if ((usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || memUsage == VMA_MEMORY_USAGE_AUTO_PREFER_HOST) {
         allocInfo.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     }
+    // Readback target: the CPU reads this mapping, so it must be CACHED. RANDOM
+    // and SEQUENTIAL_WRITE are mutually exclusive in VMA — drop the write hint.
+    if (hostRead) {
+        allocInfo.flags &= ~VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+        allocInfo.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    }
     }
 
     // ВАЖНО: Для VERTEX/INDEX буферов добавляем TRANSFER_DST для staging uploads
@@ -87,11 +94,24 @@ void CVulkanBuffer::Create(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemor
     // cross-family access — use CONCURRENT sharing so the contents survive without
     // explicit queue-ownership-transfer barriers (negligible cost for buffers).
     // Only when a TRANSFER_DST target AND the families actually differ.
-    const u32 families[2] = { VulkanHW.m_GraphicsFamily, VulkanHW.m_TransferFamily };
+    // Families this buffer is shared with, built once: graphics is always index 0,
+    // then transfer (upload target) and/or compute (async compute) when they are
+    // distinct families. A single-entry list stays EXCLUSIVE — CONCURRENT with one
+    // family is not legal, and there would be nothing to share with anyway.
+    u32 families[3] = { VulkanHW.m_GraphicsFamily, 0, 0 };
+    u32 familyCount = 1;
     if ((bufferInfo.usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
-        VulkanHW.m_TransferFamily != VulkanHW.m_GraphicsFamily) {
+        VulkanHW.m_TransferFamily != VulkanHW.m_GraphicsFamily)
+        families[familyCount++] = VulkanHW.m_TransferFamily;
+    if (computeShared) {
+        bool already = false;                       // may already be listed as graphics/transfer
+        for (u32 i = 0; i < familyCount; ++i)
+            if (families[i] == VulkanHW.m_ComputeFamily) { already = true; break; }
+        if (!already) families[familyCount++] = VulkanHW.m_ComputeFamily;
+    }
+    if (familyCount > 1) {
         bufferInfo.sharingMode           = VK_SHARING_MODE_CONCURRENT;
-        bufferInfo.queueFamilyIndexCount = 2;
+        bufferInfo.queueFamilyIndexCount = familyCount;
         bufferInfo.pQueueFamilyIndices   = families;
     }
 
@@ -237,6 +257,29 @@ void* CVulkanBuffer::Map()
     if (m_Mapped != nullptr) {
         // Already mapped (persistent-mapped uniform buffer)
         return m_Mapped;
+    }
+
+    // A gpuOnly buffer (allocInfo.requiredFlags = DEVICE_LOCAL, no host access) has
+    // no host-visible memory to map at all. Upload() already tests this and reroutes
+    // through staging, but Map() did not — so a direct caller reached vmaMapMemory on
+    // DEVICE_LOCAL-only memory (VUID-vkMapMemory-memory-00682, caught 16-08: "memory
+    // has type 1 which has properties VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT"). Whatever
+    // pointer that returns is not legally writable, so fail it here instead: every
+    // caller already handles a null Map() by falling back to staging.
+    {
+        VmaAllocationInfo ai{};
+        vmaGetAllocationInfo(VulkanHW.m_Allocator, m_Allocation, &ai);
+        VkMemoryPropertyFlags memFlags = 0;
+        vmaGetMemoryTypeProperties(VulkanHW.m_Allocator, ai.memoryType, &memFlags);
+        if ((memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+            static bool s_said = false;
+            if (!s_said) {
+                s_said = true;
+                Msg("![Vulkan] Map() on a DEVICE_LOCAL-only buffer — refused (use Upload(), which "
+                    "stages). This is reported once; the caller must not map GPU-only memory.");
+            }
+            return nullptr;
+        }
     }
 
     void* data = nullptr;

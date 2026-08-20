@@ -6,6 +6,10 @@ namespace CPU
 {
 XRCORE_API extern _processor_info ID;
 XRCORE_API extern u64 QPC();
+// Ticks per second of the counter QPC() reads. Constant for the life of the
+// machine, so a tick count can be turned into a duration without asking the OS
+// again -- which the load-time instrumentation does at every phase boundary.
+XRCORE_API u64 QPCFreq();
 
 inline u64 GetCLK() { return __rdtsc(); }
 } // namespace CPU

@@ -10,6 +10,7 @@
 #include "HW_Vulkan.h"
 #include "vk_image.h"      // VK::CreateImage2D / CreateImageView
 #include "vk_barriers.h"       // ImageBarrier — transition DLSS resources to GENERAL for NGX
+#include "../../xr_3da/device.h"   // Device.dwFrame / dwPrecacheFrame / vCameraPosition — history-reset detection
 
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_vk.h"
@@ -22,6 +23,7 @@ extern u32 ps_r_dlss_quality;   // 0=DLAA 1=Quality 2=Balanced 3=Performance 4=U
 extern u32 ps_r_dlss_preset;    // model preset hint: 0=driver default, 6=F(CNN), 10=J, 11=K (transformer)
 extern int ps_r_dlss_jitter_flip; // sign of the REPORTED jitter offset: bit0=flip X, bit1=flip Y (live A/B)
 extern int ps_r_dlss_exp;         // 1 = real exposure via 1x1 texture (default), 0 = NGX AutoExposure flag (old)
+extern int ps_r_dlss_avail;       // r_dlss_avail — this probe's answer, published for the OPTIONS SCREEN to gate its DLSS group on
 
 namespace VK { namespace Dlss {
 
@@ -98,6 +100,10 @@ bool Init()
     s_srAvail = (srAvail != 0);
     s_fgAvail = (fgAvail != 0);
     s_inited  = true;
+    // ⭐Publish the answer. The options screen has no way to call in here (it
+    // lives in xrGame, a different module) and a DLSS row on a card that cannot
+    // run it is the same placebo this pass is removing everywhere else.
+    ps_r_dlss_avail = s_srAvail ? 1 : 0;
 
     Msg("[VK DLSS] NGX initialised.");
     Msg("[VK DLSS]   Super Resolution : %s%s (min driver %d.%d)",
@@ -174,8 +180,17 @@ void EnsureOutput(u32 displayW, u32 displayH)
     if (s_outImg)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_outImg, s_outAlloc); s_outImg = VK_NULL_HANDLE; s_outAlloc = VK_NULL_HANDLE; }
     if (displayW == 0 || displayH == 0) return;
 
+    // ⚠TRANSFER_DST is for NGX, not for us: nothing in this engine clears or copies
+    // INTO the DLSS output, but the nvngx snippet does — it issues its own
+    // vkCmdClearColorImage on the output resource inside EvaluateFeature. Without the
+    // flag that clear is illegal, which is what VUID-vkCmdClearColorImage-image-00002
+    // reported every single frame (144 hits once the message cap was lifted, 16-08).
+    // ⭐The blamed image is DLSS.Output itself — handle 0x3929 against SceneColor's
+    // 0x2DA/0x2DE/0x2E2 — which is how it was finally pinned on NGX rather than on
+    // the engine's own frame-start clear of the HDR target.
     if (!VK::CreateImage2D(s_outFmt, { displayW, displayH },
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             s_outImg, s_outAlloc, "DLSS.Output"))
         return;
     s_outView = VK::CreateImageView(s_outImg, s_outFmt);
@@ -183,7 +198,12 @@ void EnsureOutput(u32 displayW, u32 displayH)
         VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_outImg, s_outAlloc); s_outImg = VK_NULL_HANDLE; return;
     }
     s_outW = displayW; s_outH = displayH; s_outFirst = true;
-    Msg("[VK DLSS] output target ready (%ux%u RGBA16F)", displayW, displayH);
+    // The handle is logged because validation blames THIS image for the frame-start
+    // vkCmdClearColorImage (VUID-...-00002, "no TRANSFER_DST"), which clears
+    // SceneColor — a different image, created with TRANSFER_DST and its own name.
+    // The error appears in the same millisecond as this line in every run, so the
+    // two handles are the thing to compare; print both rather than reason about it.
+    Msg("[VK DLSS] output target ready (%ux%u RGBA16F) img=%p", displayW, displayH, (void*)s_outImg);
 }
 
 VkImageView OutputView()   { return s_outView; }
@@ -199,6 +219,48 @@ namespace { bool s_slShadow = false; bool s_resolved = false; }
 bool        FeatureReady() { return (s_feature != nullptr || s_slShadow) && s_outImg != VK_NULL_HANDLE; }
 bool        ResolvedThisFrame()       { return s_resolved; }
 void        SetResolvedThisFrame(bool ok) { s_resolved = ok; }
+
+// ---------------------------------------------------------------------------
+// Temporal-history reset (InReset). DLSS reprojects the previous OUTPUT through
+// this frame's motion vectors — that only holds while the MVs actually describe
+// how the scene changed. Three cases where they cannot, and the history has to be
+// dropped or the transformer smears the OLD scene over the new one for ~10 frames:
+//
+//   1. we did not evaluate on the immediately preceding frame — r_dlss toggled
+//      off→on, a loading screen, the main menu, alt-tab. The "previous output" NGX
+//      still holds is minutes old and belongs to another place entirely.
+//   2. the level is (re)loading (dwPrecacheFrame != 0).
+//   3. the camera JUMPED: teleport, level transition, cutscene/camera cut. MVs are
+//      derived from the view matrices and cannot express a discontinuity — every
+//      pixel gets a garbage correspondence.
+//
+// ⚠A fast mouse turn is NOT a cut: rotation is exactly what motion vectors encode,
+// and resetting on it would throw away the AA precisely when it is most visible.
+// So the trigger is POSITION only. 10 m in one frame is ~50x a sprinting player at
+// 60 fps and still far below any real teleport.
+// ---------------------------------------------------------------------------
+namespace {
+    bool    s_evalChain    = false;        // we evaluated on frame s_lastEvalFrame
+    u32     s_lastEvalFrame = 0;
+    Fvector s_lastCamPos   = {};
+    bool    s_camPosValid  = false;
+    const float kCamCutDistSq = 10.0f * 10.0f;   // metres², squared to skip the sqrt
+}
+
+bool TakeHistoryReset()
+{
+    bool reset = false;
+
+    if (!s_evalChain || Device.dwFrame != s_lastEvalFrame + 1) reset = true;   // gap in the eval chain
+    if (Device.dwPrecacheFrame != 0)                           reset = true;   // level (re)load
+
+    const Fvector cam = Device.vCameraPosition;
+    if (s_camPosValid && cam.distance_to_sqr(s_lastCamPos) > kCamCutDistSq)    reset = true;
+
+    s_lastCamPos    = cam;   s_camPosValid = true;
+    s_lastEvalFrame = Device.dwFrame; s_evalChain = true;
+    return reset;
+}
 
 void NewFrameJitter(u32 renderW, u32 renderH)
 {
@@ -393,6 +455,8 @@ void ReleaseFeature()
 {
     if (s_feature) { NVSDK_NGX_VULKAN_ReleaseFeature(s_feature); s_feature = nullptr; }
     s_slShadow = false;
+    s_evalChain = false;   // whatever history existed died with the feature
+    s_camPosValid = false;
     s_fRenderW = s_fRenderH = s_fDispW = s_fDispH = 0;
     s_fPreset  = 0xFFFFFFFFu;
     s_fInputsGen = 0xFFFFFFFFu;
@@ -404,15 +468,29 @@ void Evaluate(VkCommandBuffer cmd, const VK::Dlss::Img& color, const VK::Dlss::I
     if (s_feature == nullptr || s_params == nullptr || s_outImg == VK_NULL_HANDLE) return;
     if (color.image == VK_NULL_HANDLE || depth.image == VK_NULL_HANDLE || mv.image == VK_NULL_HANDLE) return;
 
-    // NGX wants its VK resources in GENERAL. Inputs come in SHADER_READ_ONLY (their
-    // producing passes left them there); output goes UNDEFINED/whatever → GENERAL.
-    ImageBarrier(cmd, color.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    ImageBarrier(cmd, mv.image,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    ImageBarrier(cmd, depth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    // NGX wants its VK resources in GENERAL. The INPUTS arrive in GENERAL already —
+    // the caller transitions them straight from their attachment layouts (see the
+    // layout contract in vk_dlss.h). Routing them via SHADER_READ here, as this used
+    // to, meant 4 layout transitions per frame for colour and depth where 2 suffice,
+    // and on NVIDIA every hop out of DEPTH_ATTACHMENT decompresses the whole 1440p
+    // depth surface.
     // The output is fully (over)written by NGX every frame and the caller leaves it in
     // SHADER_READ after sampling it in the tonemap — so discard the previous contents
     // (UNDEFINED old layout) rather than tracking SHADER_READ vs GENERAL across frames.
-    ImageBarrier(cmd, s_outImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    //
+    // ⚠EXPLICIT stage/access, because the layout-derived pair is wrong here: GENERAL
+    // derives to COMPUTE_SHADER + SHADER_STORAGE_READ|WRITE, and NGX does not only run
+    // compute on this image — it also issues its own vkCmdClearColorImage on it inside
+    // EvaluateFeature. Sync validation caught exactly that, 72 times in one run:
+    // "allows SHADER_STORAGE_* at COMPUTE_SHADER, but to prevent this hazard it must
+    // allow TRANSFER_WRITE at CLEAR". So cover the transfer side as well.
+    // ALL_TRANSFER rather than CLEAR_BIT: it subsumes clear/copy/blit, and NGX's exact
+    // choice of transfer op is not ours to predict.
+    ImageBarrier(cmd, s_outImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
     s_outFirst = false;
 
     NVSDK_NGX_Resource_VK colorR = WrapImage(color, renderW, renderH, VK_IMAGE_ASPECT_COLOR_BIT, false);
@@ -465,11 +543,8 @@ void Evaluate(VkCommandBuffer cmd, const VK::Dlss::Img& color, const VK::Dlss::I
         static bool once = false;
         if (!once) { once = true; Msg("![VK DLSS] EvaluateFeature failed: 0x%08X", (unsigned)r); }
     }
-
-    // Restore the inputs for the rest of the frame; output stays GENERAL (caller samples it).
-    ImageBarrier(cmd, color.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    ImageBarrier(cmd, mv.image,    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    ImageBarrier(cmd, depth.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    // Inputs stay GENERAL and the output stays GENERAL — the caller restores every
+    // one of them to the layout the rest of the frame needs (layout contract above).
 }
 
 void SetExposureHint(float exposure)

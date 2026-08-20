@@ -8,6 +8,7 @@
 // GPU-driven shadow casters — see vk_shadow_gpu.h. Mirrors vk_TreeManager.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_shadow_gpu.h"
 #include "CRender_Vulkan.h"     // RImplementation.Visuals
 #include "vk_Visual.h"          // vkFVisual, m_mesh, m_pWorldMaterial
@@ -67,12 +68,12 @@ void MemBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
 // aren't missed — a top-level-only walk drops their shadows vs the CPU FlushDepth
 // path. Trees (MT_TREE_*) and skeletons are handled elsewhere / not opaque static
 // casters; alpha-tested + wmark leaves stay on the CPU AT path.
-void ExtractCasters(vkRender_Visual* rv, xr_vector<vkFVisual*>& out, xr_vector<vkFVisual*>* atOut)
+// Caster filter over the shared leaf index (WorldGPU::LeafVisuals): the
+// container recursion + dedup this used to repeat now happen once per load.
+void ExtractCasters(vkFVisual* fv, xr_vector<vkFVisual*>& out, xr_vector<vkFVisual*>* atOut)
 {
-    if (!rv) return;
-    const u32 t = rv->Type;
+    const u32 t = fv->Type;
     if (t == MT_NORMAL || t == MT_PROGRESSIVE) {
-        auto* fv = static_cast<vkFVisual*>(rv);
         if (!fv->m_mesh.IsValid() || !fv->m_mesh.p_rm_Vertices || !fv->m_mesh.p_rm_Indices) return;
         WorldMaterial* mat = fv->m_pWorldMaterial;
         if (mat && mat->isWmark) return;
@@ -81,13 +82,6 @@ void ExtractCasters(vkRender_Visual* rv, xr_vector<vkFVisual*>& out, xr_vector<v
             return;
         }
         out.push_back(fv);
-        return;
-    }
-    if (t == MT_HIERRARHY || t == MT_LOD) {
-        auto* hv = dynamic_cast<vkFHierrarhyVisual*>(rv);
-        if (!hv) return;
-        for (auto* child : hv->children)
-            ExtractCasters(child, out, atOut);
     }
 }
 
@@ -97,34 +91,17 @@ bool CreateCullPipeline()
     VkShaderModule cs = g_ShaderManager->Load("shadow_cull.comp.spv");
     if (!cs) { Msg("![VK ShadowGPU] shadow_cull.comp.spv load failed"); return false; }
 
-    VkDescriptorSetLayoutBinding b[3]{};
-    for (u32 i = 0; i < 3; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 3; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL) != VK_SUCCESS) return false;
+    // 0 = meta, 1 = indirect, 2 = count.
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO }, 1, s_setL, s_pool, &s_set,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "ShadowGPU.Cull"))
+        return false;
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) return false;
-
-    VkDescriptorBufferInfo bi[3] = {
-        { s_meta->GetHandle(),     0, VK_WHOLE_SIZE },
-        { s_indirect->GetHandle(), 0, VK_WHOLE_SIZE },
-        { s_count->GetHandle(),    0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet w[3]{};
-    for (u32 i = 0; i < 3; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set; w[i].dstBinding = i;
-        w[i].descriptorCount = 1; w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+    VK::DescriptorWriter(s_set)
+        .StorageBuffer(0, s_meta->GetHandle())
+        .StorageBuffer(1, s_indirect->GetHandle())
+        .StorageBuffer(2, s_count->GetHandle())
+        .Flush();
 
     s_cullLayout = VK::MakePipelineLayout({ s_setL }, sizeof(CullPush));
     if (s_cullLayout == VK_NULL_HANDLE) return false;
@@ -142,21 +119,31 @@ void Build()
     if (s_built) return;
     s_built = true;   // one attempt; stays "built" (possibly empty) so we don't retry every frame
 
+    // Sub-timers: this is 44 ms of the post-visual budget reported as ONE number,
+    // and it mixes an extract over the leaf set, two sorts, a meta pack, buffer
+    // creation, a pipeline, and three diagnostic walks over the caster set. Which
+    // of those owns the time decides whether there is anything here worth moving.
+    CTimer _s;
+    float msExtract = 0, msMeta = 0, msGroups = 0, msBufs = 0, msPipe = 0, msDiag = 0;
+
     // Collect OPAQUE static casters, recursing into hierarchy/LOD containers
     // (alpha-tested stay on the CPU AT path; wmarks never cast).
+    _s.Start();
     xr_vector<vkFVisual*> casters; casters.reserve(8192);
     xr_vector<vkFVisual*> atCasters; atCasters.reserve(8192);   // coverage diag only (GPU AT draws via WorldGPU)
-    for (IRenderVisual* iv : RImplementation.Visuals)
-        ExtractCasters(static_cast<vkRender_Visual*>(iv), casters, &atCasters);
+    for (vkFVisual* fv : VK::WorldGPU::LeafVisuals())
+        ExtractCasters(fv, casters, &atCasters);
     const u32 nPreDedup = (u32)casters.size();   // diag: hierarchy double-collection vs nesting recovered
     std::sort(casters.begin(), casters.end());
     casters.erase(std::unique(casters.begin(), casters.end()), casters.end());
     std::sort(atCasters.begin(), atCasters.end());
     atCasters.erase(std::unique(atCasters.begin(), atCasters.end()), atCasters.end());
+    msExtract = _s.GetElapsed_ms_total();
 
     if (casters.empty()) { Msg("[VK ShadowGPU] no opaque static casters"); return; }
 
     // Group consecutive by (vb, ib, stride) — opaque depth pipeline keys only on stride.
+    _s.Start();
     std::sort(casters.begin(), casters.end(), [](vkFVisual* a, vkFVisual* b) {
         const VkBuffer av = a->m_mesh.p_rm_Vertices->GetHandle(), bv = b->m_mesh.p_rm_Vertices->GetHandle();
         if (av != bv) return av < bv;
@@ -198,7 +185,9 @@ void Build()
         m.lod_count    = lodCount;
         m._pad0 = 0; m._pad1 = 0;
     }
+    msMeta = _s.GetElapsed_ms_total();
 
+    _s.Start();
     s_groups.clear(); s_maxGroupMesh = 0;
     Group cur{};
     auto seed = [&](u32 i) {
@@ -226,8 +215,10 @@ void Build()
     for (u32 g = 0; g < nGroups; ++g)
         for (u32 i = s_groups[g].meshOffset; i < s_groups[g].meshOffset + s_groups[g].meshCount; ++i)
             meta[i].group = g;
+    msGroups = _s.GetElapsed_ms_total();
 
     // meta SSBO (device-local)
+    _s.Start();
     s_meta = xr_new<CVulkanBuffer>();
     s_meta->Create(sizeof(GpuCasterMeta) * s_total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
@@ -241,8 +232,13 @@ void Build()
     s_count = xr_new<CVulkanBuffer>();
     s_count->Create((VkDeviceSize)TGT_COUNT * nGroups * sizeof(u32), iu, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
-    if (!CreateCullPipeline()) { Msg("![VK ShadowGPU] cull pipeline failed — disabled"); s_groups.clear(); return; }
+    msBufs = _s.GetElapsed_ms_total();
 
+    _s.Start();
+    if (!CreateCullPipeline()) { Msg("![VK ShadowGPU] cull pipeline failed — disabled"); s_groups.clear(); return; }
+    msPipe = _s.GetElapsed_ms_total();
+
+    _s.Start();
     // ---- DIAG: caster-LOD viability — type split, how many progressives carry
     // real LOD slices (sw_count>1; single-slice = degraded full-only), and the
     // SHARE of shadow triangles that is LOD-able (= the ceiling of caster-LOD).
@@ -297,6 +293,10 @@ void Build()
             uncoveredAT ? "!" : "", uncoveredAT, (u32)atCasters.size(),
             uncoveredAT ? " (their shadows drop under r_gpu_shadows_at)" : "");
     }
+    msDiag = _s.GetElapsed_ms_total();
+
+    Msg("[load step]   ShadowGPU::Build: extract+dedup %.0f | meta %.0f | groups %.0f | bufs %.0f | pipeline %.0f | diag walks %.0f ms",
+        msExtract, msMeta, msGroups, msBufs, msPipe, msDiag);
 }
 
 bool Built() { return s_built && !s_groups.empty() && s_cullPipe != VK_NULL_HANDLE; }

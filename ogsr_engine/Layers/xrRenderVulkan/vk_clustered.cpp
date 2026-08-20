@@ -9,6 +9,7 @@
 // single-shared-buffer + WAR-barrier discipline mirrors vk_world_gpu.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_clustered.h"
 #include "vk_buffer.h"           // CVulkanBuffer
 #include "vk_command_buffer.h"   // CVulkanCommandManager::FRAMES_IN_FLIGHT
@@ -97,38 +98,19 @@ bool Init()
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
 
     // Compute set layout: 0 = lights (in), 1 = grid (out), 2 = indices (out).
-    VkDescriptorSetLayoutBinding b[3]{};
-    for (u32 i = 0; i < 3; ++i) {
-        b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (!VK::MakeDescriptorSets({ kSSBO, kSSBO, kSSBO }, kFramesInFlight, s_setL, s_pool, s_set,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "Clustered.Cull")) {
+        s_failed = true; return false;
     }
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 3; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL) != VK_SUCCESS) { Msg("![VK Clustered] set layout create failed"); s_failed = true; return false; }
-
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kFramesInFlight };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = kFramesInFlight; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) { Msg("![VK Clustered] pool create failed"); s_failed = true; return false; }
-
-    VkDescriptorSetLayout layouts[kFramesInFlight];
-    for (u32 i = 0; i < kFramesInFlight; ++i) layouts[i] = s_setL;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = kFramesInFlight; dai.pSetLayouts = layouts;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_set) != VK_SUCCESS) { Msg("![VK Clustered] alloc sets failed"); s_failed = true; return false; }
 
     for (u32 i = 0; i < kFramesInFlight; ++i) {
-        VkDescriptorBufferInfo bi[3] = {
-            { s_lights.GetHandle(),  kLightStride * i, sizeof(Lights::GpuLight) * Lights::kMaxClusterLights },
-            { s_grid.GetHandle(),    0, VK_WHOLE_SIZE },
-            { s_indices.GetHandle(), 0, VK_WHOLE_SIZE },
-        };
-        VkWriteDescriptorSet w[3]{};
-        for (u32 k = 0; k < 3; ++k) {
-            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[k].dstSet = s_set[i]; w[k].dstBinding = k;
-            w[k].descriptorCount = 1; w[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[k].pBufferInfo = &bi[k];
-        }
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+        VK::DescriptorWriter(s_set[i])
+            .StorageBuffer(0, s_lights.GetHandle(),
+                              sizeof(Lights::GpuLight) * Lights::kMaxClusterLights, kLightStride * i)
+            .StorageBuffer(1, s_grid.GetHandle())
+            .StorageBuffer(2, s_indices.GetHandle())
+            .Flush();
     }
 
     s_layout = VK::MakePipelineLayout({ s_setL }, sizeof(CullPush));

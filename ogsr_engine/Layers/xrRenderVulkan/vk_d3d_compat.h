@@ -7,84 +7,17 @@
 
 #pragma once
 // ============================================================================
-// D3D9 Compatibility Helper Functions for Vulkan Renderer
+// Vertex-declaration helpers for the Vulkan renderer.
 //
 // These functions work with D3DVERTEXELEMENT9 structures to parse level files.
-// The D3D9 types themselves come from d3d9types.h (via engine headers).
-// When D3D9 is removed from the project, uncomment the type definitions below.
+// The types come from Layers/xrRender/xrVertexDeclTypes.h (vendored via the PCH)
+// — the engine no longer includes any Direct3D header.
 //
 // Based on stalker-cordisproject/src/Common/PlatformLinux.inl
 // ============================================================================
 
 #ifndef VK_D3D_COMPAT_H
 #define VK_D3D_COMPAT_H
-
-// ============================================================================
-// D3D9 Type Definitions (uncomment when removing d3d9 dependency)
-// ============================================================================
-/*
-// These are only needed when building without d3d9types.h
-
-typedef enum _D3DDECLTYPE {
-    D3DDECLTYPE_FLOAT1    =  0,
-    D3DDECLTYPE_FLOAT2    =  1,
-    D3DDECLTYPE_FLOAT3    =  2,
-    D3DDECLTYPE_FLOAT4    =  3,
-    D3DDECLTYPE_D3DCOLOR  =  4,
-    D3DDECLTYPE_UBYTE4    =  5,
-    D3DDECLTYPE_SHORT2    =  6,
-    D3DDECLTYPE_SHORT4    =  7,
-    D3DDECLTYPE_UBYTE4N   =  8,
-    D3DDECLTYPE_SHORT2N   =  9,
-    D3DDECLTYPE_SHORT4N   = 10,
-    D3DDECLTYPE_USHORT2N  = 11,
-    D3DDECLTYPE_USHORT4N  = 12,
-    D3DDECLTYPE_UDEC3     = 13,
-    D3DDECLTYPE_DEC3N     = 14,
-    D3DDECLTYPE_FLOAT16_2 = 15,
-    D3DDECLTYPE_FLOAT16_4 = 16,
-    D3DDECLTYPE_UNUSED    = 17,
-} D3DDECLTYPE;
-
-typedef enum _D3DDECLMETHOD {
-    D3DDECLMETHOD_DEFAULT          = 0,
-    D3DDECLMETHOD_PARTIALU         = 1,
-    D3DDECLMETHOD_PARTIALV         = 2,
-    D3DDECLMETHOD_CROSSUV          = 3,
-    D3DDECLMETHOD_UV               = 4,
-    D3DDECLMETHOD_LOOKUP           = 5,
-    D3DDECLMETHOD_LOOKUPPRESAMPLED = 6
-} D3DDECLMETHOD;
-
-typedef enum _D3DDECLUSAGE {
-    D3DDECLUSAGE_POSITION     = 0,
-    D3DDECLUSAGE_BLENDWEIGHT  = 1,
-    D3DDECLUSAGE_BLENDINDICES = 2,
-    D3DDECLUSAGE_NORMAL       = 3,
-    D3DDECLUSAGE_PSIZE        = 4,
-    D3DDECLUSAGE_TEXCOORD     = 5,
-    D3DDECLUSAGE_TANGENT      = 6,
-    D3DDECLUSAGE_BINORMAL     = 7,
-    D3DDECLUSAGE_TESSFACTOR   = 8,
-    D3DDECLUSAGE_POSITIONT    = 9,
-    D3DDECLUSAGE_COLOR        = 10,
-    D3DDECLUSAGE_FOG          = 11,
-    D3DDECLUSAGE_DEPTH        = 12,
-    D3DDECLUSAGE_SAMPLE       = 13
-} D3DDECLUSAGE;
-
-typedef struct _D3DVERTEXELEMENT9 {
-    WORD    Stream;
-    WORD    Offset;
-    BYTE    Type;
-    BYTE    Method;
-    BYTE    Usage;
-    BYTE    UsageIndex;
-} D3DVERTEXELEMENT9, *LPD3DVERTEXELEMENT9;
-
-#define MAXD3DDECLLENGTH 64
-#define D3DDECL_END() {0xFF, 0, D3DDECLTYPE_UNUSED, 0, 0, 0}
-*/
 
 // ============================================================================
 // Helper Functions for Vertex Declarations

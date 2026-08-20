@@ -7,166 +7,160 @@
 
 #pragma once
 #include "vk_core.h"
+#include "HW_Vulkan.h"   // VulkanHW.m_Device — DescriptorWriter::Flush is header-inline
+#include <initializer_list>
 
 namespace VK
 {
 
-/**
- * Vulkan Descriptor Manager
- *
- * Управляет descriptor set layouts, descriptor pool и allocation.
- *
- * Descriptor Sets организованы по частоте обновления:
- *   Set 0 (PerFrame)    - Обновляется каждый кадр (viewProj, camera)
- *   Set 1 (PerMaterial) - Обновляется при смене материала (текстуры)
- *   Set 2 (PerObject)   - Обновляется для каждого объекта (world matrix)
- *   Set 3 (Lighting)    - Обновляется при изменении освещения
- *
- * Это соответствует лучшим практикам Vulkan для минимизации rebind.
- */
-class CVulkanDescriptorManager
-{
-public:
-    CVulkanDescriptorManager();
-    ~CVulkanDescriptorManager();
+// ============================================================================
+// Set layout / pool / allocation helpers
+//
+// The counterpart to DescriptorWriter (below): the writer collapsed the UPDATE
+// side, these collapse the CREATE side — the ~15-line `VkDescriptorSetLayoutBinding
+// b[N]{}` + pool sizes + VkDescriptorSetAllocateInfo tail every pass hand-rolls.
+//
+// Bindings are POSITIONAL: types[i] describes binding i with descriptorCount 1,
+// which is what every set in this renderer already does. Pool sizes are summed
+// FROM that same list, so a pool can no longer drift behind the bindings it has
+// to satisfy — the create-side twin of the hazard the writer closed.
+//
+// A set that needs binding flags (bindless / PARTIALLY_BOUND), a non-1 descriptor
+// count, or FREE_DESCRIPTOR_SET stays hand-rolled; these cover the plain case.
+// All log a tagged error and return VK_NULL_HANDLE / false on failure.
+// ============================================================================
 
-    /**
-     * Создать descriptor set layouts и pool
-     */
-    void Create();
+VkDescriptorSetLayout MakeSetLayout(std::initializer_list<VkDescriptorType> types,
+                                    VkShaderStageFlags stages = VK_SHADER_STAGE_COMPUTE_BIT,
+                                    const char* tag = "set");
 
-    /**
-     * Уничтожить все ресурсы
-     */
-    void Destroy();
+// Pool sized for `setCount` copies of `types`.
+VkDescriptorPool MakeDescriptorPool(std::initializer_list<VkDescriptorType> types, u32 setCount,
+                                    const char* tag = "pool");
 
-    /**
-     * Получить layouts для создания pipeline layout
-     */
-    VkDescriptorSetLayout GetPerFrameLayout() const { return m_PerFrameLayout; }
-    VkDescriptorSetLayout GetPerMaterialLayout() const { return m_PerMaterialLayout; }
-    VkDescriptorSetLayout GetPerObjectLayout() const { return m_PerObjectLayout; }
-    VkDescriptorSetLayout GetLightingLayout() const { return m_LightingLayout; }
+// Allocate `count` sets of ONE layout out of `pool` into `outSets`.
+bool AllocSets(VkDescriptorPool pool, VkDescriptorSetLayout layout, u32 count,
+               VkDescriptorSet* outSets, const char* tag = "sets");
 
-    /**
-     * Allocate descriptor sets
-     */
-    VkDescriptorSet AllocatePerFrame();
-    VkDescriptorSet AllocatePerMaterial();
-    VkDescriptorSet AllocatePerObject();
-    VkDescriptorSet AllocateLighting();
-    VkDescriptorSet AllocateWithLayout(VkDescriptorSetLayout layout);
+// layout + pool + `count` sets in one call — the whole tail of a typical init.
+// For several set GROUPS out of one pool, call the three above separately.
+bool MakeDescriptorSets(std::initializer_list<VkDescriptorType> types, u32 count,
+                        VkDescriptorSetLayout& outLayout, VkDescriptorPool& outPool,
+                        VkDescriptorSet* outSets,
+                        VkShaderStageFlags stages = VK_SHADER_STAGE_COMPUTE_BIT,
+                        const char* tag = "descriptors");
 
-    /**
-     * Update uniform buffer binding
-     * @param set Descriptor set to update
-     * @param binding Binding index
-     * @param buffer Uniform buffer
-     * @param size Buffer size
-     * @param offset Offset in buffer (default 0)
-     */
-    void UpdateBuffer(VkDescriptorSet set, u32 binding, VkBuffer buffer,
-                      VkDeviceSize size, VkDeviceSize offset = 0);
-
-    /**
-     * Update storage buffer (SSBO) binding
-     */
-    void UpdateStorageBuffer(VkDescriptorSet set, u32 binding, VkBuffer buffer,
-                             VkDeviceSize size, VkDeviceSize offset = 0);
-
-    /**
-     * Update texture binding
-     * @param set Descriptor set to update
-     * @param binding Binding index
-     * @param view Image view
-     * @param sampler Sampler
-     */
-    void UpdateTexture(VkDescriptorSet set, u32 binding,
-                       VkImageView view, VkSampler sampler);
-
-    /**
-     * Update multiple textures at once (для материалов с несколькими текстурами)
-     */
-    void UpdateTextures(VkDescriptorSet set, u32 firstBinding,
-                        const VkImageView* views, const VkSampler* samplers, u32 count);
-
-    /**
-     * Reset pool for a specific frame-in-flight slot.
-     * Only resets descriptors from that frame (safe after fence wait).
-     */
-    void ResetPool(u32 frameIndex);
-
-    /**
-     * Set which frame-in-flight slot allocations go to.
-     */
-    void SetCurrentFrame(u32 frameIndex) { m_CurrentFrame = frameIndex; }
-
-    /**
-     * Статистика
-     */
-    u32 GetAllocatedSets() const { return m_AllocatedSets[m_CurrentFrame]; }
-
-private:
-    /**
-     * Создать descriptor set layouts
-     */
-    void CreateLayouts();
-
-    /**
-     * Создать descriptor pool
-     */
-    void CreatePool();
-
-    /**
-     * Helper для создания layout
-     */
-    VkDescriptorSetLayout CreateLayout(const VkDescriptorSetLayoutBinding* bindings, u32 count);
-
-private:
-    // Descriptor Set Layouts
-    VkDescriptorSetLayout m_PerFrameLayout    = VK_NULL_HANDLE;  // Set 0
-    VkDescriptorSetLayout m_PerMaterialLayout = VK_NULL_HANDLE;  // Set 1
-    VkDescriptorSetLayout m_PerObjectLayout   = VK_NULL_HANDLE;  // Set 2
-    VkDescriptorSetLayout m_LightingLayout    = VK_NULL_HANDLE;  // Set 3
-
-    // Descriptor Pools (one per frame-in-flight to avoid vkDeviceWaitIdle)
-    static constexpr u32 FRAMES_IN_FLIGHT = VK_FRAMES_IN_FLIGHT;
-    VkDescriptorPool m_Pools[FRAMES_IN_FLIGHT] = {};
-    u32 m_CurrentFrame = 0;
-
-    // Статистика (per frame)
-    u32 m_AllocatedSets[FRAMES_IN_FLIGHT] = {};
-    bool m_bCreated = false;
-};
 
 // ============================================================================
 // DescriptorWriter - fluent builder for batched descriptor updates
-// Stack-allocated, zero heap. Call Flush() to commit all writes at once.
+//
+// Replaces the hand-rolled `VkWriteDescriptorSet w[N]{}` + running `count`
+// idiom that every module had a copy of. Besides the boilerplate, that idiom
+// carried a real hazard: N is written by hand and drifts behind the binding
+// list, so an added binding writes past the end of the array and the process
+// dies during init with a garbage descriptor (see the EnvLight scar at
+// binding 32/33). Here the capacity is a template parameter checked on every
+// append, so overflow is a VERIFY at the append, not stack corruption later.
+//
+// Stack-allocated, zero heap; one instance writes ONE set. Flush() commits
+// every recorded write in a single vkUpdateDescriptorSets and resets, so a
+// writer can be refilled in a loop.
+//
+//   VK::DescriptorWriter(set)
+//       .UniformBuffer(0, ubo.GetHandle(), sizeof(UBO))
+//       .ImageSampler(1, view, sampler)
+//       .StorageImage(2, dstView)
+//       .Flush();
 // ============================================================================
-class DescriptorWriter
+template <u32 MAX_WRITES>
+class TDescriptorWriter
 {
-    static const u32 MAX_WRITES = 16;
-    VkDescriptorSet          m_Set;
-    VkWriteDescriptorSet     m_Writes[MAX_WRITES];
-    VkDescriptorBufferInfo   m_BufferInfos[MAX_WRITES];
-    VkDescriptorImageInfo    m_ImageInfos[MAX_WRITES];
-    u32                      m_Count = 0;
+    VkDescriptorSet        m_Set;
+    VkWriteDescriptorSet   m_Writes[MAX_WRITES];
+    VkDescriptorBufferInfo m_BufferInfos[MAX_WRITES];
+    VkDescriptorImageInfo  m_ImageInfos[MAX_WRITES];
+    u32                    m_Count = 0;
+
+    // Every field is assigned here, so the arrays need no up-front zeroing —
+    // which matters for the wide instantiations (48 slots = ~5 KB).
+    VkWriteDescriptorSet& Add(u32 binding, VkDescriptorType type)
+    {
+        VERIFY(m_Count < MAX_WRITES);
+        VkWriteDescriptorSet& w = m_Writes[m_Count];
+        w.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.pNext            = nullptr;
+        w.dstSet           = m_Set;
+        w.dstBinding       = binding;
+        w.dstArrayElement  = 0;
+        w.descriptorCount  = 1;
+        w.descriptorType   = type;
+        w.pImageInfo       = nullptr;
+        w.pBufferInfo      = nullptr;
+        w.pTexelBufferView = nullptr;
+        return w;
+    }
 
 public:
-    explicit DescriptorWriter(VkDescriptorSet set);
+    explicit TDescriptorWriter(VkDescriptorSet set) : m_Set(set) {}
 
-    DescriptorWriter& UniformBuffer(u32 binding, VkBuffer buf, VkDeviceSize size,
-        VkDeviceSize offset = 0);
-    DescriptorWriter& StorageBuffer(u32 binding, VkBuffer buf, VkDeviceSize size,
-        VkDeviceSize offset = 0);
-    DescriptorWriter& ImageSampler(u32 binding, VkImageView view, VkSampler sampler,
-        VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    DescriptorWriter& StorageImage(u32 binding, VkImageView view,
-        VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL);
-    void Flush();
+    // ---- buffers -----------------------------------------------------------
+    TDescriptorWriter& UniformBuffer(u32 binding, VkBuffer buf,
+                                     VkDeviceSize size = VK_WHOLE_SIZE, VkDeviceSize offset = 0)
+    {
+        return Buffer(binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, { buf, offset, size });
+    }
+    TDescriptorWriter& StorageBuffer(u32 binding, VkBuffer buf,
+                                     VkDeviceSize size = VK_WHOLE_SIZE, VkDeviceSize offset = 0)
+    {
+        return Buffer(binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, { buf, offset, size });
+    }
+
+    // ---- images ------------------------------------------------------------
+    TDescriptorWriter& ImageSampler(u32 binding, VkImageView view, VkSampler sampler,
+                                    VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    {
+        return Image(binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, { sampler, view, layout });
+    }
+    TDescriptorWriter& StorageImage(u32 binding, VkImageView view,
+                                    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL)
+    {
+        return Image(binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, { VK_NULL_HANDLE, view, layout });
+    }
+
+    // ---- prebuilt infos / runtime type -------------------------------------
+    // For the sites that already keep a VkDescriptorImageInfo[] around, or that
+    // pick the descriptor type from a table at runtime. The info is COPIED, so
+    // the caller's temporary needn't outlive the call.
+    TDescriptorWriter& Buffer(u32 binding, VkDescriptorType type, const VkDescriptorBufferInfo& info)
+    {
+        Add(binding, type).pBufferInfo = &(m_BufferInfos[m_Count] = info);
+        ++m_Count;
+        return *this;
+    }
+    // `arrayElement` addresses one slot of a descriptor ARRAY (bindless tables).
+    TDescriptorWriter& Image(u32 binding, VkDescriptorType type, const VkDescriptorImageInfo& info,
+                             u32 arrayElement = 0)
+    {
+        VkWriteDescriptorSet& w = Add(binding, type);
+        w.dstArrayElement = arrayElement;
+        w.pImageInfo = &(m_ImageInfos[m_Count] = info);
+        ++m_Count;
+        return *this;
+    }
+
+    u32 Count() const { return m_Count; }
+
+    void Flush()
+    {
+        if (m_Count > 0)
+            vkUpdateDescriptorSets(VulkanHW.m_Device, m_Count, m_Writes, 0, nullptr);
+        m_Count = 0;
+    }
 };
 
-} // namespace VK
+// Default capacity covers every set in this renderer but EnvLight's (34 bindings),
+// which names a wider instantiation explicitly. 24 slots is ~2.7 KB of stack —
+// paid only inside the function that writes a set, never held across a frame.
+using DescriptorWriter = TDescriptorWriter<24>;
 
-// Глобальный экземпляр
-extern VK::CVulkanDescriptorManager* g_DescriptorManager;
+} // namespace VK

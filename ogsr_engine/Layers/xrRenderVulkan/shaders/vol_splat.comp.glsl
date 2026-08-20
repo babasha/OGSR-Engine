@@ -33,17 +33,7 @@ layout(push_constant) uniform Push {
     vec4 params;     // x = particle count, y = density scale, z = max footprint (cells; 0 = point splat)
 } pc;
 
-// Atomic-add a weighted density+colour contribution into one accum cell (bounds-checked).
-void depositCell(ivec3 c, ivec3 dim, float dens, vec3 col)
-{
-    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, dim))) return;
-    uint cell = (uint(c.z) * uint(dim.y) + uint(c.y)) * uint(dim.x) + uint(c.x);
-    float sc = pc.dims.w;
-    atomicAdd(accum[cell * 4u + 0u], uint(dens * sc));
-    atomicAdd(accum[cell * 4u + 1u], uint(dens * col.r * sc));
-    atomicAdd(accum[cell * 4u + 2u], uint(dens * col.g * sc));
-    atomicAdd(accum[cell * 4u + 3u], uint(dens * col.b * sc));
-}
+#include "splat_common.glsl"   // depositCell + splatFootprint — shared with gp_media_splat
 
 void main()
 {
@@ -72,27 +62,11 @@ void main()
     vec3  col  = max(p.color.rgb, vec3(0.0));                   // albedo
 
     vec3  fc = vec3(uv.x * float(dim.x), uv.y * float(dim.y), w * float(dim.z));  // continuous froxel coord
-    ivec3 ci = ivec3(floor(fc));
 
-    // FOOTPRINT (Stage 1.1): spread the particle over a froxel neighbourhood sized by
-    // its world radius vs the LOCAL cell size, CAPPED at params.z cells so the cost
-    // stays bounded (cost ~ particles × (2·fr+1)³). 0 → point splat (cheapest). Gaussian
-    // falloff → soft, non-grainy blobs; not normalized, so a bigger particle deposits
-    // more total mass = denser & larger clouds.
+    // FOOTPRINT (Stage 1.1): neighbourhood size from the particle's WORLD radius vs
+    // the LOCAL cell size, capped at params.z (see splatFootprint in splat_common).
     float cellWorld = 2.0 * length(pc.camRightT.xyz) * viewZ / float(dim.x);  // ~lateral cell size (world)
     int   fr = min(int(p.posRadius.w / max(cellWorld, 1e-3)), int(pc.params.z));
 
-    if (fr <= 0) {
-        depositCell(clamp(ci, ivec3(0), dim - 1), dim, dens, col);
-    } else {
-        float sig2 = max(float(fr) * float(fr) * 0.5, 0.25);
-        for (int dz = -fr; dz <= fr; ++dz)
-        for (int dy = -fr; dy <= fr; ++dy)
-        for (int dx = -fr; dx <= fr; ++dx) {
-            ivec3 c   = ci + ivec3(dx, dy, dz);
-            vec3  off = (vec3(c) + 0.5) - fc;
-            float wgt = exp(-dot(off, off) / sig2);
-            if (wgt > 0.02) depositCell(c, dim, dens * wgt, col);
-        }
-    }
+    splatFootprint(fc, dim, fr, dens, col);
 }

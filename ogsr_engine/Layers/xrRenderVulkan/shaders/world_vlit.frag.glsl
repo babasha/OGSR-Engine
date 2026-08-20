@@ -1,5 +1,7 @@
 #version 450
-// Thin wrapper — the actual shader lives in world_vlit_frag_body.glsl (shared with the
-// _fade variant, which #defines CLUSTER_FADE for the LOD crossfade dither).
+// Thin wrapper — vert-lit variant of the shared world static FS. WORLD_VLIT swaps
+// the baked-occlusion source (packed NORMAL alpha instead of the lightmap) and
+// adds the baked vertex-lighting term; see world_frag_body.glsl.
 #extension GL_GOOGLE_include_directive : require
-#include "world_vlit_frag_body.glsl"
+#define WORLD_VLIT 1
+#include "world_frag_body.glsl"

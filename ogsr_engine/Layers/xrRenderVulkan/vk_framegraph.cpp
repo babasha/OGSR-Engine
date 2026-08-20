@@ -29,6 +29,45 @@ void FrameGraph::BeginFrame(VkImage colorImg, VkImage depthImg)
                  VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                  VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+    // NOTE: the v2 registry is deliberately NOT cleared here — see the header.
+    // A persistent target's layout survives the frame boundary; wiping it every
+    // frame would make the first consumer re-transition from a state the image is
+    // not actually in.
+}
+
+// --- v2 registry -----------------------------------------------------------
+
+ImageState& FrameGraph::Track(VkImage img, VkImageAspectFlags aspect, VkImageLayout curLayout,
+                              VkPipelineStageFlags2 curStage, VkAccessFlags2 curAccess)
+{
+    // emplace returns (iterator, inserted). Seed ONLY on a real insert: on every
+    // later call the caller's "current" arguments are its create-time belief,
+    // which is stale — the tracked state is the truth.
+    auto res = m_images.emplace(img, ImageState{});
+    if (res.second)
+        res.first->second.Seed(img, aspect, curLayout, curStage, curAccess);
+    return res.first->second;
+}
+
+BufferState& FrameGraph::TrackBuffer(VkBuffer buf, VkPipelineStageFlags2 curStage,
+                                     VkAccessFlags2 curAccess)
+{
+    auto res = m_buffers.emplace(buf, BufferState{});
+    if (res.second)
+        res.first->second.Seed(buf, curStage, curAccess);
+    return res.first->second;
+}
+
+void FrameGraph::Forget(VkImage img)  { m_images.erase(img); }
+void FrameGraph::Forget(VkBuffer buf) { m_buffers.erase(buf); }
+
+void FrameGraph::Reset()
+{
+    m_images.clear();
+    m_buffers.clear();
+    m_color = ImageState{};
+    m_depth = ImageState{};
 }
 
 } // namespace VK

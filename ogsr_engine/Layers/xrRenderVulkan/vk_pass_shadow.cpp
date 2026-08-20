@@ -7,12 +7,16 @@
 
 // xrRenderVulkan — sun shadow caster pass. See vk_pass_shadow.h.
 #include "stdafx.h"
+#include "vk_rendering.h"          // VK::RenderingBuilder
+#include "vk_descriptors.h"     // VK::DescriptorWriter
 #include "vk_pass_shadow.h"
 #include "vk_shadow.h"
 #include "vk_render_queue.h"               // RenderQueue (local caster queue)
 #include "vk_water_sim.h"                  // WaterSim::Dispatch (shallow-water flow sim)
 #include "vk_deform.h"                     // Deform::Dispatch (snow deform press field)
 #include "vk_pipeline_cache.h"             // depth pipelines/layout
+#include "vk_compute_util.h"               // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_gfx_pipeline.h"               // VK::GfxPipelineBuilder
 #include "vk_barriers.h"                   // ImageBarrier
 #include "vk_pass_skinned.h"               // Skinned_UploadBones / Skinned_RenderShadow
 #include "vk_pass_world.h"                 // g_DynamicVisuals — rigid dynamic sun casters
@@ -52,6 +56,10 @@ extern int   ps_r_snow_mesh;          // dense snow surface mesh (needs the grou
 extern float ps_r_snow_deform_radius; // print radius (m)
 extern float ps_r_snow;               // TARGET snow coverage (gate the deform dispatch)
 extern int ps_r_water_sim;   // gate the ground-height map render (sim)
+extern int   ps_r_wtr;           // water pass master switch
+extern float ps_r_wtr_shelter;   // water asks the rain map whether it has sky overhead
+extern int   ps_r_wtr_sim;       // interactive ripple sim
+extern int   ps_r_wtr_sim_pools; // ...bounded by the pool mask, which needs the GROUND map
 extern int ps_r_puddle_sss;  // gate the ground-height map render (SSS puddle real-dip placement)
 extern int ps_r_light_occ;   // dynamic-light occlusion: render the ground-height map always
 extern int ps_r_gpu_shadows; // GPU-driven opaque sun shadow casters (A/B with 0)
@@ -70,7 +78,6 @@ extern int   ps_r_grass_cull_debug;  // [VK GrassCull] per-frame culled-instance
 extern int   ps_r_vsm;               // VSM on → its mask drives ALL sun receivers, so the cascade/far sun maps are redundant
 extern int   ps_r_vol;               // froxel volumetrics: samples the cascade for froxel SUN occlusion → keep it rendered even under VSM
 extern int   ps_r_vol_debug;
-extern int   ps_r_vol_shadow;        // dedicated per-frame fog sun-shadow (continuous → no cache tick); 0 = cascade/VSM path
 
 namespace VK {
 
@@ -186,38 +193,14 @@ namespace {
             { 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 16 },   // aInstRow1
             { 5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32 },   // aInstRow2
         };
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = 2; vi.pVertexBindingDescriptions = vibd;
-        vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = via;
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_grassSpotVS; stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_grassSpotFS; stages[1].pName = "main";
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = 1; vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-        rs.depthBiasEnable = VK_TRUE;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-        ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        cb.attachmentCount = 0;
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-        VkPipelineDynamicStateCreateInfo dynState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-        VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-        prci.colorAttachmentCount = 0; prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
-        VkGraphicsPipelineCreateInfo pi{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        pi.pNext = &prci; pi.stageCount = 2; pi.pStages = stages;
-        pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
-        pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
-        pi.pColorBlendState = &cb; pi.pDynamicState = &dynState; pi.layout = s_grassSpotLayout;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pi, nullptr, &s_grassSpotPipe) != VK_SUCCESS)
-            Msg("![VK Shadow] grass spot pipeline create failed (stride=%u)", vstride);
+        // Depth-only: no colour attachment, bias set per draw by the caller.
+        s_grassSpotPipe = VK::GfxPipelineBuilder(s_grassSpotLayout)
+            .Vert(s_grassSpotVS).Frag(s_grassSpotFS)
+            .Bindings(vibd, 2).Attrs(via, 6)
+            .DynamicDepthBias()
+            .Depth(true, true)
+            .DepthTarget(VK_FORMAT_D32_SFLOAT)
+            .Build("Shadow grass spot stride=%u", vstride);
         return s_grassSpotPipe;
     }
 
@@ -337,47 +320,33 @@ namespace {
             if (!csCull || !csSetup) { Msg("![VK Shadow] grass_cull(.setup).comp.spv missing - GPU grass cull disabled"); return false; }
 
             // Set layouts: cull(0 vis,1 detail-indirect,2 lights[UBO],3 count,4 cursor,5 arena); setup(0 count,1 cursor,2 indirect,3 typeinfo).
-            { VkDescriptorSetLayoutBinding b[6]{};
-              const VkDescriptorType t[6] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
-              for (u32 i = 0; i < 6; ++i) { b[i].binding = i; b[i].descriptorType = t[i]; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-              VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-              lci.bindingCount = 6; lci.pBindings = b;
-              if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_cullSetL) != VK_SUCCESS) return false; }
-            { VkDescriptorSetLayoutBinding b[4]{};
-              for (u32 i = 0; i < 4; ++i) { b[i].binding = i; b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
-              VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-              lci.bindingCount = 4; lci.pBindings = b;
-              if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setupSetL) != VK_SUCCESS) return false; }
+            constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            s_cullSetL  = VK::MakeSetLayout({ kSSBO, kSSBO, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                                              kSSBO, kSSBO, kSSBO },
+                                            VK_SHADER_STAGE_COMPUTE_BIT, "SpotShadow.Cull");
+            s_setupSetL = VK::MakeSetLayout({ kSSBO, kSSBO, kSSBO, kSSBO },
+                                            VK_SHADER_STAGE_COMPUTE_BIT, "SpotShadow.Setup");
+            if (!s_cullSetL || !s_setupSetL) return false;
 
+            // One pool for both set groups (cull ×F + setup ×F).
             VkDescriptorPoolSize ps[2] = {
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         (5 + 4) * VK_FRAMES_IN_FLIGHT },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 * VK_FRAMES_IN_FLIGHT } };
             VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
             pci.maxSets = 2 * VK_FRAMES_IN_FLIGHT; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
             if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
-            { VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (auto& x : ls) x = s_cullSetL;
-              VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-              dai.descriptorPool = s_pool; dai.descriptorSetCount = VK_FRAMES_IN_FLIGHT; dai.pSetLayouts = ls;
-              if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_cullSet) != VK_SUCCESS) return false; }
-            { VkDescriptorSetLayout ls[VK_FRAMES_IN_FLIGHT]; for (auto& x : ls) x = s_setupSetL;
-              VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-              dai.descriptorPool = s_pool; dai.descriptorSetCount = VK_FRAMES_IN_FLIGHT; dai.pSetLayouts = ls;
-              if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_setupSet) != VK_SUCCESS) return false; }
+            if (!VK::AllocSets(s_pool, s_cullSetL,  VK_FRAMES_IN_FLIGHT, s_cullSet,  "SpotShadow.Cull"))  return false;
+            if (!VK::AllocSets(s_pool, s_setupSetL, VK_FRAMES_IN_FLIGHT, s_setupSet, "SpotShadow.Setup")) return false;
 
-            auto mkPipe = [&](VkShaderModule cs, VkDescriptorSetLayout setL, u32 pushSz, VkPipelineLayout& pl, VkPipeline& pipe) -> bool {
-                VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSz };
-                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-                plci.setLayoutCount = 1; plci.pSetLayouts = &setL; plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
-                if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &pl) != VK_SUCCESS) return false;
-                VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-                cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                cpci.stage.module = cs; cpci.stage.pName = "main"; cpci.layout = pl;
-                return vkCreateComputePipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipe) == VK_SUCCESS;
+            auto mkPipe = [&](VkShaderModule cs, VkDescriptorSetLayout setL, u32 pushSz,
+                              VkPipelineLayout& pl, VkPipeline& pipe, const char* tag) -> bool {
+                pl = VK::MakePipelineLayout({ setL }, pushSz);
+                if (pl == VK_NULL_HANDLE) return false;
+                pipe = VK::CreateComputePipeline(cs, pl, tag);
+                return pipe != VK_NULL_HANDLE;
             };
-            if (!mkPipe(csCull,  s_cullSetL,  sizeof(CullPush),  s_cullLayout,  s_cullPipe))  return false;
-            if (!mkPipe(csSetup, s_setupSetL, sizeof(SetupPush), s_setupLayout, s_setupPipe)) return false;
+            if (!mkPipe(csCull,  s_cullSetL,  sizeof(CullPush),  s_cullLayout,  s_cullPipe,  "SpotShadow.Cull"))  return false;
+            if (!mkPipe(csSetup, s_setupSetL, sizeof(SetupPush), s_setupLayout, s_setupPipe, "SpotShadow.Setup")) return false;
 
             for (u32 i = 0; i < VK_FRAMES_IN_FLIGHT; ++i) {
                 s_arena[i] = xr_new<CVulkanBuffer>();
@@ -403,23 +372,23 @@ namespace {
         }
 
         void updateSets(u32 cur, VkBuffer vis, VkBuffer ind) {
-            VkDescriptorBufferInfo cb[6] = {
-                { vis,                          0, VK_WHOLE_SIZE }, { ind,                          0, VK_WHOLE_SIZE },
-                { s_lightUBO[cur]->GetHandle(), 0, kLightBytes    }, { s_count[cur]->GetHandle(),    0, VK_WHOLE_SIZE },   // range = ONE call's window (dynamic offset picks it)
-                { s_cursor[cur]->GetHandle(),   0, VK_WHOLE_SIZE }, { s_arena[cur]->GetHandle(),    0, VK_WHOLE_SIZE } };
-            const VkDescriptorType ct[6] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
-            VkWriteDescriptorSet w[6]{};
-            for (u32 i = 0; i < 6; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_cullSet[cur]; w[i].dstBinding = i; w[i].descriptorCount = 1; w[i].descriptorType = ct[i]; w[i].pBufferInfo = &cb[i]; }
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
+            VK::DescriptorWriter(s_cullSet[cur])
+                .StorageBuffer(0, vis)
+                .StorageBuffer(1, ind)
+                // range = ONE call's window (the dynamic offset picks it)
+                .Buffer       (2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                                  { s_lightUBO[cur]->GetHandle(), 0, kLightBytes })
+                .StorageBuffer(3, s_count[cur]->GetHandle())
+                .StorageBuffer(4, s_cursor[cur]->GetHandle())
+                .StorageBuffer(5, s_arena[cur]->GetHandle())
+                .Flush();
 
-            VkDescriptorBufferInfo sb[4] = {
-                { s_count[cur]->GetHandle(),    0, VK_WHOLE_SIZE }, { s_cursor[cur]->GetHandle(),   0, VK_WHOLE_SIZE },
-                { s_indirect[cur]->GetHandle(), 0, VK_WHOLE_SIZE }, { s_typeInfo->GetHandle(),      0, VK_WHOLE_SIZE } };
-            VkWriteDescriptorSet w2[4]{};
-            for (u32 i = 0; i < 4; ++i) { w2[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w2[i].dstSet = s_setupSet[cur]; w2[i].dstBinding = i; w2[i].descriptorCount = 1; w2[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w2[i].pBufferInfo = &sb[i]; }
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w2, 0, nullptr);
+            VK::DescriptorWriter(s_setupSet[cur])
+                .StorageBuffer(0, s_count[cur]->GetHandle())
+                .StorageBuffer(1, s_cursor[cur]->GetHandle())
+                .StorageBuffer(2, s_indirect[cur]->GetHandle())
+                .StorageBuffer(3, s_typeInfo->GetHandle())
+                .Flush();
         }
 
         // Cull the given light spheres into slots [0..nLights) of THIS frame's
@@ -603,14 +572,6 @@ namespace {
     constexpr float kCascQueueDist    = 4.f;
     constexpr float kCascQueueInflate = 8.f;
     constexpr float kCascQueueSunDot  = 0.9999863f;   // cos(0.3°)
-
-    // Fog sun-shadow (r_vol_shadow): its own cached caster queue (re-collected on
-    // camera move); the depth is RE-RENDERED every frame with a fresh VP (continuous).
-    RenderQueue s_FogQueue;
-    bool        s_fogQValid = false;
-    bool        s_fogFirst  = true;            // fog map starts UNDEFINED
-    Fvector     s_fogQCamPos = {};
-    size_t      s_fogQVis = 0;
 
     // Cascade STATIC-map cache (mirrors the far map's static/combined split): the
     // statics-only cascade depth is re-rastered ONLY when the camera moved past
@@ -830,6 +791,7 @@ namespace {
                         s_RainATItems.push_back({ fv->vis.sphere, rv->vis.sphere.R, items[k] });
                 }
                 if (probe.HasGlass())      probe.ClearGlass();
+                if (probe.HasWater())      probe.ClearWater();
                 if (probe.Size() > 16384)  probe.Clear();
                 nProbe = probe.Size();
             }
@@ -968,15 +930,37 @@ void Pass_SunShadow(FrameContext& ctx)
     const bool vsmActive = ps_r_vsm && VK::VSM::MaskReady();
     // Froxel volumetrics samples the sun per-froxel for in-air occlusion (god rays
     // through windows). It can read EITHER the cascade OR the VSM STATIC ATLAS directly
-    // (vol_inject sampleVSMStatic, selected by gridParams.w==1 = atlas ready + no
-    // r_vol_shadow). When the atlas IS the fog occluder, the near cascades are pure
-    // redundant fallback under VSM → drop them and reclaim the ~2.2ms double-pay (the
-    // per-frame Casc0+Casc1 combined rebuild). The shader gracefully falls back to the
-    // cleared, fully-lit cascade for the rare froxel with no resident VSM page. We keep
-    // the cascades alive for the fog ONLY when VSM is NOT the occluder: atlas not yet
-    // ready, or r_vol_shadow's dedicated per-frame map (which falls back to the cascade).
-    const bool fogUsesVSM = VK::VSM::AtlasReady() && !ps_r_vol_shadow;
+    // (vol_inject sampleVSMStatic, selected by gridParams.w==1 = atlas ready). When the
+    // atlas IS the fog occluder, the near cascades are pure redundant fallback under
+    // VSM → drop them and reclaim the ~2.2ms double-pay (the per-frame Casc0+Casc1
+    // combined rebuild). The shader gracefully falls back to the cleared, fully-lit
+    // cascade for the rare froxel with no resident VSM page. We keep the cascades alive
+    // for the fog ONLY while the atlas is not ready yet.
+    const bool fogUsesVSM = VK::VSM::AtlasReady();
     const bool cascForVol = (ps_r_vol || ps_r_vol_debug) && !fogUsesVSM;
+    // ===== LEGACY / DEAD-END PATH (decided 12-08-2026): the classic cascades are no
+    // longer the primary sun-shadow system (r_vsm defaults to 1) and are NOT to be
+    // developed further — do not port caster LODs or other improvements here; that
+    // work belongs on the VSM side.
+    // ⚠ A stationary-camera A/B will show the cascades WINNING (they did, by 3.4 ms).
+    // That comparison is biased and should not be used to argue for reverting: with a
+    // still camera the cached static layer never refreshes, so its cost enters the
+    // measurement as zero (`Sh/TreeCache0` = 0.00 avg / 0.53 max). The cascades pay in
+    // SPIKES when the camera or sun moves (SunShadow avg 9.73 / max 15.19), which is
+    // exactly what VSM's per-page refresh is designed to avoid. Measure while MOVING,
+    // and compare tails, not averages.
+    // Kept, and must keep working, for two reasons:
+    //   1. VOLUMETRIC FOG FALLBACK. Until the VSM atlas is ready (level load, page
+    //      thrash) the froxel pass has no occluder; `cascForVol` below keeps the
+    //      cascades rasterizing for exactly that window, and the froxel shader falls
+    //      back to the cleared/fully-lit cascade for any page that is not resident.
+    //      (r_vol_shadow and its dedicated map were removed 12-08-2026.)
+    //   2. r_vsm 0 remains a valid user/debug choice (and the only path on hardware
+    //      where VSM misbehaves).
+    // ⚠ Do NOT delete this path without first giving the fog its own warm-up
+    // occluder. It is legacy, not dead. Its known weakness — no caster LOD for
+    // trees, which measured 65% of the whole SunShadow budget — is precisely why
+    // the default moved to VSM; see [[vulkan-tree-forward-no-lod-double-draw]].
     const bool cascRaster = (!vsmActive || cascForVol) && sunLit;   // render the cascade casters this frame
     // r_vol toggled WHILE under VSM: the near cascades were sitting idle (cleared /
     // never transitioned), so their cached-static state + image layouts are stale.
@@ -1025,8 +1009,7 @@ void Pass_SunShadow(FrameContext& ctx)
     Skinned_UploadBones();
 
     const u32 sz = ShadowMap::Size();
-    const VkViewport vpShadow{ 0.f, (float)sz, (float)sz, -(float)sz, 0.f, 1.f };
-    const VkRect2D   scShadow{ {0,0}, { sz, sz } };
+    const VkExtent2D extShadow{ sz, sz };
 
     // ---- STATIC map (cached): redraw only when the camera/sun/level moved. ----
     // While valid we keep the cached lightVP (ComputeLightVP is NOT re-run), so
@@ -1110,26 +1093,12 @@ void Pass_SunShadow(FrameContext& ctx)
         ImageBarrier(cmd, ShadowMap::GetStaticImage(), oldLayout,
                      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-        VkRenderingAttachmentInfo dAtt{};
-        dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        dAtt.imageView               = ShadowMap::GetStaticView();
-        dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-        dAtt.clearValue.depthStencil = { 1.0f, 0 };
-
-        VkRenderingInfo ri{};
-        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent    = { sz, sz };
-        ri.layerCount           = 1;
-        ri.colorAttachmentCount = 0;
-        ri.pDepthAttachment     = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-
-        // Negative-height viewport (same X-Ray D3D→Vulkan Y-flip as the scene passes,
-        // so the stored depth matches the camera-side sampling convention).
-        vkCmdSetViewport(cmd, 0, 1, &vpShadow);
-        vkCmdSetScissor(cmd, 0, 1, &scShadow);
+        // BeginFlipped = the negative-height viewport (same X-Ray D3D→Vulkan Y-flip
+        // as the scene passes, so the stored depth matches the camera-side
+        // sampling convention) plus the full scissor.
+        VK::RenderingBuilder(extShadow)
+            .Depth(ShadowMap::GetStaticView(), VK_ATTACHMENT_LOAD_OP_CLEAR)
+            .BeginFlipped(cmd);
         vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
         // Opaque statics via the GPU indirect path; the CPU queue draws only the
@@ -1176,23 +1145,8 @@ void Pass_SunShadow(FrameContext& ctx)
                  VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
     {
-        VkRenderingAttachmentInfo dAtt{};
-        dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        dAtt.imageView   = ShadowMap::GetView();
-        dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;     // keep the static copy
-        dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-        VkRenderingInfo ri{};
-        ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent    = { sz, sz };
-        ri.layerCount           = 1;
-        ri.colorAttachmentCount = 0;
-        ri.pDepthAttachment     = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-
-        vkCmdSetViewport(cmd, 0, 1, &vpShadow);
-        vkCmdSetScissor(cmd, 0, 1, &scShadow);
+        // loadOp LOAD keeps the static copy.
+        VK::RenderingBuilder(extShadow).Depth(ShadowMap::GetView()).BeginFlipped(cmd);
         vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
         if (!vsmActive && sunLit)                             // VSM live / night → no sun skinned overlay
@@ -1227,13 +1181,23 @@ void Pass_SunShadow(FrameContext& ctx)
         }
         const bool wantRain   = rainNeed > 0.001f;
         const bool occWanted  = ps_r_light_occ != 0;   // dynamic-light occlusion samples the RAIN map (binding 9)
-        const bool wantGround = ps_r_water_sim != 0;   // ground map (binding 13) is water-sim only
+        // Ground map (binding 13). Was water-sim only; the ripple POOL MASK needs
+        // it too, and for a subtle reason: level water is a few huge flat sheets,
+        // so "several puddles on a cellar floor" is one slab poking through uneven
+        // ground. Only the floor height tells the puddles apart.
+        const bool wantGround = ps_r_water_sim != 0
+                             || (ps_r_wtr && ps_r_wtr_sim && ps_r_wtr_sim_pools && g_RenderQueue.HasWater());
         // The snow deform compute samples the RAIN map (binding 9 — the ground map came
         // out empty) for the snow-mesh base height AND the stamp ground-gate, so force
         // the rain map to render + stay fresh whenever deform is active.
         const bool wantDeform = ps_r_snow_deform_tex &&
             ((ps_r_snow_deform && ps_r_snow > 0.f) || ps_r_mud_deform > 0.f);   // mud prints need the field year-round
-        const bool wantMap    = wantRain || occWanted || wantGround || wantDeform;
+        // Water asks the same map whether it has sky overhead (r_wtr_shelter):
+        // wind waves need wind, and a flooded cellar has none. Without this the
+        // shelter query would read a stale map the moment someone turns
+        // r_light_occ off, and the water would go back to surfing indoors.
+        const bool wantWater  = ps_r_wtr && ps_r_wtr_shelter > 0.f && g_RenderQueue.HasWater();
+        const bool wantMap    = wantRain || occWanted || wantGround || wantDeform || wantWater;
         // Occlusion-only (no rain) tolerates a much larger redraw step: the map covers
         // ±120 m and terrain is static, so redrawing every 48 m (vs 16 m for wetness)
         // cuts the always-on spike frequency 3× — fewer frame hitches that make the
@@ -1322,8 +1286,7 @@ void Pass_SunShadow(FrameContext& ctx)
             }
 
             const u32 rsz = ShadowMap::RainSize();
-            const VkViewport vpR{ 0.f, (float)rsz, (float)rsz, -(float)rsz, 0.f, 1.f };
-            const VkRect2D   scR{ {0,0}, { rsz, rsz } };
+            const VkExtent2D extR{ rsz, rsz };
 
             // RAIN map (binding 9): wetness (statics+trees while raining) AND now the
             // dynamic-light occlusion (r_light_occ) — it samples THIS map (known-good
@@ -1335,23 +1298,9 @@ void Pass_SunShadow(FrameContext& ctx)
                              s_rainFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-                VkRenderingAttachmentInfo dAtt{};
-                dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                dAtt.imageView               = ShadowMap::GetRainView();
-                dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-                dAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-                dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-                dAtt.clearValue.depthStencil = { 1.0f, 0 };
-
-                VkRenderingInfo ri{};
-                ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-                ri.renderArea.extent    = { rsz, rsz };
-                ri.layerCount           = 1;
-                ri.colorAttachmentCount = 0;
-                ri.pDepthAttachment     = &dAtt;
-                vkCmdBeginRendering(cmd, &ri);
-                vkCmdSetViewport(cmd, 0, 1, &vpR);
-                vkCmdSetScissor(cmd, 0, 1, &scR);
+                VK::RenderingBuilder(extR)
+                    .Depth(ShadowMap::GetRainView(), VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .BeginFlipped(cmd);
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
                 if (!(gpuRain && gpuAT))   // fully-GPU rain: AT rides the indirect draw
                     s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP(), false, gpuRain);
@@ -1379,22 +1328,9 @@ void Pass_SunShadow(FrameContext& ctx)
                     Msg("[VK Light] ground-height map rendered (occ=%d sim=%d, queue %u items)",
                         ps_r_light_occ, ps_r_water_sim, s_RainQueue.Size()); } }
 
-                VkRenderingAttachmentInfo gAtt{};
-                gAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                gAtt.imageView               = ShadowMap::GetGroundView();
-                gAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-                gAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-                gAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-                gAtt.clearValue.depthStencil = { 1.0f, 0 };
-                VkRenderingInfo gri{};
-                gri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-                gri.renderArea.extent    = { rsz, rsz };
-                gri.layerCount           = 1;
-                gri.colorAttachmentCount = 0;
-                gri.pDepthAttachment     = &gAtt;
-                vkCmdBeginRendering(cmd, &gri);
-                vkCmdSetViewport(cmd, 0, 1, &vpR);
-                vkCmdSetScissor(cmd, 0, 1, &scR);
+                VK::RenderingBuilder(extR)
+                    .Depth(ShadowMap::GetGroundView(), VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .BeginFlipped(cmd);
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
                 if (!(gpuRain && gpuAT))   // fully-GPU rain: AT rides the indirect draw
                     s_RainQueue.FlushDepth(cmd, ShadowMap::GetRainVP(), false, gpuRain);   // statics+terrain, NO trees
@@ -1592,8 +1528,7 @@ void Pass_SunShadow(FrameContext& ctx)
         {
             const int zCasc = VK::Prof::ZoneBegin(cmd, ci == 0 ? "Shadow/Casc0" : "Shadow/Casc1");
             const u32 nsz = ShadowMap::CascadeSize(ci);
-            const VkViewport vpC{ 0.f, (float)nsz, (float)nsz, -(float)nsz, 0.f, 1.f };
-            const VkRect2D   scC{ {0,0}, { nsz, nsz } };
+            const VkExtent2D extC{ nsz, nsz };
 
             // --- STATIC map (cached): statics + opaque casters + trees. Only on a miss.
             if (redrawStatic[ci])
@@ -1602,22 +1537,9 @@ void Pass_SunShadow(FrameContext& ctx)
                              s_cascStaticFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-                VkRenderingAttachmentInfo sAtt{};
-                sAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                sAtt.imageView               = ShadowMap::GetCascadeStaticView(ci);
-                sAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-                sAtt.loadOp                  = VK_ATTACHMENT_LOAD_OP_CLEAR;
-                sAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-                sAtt.clearValue.depthStencil = { 1.0f, 0 };
-                VkRenderingInfo sri{};
-                sri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-                sri.renderArea.extent    = { nsz, nsz };
-                sri.layerCount           = 1;
-                sri.colorAttachmentCount = 0;
-                sri.pDepthAttachment     = &sAtt;
-                vkCmdBeginRendering(cmd, &sri);
-                vkCmdSetViewport(cmd, 0, 1, &vpC);
-                vkCmdSetScissor(cmd, 0, 1, &scC);
+                VK::RenderingBuilder(extC)
+                    .Depth(ShadowMap::GetCascadeStaticView(ci), VK_ATTACHMENT_LOAD_OP_CLEAR)
+                    .BeginFlipped(cmd);
                 vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
 
                 if (cascRaster) {   // VSM live → normally cleared/fully-lit, but kept rendered for r_vol froxel occlusion
@@ -1627,12 +1549,18 @@ void Pass_SunShadow(FrameContext& ctx)
                         if (clShadows) WorldGPU::DrawShadow(cmd, (u32)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
                         else           ShadowGPU::Draw(cmd, (ShadowGPU::Target)(ShadowGPU::TGT_CASCADE0 + ci), ShadowMap::GetCascadeVP(ci));
                     }
-                    if (RImplementation.Trees && RImplementation.Trees->IsBuilt())
+                    if (RImplementation.Trees && RImplementation.Trees->IsBuilt()) {
                         // Static (cached) layer = FAR trees only; near trees sway in
                         // the per-frame dynamic overlay below (r_wind_shadow_dist;
                         // 0 → minDist 0 → all trees cached, original behaviour).
+                        // Own zone: this is the CACHE-REFILL cost (only on redraw), a
+                        // different beast from the per-frame dynamic layer below, and
+                        // Shadow/CascN lumps the two together.
+                        const int zTC = VK::Prof::ZoneBegin(cmd, ci == 0 ? "Sh/TreeCache0" : "Sh/TreeCache1");
                         RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci,
                                                            nullptr, ps_r_wind_shadow_dist, 1e9f);
+                        VK::Prof::ZoneEnd(cmd, zTC);
+                    }
                 }
 
                 vkCmdEndRendering(cmd);
@@ -1658,21 +1586,8 @@ void Pass_SunShadow(FrameContext& ctx)
             ImageBarrier(cmd, ShadowMap::GetCascadeImage(ci), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-            VkRenderingAttachmentInfo dAtt{};
-            dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            dAtt.imageView   = ShadowMap::GetCascadeView(ci);
-            dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;     // keep the static copy
-            dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo ri{};
-            ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            ri.renderArea.extent    = { nsz, nsz };
-            ri.layerCount           = 1;
-            ri.colorAttachmentCount = 0;
-            ri.pDepthAttachment     = &dAtt;
-            vkCmdBeginRendering(cmd, &ri);
-            vkCmdSetViewport(cmd, 0, 1, &vpC);
-            vkCmdSetScissor(cmd, 0, 1, &scC);
+            // loadOp LOAD keeps the static copy.
+            VK::RenderingBuilder(extC).Depth(ShadowMap::GetCascadeView(ci)).BeginFlipped(cmd);
             vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
             if (cascRaster) {                                // skinned (NPC) overlay → they also cast volumetric shadows
                 Skinned_RenderShadow(cmd, ShadowMap::GetCascadeVP(ci));
@@ -1683,9 +1598,16 @@ void Pass_SunShadow(FrameContext& ctx)
                 // NEAR trees, re-rasterized EVERY frame at their current wind pose
                 // (the far forest stays in the cached static map). Bounded by
                 // r_wind_shadow_dist → same cost class as the NPC overlay.
-                if (ps_r_wind_shadow_dist > 0.f && RImplementation.Trees && RImplementation.Trees->IsBuilt())
+                if (ps_r_wind_shadow_dist > 0.f && RImplementation.Trees && RImplementation.Trees->IsBuilt()) {
+                    // Own zone: the STEADY-STATE per-frame tree shadow cost. This is
+                    // the number that decides whether an opaque crown-hull caster LOD
+                    // is worth building — the cache-refill spike above is a separate
+                    // question with a separate answer.
+                    const int zTD = VK::Prof::ZoneBegin(cmd, ci == 0 ? "Sh/TreeDyn0" : "Sh/TreeDyn1");
                     RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetCascadeVP(ci), (s32)ci,
                                                        nullptr, 0.0f, ps_r_wind_shadow_dist);
+                    VK::Prof::ZoneEnd(cmd, zTD);
+                }
                 // GRASS casters (r_sun_grass): swaying blades cast real sun shadows.
                 // Same per-frame dynamic layer (blades track the SSFX wind of the
                 // colour pass). Instance-culled to r_sun_grass_dist around the
@@ -1704,68 +1626,13 @@ void Pass_SunShadow(FrameContext& ctx)
         s_cascFirst = false;
     }
 
-    // ===== TODO REMOVE (dead detour, r_vol_shadow default 0): a dedicated per-frame
-    // fog sun-shadow built to fix "trembling shafts" — but the real bug was the
-    // temporal reprojection (fixed in vol_inject). The VSM/cascade path + temporal is
-    // the live one. Safe to delete this whole block + the vk_shadow GetFogShadow*/
-    // ComputeFogShadowVP API + vk_volumetrics binding 10 / sampleFogShadow / mode 2. =====
-    // Volumetric fog sun-shadow: dedicated low-res sun depth, re-rendered EVERY frame
-    // with a fresh anchor-snapped VP → continuous (no cache tick). Cached caster queue. =====
-    if (ps_r_vol && ps_r_vol_shadow && loaded) {
-        const float kFogRange = 130.f;   // collect casters within this radius of the camera
-        if (!gpuAT && (!s_fogQValid || nVis != s_fogQVis
-            || Device.vCameraPosition.distance_to_sqr(s_fogQCamPos) > 8.f * 8.f)) {
-            s_fogQValid = true; s_fogQCamPos = Device.vCameraPosition; s_fogQVis = nVis;
-            s_FogQueue.Clear();
-            VK_CPU_PROBE("ShadowQ/fog");
-            EnsureCasterList();
-            Fmatrix identity; identity.identity();
-            for (const CasterEntry& e : s_Casters) {
-                if (e.bs.R > 0.f && Device.vCameraPosition.distance_to(e.bs.P) > kFogRange + e.bs.R) continue;
-                e.rv->Submit(s_FogQueue, identity, 0.0f);
-            }
-            s_FogQueue.SortByKey();
-        }
-        ShadowMap::ComputeFogShadowVP(sunDir);
-        const u32 fsz = ShadowMap::FogShadowSize();
-        ImageBarrier(cmd, ShadowMap::GetFogShadowImage(),
-                     s_fogFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                     VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-        VkRenderingAttachmentInfo fAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-        fAtt.imageView   = ShadowMap::GetFogShadowView();
-        fAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        fAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        fAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-        fAtt.clearValue.depthStencil = { 1.0f, 0 };
-        VkRenderingInfo fri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-        fri.renderArea.extent = { fsz, fsz };
-        fri.layerCount        = 1;
-        fri.pDepthAttachment  = &fAtt;
-        vkCmdBeginRendering(cmd, &fri);
-        const VkViewport vpF{ 0.f, (float)fsz, (float)fsz, -(float)fsz, 0.f, 1.f };
-        const VkRect2D   scF{ {0,0}, { fsz, fsz } };
-        vkCmdSetViewport(cmd, 0, 1, &vpF);
-        vkCmdSetScissor(cmd, 0, 1, &scF);
-        vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
-        // Same split as the far map: alpha-tested casters on the CPU queue, OPAQUE
-        // statics via the GPU-driven path (their CPU mesh buffers are freed when
-        // r_gpu_shadows is on → a CPU FlushDepth of them dereferences dangling
-        // pointers = the crash). FlushDepth's alphaTestedOnly=gpuShadows skips
-        // opaque when the GPU path covers them; reuse TGT_FAR's culled opaque set
-        // (covers the fog box) drawn with the fresh fog VP.
-        if (!gpuAT)   // GPU AT: the cutouts ride the reused TGT_FAR indirect slice below
-            s_FogQueue.FlushDepth(cmd, ShadowMap::GetFogShadowVP(), false, gpuShadows);
-        if (gpuShadows) {   // reuse whichever path culled TGT_FAR this session (stale-buffer safe)
-            if (clShadows) WorldGPU::DrawShadow(cmd, (u32)ShadowGPU::TGT_FAR, ShadowMap::GetFogShadowVP());
-            else           ShadowGPU::Draw(cmd, ShadowGPU::TGT_FAR, ShadowMap::GetFogShadowVP());
-        }
-        if (RImplementation.Trees && RImplementation.Trees->IsBuilt())
-            RImplementation.Trees->RenderDepth(cmd, ShadowMap::GetFogShadowVP());
-        vkCmdEndRendering(cmd);
-        ImageBarrier(cmd, ShadowMap::GetFogShadowImage(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-        s_fogFirst = false;
-    }
+    // (The dedicated per-frame fog sun-shadow map lived here — REMOVED 12-08-2026.
+    // It was built to fix "trembling shafts", but the real bug turned out to be the
+    // temporal reprojection, fixed in vol_inject; the map has been dead code behind
+    // r_vol_shadow 0 ever since. Removed together with the vk_shadow GetFogShadow*/
+    // ComputeFogShadowVP API, the vk_volumetrics binding 10 + fog_shadow_vp UBO field,
+    // vol_inject's sampleFogShadow, and the gridParams.w == 2 mode. The froxel pass
+    // takes its sun occlusion from the VSM atlas, falling back to the cascades.)
 
     // ===== Dynamic light shadows (STEP 3b): spot POOL + 1 point cube per frame =====
     // EnvLight::Update (Pass_World, later this frame) reads the same CollectFrame
@@ -1851,25 +1718,9 @@ void Pass_SunShadow(FrameContext& ctx)
     auto renderPointFace = [&](VkImageView view, const Fmatrix& vp, RenderQueue* statics,
                                const Fvector& lightPos, float lightRange,
                                bool clear, bool doSkinned, bool drawGrass, int grassCullSlot) {
-        VkRenderingAttachmentInfo dAtt{};
-        dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        dAtt.imageView               = view;
-        dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        dAtt.loadOp                  = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
-        dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-        dAtt.clearValue.depthStencil = { 1.0f, 0 };
-
-        VkRenderingInfo ri{};
-        ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent = { kPointSz, kPointSz };
-        ri.layerCount        = 1;
-        ri.pDepthAttachment  = &dAtt;
-        vkCmdBeginRendering(cmd, &ri);
-
-        VkViewport vp2{ 0.f, (float)kPointSz, (float)kPointSz, -(float)kPointSz, 0.f, 1.f };
-        vkCmdSetViewport(cmd, 0, 1, &vp2);
-        VkRect2D sc{ {0,0}, { kPointSz, kPointSz } };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
+        VK::RenderingBuilder(kPointSz, kPointSz)
+            .Depth(view, clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD)
+            .BeginFlipped(cmd);
         vkCmdSetDepthBias(cmd, kBiasConst, 0.0f, kBiasSlope);
         if (statics) {
             // gpuDynStatics: opaque statics via the kTargetDyn cluster slice the
@@ -2056,19 +1907,11 @@ void Pass_SunShadow(FrameContext& ctx)
             ImageBarrier(cmd, ShadowMap::GetSpotStaticImage(),
                          s_spotAtlasFirst ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-            VkRenderingAttachmentInfo dAtt{};
-            dAtt.sType                   = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            dAtt.imageView               = ShadowMap::GetSpotStaticView();
-            dAtt.imageLayout             = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            dAtt.loadOp                  = s_spotAtlasFirst ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                           : VK_ATTACHMENT_LOAD_OP_LOAD;   // keep cached tiles
-            dAtt.storeOp                 = VK_ATTACHMENT_STORE_OP_STORE;
-            dAtt.clearValue.depthStencil = { 1.0f, 0 };
-            VkRenderingInfo ri{};
-            ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            ri.renderArea.extent = atlasExt;
-            ri.layerCount        = 1;
-            ri.pDepthAttachment  = &dAtt;
+            // loadOp LOAD keeps cached tiles (CLEAR only on the atlas's first use).
+            VK::RenderingBuilder rbStatic(atlasExt);
+            rbStatic.Depth(ShadowMap::GetSpotStaticView(),
+                           s_spotAtlasFirst ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                            : VK_ATTACHMENT_LOAD_OP_LOAD);
             // WAW guard between the per-tile depth passes (disjoint tiles, but
             // same subresource): previous pass's depth writes → next pass.
             auto depthPassBarrier = [&]() {
@@ -2082,12 +1925,12 @@ void Pass_SunShadow(FrameContext& ctx)
             if (gpuDynStatics && s_spotAtlasFirst) {
                 // First use under per-tile rendering: one clear-only pass so the
                 // per-tile LOAD ops below always see defined content.
-                vkCmdBeginRendering(cmd, &ri);
+                rbStatic.Begin(cmd);
                 vkCmdEndRendering(cmd);
-                dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                rbStatic.SetDepthLoad(VK_ATTACHMENT_LOAD_OP_LOAD);
             }
             if (!gpuDynStatics)
-                vkCmdBeginRendering(cmd, &ri);
+                rbStatic.Begin(cmd);
             bool firstTilePass = true;
             for (u32 k = 0; k < FL.poolCount; ++k) {
                 if (assign[k] < 0) continue;
@@ -2106,7 +1949,7 @@ void Pass_SunShadow(FrameContext& ctx)
                     const float texel = 2.f * T.range * tanf(T.cone * 0.5f) / _max(1.f, (float)tilePx);
                     WorldGPU::CullShadow(cmd, &tgt, &vp, &texel, 1);
                     if (!firstTilePass || s_spotAtlasFirst) depthPassBarrier();
-                    vkCmdBeginRendering(cmd, &ri);
+                    rbStatic.Begin(cmd);
                 }
                 firstTilePass = false;
                 if (!s_spotAtlasFirst) {   // whole atlas cleared on first use
@@ -2175,18 +2018,8 @@ void Pass_SunShadow(FrameContext& ctx)
             copyTiles(ShadowMap::GetSpotStaticImage(), ShadowMap::GetSpotImage(), needClean);
             ImageBarrier(cmd, ShadowMap::GetSpotImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-            VkRenderingAttachmentInfo dAtt{};
-            dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            dAtt.imageView   = ShadowMap::GetSpotView();
-            dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;   // NPC ON TOP of the static copy
-            dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo ri{};
-            ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            ri.renderArea.extent = atlasExt;
-            ri.layerCount        = 1;
-            ri.pDepthAttachment  = &dAtt;
-            vkCmdBeginRendering(cmd, &ri);
+            // loadOp LOAD — NPC ON TOP of the static copy.
+            VK::RenderingBuilder(atlasExt).Depth(ShadowMap::GetSpotView()).Begin(cmd);
             for (u32 k = 0; k < FL.poolCount; ++k) {
                 if (assign[k] < 0) continue;
                 const u32 t = u32(assign[k]);
@@ -2244,18 +2077,8 @@ void Pass_SunShadow(FrameContext& ctx)
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
             ImageBarrier(cmd, ShadowMap::GetSpotBeamImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
-            VkRenderingAttachmentInfo dAtt{};
-            dAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            dAtt.imageView   = ShadowMap::GetSpotBeamView();
-            dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            dAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;   // grass ON TOP of the copy
-            dAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo ri{};
-            ri.sType             = VK_STRUCTURE_TYPE_RENDERING_INFO;
-            ri.renderArea.extent = atlasExt;
-            ri.layerCount        = 1;
-            ri.pDepthAttachment  = &dAtt;
-            vkCmdBeginRendering(cmd, &ri);
+            // loadOp LOAD — grass ON TOP of the copy.
+            VK::RenderingBuilder(atlasExt).Depth(ShadowMap::GetSpotBeamView()).Begin(cmd);
             for (u32 k = 0; k < FL.poolCount; ++k) {
                 if (assign[k] < 0) continue;
                 const u32 t = u32(assign[k]);

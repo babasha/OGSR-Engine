@@ -11,6 +11,7 @@
 // vk_clustered + the image-alloc pattern of vk_scene_color.
 
 #include "stdafx.h"
+#include "vk_rendering.h"          // VK::RenderingBuilder
 #include "vk_volumetrics.h"
 #include "vk_color_space.h"   // ColorSpace::LinearizeRGB — env colours are authored sRGB
 #include "vk_buffer.h"            // CVulkanBuffer
@@ -18,7 +19,10 @@
 #include "vk_shaders.h"           // g_ShaderManager (SPIR-V loader)
 #include "vk_image.h"             // VK::CreateImage / CreateImageView
 #include "vk_compute_util.h"      // VK::CreateComputePipeline
+#include "vk_gfx_pipeline.h"      // VK::GfxPipelineBuilder
+#include "vk_descriptors.h"       // VK::DescriptorWriter
 #include "vk_shadow.h"            // ShadowMap — sun cascade maps + matrices (occlusion source)
+#include "vk_async.h"             // VK::Async::Available — gates the shadow snapshot
 #include "vk_pass_shadow.h"       // SpotShadow_TileOfLight — spot-pool tile per fog light
 #include "vk_vsm.h"               // VSM atlas + page table + clipmap UBO (smooth occlusion, no cache tick)
 #include "vk_clustered.h"         // Clustered::DeriveGridZ — ONE source of truth for the exp-Z grid
@@ -41,6 +45,7 @@
 // r_vol knobs (global scope — a block-scope extern inside namespace VK would
 // mangle to VK::ps_r_vol and miss the C-linkage console symbol → LNK2001).
 extern int   ps_r_vol;            // master enable (0/1)
+extern int   ps_r_vsm;            // VSM shadows — blocks the async inject (no atlas snapshot exists)
 extern int   ps_r_vol_debug;      // debug view — also self-activates the path
 extern int   ps_r_vol_ground_debug;   // forensics: paint height-above-baked-terrain instead of light
 extern int   ps_r_vol_hillaire;       // V-0: energy-conserving slice integration (0 = legacy A/B)
@@ -90,7 +95,6 @@ extern float ps_r_vol_noise_speed;// P3: dust drift speed
 extern float ps_r_vol_soft;       // cascade shadow PCF blur radius (texels) — soft penumbra hides the cache tick
 extern int   ps_r_vol_ta;         // temporal accumulation on/off
 extern float ps_r_vol_ta_blend;   // EMA history weight
-extern int   ps_r_vol_shadow;     // dedicated per-frame fog sun-shadow (continuous) vs cascade/VSM
 extern float ps_r_sun_boost;      // same global sun multiplier the receivers use
 extern float ps_r_ambient_floor;  // same flat ambient lift the receivers use
 extern float ps_r_vol_smoke_inject;  // Stage-1 VMS: inject smoke-particle density into the froxel grid (0 = off)
@@ -154,7 +158,6 @@ namespace {
         float prevCamPos[4];   // xyz prev camera world pos, w = prev near
         float prevCamDir[4];   // xyz prev camera forward, w = prev log2(far/near)
         float temporal[4];     // xyz = froxel jitter (−0.5..0.5), w = history blend (0 = no temporal)
-        float fog_shadow_vp[16]; // r_vol_shadow: dedicated per-frame fog sun-shadow VP
         // P2 — local lights in fog (nearest few; matches Lights::GpuLight layout).
         float lightParams[4];  // x = count, y = boost, z = spot-shadowed light idx (-1), w = point-shadowed idx (-1)
         struct { float pos[4]; float color[4]; float dir[4]; } lights[8];
@@ -202,6 +205,41 @@ namespace {
     VkImageView   s_histView = VK_NULL_HANDLE;
     bool          s_haveHistory = false;   // false until the first frame fills it (alpha 0)
     u32           s_frame = 0;             // jitter sequence index
+
+    // ---- ASYNC SHADOW SNAPSHOT (r_async) ----------------------------------------
+    // Under async compute the inject records onto the COMPUTE queue while the graphics
+    // queue is still rewriting the sun cascades FOR THE SAME FRAME. Sampling the live
+    // cascades there would race on both the contents and the layout transitions, and
+    // "just read last frame" is not available — nothing stores last frame's cascade.
+    // So the graphics queue takes a DOWNSCALED snapshot right after Pass_SunShadow and
+    // the fog samples that instead.
+    //
+    // 1024² is not a compromise here: the froxel grid samples shadows at its OWN
+    // resolution (kGridX×kGridY), far coarser than a 4096² cascade, and r_vol_soft
+    // blurs the result anyway. Smaller also means fewer cache misses in the inject.
+    //
+    // TWO sets, ping-ponged: graphics writes set (frame&1) for frame N while the
+    // compute queue reads the other set, written during frame N-1. One set would just
+    // move the race down a level.
+    constexpr u32 kSnapSize = 1024;
+    constexpr u32 kSnapMaps = 4;    // cascade0, cascade1, far, rain — the inject's shadow bindings
+    constexpr u32 kSnapSets = 2;
+    VkImage       s_snapImg  [kSnapSets][kSnapMaps] = {};
+    VmaAllocation s_snapAlloc[kSnapSets][kSnapMaps] = {};
+    VkImageView   s_snapView [kSnapSets][kSnapMaps] = {};
+    bool s_snapReady    = false;   // images built
+    u32  s_snapWriteSet = 0;       // set the GRAPHICS queue fills THIS frame
+    u32  s_snapReadSet  = 0;       // set the COMPUTE queue may sample this frame
+    bool s_snapHaveRead = false;   // s_snapReadSet holds a COMPLETED snapshot
+    int  s_snapPending  = -1;      // set filled this frame — becomes readable NEXT frame
+
+    // ⚠️Explicit sets, not "frame & 1": SnapshotShadows runs EARLIER in the frame than
+    // Execute, so any counter it bumps is already one ahead by the time the inject
+    // reads it — the first version of this had the inject sampling the very set the
+    // graphics queue was filling at that moment, which is the race the snapshot exists
+    // to remove (it cost a DEVICE_LOST on the first frame under r_async).
+    // A set becomes readable only on the FOLLOWING frame, because that is when the
+    // compute batch's wait on the previous frame's graphics timeline proves it done.
 
     // Previous frame's reprojection inputs (cached at the end of Execute).
     Fmatrix s_prevVP;
@@ -262,22 +300,38 @@ namespace {
 
     GridZParams s_gridZ{ 0.1f, 300.f, 8.0f };   // last Execute's exp-Z params (composite reads it)
 
-    // ---- One-shot 16-byte-aligned image-memory barrier (matches SceneColor) ----
-    void ImgBarrier(VkCommandBuffer cmd, VkImage img,
-                    VkImageLayout oldL, VkImageLayout newL,
-                    VkAccessFlags2 srcA, VkAccessFlags2 dstA,
-                    VkPipelineStageFlags2 srcS, VkPipelineStageFlags2 dstS)
+    // Image barriers go through VK::ImageBarrier (vk_barriers.h) — the explicit
+    // stage/access overload. The shadow snapshot is D32_SFLOAT, so ITS barriers must
+    // pass VK_IMAGE_ASPECT_DEPTH_BIT or the transition is silently about the wrong
+    // subresource; that is the only thing the old private twin encoded.
+
+    // Build both ping-pong sets of shadow snapshots. Format MUST equal the source's
+    // (vkCmdBlitImage refuses a depth blit between different formats), hence
+    // D32_SFLOAT — the format every ShadowMap target uses.
+    bool EnsureSnapshot()
     {
-        VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        b.srcStageMask = srcS; b.srcAccessMask = srcA;
-        b.dstStageMask = dstS; b.dstAccessMask = dstA;
-        b.oldLayout = oldL; b.newLayout = newL;
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = img;
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkDependencyInfo di{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &b;
-        vkCmdPipelineBarrier2(cmd, &di);
+        if (s_snapReady) return true;
+        static const char* names[kSnapMaps] = { "Vol.Snap.Casc0", "Vol.Snap.Casc1", "Vol.Snap.Far", "Vol.Snap.Rain" };
+        for (u32 s = 0; s < kSnapSets; ++s)
+            for (u32 m = 0; m < kSnapMaps; ++m) {
+                VK::ImageDesc d;
+                d.type   = VK_IMAGE_TYPE_2D;
+                d.format = VK_FORMAT_D32_SFLOAT;
+                d.extent = { kSnapSize, kSnapSize, 1 };
+                d.usage  = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                d.name   = names[m];
+                d.computeShared = true;   // written on graphics, sampled by the inject on compute
+                if (!VK::CreateImage(d, s_snapImg[s][m], s_snapAlloc[s][m])) {
+                    Msg("![VK Vol] shadow snapshot image failed (set %u map %u)", s, m);
+                    return false;
+                }
+                s_snapView[s][m] = VK::CreateImageView(s_snapImg[s][m], VK_FORMAT_D32_SFLOAT,
+                                                       VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT);
+                if (!s_snapView[s][m]) { Msg("![VK Vol] shadow snapshot view failed"); return false; }
+            }
+        s_snapReady = true;
+        Msg("[VK Vol] async shadow snapshot ready: %u sets x %u maps @ %u^2", kSnapSets, kSnapMaps, kSnapSize);
+        return true;
     }
 
     bool CreateVolume(VkImage& img, VmaAllocation& alloc, VkImageView& view,
@@ -294,17 +348,16 @@ namespace {
         d.usage  = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                  | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         d.name   = name;
+        // Async compute (r_async): these volumes are WRITTEN on the compute queue and
+        // SAMPLED on graphics (integrated → tonemap, scatter → the particle pass), so
+        // they must be CONCURRENT to survive the family switch. Not attachments — no
+        // framebuffer compression to lose. No-op when compute aliases graphics.
+        d.computeShared = true;
         if (!VK::CreateImage(d, img, alloc)) return false;
         view = VK::CreateImageView(img, kVolFormat, VK_IMAGE_VIEW_TYPE_3D);
         return view != VK_NULL_HANDLE;
     }
 
-    VkPipeline BuildComputePipe(const char* spv, VkPipelineLayout layout)
-    {
-        VkShaderModule cs = g_ShaderManager->Load(spv);
-        if (!cs) { Msg("![VK Vol] %s load failed", spv); return VK_NULL_HANDLE; }
-        return VK::CreateComputePipeline(cs, layout, spv);
-    }
 }
 
 bool Wanted() { return ps_r_vol != 0 || ps_r_vol_debug != 0; }   // debug self-activates (mirrors r_clustered_debug)
@@ -314,6 +367,98 @@ VkImageView GetScatterView()    { return s_scatterView; }
 VkSampler   GetSampler()        { return s_sampler; }
 u32         Generation()        { return s_generation; }
 GridZParams GetGridZ()          { return s_gridZ; }
+
+bool ProbeAvailableToGraphics() { return !VK::Async::Available(); }
+
+bool AsyncInjectReady()
+{
+    // The inject may only move to the compute queue once a COMPLETED shadow snapshot
+    // exists to sample. Until then (first frames after a level load / async being
+    // switched on) it must stay on the graphics queue: falling back to the LIVE
+    // cascades from the compute queue would read maps the graphics queue is writing
+    // and transitioning at that very moment — that is what killed the device on the
+    // first frame under r_async.
+    // ⚠️VSM blocks async outright: the inject samples the VSM atlas + page table, which
+    // the graphics queue renders and resolves DURING this same frame. Unlike the sun
+    // cascades there is no snapshot of it (an atlas is far too big to copy), so the
+    // only safe answer while r_vsm is on is to keep the pass on the graphics queue.
+    if (ps_r_vsm && VSM::AtlasReady()) {
+        // Say so ONCE, and only when async was actually asked for: otherwise "r_async 1
+        // and nothing happens" is indistinguishable from a broken feature.
+        static bool s_loggedVsmBlock = false;
+        if (VK::Async::Available() && !s_loggedVsmBlock) {
+            s_loggedVsmBlock = true;
+            Msg("[VK Vol] async inject BLOCKED by r_vsm 1 — the inject samples the VSM atlas, which graphics "
+                "renders during this same frame and which is too large to snapshot. Fog stays on the graphics "
+                "queue. Use r_vsm 0 to exercise async compute.");
+        }
+        return false;
+    }
+    return VK::Async::Available() && Ready() && s_snapReady && s_snapHaveRead;
+}
+
+void SnapshotShadows(VkCommandBuffer cmd)
+{
+    // GRAPHICS-queue call, recorded right after Pass_SunShadow: downscale the sun
+    // cascades + rain map into this frame's snapshot set, which the NEXT frame's
+    // inject samples from the compute queue. See the kSnapSize block above for why
+    // a snapshot exists at all and why 1024² is enough.
+    if (!Ready() || !VK::Async::Available()) return;   // r_async off → inject samples the live maps
+    if (!EnsureSnapshot()) return;
+
+    // Promote the set filled LAST frame: this frame's compute batch waits on the
+    // previous frame's graphics timeline, so that fill is provably complete and is
+    // the only set the inject may sample.
+    if (s_snapPending >= 0) { s_snapReadSet = (u32)s_snapPending; s_snapHaveRead = true; }
+
+    VkImage src[kSnapMaps] = { ShadowMap::GetCascadeImage(0), ShadowMap::GetCascadeImage(1),
+                               ShadowMap::GetImage(), ShadowMap::GetRainImage() };
+    const u32 srcSize[kSnapMaps] = { ShadowMap::CascadeSize(0), ShadowMap::CascadeSize(1),
+                                     ShadowMap::Size(), ShadowMap::RainSize() };
+    const u32 set = s_snapWriteSet;
+
+    for (u32 m = 0; m < kSnapMaps; ++m) {
+        if (src[m] == VK_NULL_HANDLE) continue;
+
+        // Source: sampled everywhere else this frame → TRANSFER_SRC and back.
+        VK::ImageBarrier(cmd, src[m], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Destination: last frame's compute reads of THIS set have long retired (it
+        // was the read set two frames ago), so its contents are free to discard.
+        VK::ImageBarrier(cmd, s_snapImg[set][m], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_NONE, 0,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+        blit.srcOffsets[1] = { int(srcSize[m]), int(srcSize[m]), 1 };
+        blit.dstOffsets[1] = { int(kSnapSize),  int(kSnapSize),  1 };
+        // NEAREST is not a choice: vkCmdBlitImage REQUIRES it for depth formats
+        // (VUID-vkCmdBlitImage-srcImage-00232). Fine here — see kSnapSize.
+        vkCmdBlitImage(cmd, src[m], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s_snapImg[set][m], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_NEAREST);
+
+        VK::ImageBarrier(cmd, src[m], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Leave the snapshot SHADER_READ. The compute queue only ever SAMPLES it, so
+        // it never transitions the image — the cross-queue handoff is the timeline
+        // semaphore plus CONCURRENT sharing, with no ownership transfer to express.
+        VK::ImageBarrier(cmd, s_snapImg[set][m], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    s_snapPending  = (int)set;   // readable from the NEXT frame on, not this one
+    s_snapWriteSet ^= 1u;        // next frame fills the other set
+}
 
 bool Init()
 {
@@ -337,81 +482,63 @@ bool Init()
     if (vkCreateSampler(VulkanHW.m_Device, &si, nullptr, &s_sampler) != VK_SUCCESS) { Msg("![VK Vol] sampler failed"); s_failed = true; return false; }
 
     // Per-slot UBO (host-visible mapped).
-    s_ubo.Create(kUboStride * kFramesInFlight, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    // computeShared on every Vol buffer below: under r_async the whole pass records
+    // onto the compute queue, so its UBO/SSBOs are read there instead of on graphics.
+    s_ubo.Create(kUboStride * kFramesInFlight, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                 /*gpuOnly=*/false, /*computeShared=*/true);
     s_uboMapped = static_cast<u8*>(s_ubo.Map());
     if (!s_uboMapped) { Msg("![VK Vol] UBO map failed"); s_failed = true; return false; }
 
     // Dummy SSBO — keeps the VSM page-table binding valid before VSM is ready.
-    s_dummySSBO.Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+    s_dummySSBO.Create(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true,
+                       /*computeShared=*/true);
 
     // Stage-1 smoke: device-local atomic accumulation SSBO (uint[cells*4], cleared +
     // splatted + resolved each frame on the GPU) + a host-visible per-particle upload
     // ring (one buffer per in-flight slot, CPU writes off the GPU timeline).
     s_smokeAccum.Create(VkDeviceSize(kSmokeCells) * 4 * sizeof(u32),
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true);
+                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, true, /*computeShared=*/true);
     for (u32 i = 0; i < kFramesInFlight; ++i) {
         s_smokeParts[i].Create(VkDeviceSize(kMaxSmokeParticles) * sizeof(SmokeParticle),
-                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                               /*gpuOnly=*/false, /*computeShared=*/true);
         s_smokePartsMapped[i] = static_cast<u8*>(s_smokeParts[i].Map());
         if (!s_smokePartsMapped[i]) { Msg("![VK Vol] smoke particle buffer map failed"); s_failed = true; return false; }
     }
 
+    // Shorthands — the lists below read as tables of bindings.
+    constexpr auto kSSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    constexpr auto kUBO  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constexpr auto kTex  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    constexpr auto kImg  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
     // --- Inject set layout (0=UBO 1-3=cascades 4=scatter storage 5=rain/sky-vis 6=history sampler).
-    {
-        VkDescriptorSetLayoutBinding b[20]{};
-        b[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,        1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[1] = { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[2] = { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[3] = { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[5] = { 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[6] = { 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[7] = { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT };  // VSM atlas
-        b[8] = { 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1, VK_SHADER_STAGE_COMPUTE_BIT };  // VSM page table
-        b[9] = { 9, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,        1, VK_SHADER_STAGE_COMPUTE_BIT };  // VSM clipmap UBO
-        b[10] = { 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // fog sun-shadow
-        b[11] = { 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // spot (flashlight) shadow
-        b[12] = { 12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // point (campfire) shadow cube
-        b[13] = { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // Stage-1 smoke media
-        b[14] = { 14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // VSM DYNAMIC atlas (near wind-trees/NPC/grass)
-        b[15] = { 15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1, VK_SHADER_STAGE_COMPUTE_BIT }; // VSM dyn page table
-        b[16] = { 16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1, VK_SHADER_STAGE_COMPUTE_BIT }; // VSM dyn has-caster flags
-        b[17] = { 17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // PREV frame scene depth (depth rejection)
-        b[18] = { 18, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // TERRAIN height field (ground anchor for height fog)
-        b[19] = { 19, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT }; // GRASS CANOPY field (sun occlusion by the grass medium)
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 20; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_injSetL) != VK_SUCCESS) { Msg("![VK Vol] inject set layout failed"); s_failed = true; return false; }
-    }
-    // --- Integrate set layout (0=UBO 1=scatter[read] 2=integrated[write]).
-    {
-        VkDescriptorSetLayoutBinding b[3]{};
-        b[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT };
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 3; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_intSetL) != VK_SUCCESS) { Msg("![VK Vol] integrate set layout failed"); s_failed = true; return false; }
-    }
-    // --- Stage-1 splat set layout (0=particles SSBO[read] 1=accum SSBO[read-modify-write]).
-    {
-        VkDescriptorSetLayoutBinding b[2]{};
-        b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 2; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_splatSetL) != VK_SUCCESS) { Msg("![VK Vol] splat set layout failed"); s_failed = true; return false; }
-    }
-    // --- Stage-1 resolve set layout (0=accum SSBO[read] 1=media image[write]).
-    {
-        VkDescriptorSetLayoutBinding b[2]{};
-        b[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
-        b[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT };
-        VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        lci.bindingCount = 2; lci.pBindings = b;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_resolveSetL) != VK_SUCCESS) { Msg("![VK Vol] resolve set layout failed"); s_failed = true; return false; }
-    }
+    s_injSetL = VK::MakeSetLayout({ kUBO, kTex, kTex, kTex, kImg, kTex, kTex,
+                                    kTex,    // 7  VSM atlas
+                                    kSSBO,   // 8  VSM page table
+                                    kUBO,    // 9  VSM clipmap UBO
+                                    kTex,    // 10 RESERVED — was the dedicated fog sun-shadow (removed
+                                             //    12-08-2026). The slot STAYS: this list is positional,
+                                             //    so dropping it would renumber 11..19 and every shader
+                                             //    that names them. Bound to a valid image, unused by the
+                                             //    shader (a bound-but-undeclared descriptor is legal).
+                                    kTex,    // 11 spot (flashlight) shadow
+                                    kTex,    // 12 point (campfire) shadow cube
+                                    kTex,    // 13 Stage-1 smoke media
+                                    kTex,    // 14 VSM DYNAMIC atlas (near wind-trees/NPC/grass)
+                                    kSSBO,   // 15 VSM dyn page table
+                                    kSSBO,   // 16 VSM dyn has-caster flags
+                                    kTex,    // 17 PREV frame scene depth (depth rejection)
+                                    kTex,    // 18 TERRAIN height field (ground anchor for height fog)
+                                    kTex },  // 19 GRASS CANOPY field (sun occlusion by the grass medium)
+                                  VK_SHADER_STAGE_COMPUTE_BIT, "Vol.Inject");
+    // --- Integrate (0=UBO 1=scatter[read] 2=integrated[write]), Stage-1 splat
+    // (0=particles[read] 1=accum[RMW]) and resolve (0=accum[read] 1=media[write]).
+    s_intSetL     = VK::MakeSetLayout({ kUBO,  kImg,  kImg }, VK_SHADER_STAGE_COMPUTE_BIT, "Vol.Integrate");
+    s_splatSetL   = VK::MakeSetLayout({ kSSBO, kSSBO },       VK_SHADER_STAGE_COMPUTE_BIT, "Vol.Splat");
+    s_resolveSetL = VK::MakeSetLayout({ kSSBO, kImg },        VK_SHADER_STAGE_COMPUTE_BIT, "Vol.Resolve");
+    if (!s_injSetL || !s_intSetL || !s_splatSetL || !s_resolveSetL) { s_failed = true; return false; }
 
     // Pool: UBO 3*F, sampler 10*F (9 + Stage-1 smoke media on inject), storage image
     // 3*F+1 (+resolve media write), storage buffer 3*F+1 (VSM PT*F + splat particles+accum
@@ -426,26 +553,13 @@ bool Init()
     pci.maxSets = 3 * kFramesInFlight + 1; pci.poolSizeCount = 4; pci.pPoolSizes = ps;
     if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) { Msg("![VK Vol] pool failed"); s_failed = true; return false; }
 
-    // Allocate per-slot sets.
-    {
-        VkDescriptorSetLayout iL[kFramesInFlight], tL[kFramesInFlight];
-        for (u32 i = 0; i < kFramesInFlight; ++i) { iL[i] = s_injSetL; tL[i] = s_intSetL; }
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = s_pool;
-        dai.descriptorSetCount = kFramesInFlight; dai.pSetLayouts = iL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_injSet) != VK_SUCCESS) { Msg("![VK Vol] inject set alloc failed"); s_failed = true; return false; }
-        dai.pSetLayouts = tL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_intSet) != VK_SUCCESS) { Msg("![VK Vol] integrate set alloc failed"); s_failed = true; return false; }
-    }
-    // Stage-1 smoke sets: per-slot splat (its slot's particle buffer) + one resolve.
-    {
-        VkDescriptorSetLayout sL[kFramesInFlight];
-        for (u32 i = 0; i < kFramesInFlight; ++i) sL[i] = s_splatSetL;
-        VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        dai.descriptorPool = s_pool; dai.descriptorSetCount = kFramesInFlight; dai.pSetLayouts = sL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, s_splatSet) != VK_SUCCESS) { Msg("![VK Vol] splat set alloc failed"); s_failed = true; return false; }
-        dai.descriptorSetCount = 1; dai.pSetLayouts = &s_resolveSetL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_resolveSet) != VK_SUCCESS) { Msg("![VK Vol] resolve set alloc failed"); s_failed = true; return false; }
+    // Per-slot inject/integrate sets; Stage-1 smoke: per-slot splat (its slot's
+    // particle buffer) + one resolve. All out of the shared pool above.
+    if (!VK::AllocSets(s_pool, s_injSetL,     kFramesInFlight, s_injSet,      "Vol.Inject")    ||
+        !VK::AllocSets(s_pool, s_intSetL,     kFramesInFlight, s_intSet,      "Vol.Integrate") ||
+        !VK::AllocSets(s_pool, s_splatSetL,   kFramesInFlight, s_splatSet,    "Vol.Splat")     ||
+        !VK::AllocSets(s_pool, s_resolveSetL, 1,               &s_resolveSet, "Vol.Resolve")) {
+        s_failed = true; return false;
     }
 
     // Write the stable descriptors (UBO per slot + storage images). Cascade
@@ -459,108 +573,98 @@ bool Init()
         VkDescriptorImageInfo  vAtlasI{ ShadowMap::GetSampler(), ShadowMap::GetView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorBufferInfo vPtI{ s_dummySSBO.GetHandle(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo vUboI{ s_ubo.GetHandle(), kUboStride * i, 192 };
-        VkDescriptorImageInfo  fogShI{ ShadowMap::GetSampler(), ShadowMap::GetFogShadowView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        // Binding 10 is a RESERVED hole (the fog sun-shadow map it used to carry was
+        // removed 12-08-2026). It still needs a VALID image — an unbound combined
+        // image sampler is UB on dispatch even when no shader reads it — so point it
+        // at the cascade view, which always exists.
+        VkDescriptorImageInfo  reservedI{ ShadowMap::GetSampler(), ShadowMap::GetView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         // Fog beam samples the spot+GRASS map (blades cut the beam); surfaces keep
         // the clean spot map so grass doesn't blanket the ground's light pool.
         VkDescriptorImageInfo  spotShI{ ShadowMap::GetSampler(), ShadowMap::GetSpotBeamView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  pointShI{ ShadowMap::GetSampler(), ShadowMap::GetPointCubeView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo  smokeI{ s_sampler, s_smokeView, VK_IMAGE_LAYOUT_GENERAL };   // Stage-1 smoke media (sampled from GENERAL)
 
-        VkWriteDescriptorSet w[17]{};
-        // inject: UBO(0) + scatter storage(4) + history sampler(6) + VSM atlas(7)/PT(8)/clipmap(9)
-        w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_injSet[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &ubi;
-        w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_injSet[i]; w[1].dstBinding = 4; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &scatterI;
-        w[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[5].dstSet = s_injSet[i]; w[5].dstBinding = 6; w[5].descriptorCount = 1; w[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[5].pImageInfo = &histI;
-        w[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[6].dstSet = s_injSet[i]; w[6].dstBinding = 7; w[6].descriptorCount = 1; w[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[6].pImageInfo = &vAtlasI;
-        w[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[7].dstSet = s_injSet[i]; w[7].dstBinding = 8; w[7].descriptorCount = 1; w[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[7].pBufferInfo = &vPtI;
-        w[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[8].dstSet = s_injSet[i]; w[8].dstBinding = 9; w[8].descriptorCount = 1; w[8].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[8].pBufferInfo = &vUboI;
-        w[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[9].dstSet = s_injSet[i]; w[9].dstBinding = 10; w[9].descriptorCount = 1; w[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[9].pImageInfo = &fogShI;
-        w[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[10].dstSet = s_injSet[i]; w[10].dstBinding = 11; w[10].descriptorCount = 1; w[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[10].pImageInfo = &spotShI;
-        w[11] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[11].dstSet = s_injSet[i]; w[11].dstBinding = 12; w[11].descriptorCount = 1; w[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[11].pImageInfo = &pointShI;
-        w[12] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[12].dstSet = s_injSet[i]; w[12].dstBinding = 13; w[12].descriptorCount = 1; w[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[12].pImageInfo = &smokeI;
-        // VSM dyn atlas(14)/PT(15)/dynUsed(16) fallbacks — rebound to the real VSM
-        // resources per-frame once AtlasReady (same scheme as the static 7/8).
-        w[13] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[13].dstSet = s_injSet[i]; w[13].dstBinding = 14; w[13].descriptorCount = 1; w[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[13].pImageInfo = &vAtlasI;
-        w[14] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[14].dstSet = s_injSet[i]; w[14].dstBinding = 15; w[14].descriptorCount = 1; w[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[14].pBufferInfo = &vPtI;
-        w[15] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[15].dstSet = s_injSet[i]; w[15].dstBinding = 16; w[15].descriptorCount = 1; w[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[15].pBufferInfo = &vPtI;
-        // Prev scene depth(17) fallback — re-written EVERY Execute for the current slot.
-        w[16] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[16].dstSet = s_injSet[i]; w[16].dstBinding = 17; w[16].descriptorCount = 1; w[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[16].pImageInfo = &vAtlasI;
+        // inject: UBO(0) + scatter storage(4) + history sampler(6) + shadow sources.
+        // The VSM slots (7/8/9 static, 14/15/16 dyn) and prev depth (17) start on
+        // fallbacks and are rebound per-frame in Execute once VSM is ready.
+        VK::DescriptorWriter(s_injSet[i])
+            .Buffer(0,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         ubi)
+            .Image (4,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          scatterI)
+            .Image (6,  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, histI)
+            .Image (7,  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vAtlasI)
+            .Buffer(8,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         vPtI)
+            .Buffer(9,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         vUboI)
+            .Image (10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, reservedI)
+            .Image (11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, spotShI)
+            .Image (12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pointShI)
+            .Image (13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, smokeI)
+            .Image (14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vAtlasI)
+            .Buffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         vPtI)
+            .Buffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         vPtI)
+            .Image (17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vAtlasI)
+            .Flush();
         // integrate: UBO(0) + scatter read(1) + integrated write(2)
-        w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[2].dstSet = s_intSet[i]; w[2].dstBinding = 0; w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[2].pBufferInfo = &ubi;
-        w[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[3].dstSet = s_intSet[i]; w[3].dstBinding = 1; w[3].descriptorCount = 1; w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[3].pImageInfo = &scatterI;
-        w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[4].dstSet = s_intSet[i]; w[4].dstBinding = 2; w[4].descriptorCount = 1; w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[4].pImageInfo = &integI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 17, w, 0, nullptr);
+        VK::DescriptorWriter(s_intSet[i])
+            .Buffer(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, ubi)
+            .Image (1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  scatterI)
+            .Image (2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  integI)
+            .Flush();
     }
 
     // Stage-1 smoke descriptor writes: per-slot splat (its particle buffer + the
     // shared accum SSBO) + the resolve set (accum read + media storage write).
     {
         VkDescriptorBufferInfo accumI{ s_smokeAccum.GetHandle(), 0, VK_WHOLE_SIZE };
-        for (u32 i = 0; i < kFramesInFlight; ++i) {
-            VkDescriptorBufferInfo partI{ s_smokeParts[i].GetHandle(), 0, VK_WHOLE_SIZE };
-            VkWriteDescriptorSet w[2]{};
-            w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_splatSet[i]; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &partI;
-            w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_splatSet[i]; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &accumI;
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
-        }
-        VkDescriptorImageInfo mediaStoreI{ VK_NULL_HANDLE, s_smokeView, VK_IMAGE_LAYOUT_GENERAL };
-        VkWriteDescriptorSet w[2]{};
-        w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_resolveSet; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &accumI;
-        w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_resolveSet; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &mediaStoreI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+        for (u32 i = 0; i < kFramesInFlight; ++i)
+            VK::DescriptorWriter(s_splatSet[i])
+                .StorageBuffer(0, s_smokeParts[i].GetHandle())
+                .Buffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumI)
+                .Flush();
+        VK::DescriptorWriter(s_resolveSet)
+            .Buffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumI)
+            .StorageImage(1, s_smokeView)
+            .Flush();
     }
 
     // Pipeline layouts + pipelines.
-    {
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &s_injSetL;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_injLayout) != VK_SUCCESS) { Msg("![VK Vol] inject layout failed"); s_failed = true; return false; }
-        plci.pSetLayouts = &s_intSetL;
-        // The integrate set only carries a PREFIX of the Vol UBO, so its V-0 flag
-        // (r_vol_hillaire) rides a push constant rather than forcing the shader to
-        // declare every field up to a new tail lane.
-        VkPushConstantRange intPC{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 4 };
-        plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &intPC;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_intLayout) != VK_SUCCESS) { Msg("![VK Vol] integrate layout failed"); s_failed = true; return false; }
-        plci.pushConstantRangeCount = 0; plci.pPushConstantRanges = nullptr;
-    }
-    s_injPipe = BuildComputePipe("vol_inject.comp.spv",    s_injLayout);
-    s_intPipe = BuildComputePipe("vol_integrate.comp.spv", s_intLayout);
+    // The integrate set only carries a PREFIX of the Vol UBO, so its V-0 flag
+    // (r_vol_hillaire) rides a push constant rather than forcing the shader to
+    // declare every field up to a new tail lane.
+    s_injLayout = VK::MakePipelineLayout({ s_injSetL });
+    s_intLayout = VK::MakePipelineLayout({ s_intSetL }, sizeof(float) * 4);
+    if (!s_injLayout || !s_intLayout) { s_failed = true; return false; }
+
+    s_injPipe = VK::CreateComputePipeline("vol_inject.comp.spv",    s_injLayout);
+    s_intPipe = VK::CreateComputePipeline("vol_integrate.comp.spv", s_intLayout);
     if (!s_injPipe || !s_intPipe) { s_failed = true; return false; }
 
     // Stage-1 smoke splat + resolve (push-constant driven, no UBO).
-    {
-        VkPushConstantRange pcS{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SplatPush) };
-        VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        plci.setLayoutCount = 1; plci.pSetLayouts = &s_splatSetL;
-        plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcS;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_splatLayout) != VK_SUCCESS) { Msg("![VK Vol] splat layout failed"); s_failed = true; return false; }
-        VkPushConstantRange pcR{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ResolvePush) };
-        plci.pSetLayouts = &s_resolveSetL; plci.pPushConstantRanges = &pcR;
-        if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_resolveLayout) != VK_SUCCESS) { Msg("![VK Vol] resolve layout failed"); s_failed = true; return false; }
-    }
-    s_splatPipe   = BuildComputePipe("vol_splat.comp.spv",   s_splatLayout);
-    s_resolvePipe = BuildComputePipe("vol_resolve.comp.spv", s_resolveLayout);
+    s_splatLayout   = VK::MakePipelineLayout({ s_splatSetL },   sizeof(SplatPush));
+    s_resolveLayout = VK::MakePipelineLayout({ s_resolveSetL }, sizeof(ResolvePush));
+    if (!s_splatLayout || !s_resolveLayout) { s_failed = true; return false; }
+
+    s_splatPipe   = VK::CreateComputePipeline("vol_splat.comp.spv",   s_splatLayout);
+    s_resolvePipe = VK::CreateComputePipeline("vol_resolve.comp.spv", s_resolveLayout);
     if (!s_splatPipe || !s_resolvePipe) { s_failed = true; return false; }
 
     // One-time UNDEFINED -> SHADER_READ so the tonemap binding is valid before the
     // first Execute (and stays valid on the menu / with r_vol off — never sampled).
     if (VkCommandBuffer cmd = VulkanHW.BeginSingleTimeCommands()) {
-        ImgBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   0, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
-        ImgBarrier(cmd, s_integImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   0, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        VK::ImageBarrier(cmd, s_integImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         // History starts SHADER_READ so inject's first sample (alpha 0) is valid.
-        ImgBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   0, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         // Smoke media stays GENERAL for its life (resolve writes it as a storage image,
         // inject samples it from GENERAL); never sampled until the first splat (gated).
-        ImgBarrier(cmd, s_smokeImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                   0, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_smokeImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         VulkanHW.EndSingleTimeCommands(cmd);
     }
 
@@ -689,6 +793,7 @@ void BakeGrassCanopy()
         d.extent = { W, H, 1 };
         d.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         d.name  = "Vol.GrassCanopy";
+        d.computeShared = true;   // uploaded via graphics/transfer, sampled by the inject (compute queue under r_async)
         if (!VK::CreateImage(d, s_canopyImg, s_canopyAlloc)) { Msg("![VK Vol] grass canopy image failed"); return; }
         s_canopyView = VK::CreateImageView(s_canopyImg, VK_FORMAT_R8G8_UNORM, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
         if (!s_canopyView) { Msg("![VK Vol] grass canopy view failed"); return; }
@@ -758,47 +863,15 @@ VkPipeline MakeTerraPipe(u32 stride, VkPipelineLayout layout)
     VkShaderModule vs = g_ShaderManager->Load("shadow_depth.vert.spv");
     if (!vs) { Msg("![VK Vol] shadow_depth.vert.spv missing — terrain height bake skipped"); return VK_NULL_HANDLE; }
 
-    VkPipelineShaderStageCreateInfo st{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    st.stage = VK_SHADER_STAGE_VERTEX_BIT; st.module = vs; st.pName = "main";
-
-    VkVertexInputBindingDescription vb{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription va{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &va;
-
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;   // X-Ray winding is not trustworthy
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS;
-    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    const VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dy{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
-
-    const VkFormat dfmt = VK_FORMAT_D32_SFLOAT;
-    VkPipelineRenderingCreateInfo rci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    rci.depthAttachmentFormat = dfmt;
-
-    VkGraphicsPipelineCreateInfo pci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    pci.pNext = &rci; pci.stageCount = 1; pci.pStages = &st;
-    pci.pVertexInputState = &vi; pci.pInputAssemblyState = &ia; pci.pViewportState = &vp;
-    pci.pRasterizationState = &rs; pci.pMultisampleState = &ms; pci.pDepthStencilState = &ds;
-    pci.pColorBlendState = &cb; pci.pDynamicState = &dy; pci.layout = layout;
-
-    VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &pci, nullptr, &p) != VK_SUCCESS) {
-        Msg("![VK Vol] terrain height pipeline (stride %u) failed", stride);
-        return VK_NULL_HANDLE;
-    }
-    return p;
+    // No fragment stage and no colour attachment — depth only. Cull NONE because
+    // X-Ray winding is not trustworthy.
+    return VK::GfxPipelineBuilder(layout)
+        .Vert(vs)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Depth(true, true, VK_COMPARE_OP_LESS)
+        .DepthTarget(VK_FORMAT_D32_SFLOAT)
+        .Build("Vol terrain height stride=%u", stride);
 }
 
 void BakeTerrainHeight(VkCommandBuffer cmd)
@@ -844,6 +917,11 @@ void BakeTerrainHeight(VkCommandBuffer cmd)
         d.extent = { kTerraSize, kTerraSize, 1 };
         d.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         d.name  = "Vol.TerrainHeight";
+        // Baked ONCE per level by a graphics pass, then sampled every frame by the
+        // inject — which moves to the compute queue under r_async. It is a depth
+        // attachment, so CONCURRENT may cost its compression; that is paid on a
+        // one-off bake, never in the frame, so the trade is right here.
+        d.computeShared = true;
         if (!VK::CreateImage(d, s_terraImg, s_terraAlloc)) { Msg("![VK Vol] terrain height image failed"); return; }
         s_terraView = VK::CreateImageView(s_terraImg, VK_FORMAT_D32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT);
         if (!s_terraView) { Msg("![VK Vol] terrain height view failed"); return; }
@@ -868,21 +946,12 @@ void BakeTerrainHeight(VkCommandBuffer cmd)
 
     ImageBarrier(cmd, s_terraImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    VkRenderingAttachmentInfo dAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    dAtt.imageView = s_terraView; dAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    dAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; dAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    dAtt.clearValue.depthStencil = { 1.0f, 0 };
-    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea.extent = { kTerraSize, kTerraSize }; ri.layerCount = 1; ri.pDepthAttachment = &dAtt;
-    vkCmdBeginRendering(cmd, &ri);
-
-    // NEGATIVE-height viewport: the same D3D→Vulkan Y flip the scene and shadow
-    // passes use, so the stored depth matches the sampling convention on the
-    // camera side (uv.y = 1 - uv.y, as in SF_MapUV).
-    VkViewport vpr{ 0.f, float(kTerraSize), float(kTerraSize), -float(kTerraSize), 0.f, 1.f };
-    vkCmdSetViewport(cmd, 0, 1, &vpr);
-    VkRect2D scr{ {0, 0}, { kTerraSize, kTerraSize } };
-    vkCmdSetScissor(cmd, 0, 1, &scr);
+    // BeginFlipped's NEGATIVE-height viewport is the same D3D→Vulkan Y flip the
+    // scene and shadow passes use, so the stored depth matches the sampling
+    // convention on the camera side (uv.y = 1 - uv.y, as in SF_MapUV).
+    VK::RenderingBuilder(kTerraSize, kTerraSize)
+        .Depth(s_terraView, VK_ATTACHMENT_LOAD_OP_CLEAR)
+        .BeginFlipped(cmd);
 
     u32 drawn = 0;
     VkPipeline bound = VK_NULL_HANDLE;
@@ -913,17 +982,56 @@ void BakeTerrainHeight(VkCommandBuffer cmd)
 
 VkImageView GetTerrainHeightView() { return s_terraView; }
 
-void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
-             const SmokeParticle* smoke, u32 smokeCount,
-             VkImageView sceneDepthPrev)
+void RecordGraphicsBakes(VkCommandBuffer gfxCmd)
 {
     if (!s_ready || !Wanted()) return;
+    // GRAPHICS-queue only, and always ahead of Execute. The terrain height field is
+    // RENDERED (depth attachment) and the canopy is uploaded — neither is legal on a
+    // compute queue. One-shot per level in practice; both early-out once baked.
+    BakeTerrainHeight(gfxCmd);
+    BakeGrassCanopy();          // CPU-side, own command buffer
+}
+
+void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
+             const SmokeParticle* smoke, u32 smokeCount,
+             VkImageView sceneDepthPrev, bool onComputeQueue)
+{
+    if (!s_ready || !Wanted()) return;
+
+    // On the compute queue a barrier may not name a graphics stage. The pass's
+    // boundary barriers (handing integ to the tonemap, scatter to the particle pass,
+    // and the WAR against last frame's tonemap read) use these instead: the ordering
+    // they used to express is carried by the timeline semaphore between the queues,
+    // and a semaphore wait already makes prior writes visible — hence access 0.
+    const VkPipelineStageFlags2 kGfxRead   = onComputeQueue ? VK_PIPELINE_STAGE_2_NONE
+                                                            : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    const VkAccessFlags2        kGfxReadA  = onComputeQueue ? VkAccessFlags2(0)
+                                                            : VkAccessFlags2(VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+    // One line the first time the pass actually moves onto the compute queue — with
+    // the profiler zones gone there (see below) this is the only positive evidence in
+    // the log that the overlap is live rather than silently falling back.
+    if (onComputeQueue) {
+        static bool s_loggedAsync = false;
+        if (!s_loggedAsync) {
+            s_loggedAsync = true;
+            Msg("[VK Vol] inject/integrate now recording on the COMPUTE queue (snapshot set %u, depth-reject off, GPU splat off)",
+                s_snapReadSet);
+        }
+    }
+
+    // Profiler zones are skipped on the compute queue: the timestamp query pool is
+    // RESET by the graphics segment, and nothing orders that reset against writes
+    // coming from another queue — the results would be garbage and the validator
+    // would (rightly) complain. Cost of the pass is still visible as frame GPU time.
+    // A proper fix is a second query pool owned by the compute queue.
     if (slot >= kFramesInFlight) slot = 0;
 
-    // Ground anchor for the height fog — one-shot per level, before anything samples it.
-    BakeTerrainHeight(cmd);
-    // Grass canopy for the sun occlusion — same deal, CPU-side (own command buffer).
-    BakeGrassCanopy();
+    // NOTE: the terrain-height and canopy bakes used to run HERE. They must not:
+    // BakeTerrainHeight records a RENDER PASS into `cmd`, and under async `cmd` is a
+    // COMPUTE command buffer — graphics commands on a compute queue kill the device
+    // (that is exactly what happened on 12-08). They now run on the graphics queue via
+    // RecordGraphicsBakes(), called by the pass before it decides which queue to use.
 
     // Stage-1 smoke: clamp the upload to capacity; gate the splat + inject sample on
     // the knob (or the debug view, which also drives the path). smokeActive false →
@@ -933,7 +1041,12 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // splat of the particle pool (recorded below, same accum SSBO). The GPU alive
     // count is unknown on the CPU, so when the GP pool is live the splat+resolve
     // run every frame (bounded: one early-out dispatch + the coarse-grid resolve).
-    const bool gpSplat     = GPUParticles::WantsMediaSplat();
+    // GPU-routed smoke splat reads the GPU particle pool, which the graphics queue
+    // rewrites LATER this frame (the GPUParticles pass) — reading it from the compute
+    // queue in parallel is the same cross-queue race the shadow snapshot exists to
+    // avoid, and there is no snapshot for the pool. Skip it under async; CPU smoke
+    // particles (copied into this slot's own buffer) are unaffected.
+    const bool gpSplat     = GPUParticles::WantsMediaSplat() && !onComputeQueue;
     const bool smokeActive = (ps_r_vol_smoke_inject > 0.0f || ps_r_vol_smoke_debug != 0) && (smokeN > 0u || gpSplat);
 
     // exp-Z grid — ONE source of truth shared with the clustered cull, so the
@@ -1083,10 +1196,10 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     memcpy(ub.sun_c1_vp,   &ShadowMap::GetCascadeVP(1), sizeof(ub.sun_c1_vp));
 
     ub.gridParams[0] = float(kGridX); ub.gridParams[1] = float(kGridY); ub.gridParams[2] = float(kGridZ);
-    // Occlusion source enum: 2 = dedicated per-frame fog sun-shadow (CONTINUOUS, no
-    // cache tick — r_vol_shadow), 1 = VSM atlas (smooth-ish), 0 = cascade (default).
-    // r_vol_shadow wins; each falls back to the cascade where it has no coverage.
-    ub.gridParams[3] = ps_r_vol_shadow ? 2.0f : (VSM::AtlasReady() ? 1.0f : 0.0f);
+    // Occlusion source enum: 1 = VSM atlas, 0 = cascade (fallback). Mode 2 (the
+    // dedicated per-frame fog sun-shadow) was removed 12-08-2026.
+
+    ub.gridParams[3] = VSM::AtlasReady() ? 1.0f : 0.0f;
     ub.zParams[0] = gz.nearZ; ub.zParams[1] = gz.farZ; ub.zParams[2] = gz.logFarNear; ub.zParams[3] = ps_r_vol_soft;
     // Height fog anchored just below eye level (ground unknown per-level): full
     // density below, exp falloff above. r_vol_height 0 = uniform fog.
@@ -1104,7 +1217,6 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // Sky-visibility map (top-down statics depth) → the inject occludes the
     // unconditional ambient term so interiors don't glow with outdoor haze.
     memcpy(ub.rain_vp, &ShadowMap::GetRainVP(), sizeof(ub.rain_vp));
-    memcpy(ub.fog_shadow_vp, &ShadowMap::GetFogShadowVP(), sizeof(ub.fog_shadow_vp));
 
     // P2 — nearest local lights (flashlight/lamps/campfires) so they glow/cone in the
     // fog. Reuse the same per-frame collection EnvLight/shadows use (nearest-first).
@@ -1294,26 +1406,41 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     memcpy(s_uboMapped + size_t(slot) * kUboStride, &ub, sizeof(ub));
 
     // ---- Rebind the cascade + rain samplers if ShadowMap recreated them (defensive).
+    // Under async compute the inject runs on the COMPUTE queue while graphics rewrites
+    // these very maps, so it samples the previous frame's SNAPSHOT set instead (see
+    // SnapshotShadows). Until the first snapshot is taken we stay on the live views —
+    // one frame of a fog shadow sourced from a map being rewritten is invisible, and
+    // it keeps the descriptors valid from frame zero.
+    // On the compute queue the snapshot is the ONLY legal source (the live maps are
+    // being rewritten by the graphics queue right now); on the graphics queue it is
+    // never used. AsyncInjectReady() gates the caller, so a completed snapshot is
+    // guaranteed here — no live-map fallback, which is exactly what must not happen.
+    const bool useSnap = onComputeQueue;
     VkImageView rainV = ShadowMap::GetRainView();
     if (!rainV) rainV = ShadowMap::GetView();   // fallback keeps the descriptor valid
     VkImageView casc[4] = { ShadowMap::GetCascadeView(0), ShadowMap::GetCascadeView(1), ShadowMap::GetView(), rainV };
-    if (casc[0] != s_boundCasc[0] || casc[1] != s_boundCasc[1] || casc[2] != s_boundCasc[2] || casc[3] != s_boundCasc[3]) {
+    const u32 bindOf[4] = { 1, 2, 3, 5 };   // cascade0/1/far at 1-3, rain at 5
+    if (useSnap) {
+        // The read set ALTERNATES every frame, so this rebinds every frame — and may
+        // therefore touch ONLY this slot's set. The other slots' sets can still be in
+        // flight on the GPU, and updating a descriptor set a running command buffer
+        // uses is undefined behaviour. Same rule the prev-depth block below follows.
+        const u32 rd = s_snapReadSet;
         VkSampler ss = ShadowMap::GetSampler();
-        const u32 bindOf[4] = { 1, 2, 3, 5 };   // cascade0/1/far at 1-3, rain at 5
+        VK::DescriptorWriter dw(s_injSet[slot]);
+        for (u32 k = 0; k < kSnapMaps; ++k) dw.ImageSampler(bindOf[k], s_snapView[rd][k], ss);
+        dw.Flush();
+        // Force the live-view path to rewrite all slots if async is ever turned off.
+        s_boundCasc[0] = s_boundCasc[1] = s_boundCasc[2] = s_boundCasc[3] = VK_NULL_HANDLE;
+    }
+    else if (casc[0] != s_boundCasc[0] || casc[1] != s_boundCasc[1] || casc[2] != s_boundCasc[2] || casc[3] != s_boundCasc[3]) {
+        // Live views: only changes when ShadowMap recreates its maps (rare, device
+        // idle), so writing every slot at once is safe here.
+        VkSampler ss = ShadowMap::GetSampler();
         for (u32 i = 0; i < kFramesInFlight; ++i) {
-            VkDescriptorImageInfo ci[4] = {
-                { ss, casc[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-                { ss, casc[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-                { ss, casc[2], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-                { ss, casc[3], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-            };
-            VkWriteDescriptorSet w[4]{};
-            for (u32 k = 0; k < 4; ++k) {
-                w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[k].dstSet = s_injSet[i];
-                w[k].dstBinding = bindOf[k]; w[k].descriptorCount = 1;
-                w[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[k].pImageInfo = &ci[k];
-            }
-            vkUpdateDescriptorSets(VulkanHW.m_Device, 4, w, 0, nullptr);
+            VK::DescriptorWriter dw(s_injSet[i]);
+            for (u32 k = 0; k < 4; ++k) dw.ImageSampler(bindOf[k], casc[k], ss);
+            dw.Flush();
         }
         s_boundCasc[0] = casc[0]; s_boundCasc[1] = casc[1]; s_boundCasc[2] = casc[2]; s_boundCasc[3] = casc[3];
     }
@@ -1330,22 +1457,15 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
         VkBuffer    used   = VSM::GetDynUsedHandle();
         if (atlas && pt && cubo && atlasD && ptD && used &&
             (atlas != s_boundVsmAtlas || pt != s_boundVsmPT || cubo != s_boundVsmUBO || atlasD != s_boundVsmAtlasD)) {
-            VkDescriptorImageInfo  aI{ VSM::GetSampler(), atlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkDescriptorBufferInfo pI{ pt, 0, VK_WHOLE_SIZE };
-            VkDescriptorBufferInfo uI{ cubo, 0, VK_WHOLE_SIZE };
-            VkDescriptorImageInfo  aDI{ VSM::GetSampler(), atlasD, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            VkDescriptorBufferInfo pDI{ ptD, 0, VK_WHOLE_SIZE };
-            VkDescriptorBufferInfo usI{ used, 0, VK_WHOLE_SIZE };
-            for (u32 i = 0; i < kFramesInFlight; ++i) {
-                VkWriteDescriptorSet w[6]{};
-                w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[0].dstSet = s_injSet[i]; w[0].dstBinding = 7; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &aI;
-                w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[1].dstSet = s_injSet[i]; w[1].dstBinding = 8; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &pI;
-                w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[2].dstSet = s_injSet[i]; w[2].dstBinding = 9; w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[2].pBufferInfo = &uI;
-                w[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[3].dstSet = s_injSet[i]; w[3].dstBinding = 14; w[3].descriptorCount = 1; w[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[3].pImageInfo = &aDI;
-                w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[4].dstSet = s_injSet[i]; w[4].dstBinding = 15; w[4].descriptorCount = 1; w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[4].pBufferInfo = &pDI;
-                w[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; w[5].dstSet = s_injSet[i]; w[5].dstBinding = 16; w[5].descriptorCount = 1; w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[5].pBufferInfo = &usI;
-                vkUpdateDescriptorSets(VulkanHW.m_Device, 6, w, 0, nullptr);
-            }
+            for (u32 i = 0; i < kFramesInFlight; ++i)
+                VK::DescriptorWriter(s_injSet[i])
+                    .ImageSampler (7,  atlas,  VSM::GetSampler())
+                    .StorageBuffer(8,  pt)
+                    .UniformBuffer(9,  cubo)
+                    .ImageSampler (14, atlasD, VSM::GetSampler())
+                    .StorageBuffer(15, ptD)
+                    .StorageBuffer(16, used)
+                    .Flush();
             s_boundVsmAtlas = atlas; s_boundVsmPT = pt; s_boundVsmUBO = cubo; s_boundVsmAtlasD = atlasD;
         }
     }
@@ -1356,26 +1476,17 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // known-valid map when rejection is off (the shader path is gated by sun_dir.w).
     {
         VkImageView dv = depthRej ? sceneDepthPrev : (ShadowMap::GetRainView() ? ShadowMap::GetRainView() : ShadowMap::GetView());
-        VkDescriptorImageInfo dI{ ShadowMap::GetSampler(), dv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         // Terrain height field — the bake above may have just created it. Falls back
         // to a known-valid depth map; the shader path is gated by terra.w, so the
         // fallback is never sampled, it only keeps the binding legal.
         VkImageView th = s_terraView ? s_terraView : (ShadowMap::GetRainView() ? ShadowMap::GetRainView() : ShadowMap::GetView());
-        VkDescriptorImageInfo tI{ ShadowMap::GetSampler(), th, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         // Grass canopy — same deal: gated by canopy.x, the fallback only keeps it legal.
         VkImageView cv = s_canopyView ? s_canopyView : th;
-        VkDescriptorImageInfo cI{ ShadowMap::GetSampler(), cv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkWriteDescriptorSet w[3]{};
-        w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w[0].dstSet = s_injSet[slot]; w[0].dstBinding = 17; w[0].descriptorCount = 1;
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &dI;
-        w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w[1].dstSet = s_injSet[slot]; w[1].dstBinding = 18; w[1].descriptorCount = 1;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[1].pImageInfo = &tI;
-        w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w[2].dstSet = s_injSet[slot]; w[2].dstBinding = 19; w[2].descriptorCount = 1;
-        w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[2].pImageInfo = &cI;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 3, w, 0, nullptr);
+        VK::DescriptorWriter(s_injSet[slot])
+            .ImageSampler(17, dv, ShadowMap::GetSampler())
+            .ImageSampler(18, th, ShadowMap::GetSampler())
+            .ImageSampler(19, cv, ShadowMap::GetSampler())
+            .Flush();
     }
 
     // Make last frame's occluder writes visible to this frame's COMPUTE sample: the
@@ -1395,7 +1506,7 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // volume the inject below samples. Particles were simulated in CollectVisuals
     // (before any pass), so their data is valid here. Skipped when disabled / no smoke.
     if (smokeActive) {
-        const int z = Prof::ZoneBegin(cmd, "VolSmoke");
+        const int z = onComputeQueue ? -1 : Prof::ZoneBegin(cmd, "VolSmoke");
         if (ps_r_vol_smoke_debug && (s_frame % 120u) == 0u)
             Msg("[VK Vol] smoke inject: %u particles (debug %d, density %.2f)", smokeN, ps_r_vol_smoke_debug, ps_r_vol_smoke_density);
         if (smokeN)
@@ -1475,66 +1586,70 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
         vkCmdDispatch(cmd, (kSmokeX + 3) / 4, (kSmokeY + 3) / 4, (kSmokeZ + 3) / 4);
 
         // media resolve-write → inject sampled-read (stays GENERAL).
-        ImgBarrier(cmd, s_smokeImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        Prof::ZoneEnd(cmd, z);
+        VK::ImageBarrier(cmd, s_smokeImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        if (!onComputeQueue) Prof::ZoneEnd(cmd, z);
     }
 
     // ---- INJECT: per froxel in-scatter + extinction.
     {
-        const int z = Prof::ZoneBegin(cmd, "VolInject");
+        const int z = onComputeQueue ? -1 : Prof::ZoneBegin(cmd, "VolInject");
         // scatter: (prev frame's integrate read / history copy) -> GENERAL for the
         // storage write. WAR vs last frame's copy READ → src stage covers COPY too.
-        ImgBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_injPipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_injLayout, 0, 1, &s_injSet[slot], 0, nullptr);
         vkCmdDispatch(cmd, (kGridX + 3) / 4, (kGridY + 3) / 4, (kGridZ + 3) / 4);
-        Prof::ZoneEnd(cmd, z);
+        if (!onComputeQueue) Prof::ZoneEnd(cmd, z);
     }
 
     // ---- INTEGRATE: march Z, accumulate in-scatter + transmittance.
     {
-        const int z = Prof::ZoneBegin(cmd, "VolIntegrate");
+        const int z = onComputeQueue ? -1 : Prof::ZoneBegin(cmd, "VolIntegrate");
         // scatter write -> read (same GENERAL layout, memory barrier only).
-        ImgBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         // integrated: (prev tonemap FRAGMENT read) -> GENERAL for the storage write (WAR).
-        ImgBarrier(cmd, s_integImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        // Under async that read happened on the OTHER queue; the frame-timeline wait in
+        // Async::Submit already orders us behind it, so the stage/access go empty.
+        VK::ImageBarrier(cmd, s_integImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         kGfxRead, kGfxReadA,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_intPipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_intLayout, 0, 1, &s_intSet[slot], 0, nullptr);
         const float intPush[4] = { ps_r_vol_hillaire ? 1.0f : 0.0f, 0.f, 0.f, 0.f };
         vkCmdPushConstants(cmd, s_intLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intPush), intPush);
         vkCmdDispatch(cmd, (kGridX + 7) / 8, (kGridY + 7) / 8, 1);
-        // integrated write -> tonemap FRAGMENT sample.
-        ImgBarrier(cmd, s_integImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
-        Prof::ZoneEnd(cmd, z);
+        // integrated write -> tonemap FRAGMENT sample. The layout change still has to
+        // happen here (SHADER_READ_ONLY is legal to transition to on a compute queue);
+        // only the consumer half moves to the semaphore under async.
+        VK::ImageBarrier(cmd, s_integImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         kGfxRead, kGfxReadA);
+        if (!onComputeQueue) Prof::ZoneEnd(cmd, z);
     }
 
     // ---- Temporal: copy this frame's blended scatter → history for next frame.
     if (ps_r_vol_ta != 0) {
-        ImgBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   VK_ACCESS_2_SHADER_STORAGE_READ_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COPY_BIT);
-        ImgBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COPY_BIT);
+        VK::ImageBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VK::ImageBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         VkImageCopy cp{};
         cp.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         cp.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         cp.extent = { kGridX, kGridY, kGridZ };
         vkCmdCopyImage(cmd, s_scatterImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        s_histImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        ImgBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_histImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         s_haveHistory = true;
     }
 
@@ -1545,13 +1660,13 @@ void Execute(VkCommandBuffer cmd, const ProjTerms& pt, u32 slot,
     // storage read left it there). Next frame's inject re-acquires it via an
     // UNDEFINED→GENERAL barrier, so discarding the contents here is fine.
     if (ps_r_vol_ta != 0) {
-        ImgBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         kGfxRead, kGfxReadA);
     } else {
-        ImgBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_ACCESS_2_SHADER_STORAGE_READ_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+        VK::ImageBarrier(cmd, s_scatterImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                         kGfxRead, kGfxReadA);
     }
 
     // Cache this frame's reprojection inputs for next frame's temporal pass.
@@ -1597,6 +1712,13 @@ void Destroy()
     if (s_integImg)    { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_integImg, s_integAlloc); s_integImg = VK_NULL_HANDLE; s_integAlloc = VK_NULL_HANDLE; }
     if (s_histImg)     { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_histImg, s_histAlloc); s_histImg = VK_NULL_HANDLE; s_histAlloc = VK_NULL_HANDLE; }
     if (s_smokeImg)    { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_smokeImg, s_smokeAlloc); s_smokeImg = VK_NULL_HANDLE; s_smokeAlloc = VK_NULL_HANDLE; }
+    // Async shadow snapshot (both ping-pong sets).
+    for (u32 s = 0; s < kSnapSets; ++s)
+        for (u32 m = 0; m < kSnapMaps; ++m) {
+            if (s_snapView[s][m]) { vkDestroyImageView(VulkanHW.m_Device, s_snapView[s][m], nullptr); s_snapView[s][m] = VK_NULL_HANDLE; }
+            if (s_snapImg[s][m])  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_snapImg[s][m], s_snapAlloc[s][m]); s_snapImg[s][m] = VK_NULL_HANDLE; s_snapAlloc[s][m] = VK_NULL_HANDLE; }
+        }
+    s_snapReady = false; s_snapHaveRead = false; s_snapPending = -1; s_snapWriteSet = 0; s_snapReadSet = 0;
     s_ubo.Destroy(); s_uboMapped = nullptr;
     s_dummySSBO.Destroy();
     s_smokeAccum.Destroy();

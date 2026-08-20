@@ -11,6 +11,7 @@
 #include "vk_ibl.h"
 #include "vk_image.h"            // VK::CreateImage / CreateImageView
 #include "vk_compute_util.h"     // VK::MakePipelineLayout / CreateComputePipeline
+#include "vk_descriptors.h"      // VK::DescriptorWriter
 #include "vk_command_buffer.h"   // CommandManager (BeginImmediate / EndAndSubmitImmediate)
 #include "vk_shaders.h"          // g_ShaderManager (SPIR-V loader)
 #include "vk_buffer.h"           // CVulkanBuffer (SH coefficient SSBO)
@@ -131,33 +132,17 @@ bool Init()
     }
 
     // Compute set: 0/1 = sky cubes (in), 2 = spec cube mip 0 storage (out).
-    VkDescriptorSetLayoutBinding b[3]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 3; lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setL) != VK_SUCCESS) { Msg("![VK IBL] set layout failed"); s_failed = true; return false; }
-
-    VkDescriptorPoolSize ps[2]{
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1 },
-    };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 2; pci.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) { Msg("![VK IBL] pool failed"); s_failed = true; return false; }
-
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setL;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_set) != VK_SUCCESS) { Msg("![VK IBL] alloc set failed"); s_failed = true; return false; }
+    if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+                                1, s_setL, s_pool, &s_set,
+                                VK_SHADER_STAGE_COMPUTE_BIT, "IBL.Prefilter")) {
+        s_failed = true; return false;
+    }
 
     // Storage output (binding 2) is stable — write it once; Update rewrites 0/1.
     {
-        VkDescriptorImageInfo oi{ VK_NULL_HANDLE, s_storeV, VK_IMAGE_LAYOUT_GENERAL };
-        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        w.dstSet = s_set; w.dstBinding = 2; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w.pImageInfo = &oi;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+        VK::DescriptorWriter(s_set).StorageImage(2, s_storeV).Flush();
     }
 
     s_layout = VK::MakePipelineLayout({ s_setL }, sizeof(Push));
@@ -186,34 +171,17 @@ bool Init()
         // no extra sync, and nothing is read unless the cvar is on.
         s_shRead.Create(kSHBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
 
-        VkDescriptorSetLayoutBinding sb[2]{};
-        sb[0].binding = 0; sb[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sb[0].descriptorCount = 1; sb[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        sb[1].binding = 1; sb[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         sb[1].descriptorCount = 1; sb[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        VkDescriptorSetLayoutCreateInfo sl{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        sl.bindingCount = 2; sl.pBindings = sb;
-        if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &sl, nullptr, &s_shSetL) != VK_SUCCESS) break;
-
-        VkDescriptorPoolSize sps[2]{
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1 },
-        };
-        VkDescriptorPoolCreateInfo spci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        spci.maxSets = 1; spci.poolSizeCount = 2; spci.pPoolSizes = sps;
-        if (vkCreateDescriptorPool(VulkanHW.m_Device, &spci, nullptr, &s_shPool) != VK_SUCCESS) break;
-
-        VkDescriptorSetAllocateInfo sdai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        sdai.descriptorPool = s_shPool; sdai.descriptorSetCount = 1; sdai.pSetLayouts = &s_shSetL;
-        if (vkAllocateDescriptorSets(VulkanHW.m_Device, &sdai, &s_shSet) != VK_SUCCESS) break;
+        if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+                                    1, s_shSetL, s_shPool, &s_shSet,
+                                    VK_SHADER_STAGE_COMPUTE_BIT, "IBL.SHProject"))
+            break;
 
         // Both operands are stable for the module's lifetime — write the set once.
-        VkDescriptorImageInfo  pi{ s_sampler, s_sampleV, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        VkDescriptorBufferInfo bi{ s_shBuf.GetHandle(), 0, kSHBytes };
-        VkWriteDescriptorSet   sw[2]{};
-        sw[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; sw[0].dstSet = s_shSet; sw[0].dstBinding = 0;
-        sw[0].descriptorCount = 1; sw[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sw[0].pImageInfo = &pi;
-        sw[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; sw[1].dstSet = s_shSet; sw[1].dstBinding = 1;
-        sw[1].descriptorCount = 1; sw[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; sw[1].pBufferInfo = &bi;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 2, sw, 0, nullptr);
+        VK::DescriptorWriter(s_shSet)
+            .ImageSampler (0, s_sampleV, s_sampler)
+            .StorageBuffer(1, s_shBuf.GetHandle(), kSHBytes)
+            .Flush();
 
         s_shLayout = VK::MakePipelineLayout({ s_shSetL }, sizeof(Push));
         if (s_shLayout == VK_NULL_HANDLE) break;
@@ -228,7 +196,40 @@ bool Init()
 
 bool Ready() { return s_ready && !s_failed && s_hasContent; }
 
-void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyDesc& sky)
+// r_sky_sh_debug: report what the projection actually produced. The question a
+// flat-looking dusk raises is not "did SH run" but "does the sky the probe sees
+// carry any azimuthal energy at all" — and that is exactly the L0 vs L1 ratio.
+//   L0  = the omnidirectional average (how bright the sky is overall),
+//   L1  = the linear band; its length is how much the irradiance VARIES with
+//         direction, and its direction is where the sky is brightest.
+// aniso = |L1|/L0 near 0 means a uniform sky dome: no amount of correct maths
+// downstream can make terrain directional, because the source has no direction.
+//
+// ⚠Called at the TOP of the next refresh, so the mirror holds a COMPLETED projection.
+// It prints s_last* — the descriptor that produced those coefficients — not the sky
+// being built right now, or the numbers and their labels would describe two skies.
+static void DumpSHDebug()
+{
+    if (!ps_r_sky_sh_debug || !s_hasContent || s_shRead.GetHandle() == VK_NULL_HANDLE) return;
+    const float* c = static_cast<const float*>(s_shRead.Map());
+    if (!c) return;
+    auto lum = [](const float* v) { return 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]; };
+    const float l0 = lum(c + 0);
+    // Basis order (sky_sh_project.comp): 1 = y, 2 = z, 3 = x.
+    const float dx = lum(c + 12), dy = lum(c + 4), dz = lum(c + 8);
+    const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    const float aniso = (l0 > 1e-6f) ? (len / l0) : 0.f;
+    Msg("[VK SH] L0=(%.4f,%.4f,%.4f) lum=%.4f | L1 dir=(%.2f,%.2f,%.2f) len=%.4f | aniso=%.3f "
+        "| azimuth=%.1f deg | skyRot=%.1f deg | ground=%.2f",
+        c[0], c[1], c[2], l0,
+        (len > 1e-6f) ? dx / len : 0.f, (len > 1e-6f) ? dy / len : 0.f, (len > 1e-6f) ? dz / len : 0.f,
+        len, aniso, atan2f(dz, dx) * 57.2957795f, s_lastRot * 57.2957795f, s_lastGround);
+    Msg("[VK SH]   tint sky_color=(%.3f,%.3f,%.3f) x1.7  (probe = raw cube x tint)",
+        s_lastTint[0], s_lastTint[1], s_lastTint[2]);
+    s_shRead.Unmap();
+}
+
+void Update(VkCommandBuffer cmd, VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyDesc& sky)
 {
     if (!s_ready || s_failed) return;
     // The procedural sky needs no cube at all — it IS the source. Only the legacy
@@ -270,27 +271,33 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyD
                                      || std::fabs(sky.mieG      - s_lastAtmo[2]) > 0.01f))
                        || !s_hasContent;
     if (!changed) return;
+    if (cmd == VK_NULL_HANDLE) return;   // caller cannot record here — keep last frame's probe
 
-    VkCommandBuffer cmd = CommandManager.BeginImmediate();
-    if (cmd == VK_NULL_HANDLE) { Msg("![VK IBL] BeginImmediate failed"); return; }
+    // ⭐r_sky_sh_debug reads the PREVIOUS refresh, before this one overwrites the
+    // mirror. The copy below is now recorded, not fence-waited, so mapping it right
+    // after recording would read whatever the GPU had not yet written. One refresh of
+    // lag in a debug dump is free; a torn read that quietly prints plausible numbers
+    // is exactly the kind of lying instrument this arc kept tripping over.
+    DumpSHDebug();
 
     // Sky cubes (bindings 0/1) for this refresh.
-    VkDescriptorImageInfo si[2]{
-        { skySampler, sky0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-        { skySampler, sky1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-    };
-    VkWriteDescriptorSet w[2]{};
-    for (u32 i = 0; i < 2; ++i) {
-        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = s_set;
-        w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = &si[i];
-    }
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 2, w, 0, nullptr);
+    VK::DescriptorWriter(s_set)
+        .ImageSampler(0, sky0, skySampler)
+        .ImageSampler(1, sky1, skySampler)
+        .Flush();
 
     // mip 0 → GENERAL (we overwrite; UNDEFINED discards the old content).
+    //
+    // ⭐WRITE-AFTER-READ, and it is the whole reason this no longer needs a CPU wait.
+    // Frames still in flight are sampling this cube. srcStage/srcAccess name those reads,
+    // and a barrier applies to everything submitted EARLIER on the same queue — so the
+    // GPU simply does not start the prefilter until those frames' fragment work is done.
+    // That is ordinary pipelining; the old TOP_OF_PIPE/0 pair expressed no such
+    // dependency and leaned on the fence wait to be safe by accident.
+    constexpr VkPipelineStageFlags kReaders = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     BarrierMips(cmd, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                0, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                kReaders, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_layout, 0, 1, &s_set, 0, nullptr);
@@ -307,8 +314,8 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyD
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     BarrierMips(cmd, 1, kMips - 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,   // same WAR as mip 0 — in-flight frames sample these too
+                kReaders, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     // Box-blit chain: mip m = downsample of mip m-1 (roughness grows with mip).
     for (u32 m = 1; m < kMips; ++m) {
@@ -360,7 +367,8 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyD
         }
     }
 
-    CommandManager.EndAndSubmitImmediate(cmd);   // fence-waited
+    // No submit and no fence here on purpose: these commands ride the frame's own
+    // command buffer and are presented with it. See the note in vk_ibl.h.
 
     s_last0 = sky0; s_last1 = sky1; s_lastW = weight;
     s_lastRot = skyRotation; s_lastGround = groundBounce;
@@ -375,32 +383,6 @@ void Update(VkImageView sky0, VkImageView sky1, VkSampler skySampler, const SkyD
             weight, skyRotation, s_shReady ? "projected" : "off");
     }
 
-    // r_sky_sh_debug: report what the projection actually produced. The question a
-    // flat-looking dusk raises is not "did SH run" but "does the sky the probe sees
-    // carry any azimuthal energy at all" — and that is exactly the L0 vs L1 ratio.
-    //   L0  = the omnidirectional average (how bright the sky is overall),
-    //   L1  = the linear band; its length is how much the irradiance VARIES with
-    //         direction, and its direction is where the sky is brightest.
-    // aniso = |L1|/L0 near 0 means a uniform sky dome: no amount of correct maths
-    // downstream can make terrain directional, because the source has no direction.
-    if (ps_r_sky_sh_debug && s_shRead.GetHandle() != VK_NULL_HANDLE) {
-        if (const float* c = static_cast<const float*>(s_shRead.Map())) {
-            auto lum = [](const float* v) { return 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]; };
-            const float l0 = lum(c + 0);
-            // Basis order (sky_sh_project.comp): 1 = y, 2 = z, 3 = x.
-            const float dx = lum(c + 12), dy = lum(c + 4), dz = lum(c + 8);
-            const float len = sqrtf(dx * dx + dy * dy + dz * dz);
-            const float aniso = (l0 > 1e-6f) ? (len / l0) : 0.f;
-            Msg("[VK SH] L0=(%.4f,%.4f,%.4f) lum=%.4f | L1 dir=(%.2f,%.2f,%.2f) len=%.4f | aniso=%.3f "
-                "| azimuth=%.1f deg | skyRot=%.1f deg | ground=%.2f",
-                c[0], c[1], c[2], l0,
-                (len > 1e-6f) ? dx / len : 0.f, (len > 1e-6f) ? dy / len : 0.f, (len > 1e-6f) ? dz / len : 0.f,
-                len, aniso, atan2f(dz, dx) * 57.2957795f, skyRotation * 57.2957795f, groundBounce);
-            Msg("[VK SH]   tint sky_color=(%.3f,%.3f,%.3f) x1.7  (probe = raw cube x tint)",
-                skyTint[0], skyTint[1], skyTint[2]);
-            s_shRead.Unmap();
-        }
-    }
 }
 
 VkImageView GetSpecView() { return s_hasContent ? s_sampleV : VK_NULL_HANDLE; }

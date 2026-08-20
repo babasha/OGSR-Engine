@@ -25,16 +25,13 @@
 #include "vsm_common.glsl"
 #include "ssfx_tree_wind.glsl"
 
-struct TreeInstance { mat4 xform; float c_scale_hemi; float c_bias_hemi; uint _p0; uint _p1; };
-layout(set = 0, binding = 0, std430) readonly buffer XformBuf { TreeInstance inst[]; };
+#include "tree_instance.glsl"   // TreeInstance + XformBuf (set 0 b0) — matches VK::GpuTreeInstance
 
 layout(set = 2, binding = 0) readonly buffer PageList    { uvec4 pageList[]; };
 layout(set = 2, binding = 1) readonly buffer CasterPages { uint  casterPages[]; };
-layout(set = 2, binding = 2) uniform VsmParams {
-    mat4 view;
-    vec4 level[VSM_LEVELS];
-    vec4 zparams;
-} vsm;
+#define VSM_PARAMS_SET     2
+#define VSM_PARAMS_BINDING 2
+#include "vsm_params.glsl"   // VsmParams UBO (clipmap view/levels/depth)
 
 // Matches GpuTreeBrick (32 B): p = brick MIN corner (mesh-local), meta = avgCov4 |
 // hash8<<4, masks = (fullLo, fullHi, coreLo, coreHi).
@@ -52,12 +49,7 @@ layout(set = 3, binding = 1, std430) readonly buffer Choice { uvec4 choice[]; };
 // dissolve are unchanged).
 layout(set = 3, binding = 2, std430) readonly buffer BrickRemap { uint blist[]; };
 
-layout(push_constant) uniform PC {
-    float uvScale; float alphaRef; uint cap; uint pad;
-    vec4  wind_params;
-    vec4  wsetup_trees;
-    vec4  wind_anim;
-} pc;
+#include "tree_vsm_push.glsl"   // VSM caster push — shared by the four caster bodies
 
 layout(location = 0) out flat float vFade;
 layout(location = 1) out flat uvec2 vMask;

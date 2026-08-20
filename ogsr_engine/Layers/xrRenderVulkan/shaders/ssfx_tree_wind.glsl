@@ -5,6 +5,9 @@
 // Displacement is WORLD-space (VP-independent): both passes add it before their
 // own view-proj. Requires the flow map bound at set 0, binding 1.
 
+#ifndef SSFX_TREE_WIND_GLSL
+#define SSFX_TREE_WIND_GLSL
+
 layout(set = 0, binding = 1) uniform sampler2D s_waves;   // wind_wave.dds flow map
 
 // xy = trunk XZ bend, z = gust factor (fed to the branch flutter).
@@ -60,3 +63,27 @@ vec3 ssfxTreeWind(uint windClass, vec3 worldPos, float H, float tc_y, vec2 dir,
     }
     return vec3(0.0);
 }
+
+// Wind setup + apply, in WORLD space. Every tree pass (forward, depth, motion
+// vectors, hull/voxel debug, and the VSM page/meshlet/hull casters) needs the
+// same four lines before the call — including the wind-direction convention
+// (-wind_params.x + pi/2) and the minimum-speed floor. Those were written out
+// nine times; the casters MUST agree with the forward pass or a tree bends one
+// way and its shadow the other.
+//   wp    world-space vertex position
+//   H     height above the tree base (wp.y - baseY)
+//   tc_y  scaled UV V (fades flutter toward the trunk base); 0.35 for hull/voxel
+//         proxies, which carry no UVs
+//   cls   wind class from TreeInstance._p0 (2=foliage, 1=trunk, 0=rigid)
+//   baseY tree origin world Y = per-tree phase
+vec3 ssfxTreeWindWorld(vec3 wp, float H, float tc_y, uint cls, float baseY,
+                       vec4 wparams, vec4 wsetup, vec4 wanim)
+{
+    float r    = -wparams.x + 1.57079;
+    vec2  wdir = vec2(cos(r), sin(r));
+    float spd  = max(wsetup.w, clamp(wparams.y * 0.001, 0.0, 1.0));
+    return ssfxTreeWind(cls, wp, H, tc_y, wdir, spd, baseY,
+                        wanim.xyz, wsetup.x, wsetup.y, wsetup.z, wanim.w, wparams.w);
+}
+
+#endif // SSFX_TREE_WIND_GLSL

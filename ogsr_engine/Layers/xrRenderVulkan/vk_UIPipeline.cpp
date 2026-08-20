@@ -9,13 +9,16 @@
 // notes vs the monolith original.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
+#include "vk_rendering.h"     // VK::RenderingBuilder
 #include "vk_UIPipeline.h"
 #include "vk_buffer.h"
 #include "vk_texture.h"
 #include "vk_shaders.h"
 #include "vk_swapchain.h"
-#include "vk_pipeline_cache.h"     // VK::PipelineCache::GetCacheObject() — shared disk-backed cache
+#include "vk_gfx_pipeline.h"       // VK::GfxPipelineBuilder
 #include "vk_barriers.h"           // VK::SceneAttachmentBarrier — inter-pass ordering
+#include "vk_framegraph.h"         // VK::g_FrameGraph — swapchain image layout (see BeginUIPassInternal)
 #include "vk_command_buffer.h"     // CVulkanCommandManager::FRAMES_IN_FLIGHT — VB ring slots
 #include "HW_Vulkan.h"
 #include "../../xr_3da/device.h"   // Device.dwWidth / dwHeight
@@ -41,6 +44,12 @@ namespace VulkanUI
 
     // Frame state ------------------------------------------------------------
     bool   s_bUIPassActive  = false;
+    bool   s_SceneDone      = false;   // see the header: gates the immediate path
+    // ⚠Which buffer the open pass belongs to. vkCmdEndRendering on any OTHER one
+    // is undefined behaviour, and this file has two ways to end up there: an
+    // abandoned frame (see OnFrameBegin) and the async frame-split, which swaps
+    // g_VkUI_FrameCmd to the second segment mid-frame (CRender_Vulkan.cpp).
+    VkCommandBuffer s_UIPassCmd = VK_NULL_HANDLE;
     u32    s_UIVertexOffset = 0;   // slot-relative write offset
     u32    s_VBBase         = 0;   // byte base of this frame-slot's VB region
     void*  s_pMappedVB      = nullptr;
@@ -95,6 +104,11 @@ namespace VulkanUI
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        // FREE_DESCRIPTOR_SET so individual sets can be given back: dynamic UI
+        // textures (a font atlas, say) come and go with a document, and without
+        // this flag vkFreeDescriptorSets is illegal and the pool would only ever
+        // drain. See IUIRender::DynTextureCreate.
+        poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
         poolInfo.maxSets       = 256;
         poolInfo.poolSizeCount = 1;
         poolInfo.pPoolSizes    = &poolSize;
@@ -129,19 +143,9 @@ namespace VulkanUI
         allocInfo.pSetLayouts        = &s_DescriptorSetLayout;
         VK_CHECK(vkAllocateDescriptorSets(VulkanHW.m_Device, &allocInfo, &s_WhiteTextureSet));
 
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView   = s_WhiteTexture.GetView();
-        imageInfo.sampler     = s_WhiteTexture.GetSampler();
-
-        VkWriteDescriptorSet write{};
-        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet          = s_WhiteTextureSet;
-        write.dstBinding      = 0;
-        write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.descriptorCount = 1;
-        write.pImageInfo      = &imageInfo;
-        vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &write, 0, nullptr);
+        VK::DescriptorWriter(s_WhiteTextureSet)
+            .ImageSampler(0, s_WhiteTexture.GetView(), s_WhiteTexture.GetSampler())
+            .Flush();
 
         // 7. Lazily create the SPIR-V loader, then load UI shaders.
         if (!g_ShaderManager) {
@@ -156,116 +160,28 @@ namespace VulkanUI
         }
 
         // 8. Build the graphics pipeline. FVF::TL = vec4 pos + u32 color + vec2 uv = 28 B.
-        VkPipelineShaderStageCreateInfo shaderStages[2]{};
-        shaderStages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        shaderStages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-        shaderStages[0].module = vertShader;
-        shaderStages[0].pName  = "main";
-        shaderStages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        shaderStages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-        shaderStages[1].module = fragShader;
-        shaderStages[1].pName  = "main";
-
-        VkVertexInputBindingDescription binding{};
-        binding.binding   = 0;
-        binding.stride    = 28;
-        binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-        VkVertexInputAttributeDescription attributes[3]{};
-        attributes[0].binding = 0; attributes[0].location = 0; attributes[0].format = VK_FORMAT_R32G32B32A32_SFLOAT; attributes[0].offset = 0;
-        attributes[1].binding = 0; attributes[1].location = 1; attributes[1].format = VK_FORMAT_B8G8R8A8_UNORM;     attributes[1].offset = 16;
-        attributes[2].binding = 0; attributes[2].location = 2; attributes[2].format = VK_FORMAT_R32G32_SFLOAT;       attributes[2].offset = 20;
-
-        VkPipelineVertexInputStateCreateInfo vertexInput{};
-        vertexInput.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInput.vertexBindingDescriptionCount   = 1;
-        vertexInput.pVertexBindingDescriptions      = &binding;
-        vertexInput.vertexAttributeDescriptionCount = 3;
-        vertexInput.pVertexAttributeDescriptions    = attributes;
-
-        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-        inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo viewportState{};
-        viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = 1;
-        viewportState.scissorCount  = 1;
-
-        VkPipelineRasterizationStateCreateInfo rasterizer{};
-        rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterizer.lineWidth   = 1.0f;
-        rasterizer.cullMode    = VK_CULL_MODE_NONE;
-        rasterizer.frontFace   = VK_FRONT_FACE_CLOCKWISE;
-
-        VkPipelineMultisampleStateCreateInfo multisampling{};
-        multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo depthStencil{};
-        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        // depth disabled for UI
-
-        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-        colorBlendAttachment.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        colorBlendAttachment.blendEnable         = VK_TRUE;
-        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        colorBlendAttachment.colorBlendOp        = VK_BLEND_OP_ADD;
-        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        colorBlendAttachment.alphaBlendOp        = VK_BLEND_OP_ADD;
-
-        VkPipelineColorBlendStateCreateInfo colorBlending{};
-        colorBlending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        colorBlending.attachmentCount = 1;
-        colorBlending.pAttachments    = &colorBlendAttachment;
-
-        VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-        VkPipelineDynamicStateCreateInfo dynamicState{};
-        dynamicState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynamicState.dynamicStateCount = 2;
-        dynamicState.pDynamicStates    = dynamicStates;
-
-        VkFormat colorFormat = Swapchain.m_Format;
-        VkPipelineRenderingCreateInfo renderingInfo{};
-        renderingInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        renderingInfo.colorAttachmentCount    = 1;
-        renderingInfo.pColorAttachmentFormats = &colorFormat;
-
-        VkGraphicsPipelineCreateInfo pipelineInfo{};
-        pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pipelineInfo.pNext               = &renderingInfo;
-        pipelineInfo.stageCount          = 2;
-        pipelineInfo.pStages             = shaderStages;
-        pipelineInfo.pVertexInputState   = &vertexInput;
-        pipelineInfo.pInputAssemblyState = &inputAssembly;
-        pipelineInfo.pViewportState      = &viewportState;
-        pipelineInfo.pRasterizationState = &rasterizer;
-        pipelineInfo.pMultisampleState   = &multisampling;
-        pipelineInfo.pDepthStencilState  = &depthStencil;
-        pipelineInfo.pColorBlendState    = &colorBlending;
-        pipelineInfo.pDynamicState       = &dynamicState;
-        pipelineInfo.layout              = s_PipelineLayout;
-
-        VkPipelineCache pcache = VK::PipelineCache::GetCacheObject();
-        VkResult result = vkCreateGraphicsPipelines(VulkanHW.m_Device, pcache, 1, &pipelineInfo, nullptr, &s_Pipeline);
-        if (result != VK_SUCCESS) {
-            Msg("![Vulkan UI] Failed to create UI pipeline! Error: %d", result);
-            return;
-        }
-
-        // Line-topology variants — identical state, only inputAssembly.topology differs.
-        // UIRender drives ptLineList (HUD crosshair) / ptLineStrip (UIWindow borders);
-        // without these they'd render through the triangle-list pipeline and the line
+        const VkVertexInputAttributeDescription attributes[3]{
+            { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0  },   // pos
+            { 1, 0, VK_FORMAT_B8G8R8A8_UNORM,      16 },   // color
+            { 2, 0, VK_FORMAT_R32G32_SFLOAT,       20 },   // uv
+        };
+        // The three pipelines differ only in topology. UIRender drives ptLineList
+        // (HUD crosshair) / ptLineStrip (UIWindow borders); without them the line
         // endpoints would assemble into stray stretched triangles (the "sky spike").
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, pcache, 1, &pipelineInfo, nullptr, &s_PipelineLineList) != VK_SUCCESS)
-            Msg("![Vulkan UI] Failed to create UI line-list pipeline");
-        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-        if (vkCreateGraphicsPipelines(VulkanHW.m_Device, pcache, 1, &pipelineInfo, nullptr, &s_PipelineLineStrip) != VK_SUCCESS)
-            Msg("![Vulkan UI] Failed to create UI line-strip pipeline");
+        auto makeUIPipe = [&](VkPrimitiveTopology topo, const char* tag) {
+            return VK::GfxPipelineBuilder(s_PipelineLayout)
+                .Vert(vertShader).Frag(fragShader)
+                .Binding(0, 28).Attrs(attributes, 3)
+                .Topology(topo)
+                .Cull(VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE)
+                .Color(Swapchain.m_Format).BlendAlpha()
+                .Build("UI %s", tag);   // depth disabled for UI
+        };
+        s_Pipeline = makeUIPipe(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "triangles");
+        if (s_Pipeline == VK_NULL_HANDLE)
+            return;
+        s_PipelineLineList  = makeUIPipe(VK_PRIMITIVE_TOPOLOGY_LINE_LIST,  "line list");
+        s_PipelineLineStrip = makeUIPipe(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, "line strip");
 
         Msg("[Vulkan UI] UI infrastructure created successfully");
     }
@@ -295,59 +211,85 @@ namespace VulkanUI
 
     // ----- Frame UI pass ----------------------------------------------------
 
+    // ⚠Diagnostic only, and capped: the UI pass state machine is what the 18-08
+    // ESC-in-game crash turned out to live in, and every early-out below looks
+    // identical from the outside -- "no UI this frame" -- while one of them ends
+    // in a driver fault. `ui_pass_trace 1` prints the transitions; the cap keeps
+    // a forgotten trace from filling a log.
+    u32 s_TraceLeft = 0;
+    void TraceUIPass(u32 lines) { s_TraceLeft = lines; }
+    static void trace(const char* what, const void* a = nullptr, u32 b = 0)
+    {
+        if (!s_TraceLeft) return;
+        --s_TraceLeft;
+        Msg("~ [VK UIpass] %s cmd=%p n=%u frame=%u", what, a, b, Device.dwFrame);
+    }
+
     void BeginUIPassInternal()
     {
         VkCommandBuffer cmd = g_VkUI_FrameCmd;
-        if (!cmd || s_bUIPassActive) return;
+        if (!cmd)            { trace("begin REFUSED: no cmd"); return; }
+        if (s_bUIPassActive) { trace("begin skipped: already active", cmd); return; }
 
         u32 imageIndex = Swapchain.m_CurrentImageIndex;
-        if (imageIndex >= Swapchain.m_Images.size()) return;
+        if (imageIndex >= Swapchain.m_Images.size()) { trace("begin REFUSED: bad image index", cmd, imageIndex); return; }
 
         VkImage     img = Swapchain.m_Images[imageIndex];
         VkImageView view = Swapchain.m_ImageViews[imageIndex];
-        if (!img || !view) return;
+        if (!img || !view) { trace("begin REFUSED: null image/view", cmd, imageIndex); return; }
 
-        // Image is already COLOR_ATTACHMENT (Begin set it; scene passes left it
-        // there). Just order any prior scene color writes before the UI draws —
-        // no layout change. Covers both the immediate path (opened mid-frame) and
-        // the deferred replay in CRender::End.
-        VK::SceneAttachmentBarrier(cmd);
+        // The comment that used to sit here said "image is already COLOR_ATTACHMENT
+        // (Begin set it)" and that was FALSE: CRender::Begin transitions the HDR
+        // SceneColor target, and deliberately leaves the SWAPCHAIN image alone
+        // ("transitioned by the tonemap pass" — CRender_Vulkan.cpp). So on any frame
+        // where the tonemap does not run — the loading screen and the main menu,
+        // which have no scene — the UI opened a rendering scope on an image sitting
+        // in PRESENT_SRC_KHR (or UNDEFINED on the very first use) while declaring
+        // COLOR_ATTACHMENT_OPTIMAL. Caught 16-08 by `-vk_validation` as ~10×
+        // VUID-vkCmdBeginRendering-pRenderingInfo-09592 clustered at level load.
+        //
+        // Routed through the frame graph's resource registry instead of a hand-placed
+        // barrier, because the correct OLD layout is exactly what a hand-placed
+        // barrier here cannot know: it is COLOR_ATTACHMENT when the tonemap ran and
+        // PRESENT_SRC when it did not. Require() reads the tracked state, so it
+        // transitions when needed and no-ops (into a plain write-after-write
+        // ordering) when the tonemap already did it — which also subsumes the
+        // SceneAttachmentBarrier this replaces, and more narrowly: that one was a
+        // global memory barrier, this names the one image actually at stake.
+        // ⚠Seeded at COLOR_ATTACHMENT_OUTPUT, not the default TOP_OF_PIPE. On a frame
+        // where the UI is the FIRST toucher (menu, loading screen — no tonemap) this
+        // seed becomes the srcStageMask of the transition Require emits, and the image
+        // is the one vkAcquireNextImageKHR just handed over, whose semaphore the submit
+        // waits at COLOR_ATTACHMENT_OUTPUT. TOP_OF_PIPE orders the transition against
+        // nothing, so the write could land while the presentation engine still owns the
+        // image — the same SYNC-HAZARD-WRITE-AFTER-READ the tonemap path had (16-08).
+        VK::ImageState& scState = VK::g_FrameGraph.Track(img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                                         VK_IMAGE_LAYOUT_UNDEFINED,
+                                                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
+        scState.Require(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
 
-        VkRenderingAttachmentInfo colorAttachment{};
-        colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachment.imageView   = view;
-        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;   // preserve clear colour
-        colorAttachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-
-        VkRenderingInfo renderInfo{};
-        renderInfo.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        renderInfo.renderArea.extent    = Swapchain.m_Extent;
-        renderInfo.layerCount           = 1;
-        renderInfo.colorAttachmentCount = 1;
-        renderInfo.pColorAttachments    = &colorAttachment;
-        vkCmdBeginRendering(cmd, &renderInfo);
-
-        VkViewport viewport{};
-        viewport.width    = (float)Swapchain.m_Extent.width;
-        viewport.height   = (float)Swapchain.m_Extent.height;
-        viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-        VkRect2D scissor{};
-        scissor.extent = Swapchain.m_Extent;
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        // loadOp LOAD preserves the clear colour already in the image.
+        VK::RenderingBuilder(Swapchain.m_Extent).Color(view).BeginPlain(cmd);
 
         s_bUIPassActive = true;
+        s_UIPassCmd     = cmd;
+        trace("begin OK", cmd, imageIndex);
     }
 
     void EndUIPass()
     {
         if (!s_bUIPassActive) return;
         VkCommandBuffer cmd = g_VkUI_FrameCmd;
-        if (!cmd) return;
+        if (!cmd) { s_bUIPassActive = false; s_UIPassCmd = VK_NULL_HANDLE; return; }
+        // ⚠Only the buffer that opened it may close it -- see s_UIPassCmd. Ending
+        // a pass on a stranger is the fault this whole guard chain is about.
+        if (cmd != s_UIPassCmd) { s_bUIPassActive = false; s_UIPassCmd = VK_NULL_HANDLE; return; }
 
         vkCmdEndRendering(cmd);
+        trace("end OK", cmd);
+        s_UIPassCmd = VK_NULL_HANDLE;
 
         // No layout transition here: the image stays COLOR_ATTACHMENT. CRender::End
         // owns the single COLOR→PRESENT transition for the whole frame.
@@ -363,6 +305,23 @@ namespace VulkanUI
         if (frameSlot >= CVulkanCommandManager::FRAMES_IN_FLIGHT) frameSlot = 0;
         s_VBBase         = frameSlot * (u32)VERTEX_BUFFER_SIZE;
         s_UIVertexOffset = 0;
+
+        // ⚠⚠A fresh command buffer has no rendering instance open, whatever the
+        // last frame believed. Left sticky, this flag is a crash rather than a
+        // glitch: BeginUIPassInternal returns early on it, every UI draw of the
+        // new frame lands OUTSIDE a pass, and EndUIPass then calls
+        // vkCmdEndRendering with none active -- ACCESS_VIOLATION in the driver.
+        // It went sticky whenever a frame drew UI and then never reached End()
+        // (Begin failed: no swapchain image, fence timeout, device lost).
+        // 📏18-08: that is exactly the ESC-from-a-loaded-level crash; see the
+        // long note in CRender::Begin.
+        s_bUIPassActive = false;
+        s_UIPassCmd     = VK_NULL_HANDLE;
+        // Nothing of this frame is drawn yet, so UI issued now belongs in the queue.
+        s_SceneDone     = false;
+        // Leftovers from an abandoned frame point into that frame's ring slot and
+        // must not be replayed into this one.
+        s_DeferredCmdCount = 0;
     }
 
     void ReplayDeferredUI()
@@ -373,6 +332,12 @@ namespace VulkanUI
 
         s_VertexBuffer.Flush();
         BeginUIPassInternal();
+        // ⚠The pass may refuse to open (no swapchain image, no view). Recording
+        // draws anyway is what the validation layer reported eleven times in a
+        // row as "vkCmdDraw(): must be issued inside an active render pass" --
+        // and the frame died on the vkCmdEndRendering that followed. Drop the
+        // queue instead: a frame that cannot open its UI pass has no UI.
+        if (!s_bUIPassActive) { s_DeferredCmdCount = 0; return; }
         if (s_Pipeline == VK_NULL_HANDLE) { s_DeferredCmdCount = 0; return; }
 
         for (u32 i = 0; i < s_DeferredCmdCount; ++i)

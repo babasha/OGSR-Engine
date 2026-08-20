@@ -34,6 +34,16 @@ u64 QPC()
     QueryPerformanceCounter(PLARGE_INTEGER(&_dest));
     return _dest;
 }
+
+u64 QPCFreq()
+{
+    static const u64 freq = [] {
+        u64 f = 0;
+        QueryPerformanceFrequency(PLARGE_INTEGER(&f));
+        return f ? f : 1;
+    }();
+    return freq;
+}
 } // namespace CPU
 
 void _initialize_cpu()

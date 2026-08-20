@@ -9,14 +9,12 @@
 // that cannot include THIS one (grass / tree / skinned — they lack shadow_common,
 // which rainVis needs) share the same implementation instead of copying it.
 #include "sky_ambient.glsl"
+#include "ao_common.glsl"
+#include "common_math.glsl"   // EnvBRDFApprox / ndc2uv — pure, no bindings
+#include "ao_sampled.glsl"    // gtaoVis / gtaoVisK / ssilBoost — need light_ubo's uAO/uIL/L
 
-// GTAO visibility (R4 combine_1.ps: occludes hemi+ambient only, never sun/dyn).
-// Strength is an EXPONENT: 0 = off (->1.0), 1 = raw, 2-3 deepens corners.
-float gtaoVis()
-{
-    float ao = textureLod(uAO, gl_FragCoord.xy * L.ao_params.xy, 0.0).r;
-    return pow(clamp(ao, 0.0, 1.0), L.ao_params.z);
-}
+// gtaoVis / ssilBoost → ao_sampled.glsl (below), shared with the foliage passes
+// that cannot include THIS header.
 
 // Raw GTAO visibility (NO strength exponent) — for the specular-occlusion cone,
 // which wants the geometric openness, not the artistically deepened diffuse AO.
@@ -51,24 +49,9 @@ vec3 gtaoBentN(vec3 fallbackN)
 
 // SSIL — one-bounce indirect-light boost for the AMBIENT term (SSFX combine_1.ps:
 // `hdiffuse *= IL factor`). Multiplies the SAME hemisphere/flat ambient that AO
-// darkens — NEVER the sun or dynamic lights. uIL holds the occluder-colour bounce
-// (r_ssil_strength baked in by the GTAO pass); 0 where there's no bounce / r_ssil
-// off → returns vec3(1) (no-op). `il/(1+il)` = SSFX soft compression → ×[1,2).
-vec3 ssilBoost()
-{
-    vec3 il = textureLod(uIL, gl_FragCoord.xy * L.ao_params.xy, 0.0).rgb;
-    return vec3(1.0) + il / (1.0 + il);
-}
+// darkens — NEVER the sun or dynamic lights. → ssilBoost in ao_sampled.glsl.
 
-// Colored AO (R4 / Activision SIGGRAPH'16): mid-range occlusion bends toward the
-// albedo colour. Full open (ao=1) and full black (ao=0) are unchanged.
-vec3 coloredAO(float ao, vec3 albedo)
-{
-    vec3 a =  2.0404 * albedo - 0.3324;
-    vec3 b = -4.7951 * albedo + 0.6417;
-    vec3 c =  2.7552 * albedo + 0.6903;
-    return max(vec3(ao), ((ao * a + b) * ao + c) * ao);
-}
+// coloredAO → ao_common.glsl (included above; the foliage passes share it).
 
 // skyAmbient() / skyAmbientUp() / shIrradiance() → sky_ambient.glsl (included above).
 
@@ -144,16 +127,8 @@ float skyAmbientGate(vec3 wp)
 // cube (binding 26) supplies the roughness-blurred reflection; the split-sum
 // specular term uses Karis's analytic environment-BRDF (no LUT).
 
-// UE4 mobile "EnvBRDFApprox" (Karis 2014) — split-sum scale/bias without a LUT.
-vec3 EnvBRDFApprox(vec3 F0, float roughness, float NoV)
-{
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
-    const vec4 c1 = vec4( 1.0,  0.0425,  1.040, -0.040);
-    vec4  r    = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
-    vec2  ab   = vec2(-1.04, 1.04) * a004 + r.zw;
-    return F0 * ab.x + ab.y;
-}
+// EnvBRDFApprox (Karis 2014) → common_math.glsl (included above; it is a pure
+// function, so the foliage passes share the same one).
 
 // Specular reflection of the sky. N/V world-space (V = surface→eye, unit),
 // roughness in [0,1], F0 = base reflectance (0.04 dielectric). Returns 0 when

@@ -114,17 +114,6 @@ namespace {
     Fmatrix       s_cascVP[kNumSunCascades];
     Fmatrix       s_cascViewM[kNumSunCascades];   // world→light-view, kept for CascadeSphereVisible
 
-    // Volumetric fog sun-shadow (r_vol_shadow): ONE low-res sun depth, re-rendered
-    // EVERY frame (no cache) → continuous occlusion for the fog (no cache tick). Big
-    // box + modest res = soft (good for fog) + cheap even per-frame. Anchor-snapped
-    // like the cascades so the per-frame raster itself doesn't shimmer.
-    constexpr u32   kFogShadowSize = 2048;
-    constexpr float kFogShadowBox  = 220.f;   // full ortho width (±110 m around camera)
-    VkImage       s_fogImage = VK_NULL_HANDLE;
-    VmaAllocation s_fogAlloc = VK_NULL_HANDLE;
-    VkImageView   s_fogView  = VK_NULL_HANDLE;
-    Fmatrix       s_fogVP;
-
     // Rain occlusion map: straight-down ortho box around the camera. The fixed
     // (vertical) direction means a plain view-translation texel snap fully
     // stabilizes re-renders — no rotating lattice like the sun cascades.
@@ -230,10 +219,6 @@ VkImageView GetCascadeView(u32 i)  { return (i < kNumSunCascades) ? s_cascView[i
 u32         CascadeSize(u32 i)     { return kCascadeSizes[i < kNumSunCascades ? i : 0]; }
 VkImage     GetCascadeStaticImage(u32 i) { return (i < kNumSunCascades) ? s_cascStaticImage[i] : VK_NULL_HANDLE; }
 VkImageView GetCascadeStaticView(u32 i)  { return (i < kNumSunCascades) ? s_cascStaticView[i]  : VK_NULL_HANDLE; }
-VkImage        GetFogShadowImage() { return s_fogImage; }
-VkImageView    GetFogShadowView()  { return s_fogView; }
-u32            FogShadowSize()     { return kFogShadowSize; }
-const Fmatrix& GetFogShadowVP()    { return s_fogVP; }
 
 bool Init()
 {
@@ -253,7 +238,7 @@ bool Init()
     if (!CreateDepthImage(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                           s_imageStatic, s_allocStatic, s_viewStatic) ||
         !CreateDepthImage(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                          VK_IMAGE_USAGE_SAMPLED_BIT,
+                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,   // SRC: async fog snapshot
                           s_image, s_alloc, s_view)) {
         s_failed = true; return false;
     }
@@ -262,7 +247,13 @@ bool Init()
 
     // Dynamic light shadow targets: spot map + point cube (render per face,
     // sample as cube). Both attachment + sampled.
-    const VkImageUsageFlags dynUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // TRANSFER_SRC on the sampled maps: under async compute the volumetrics pass
+    // blits a downscaled snapshot of the cascades + rain map on the graphics queue,
+    // because its inject samples them from the COMPUTE queue a frame later and the
+    // live maps are being rewritten by then (see vk_volumetrics SnapshotShadows).
+    // A usage flag only widens what is legal — nothing else changes.
+    const VkImageUsageFlags dynUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     // Combined cascade = sampled + copy DEST (static copied into it each frame);
     // static cascade = render target + copy SOURCE (same roles as the far map pair).
     for (u32 i = 0; i < kNumSunCascades; ++i)
@@ -283,11 +274,6 @@ bool Init()
         !CreateDepthView(s_groundImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_groundView)) {
         s_failed = true; return false;
     }
-    if (!CreateDepthImageEx(kFogShadowSize, 1, 0, dynUsage, s_fogImage, s_fogAlloc) ||
-        !CreateDepthView(s_fogImage, VK_IMAGE_VIEW_TYPE_2D, 0, 1, s_fogView)) {
-        s_failed = true; return false;
-    }
-    s_fogVP.identity();
     if (!CreateDepthImageWH(kSpotSize * kSpotAtlasX, kSpotSize * kSpotAtlasY, 1, 0,
                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                             s_spotStaticImage, s_spotStaticAlloc) ||
@@ -420,37 +406,6 @@ void ComputeCascadeVP(u32 i, const Fvector& sunDirIn)
     s_cascVP[i].mul(snap, vp);                           // NDC translate AFTER vp
 }
 
-// Fog sun-shadow VP — a single big ortho box around the camera, recomputed FRESH
-// every frame (no cache) so the fog occlusion updates continuously. Same R4 anchor
-// texel-snap as the cascades so the per-frame raster doesn't crawl/shimmer.
-void ComputeFogShadowVP(const Fvector& sunDirIn)
-{
-    Fvector sunDir = sunDirIn;
-    if (sunDir.magnitude() < 1e-4f) sunDir.set(0.f, -1.f, 0.f);
-    sunDir.normalize();
-
-    Fvector up; up.set(0.f, 1.f, 0.f);
-    if (_abs(sunDir.y) > 0.99f) up.set(0.f, 0.f, 1.f);
-    Fmatrix view; view.build_camera_dir(Device.vCameraPosition, sunDir, up);
-
-    Fmatrix proj; proj.build_projection_ortho(kFogShadowBox, kFogShadowBox, kCascadeZBehind, kCascadeZAhead);
-    Fmatrix vp;   vp.mul(proj, view);
-
-    // R4 anchor snap (same as ComputeCascadeVP).
-    Fvector anchor;
-    anchor.set((floorf(Device.vCameraPosition.x / kAnchorGrid) + 0.5f) * kAnchorGrid,
-               (floorf(Device.vCameraPosition.y / kAnchorGrid) + 0.5f) * kAnchorGrid,
-               (floorf(Device.vCameraPosition.z / kAnchorGrid) + 0.5f) * kAnchorGrid);
-    Fvector a; vp.transform_tiny(a, anchor);
-    const float texNdc = 2.f / float(kFogShadowSize);
-    const float fx = a.x - floorf(a.x / texNdc) * texNdc;
-    const float fy = a.y - floorf(a.y / texNdc) * texNdc;
-    Fmatrix snap; snap.identity();
-    snap.c.x = -fx;
-    snap.c.y = -fy;
-    s_fogVP.mul(snap, vp);
-}
-
 bool CascadeSphereVisible(u32 i, const Fvector& center, float radius, float inflate)
 {
     if (i >= kNumSunCascades) return false;
@@ -563,8 +518,6 @@ void Destroy()
         if (s_cascStaticView[i])  { vkDestroyImageView(VulkanHW.m_Device, s_cascStaticView[i], nullptr); s_cascStaticView[i] = VK_NULL_HANDLE; }
         if (s_cascStaticImage[i]) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_cascStaticImage[i], s_cascStaticAlloc[i]); s_cascStaticImage[i] = VK_NULL_HANDLE; s_cascStaticAlloc[i] = VK_NULL_HANDLE; }
     }
-    if (s_fogView)  { vkDestroyImageView(VulkanHW.m_Device, s_fogView, nullptr); s_fogView = VK_NULL_HANDLE; }
-    if (s_fogImage) { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_fogImage, s_fogAlloc); s_fogImage = VK_NULL_HANDLE; s_fogAlloc = VK_NULL_HANDLE; }
     if (s_imageStatic){ VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_imageStatic, s_allocStatic); s_imageStatic = VK_NULL_HANDLE; s_allocStatic = VK_NULL_HANDLE; }
     if (s_rainView)   { vkDestroyImageView(VulkanHW.m_Device, s_rainView, nullptr); s_rainView = VK_NULL_HANDLE; }
     if (s_rainImage)  { VK::Vram::DestroyImage(VulkanHW.m_Allocator, s_rainImage, s_rainAlloc); s_rainImage = VK_NULL_HANDLE; s_rainAlloc = VK_NULL_HANDLE; }

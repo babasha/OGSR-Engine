@@ -7,6 +7,7 @@
 
 #include "stdafx.h"
 #include "vk_pipeline_cache.h"
+#include "vk_gfx_pipeline.h"    // GfxPipelineBuilder
 #include "vk_swapchain.h"
 #include "vk_scene_color.h"   // HDR scene target format (passes render to it, not the swapchain)
 #include "vk_shaders.h"
@@ -15,6 +16,10 @@
 #include "HW_Vulkan.h"
 
 #include <unordered_map>
+#include <unordered_set>
+#include <thread>          // weather prewarm runs off the render thread
+#include <mutex>
+#include <utility>
 
 // Terrain POM depth offset (SSFX port): the getters pick the zoff pipeline
 // variants (FS depth export) when both are on, so call sites stay unchanged.
@@ -23,7 +28,13 @@ extern float ps_r_pom_zoff;      // r_pom_zoff — depth-offset strength (0 = of
 extern int   ps_r_vrs_static;    // r_vrs_static — diag: bake a static 2x2 rate into world pipelines
 extern int   ps_r_uber_variants; // r_uber_variants — A/B: 0 forces the old monolithic world uber-FS (WS_ALL)
 
+// r_prewarm_async -- see vk_console_min.cpp. Global scope on purpose: a
+// namespace-scope extern mangles differently and silently fails to bind.
+extern int ps_r_prewarm_async;
+
 namespace VK { namespace PipelineCache {
+
+namespace { void PrewarmTeardown(); }   // defined with the prewarm state, below
 
 namespace {
     VkPipelineLayout                       s_Layout      = VK_NULL_HANDLE;
@@ -410,73 +421,17 @@ VkPipeline GetDepthPipeline(u32 stride)
     auto it = s_DepthPipelines.find(stride);
     if (it != s_DepthPipelines.end()) return it->second;
 
-    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &attr;
-
-    VkPipelineShaderStageCreateInfo stage{};   // VERTEX only — depth-only pass
-    stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.stage  = VK_SHADER_STAGE_VERTEX_BIT; stage.module = s_DepthVS; stage.pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType        = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode  = VK_POLYGON_MODE_FILL;
-    rs.cullMode     = VK_CULL_MODE_NONE;
-    rs.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth    = 1.0f;
-    rs.depthBiasEnable         = VK_TRUE;          // constant + slope bias vs acne (dynamic)
-    rs.depthBiasConstantFactor = 0.0f;
-    rs.depthBiasSlopeFactor    = 0.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendStateCreateInfo cb{};       // no color attachments
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 0;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount  = 0;
-    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;   // matches the shadow map
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = 1;        pi.pStages = &stage;
-    pi.pVertexInputState   = &vi;      pi.pInputAssemblyState = &ia;
-    pi.pViewportState      = &vp;      pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;      pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;      pi.pDynamicState       = &dynState;
-    pi.layout              = s_DepthLayout;
-
-    VkPipeline h = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h);
-    if (r != VK_SUCCESS) { Msg("![VK PipelineCache] shadow depth pipeline failed (%d) stride=%u", r, stride); h = VK_NULL_HANDLE; }
-    else                 Msg("[VK PipelineCache] shadow depth pipeline stride=%u", stride);
+    // VERTEX only, no color attachments — depth-only pass.
+    VkPipeline h = VK::GfxPipelineBuilder(s_DepthLayout)
+        .Vert(s_DepthVS)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Cull(VK_CULL_MODE_NONE)
+        .DynamicDepthBias()                  // constant + slope bias vs acne (dynamic)
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D32_SFLOAT)   // matches the shadow map
+        .Build("PipelineCache shadow depth stride=%u", stride);
+    if (h != VK_NULL_HANDLE) Msg("[VK PipelineCache] shadow depth pipeline stride=%u", stride);
     s_DepthPipelines.emplace(stride, h);
     return h;
 }
@@ -491,60 +446,15 @@ VkPipeline GetDepthFadePipeline(u32 stride)
     auto it = s_DepthFadePipelines.find(stride);
     if (it != s_DepthFadePipelines.end()) return it->second;
 
-    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attr{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &attr;
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_DepthFadeVS; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_DepthFadeFS; stages[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext             = &prci;
-    pi.stageCount        = 2;    pi.pStages = stages;
-    pi.pVertexInputState = &vi;  pi.pInputAssemblyState = &ia;
-    pi.pViewportState    = &vp;  pi.pRasterizationState = &rs;
-    pi.pMultisampleState = &ms;  pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState  = &cb;  pi.pDynamicState       = &dynState;
-    pi.layout            = s_DepthLayout;
-
-    VkPipeline h = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h) != VK_SUCCESS) {
-        Msg("![VK PipelineCache] depth fade pipeline failed stride=%u", stride); h = VK_NULL_HANDLE;
-    }
+    VkPipeline h = VK::GfxPipelineBuilder(s_DepthLayout)
+        .Vert(s_DepthFadeVS).Frag(s_DepthFadeFS)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Cull(VK_CULL_MODE_NONE)
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D32_SFLOAT)
+        .Build("PipelineCache depth fade stride=%u", stride);
     s_DepthFadePipelines.emplace(stride, h);
     return h;
 }
@@ -560,73 +470,17 @@ VkPipeline GetDepthATPipeline(u32 stride, u32 tcOffset)
     auto it = s_DepthATPipelines.find(key);
     if (it != s_DepthATPipelines.end()) return it->second;
 
-    VkVertexInputBindingDescription binding{ 0, stride, VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attrs[2]{};
-    attrs[0] = { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0 };
-    attrs[1] = { 1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset };
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = attrs;
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = s_DepthATVS; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = s_DepthATFS; stages[1].pName = "main";
-
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType        = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode  = VK_POLYGON_MODE_FILL;
-    rs.cullMode     = VK_CULL_MODE_NONE;
-    rs.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth    = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendStateCreateInfo cb{};       // no color attachments
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType             = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext             = &prci;
-    pi.stageCount        = 2;      pi.pStages             = stages;
-    pi.pVertexInputState = &vi;    pi.pInputAssemblyState = &ia;
-    pi.pViewportState    = &vp;    pi.pRasterizationState = &rs;
-    pi.pMultisampleState = &ms;    pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState  = &cb;    pi.pDynamicState       = &dynState;
-    pi.layout            = s_DepthATLayout;
-
-    VkPipeline h = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h);
-    if (r != VK_SUCCESS) { Msg("![VK PipelineCache] AT shadow pipeline failed (%d) stride=%u tcOff=%u", r, stride, tcOffset); h = VK_NULL_HANDLE; }
-    else                 Msg("[VK PipelineCache] AT shadow pipeline stride=%u tcOff=%u", stride, tcOffset);
+    VkPipeline h = VK::GfxPipelineBuilder(s_DepthATLayout)   // no color attachments
+        .Vert(s_DepthATVS).Frag(s_DepthATFS)
+        .Binding(0, stride)
+        .Attr(0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0)
+        .Attr(1, 0, VK_FORMAT_R16G16_SSCALED,   tcOffset)
+        .Cull(VK_CULL_MODE_NONE)
+        .DynamicDepthBias()
+        .Depth(true, true)
+        .DepthTarget(VK_FORMAT_D32_SFLOAT)
+        .Build("PipelineCache AT shadow stride=%u tcOff=%u", stride, tcOffset);
+    if (h != VK_NULL_HANDLE) Msg("[VK PipelineCache] AT shadow pipeline stride=%u tcOff=%u", stride, tcOffset);
     s_DepthATPipelines.emplace(key, h);
     return h;
 }
@@ -660,116 +514,43 @@ VkPipeline GetTerrainPipeline()
     VkVertexInputAttributeDescription attrs[6]{};
     BuildVertexInputForStride(32, 24, binding, attrs);
 
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1;
-    vi.pVertexBindingDescriptions      = &binding;
-    vi.vertexAttributeDescriptionCount = 6;
-    vi.pVertexAttributeDescriptions    = attrs;
-
     // Snow footprint tessellation: VS -> TCS -> TES -> FS over patch lists when the
     // device supports it + the terrain TCS/TES loaded (the TCS gates tess to snow areas).
     const bool tess = VulkanHW.m_bTessellationSupported && s_WorldTerrainTCS != VK_NULL_HANDLE && s_WorldTerrainTES != VK_NULL_HANDLE;
-    VkPipelineShaderStageCreateInfo stages[4]{};
-    for (auto& s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
-    u32 nStage = 0;
-    stages[nStage].stage = VK_SHADER_STAGE_VERTEX_BIT;     stages[nStage++].module = s_TerrainVS;
-    if (tess) {
-        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;    stages[nStage++].module = s_WorldTerrainTCS;
-        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; stages[nStage++].module = s_WorldTerrainTES;
-    }
-    const u32 fsIdx = nStage;
-    stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT;   stages[nStage++].module = zoff ? s_TerrainFSZoff : s_TerrainFS;
     // Bake the world-variant spec constants into the terrain FS (storage lives to the create).
     VkBool32                 specVals[6];
     VkSpecializationMapEntry specEntries[6];
     VkSpecializationInfo     specInfo;
     BuildWorldSpecInfo(mask, specVals, specEntries, specInfo);
-    stages[fsIdx].pSpecializationInfo = &specInfo;
 
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineTessellationStateCreateInfo ts{};
-    ts.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-    ts.patchControlPoints = 3;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode    = VK_CULL_MODE_NONE;
-    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth   = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable = VK_FALSE;
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1; cb.pAttachments = &ba;
+    VK::GfxPipelineBuilder b(s_TerrainLayout);
+    b.Vert(s_TerrainVS);
+    if (tess) b.Tess(s_WorldTerrainTCS, s_WorldTerrainTES);
+    b.Frag(zoff ? s_TerrainFSZoff : s_TerrainFS, &specInfo)
+     .Bindings(&binding, 1).Attrs(attrs, 6)
+     .Cull(VK_CULL_MODE_NONE)
+     .Depth(true, true)
+     .Color(VK::SceneColor::Format())
+     .DepthTarget(Swapchain.m_DepthFormat);
 
     // VRS: STATIC {1x1, KEEP, REPLACE} like the world pipelines (see CreatePipeline —
     // a dynamic rate gets invalidated by unrelated binds). zoff variant: NO VRS
     // (full-rate gl_FragDepth must equal the prepass depth) → no FSR state at all
     // (implicit static 1x1, combiners KEEP/KEEP ignore the SRI).
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2u; dynState.pDynamicStates = dyn;
-
-    VkFormat colorFormat = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount    = 1;
-    prci.pColorAttachmentFormats = &colorFormat;
-    prci.depthAttachmentFormat   = Swapchain.m_DepthFormat;
     VkPipelineFragmentShadingRateStateCreateInfoKHR fsrState{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
     fsrState.fragmentSize   = { 1, 1 };
     fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
     fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;   // SRI attachment wins
     if (ps_r_vrs_static > 0) { fsrState.fragmentSize = { 2, 2 }; fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR; }
-    if (VulkanHW.m_bVRSSupported && !zoff) prci.pNext = &fsrState;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = nStage;
-    pi.pStages             = stages;
-    pi.pVertexInputState   = &vi;
-    pi.pInputAssemblyState = &ia;
-    pi.pTessellationState  = tess ? &ts : nullptr;
-    pi.pViewportState      = &vp;
-    pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;
-    pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;
-    pi.pDynamicState       = &dynState;
-    pi.layout              = s_TerrainLayout;
+    if (VulkanHW.m_bVRSSupported && !zoff) b.RenderingNext(&fsrState);
     // Same SRI pass as the world pipelines above → same create flag. The zoff
-    // variant keeps its static 1x1 rate (no dynamic state) but still needs the
+    // variant keeps its static 1x1 rate (no FSR state) but still needs the
     // flag to be legally bound while the SRI is attached.
     if (VulkanHW.m_bVRSSupported)
-        pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        b.CreateFlags(VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
 
-    VkPipeline h = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &h) != VK_SUCCESS) {
-        Msg("![VK PipelineCache] terrain pipeline create failed (zoff=%d mask=0x%02x)", zoff ? 1 : 0, mask);
+    VkPipeline h = b.Build("PipelineCache terrain (zoff=%d mask=0x%02x)", zoff ? 1 : 0, mask);
+    if (h == VK_NULL_HANDLE) {
         s_TerrainColorPipelines.emplace(pkey, VK_NULL_HANDLE);
         return VK_NULL_HANDLE;
     }
@@ -793,86 +574,23 @@ VkPipeline GetTerrainDepthPipeline()
     VkVertexInputBindingDescription   binding{};
     VkVertexInputAttributeDescription attrs[6]{};
     BuildVertexInputForStride(32, 24, binding, attrs);
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1; vi.pVertexBindingDescriptions   = &binding;
-    vi.vertexAttributeDescriptionCount = 6; vi.pVertexAttributeDescriptions = attrs;
 
     // Tessellated (snow footprints) when available - MUST match the color terrain
     // pipeline's displacement so the prepass depth lines up (no z-fight on prints).
     const bool tess = VulkanHW.m_bTessellationSupported && s_WorldTerrainTCS != VK_NULL_HANDLE && s_WorldTerrainTES != VK_NULL_HANDLE;
-    VkPipelineShaderStageCreateInfo stages[4]{};   // VS (+ TCS/TES) (+ zoff FS)
-    for (auto& s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
-    u32 nStage = 0;
-    stages[nStage].stage = VK_SHADER_STAGE_VERTEX_BIT;     stages[nStage++].module = s_TerrainVS;
-    if (tess) {
-        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;    stages[nStage++].module = s_WorldTerrainTCS;
-        stages[nStage].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; stages[nStage++].module = s_WorldTerrainTES;
-    }
-    if (zoff) {   // prepass FS: same POM march as color -> displaced gl_FragDepth
-        stages[nStage].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[nStage++].module = s_TerrainDepthFS;
-    }
 
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VK::GfxPipelineBuilder b(s_TerrainLayout);   // no color attachments
+    b.Vert(s_TerrainVS);
+    if (tess) b.Tess(s_WorldTerrainTCS, s_WorldTerrainTES);
+    if (zoff) b.Frag(s_TerrainDepthFS);   // prepass FS: same POM march as color -> displaced gl_FragDepth
+    b.Bindings(&binding, 1).Attrs(attrs, 6)
+     .Cull(VK_CULL_MODE_NONE)
+     .DynamicDepthBias()                     // prepass sets 0 (match color)
+     .Depth(true, true)
+     .DepthTarget(Swapchain.m_DepthFormat);  // the scene prepass depth
 
-    VkPipelineTessellationStateCreateInfo ts{};
-    ts.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-    ts.patchControlPoints = 3;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType           = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode     = VK_POLYGON_MODE_FILL;
-    rs.cullMode        = VK_CULL_MODE_NONE;
-    rs.frontFace       = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth       = 1.0f;
-    rs.depthBiasEnable = VK_TRUE;                  // dynamic; prepass sets 0 (match color)
-
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_TRUE;
-    ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendStateCreateInfo cb{};      // no color attachments
-    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 0;
-
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 3; dynState.pDynamicStates = dyn;
-
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                 = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount  = 0;
-    prci.depthAttachmentFormat = Swapchain.m_DepthFormat;   // the scene prepass depth
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = nStage;   pi.pStages = stages;
-    pi.pVertexInputState   = &vi;      pi.pInputAssemblyState = &ia;
-    pi.pTessellationState  = tess ? &ts : nullptr;
-    pi.pViewportState      = &vp;      pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;      pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;      pi.pDynamicState       = &dynState;
-    pi.layout              = s_TerrainLayout;
-
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &slot) != VK_SUCCESS) {
-        Msg("![VK PipelineCache] terrain DEPTH pipeline create failed (zoff=%d)", zoff ? 1 : 0);
-        slot = VK_NULL_HANDLE;
-        return VK_NULL_HANDLE;
-    }
+    slot = b.Build("PipelineCache terrain DEPTH (zoff=%d)", zoff ? 1 : 0);
+    if (slot == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     Msg("[VK PipelineCache] Created terrain depth (snow-displaced) pipeline (zoff=%d)", zoff ? 1 : 0);
     return slot;
 }
@@ -880,6 +598,10 @@ VkPipeline GetTerrainDepthPipeline()
 void Destroy()
 {
     if (VulkanHW.m_Device == VK_NULL_HANDLE) return;
+
+    // The prewarm worker holds no lock on anything we are about to free, but it
+    // is still creating pipelines against this device -- join before the teardown.
+    PrewarmTeardown();
 
     // Persist the warmed cache, then drop the object. Done first (while every
     // producer's pipelines are still around) so the blob captures this run's work.
@@ -1025,13 +747,6 @@ static VkPipeline CreatePipeline(const Key& k)
             attrsInst[6 + r] = { 6 + r, 1, VK_FORMAT_R32G32B32A32_SFLOAT, r * 16u };
     }
 
-    VkPipelineVertexInputStateCreateInfo vi{};
-    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = k.instanced ? 2u : 1u;
-    vi.pVertexBindingDescriptions      = k.instanced ? bindings : &binding;
-    vi.vertexAttributeDescriptionCount = k.instanced ? 10u : 6u;
-    vi.pVertexAttributeDescriptions    = k.instanced ? attrsInst : attrs;
-
     // Heightmap tessellation (R4 TESS_HM): the tess variant inserts the
     // TCS/TES pair (picked by sub-layout) and assembles patch lists. Guard
     // against keys built while the modules are unavailable.
@@ -1039,83 +754,40 @@ static VkPipeline CreatePipeline(const Key& k)
     const VkShaderModule tcs = (k.tcOffset == 24) ? s_WorldLmapTCS : s_WorldVlitTCS;
     const VkShaderModule tes = (k.tcOffset == 24) ? s_WorldLmapTES : s_WorldVlitTES;
 
-    u32 stageCount = 2;
-    VkPipelineShaderStageCreateInfo stages[4]{};
-    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = k.vs; stages[0].pName = "main";
-    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
     // No-z-write statics (atEqual/noZWrite): swap in the EARLY_ZTEST twin —
     // matches the depth-state block below, which forces depthWrite off for
     // exactly this condition (early tests + z-write would break AT discard).
     const bool earlyZ = (k.atEqual || k.noZWrite) && !tess && !k.wmark && !k.emis;
-    stages[1].module = earlyZ ? EarlyTwin(k.fs) : k.fs;
-    stages[1].pName  = "main";
     // World uber-FS variants (Inc 1): bake POM/SNOW/WET/IBL/DEBUG/FEEDBACK spec constants
     // so the driver DCEs the unused features (and their VGPRs). Storage lives to the create call.
     VkBool32                 specVals[6];
     VkSpecializationMapEntry specEntries[6];
     VkSpecializationInfo     specInfo;
     BuildWorldSpecInfo(k.specMask, specVals, specEntries, specInfo);
-    stages[1].pSpecializationInfo = &specInfo;
-    if (tess) {
-        stages[2].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[2].stage  = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
-        stages[2].module = tcs; stages[2].pName = "main";
-        stages[3].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[3].stage  = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-        stages[3].module = tes; stages[3].pName = "main";
-        stageCount = 4;
-    }
 
-    VkPipelineInputAssemblyStateCreateInfo ia{};
-    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineTessellationStateCreateInfo ts{};
-    ts.sType              = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-    ts.patchControlPoints = 3;
-
-    VkPipelineViewportStateCreateInfo vp{};
-    vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    vp.viewportCount = 1;
-    vp.scissorCount  = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{};
-    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode    = VK_CULL_MODE_NONE;     // no winding info yet → don't drop faces
-    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.lineWidth   = 1.0f;
+    VK::GfxPipelineBuilder b(s_Layout);
+    b.Vert(k.vs).Frag(earlyZ ? EarlyTwin(k.fs) : k.fs, &specInfo);
+    if (tess) b.Tess(tcs, tes);
+    b.Bindings(k.instanced ? bindings : &binding, k.instanced ? 2u : 1u)
+     .Attrs(k.instanced ? attrsInst : attrs, k.instanced ? 10u : 6u)
+     .Cull(VK_CULL_MODE_NONE);   // no winding info yet → don't drop faces
     if (k.wmark && !k.emis) {   // emissive billboards float free — no decal bias
         // Baked level decals (newspapers/dirt) lie exactly on the surface
         // beneath — pull them towards the camera (LESS_OR_EQUAL: smaller
         // depth = closer → bias NEGATIVE) so they pass the depth test
         // without z-fight flicker.
-        rs.depthBiasEnable         = VK_TRUE;
-        rs.depthBiasConstantFactor = -2.0f;
-        rs.depthBiasSlopeFactor    = -2.0f;
+        b.DepthBias(-2.0f, -2.0f);
     } else if (tess) {
         // The depth prepass rasterizes these surfaces FLAT as plain triangles;
         // the tessellated color pass re-rasterizes the same planes as many
         // small triangles whose snapped vertices can land ±1 ulp off the
         // prepass depth. A ~1-gradient-step pull toward the camera makes the
         // un-displaced margins win those ties instead of sparkling.
-        rs.depthBiasEnable         = VK_TRUE;
-        rs.depthBiasConstantFactor = -2.0f;
-        rs.depthBiasSlopeFactor    = -1.0f;
+        b.DepthBias(-2.0f, -1.0f);
     }
 
-    VkPipelineMultisampleStateCreateInfo ms{};
-    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo ds{};
-    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = k.depthTest ? VK_TRUE : VK_FALSE;
-    ds.depthWriteEnable = (k.depthTest && !k.wmark) ? VK_TRUE : VK_FALSE;   // decals never write depth
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+    bool        depthWrite = k.depthTest && !k.wmark;   // decals never write depth
+    VkCompareOp depthOp    = VK_COMPARE_OP_LESS_OR_EQUAL;
     // AT statics (r_at_equal): the prepass depth IS this geometry's final depth,
     // so EQUAL + no-write lets early-Z kill occluded AT layers and the front
     // layer's transparent texels without invoking the FS. Depth equality holds
@@ -1128,43 +800,29 @@ static VkPipeline CreatePipeline(const Key& k)
     // IS the front opaque texel, so early-Z also kills the transparent texels
     // and every occluded AT layer. Opaque keep LEQUAL (safe on prepass gaps).
     if (earlyZ) {
-        ds.depthWriteEnable = VK_FALSE;
-        if (k.atEqual) ds.depthCompareOp = VK_COMPARE_OP_EQUAL;
+        depthWrite = false;
+        if (k.atEqual) depthOp = VK_COMPARE_OP_EQUAL;
     }
     // Phase 4 wires up an actual depth attachment; right now no depth target
     // is bound at draw time so these flags only affect future passes.
+    b.Depth(k.depthTest, depthWrite, depthOp);
 
-    VkPipelineColorBlendAttachmentState ba{};
-    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    ba.blendEnable    = VK_FALSE;
+    b.Color(VK::SceneColor::Format());
     if (k.emis) {
         // Emissive-additive (glow billboards / selflight parts): the texture ADDS
         // light over the scene — never darkens, alpha shapes the halo.
-        ba.blendEnable         = VK_TRUE;
-        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.colorBlendOp        = VK_BLEND_OP_ADD;
-        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+        b.BlendAdd();
     }
     else if (k.wmark) {
         // Alpha-blend the decal over the lit surface (the texture alpha masks
         // the sheet/stain shape).
-        ba.blendEnable         = VK_TRUE;
-        ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        ba.colorBlendOp        = VK_BLEND_OP_ADD;
-        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+        b.BlendAlpha();
     }
-
-    VkPipelineColorBlendStateCreateInfo cb{};
-    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    cb.attachmentCount = 1;
-    cb.pAttachments    = &ba;
+    if (k.depthTest) {
+        b.DepthTarget(Swapchain.m_DepthFormat);
+        // Stencil aspect lives in the same view for combined formats but the
+        // pass doesn't read or write it; leave stencilAttachmentFormat = UNDEFINED.
+    }
 
     // VRS: STATIC per-pipeline FSR state {1x1, KEEP, REPLACE} — the attachment
     // (SRI) replaces the rate when Pass_World attaches one; passes without an SRI
@@ -1174,22 +832,6 @@ static VkPipeline CreatePipeline(const Key& k)
     // INVALIDATES the previously set rate, so every draw after it fell back to
     // 1x1 (VUID-...-pipelineFragmentShadingRate-09238, 18-07-2026).
     // r_vrs_static diag: bake a hard 2x2 (KEEP/KEEP ignores the SRI) instead.
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynState{};
-    dynState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynState.dynamicStateCount = 2u;
-    dynState.pDynamicStates    = dyn;
-
-    VkFormat colorFormat = VK::SceneColor::Format();
-    VkPipelineRenderingCreateInfo prci{};
-    prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    prci.colorAttachmentCount    = 1;
-    prci.pColorAttachmentFormats = &colorFormat;
-    if (k.depthTest) {
-        prci.depthAttachmentFormat = Swapchain.m_DepthFormat;
-        // Stencil aspect lives in the same view for combined formats but the
-        // pass doesn't read or write it; leave stencilAttachmentFormat = UNDEFINED.
-    }
     VkPipelineFragmentShadingRateStateCreateInfoKHR fsrState{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
     if (k.vrsStatic) {
         fsrState.fragmentSize   = { 2, 2 };                                        // diag: hard 2x2
@@ -1200,36 +842,15 @@ static VkPipeline CreatePipeline(const Key& k)
         fsrState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;   // ignore primitive rate
         fsrState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;// SRI attachment wins
     }
-    if (VulkanHW.m_bVRSSupported) prci.pNext = &fsrState;
-
-    VkGraphicsPipelineCreateInfo pi{};
-    pi.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pi.pNext               = &prci;
-    pi.stageCount          = stageCount;
-    pi.pStages             = stages;
-    pi.pVertexInputState   = &vi;
-    pi.pInputAssemblyState = &ia;
-    pi.pTessellationState  = tess ? &ts : nullptr;
-    pi.pViewportState      = &vp;
-    pi.pRasterizationState = &rs;
-    pi.pMultisampleState   = &ms;
-    pi.pDepthStencilState  = &ds;
-    pi.pColorBlendState    = &cb;
-    pi.pDynamicState       = &dynState;
-    pi.layout              = s_Layout;
-    // VRS: these pipelines draw inside a dynamic-rendering pass that attaches the
-    // shading-rate image (Pass_World). Without this create flag the spec leaves the
+    // These pipelines draw inside a dynamic-rendering pass that attaches the
+    // shading-rate image (Pass_World). Without the create flag the spec leaves the
     // SRI's effect undefined — NVIDIA silently ignores it (draws stay 1x1).
     if (VulkanHW.m_bVRSSupported)
-        pi.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        b.RenderingNext(&fsrState).CreateFlags(VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
 
-    VkPipeline handle = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(VulkanHW.m_Device, s_CacheObject, 1, &pi, nullptr, &handle);
-    if (r != VK_SUCCESS) {
-        Msg("![VK PipelineCache] vkCreateGraphicsPipelines failed (%d) for stride=%u tcOff=%u depth=%d tess=%d",
-            r, k.stride, k.tcOffset, (int)k.depthTest, (int)tess);
-        return VK_NULL_HANDLE;
-    }
+    VkPipeline handle = b.Build("PipelineCache world stride=%u tcOff=%u depth=%d tess=%d",
+                                k.stride, k.tcOffset, (int)k.depthTest, (int)tess);
+    if (handle == VK_NULL_HANDLE) return VK_NULL_HANDLE;
     Msg("[VK PipelineCache] Created pipeline stride=%u tcOff=%u depth=%d wmark=%d tess=%d vrs2x2=%d",
         k.stride, k.tcOffset, (int)k.depthTest, (int)k.wmark, (int)tess, (int)k.vrsStatic);
     return handle;
@@ -1263,6 +884,67 @@ namespace {
     xr_vector<Key> s_prewarmWorld;       // pending world weather-variant keys
     xr_vector<u8>  s_prewarmTerrainMask; // pending terrain frame-masks (WS_FRAME bits)
     bool           s_prewarmBuilt = false;
+
+    // ---- Async prewarm -------------------------------------------------------
+    // These compiles used to run one per frame ON the render thread, and the
+    // precache countdown waited for them: measured on pripyat_full, that is 17
+    // frames of load screen (~12 ms each) spent compiling variants nothing draws
+    // until it rains. Worse, the 1/frame pace was chosen for a COLD shader cache
+    // (~300 ms a compile) -- so a first-ever run holds the load screen for the
+    // full compile time of forty pipelines.
+    //
+    // vkCreateGraphicsPipelines is thread-safe and the VkPipelineCache passed to
+    // it is internally synchronized (it is not listed as externally synchronized
+    // in the spec's threading rules), and CreatePipeline touches no shared state
+    // beyond the immutable shader modules + layout. So the worker only CREATES;
+    // the map insert stays on the render thread, which is what Get() reads.
+    std::thread                              s_prewarmThread;
+    std::mutex                               s_prewarmMx;
+    xr_vector<std::pair<Key, VkPipeline>>    s_prewarmOut;   // worker -> render thread
+    bool                                     s_prewarmAsyncRun = false;
+
+}
+
+// Move whatever the worker finished into the live map. Render thread only.
+// A key the worker and a lazy Get() both built ends up with two handles -- the
+// one Get() returned is already recorded somewhere, so the DUPLICATE we drop is
+// always the worker's.
+void PrewarmDrain()
+{
+    if (!s_prewarmAsyncRun) return;
+    xr_vector<std::pair<Key, VkPipeline>> got;
+    {
+        std::lock_guard<std::mutex> lk(s_prewarmMx);
+        if (s_prewarmOut.empty()) return;
+        got.swap(s_prewarmOut);
+    }
+    for (auto& kv : got) {
+        if (kv.second == VK_NULL_HANDLE) continue;
+        if (s_Pipelines.find(kv.first) != s_Pipelines.end())
+            vkDestroyPipeline(VulkanHW.m_Device, kv.second, nullptr);
+        else
+            s_Pipelines.emplace(kv.first, kv.second);
+    }
+}
+
+namespace {
+// Device teardown: let the worker finish, take what it built into the live map
+// (the loop in Destroy frees it from there), then go quiet.
+void PrewarmTeardown()
+{
+    if (s_prewarmThread.joinable()) s_prewarmThread.join();
+    PrewarmDrain();
+    s_prewarmAsyncRun = false;
+}
+}   // anonymous namespace
+
+bool PrewarmPending()
+{
+    // The precache countdown asks this. With the world variants on a worker there
+    // is nothing left for those frames to warm: the terrain trio is created in one
+    // batch on the first call, and the worker needs no frames at all.
+    if (ps_r_prewarm_async) return false;
+    return !s_prewarmBuilt || !s_prewarmWorld.empty() || !s_prewarmTerrainMask.empty();
 }
 
 bool PrewarmWeatherVariants(u32 budget)
@@ -1286,6 +968,40 @@ bool PrewarmWeatherVariants(u32 budget)
     }
     // Create up to `budget` this call — spread across frames so cold uber-FS compiles
     // (~300ms each) don't freeze a whole frame.
+    // Async path: hand the whole world list to one worker and take the terrain
+    // trio here (GetTerrainPipeline reads the frame-global mask, which belongs to
+    // this thread). Returns false -- the caller has nothing left to spread.
+    if (ps_r_prewarm_async) {
+        if (!s_prewarmAsyncRun && !s_prewarmWorld.empty()) {
+            // The 1/frame path skipped a key that a lazy Get() had built in the
+            // meantime; the worker cannot look at the map, so filter HERE instead
+            // -- otherwise it compiles ~22 pipelines the drain then throws away,
+            // and those compiles are what slows the load screen down.
+            xr_vector<Key> work;
+            work.reserve(s_prewarmWorld.size());
+            std::unordered_set<Key> seen;   // two source keys can flip to the same variant
+            for (const Key& k : s_prewarmWorld)
+                if (s_Pipelines.find(k) == s_Pipelines.end() && seen.insert(k).second) work.push_back(k);
+            s_prewarmWorld.clear();
+            Msg("[VK PipelineCache] prewarm async: %u of the queued variants still missing", (u32)work.size());
+            s_prewarmAsyncRun = true;
+            s_prewarmThread = std::thread([work = std::move(work)]() {
+                for (const Key& k : work) {
+                    VkPipeline p = CreatePipeline(k);
+                    if (p == VK_NULL_HANDLE) continue;
+                    std::lock_guard<std::mutex> lk(s_prewarmMx);
+                    s_prewarmOut.emplace_back(k, p);
+                }
+            });
+        }
+        while (!s_prewarmTerrainMask.empty()) {
+            const u8 m = s_prewarmTerrainMask.back(); s_prewarmTerrainMask.pop_back();
+            const u8 saved = s_FrameSpecMask;   // GetTerrainPipeline reads the frame mask
+            s_FrameSpecMask = m; GetTerrainPipeline(); s_FrameSpecMask = saved;
+        }
+        return false;
+    }
+
     u32 done = 0;
     while (done < budget && !s_prewarmWorld.empty()) {
         Key k = s_prewarmWorld.back(); s_prewarmWorld.pop_back();

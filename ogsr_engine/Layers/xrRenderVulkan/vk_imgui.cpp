@@ -8,9 +8,12 @@
 // Minimal Dear ImGui Vulkan backend + profiler overlay. See vk_imgui.h.
 
 #include "stdafx.h"
+#include "vk_descriptors.h"     // VK::DescriptorWriter
+#include "vk_rendering.h"       // VK::RenderingBuilder
 #include "vk_imgui.h"
 #include "vk_profiler.h"            // Prof::GetZones / GetMem / GetFrame
 #include "vk_image.h"               // VK::CreateImage / CreateImageView
+#include "vk_gfx_pipeline.h"        // VK::GfxPipelineBuilder
 #include "HW_Vulkan.h"             // VulkanHW (device/allocator + single-time cmds)
 #include "vk_swapchain.h"          // Swapchain.m_Format
 #include "vk_shaders.h"            // g_ShaderManager (.spv loader)
@@ -173,20 +176,10 @@ bool CreatePipeline()
     if (!vs || !fs) { Msg("![VK ImGui] shader load failed"); return false; }
 
     // set 0: combined image sampler (font), fragment
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 1; lci.pBindings = &b;
-    if (vkCreateDescriptorSetLayout(VulkanHW.m_Device, &lci, nullptr, &s_setLayout) != VK_SUCCESS) return false;
-
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
-    VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(VulkanHW.m_Device, &pci, nullptr, &s_pool) != VK_SUCCESS) return false;
-    VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dai.descriptorPool = s_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &s_setLayout;
-    if (vkAllocateDescriptorSets(VulkanHW.m_Device, &dai, &s_fontSet) != VK_SUCCESS) return false;
+    if (!VK::MakeDescriptorSets({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER }, 1,
+                                s_setLayout, s_pool, &s_fontSet,
+                                VK_SHADER_STAGE_FRAGMENT_BIT, "ImGui.Font"))
+        return false;
 
     VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
@@ -195,11 +188,7 @@ bool CreatePipeline()
     si.minLod = -1000.f; si.maxLod = 1000.f; si.maxAnisotropy = 1.0f;
     if (vkCreateSampler(VulkanHW.m_Device, &si, nullptr, &s_sampler) != VK_SUCCESS) return false;
 
-    VkDescriptorImageInfo ii{ s_sampler, s_fontView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    w.dstSet = s_fontSet; w.dstBinding = 0; w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
-    vkUpdateDescriptorSets(VulkanHW.m_Device, 1, &w, 0, nullptr);
+    VK::DescriptorWriter(s_fontSet).ImageSampler(0, s_fontView, s_sampler).Flush();
 
     VkPushConstantRange pcr{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushC) };
     VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -207,35 +196,13 @@ bool CreatePipeline()
     plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(VulkanHW.m_Device, &plci, nullptr, &s_layout) != VK_SUCCESS) return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
-
-    VkVertexInputBindingDescription bind{ 0, sizeof(ImDrawVert), VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription attr[3]{
         { 0, 0, VK_FORMAT_R32G32_SFLOAT,  (u32)IM_OFFSETOF(ImDrawVert, pos) },
         { 1, 0, VK_FORMAT_R32G32_SFLOAT,  (u32)IM_OFFSETOF(ImDrawVert, uv)  },
         { 2, 0, VK_FORMAT_R8G8B8A8_UNORM, (u32)IM_OFFSETOF(ImDrawVert, col) },
     };
-    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &bind;
-    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = attr;
-
-    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-    vp.viewportCount = 1; vp.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
+    // ImGui's own blend: straight alpha over, and the destination alpha is kept
+    // premultiplied (ONE_MINUS_SRC_ALPHA, not the ZERO the engine's BlendAlpha uses).
     VkPipelineColorBlendAttachmentState cb{};
     cb.blendEnable = VK_TRUE;
     cb.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -246,32 +213,14 @@ bool CreatePipeline()
     cb.alphaBlendOp = VK_BLEND_OP_ADD;
     cb.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo bs{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    bs.attachmentCount = 1; bs.pAttachments = &cb;
 
-    VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    ds.depthTestEnable = VK_FALSE; ds.depthWriteEnable = VK_FALSE;
-
-    VkDynamicState dyn[2]{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynci{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynci.dynamicStateCount = 2; dynci.pDynamicStates = dyn;
-
-    VkFormat colFmt = Swapchain.m_Format;
-    VkPipelineRenderingCreateInfo prci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
-    prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colFmt;
-
-    VkGraphicsPipelineCreateInfo gp{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-    gp.pNext = &prci;
-    gp.stageCount = 2; gp.pStages = stages;
-    gp.pVertexInputState = &vi; gp.pInputAssemblyState = &ia;
-    gp.pViewportState = &vp; gp.pRasterizationState = &rs;
-    gp.pMultisampleState = &ms; gp.pColorBlendState = &bs;
-    gp.pDepthStencilState = &ds; gp.pDynamicState = &dynci;
-    gp.layout = s_layout;
-    if (vkCreateGraphicsPipelines(VulkanHW.m_Device, VK_NULL_HANDLE, 1, &gp, nullptr, &s_pipeline) != VK_SUCCESS) {
-        Msg("![VK ImGui] pipeline create failed"); return false;
-    }
-    return true;
+    s_pipeline = VK::GfxPipelineBuilder(s_layout)
+        .Vert(vs).Frag(fs)
+        .Binding(0, sizeof(ImDrawVert))
+        .Attrs(attr, 3)
+        .ColorBlend(Swapchain.m_Format, cb)
+        .Build("ImGui");
+    return s_pipeline != VK_NULL_HANDLE;
 }
 
 bool Init()
@@ -695,15 +644,9 @@ void DrawOverlay(VkCommandBuffer cmd, VkImageView swapchainView, VkExtent2D exte
 
     Prof::CmdBeginLabel(cmd, "ImGui Overlay", 0.9f, 0.7f, 0.2f);
 
-    VkRenderingAttachmentInfo cAtt{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    cAtt.imageView = swapchainView;
-    cAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    cAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;     // draw on top of the final frame
-    cAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
-    ri.renderArea.extent = extent; ri.layerCount = 1;
-    ri.colorAttachmentCount = 1; ri.pColorAttachments = &cAtt;
-    vkCmdBeginRendering(cmd, &ri);
+    // loadOp LOAD — draw on top of the final frame. Scissor is per-draw below,
+    // so this opens the scope and sets only the viewport.
+    VK::RenderingBuilder(extent).Color(swapchainView).Begin(cmd);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_layout, 0, 1, &s_fontSet, 0, nullptr);

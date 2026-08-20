@@ -24,6 +24,13 @@ class CVulkanBuffer;
 class CVulkanTexture;
 struct FrameContext;
 
+// Range at which an FLOD container starts drawing its billboard instead of
+// relying on the full mesh. Shared, NOT file-local, because CTreeManager's
+// r_tree_dist cut keys off it: dropping a tree's mesh BEFORE its imposter kicks
+// in makes the tree vanish, so TreeFlodCutDist() floors itself at this value.
+// Far enough that the flatness reads as distant haze, not a low-poly pop-in.
+static constexpr float kImposterMinDist = 250.0f;
+
 // Per-vertex imposter quad data (host-built each frame). 24 B.
 struct LodImposterVertex
 {

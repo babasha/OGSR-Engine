@@ -6,16 +6,56 @@
 #include <iomanip> //для std::strftime
 #include <array> //для std::array
 #include <iostream>
+#include <atomic>
+#include <cstdlib>          // getenv — XROS_LOG_FLUSH
 
 static LogCallback LogCB = nullptr;
 xr_vector<std::string> LogFile;
 static std::ofstream logstream;
 string_path logFName{};
 
+// What a level load spends writing its own log: 14926 lines for one pripyat_full
+// load, each of them an ofstream write followed by a flush -- i.e. a syscall per
+// line, taken on whatever thread called Msg, and never counted by any phase timer
+// because it is spread across all of them. Measured here so the argument about it
+// is about a number: 6859 lines cost 60 ms of the render phases, 23 of them once
+// the flush stopped being per-line. XROS_LOG_FLUSH=1 puts the old behaviour back.
+namespace {
+std::atomic<u64> g_logLines{0}, g_logClk{0}, g_logWriteClk{0};
+u32  g_logSinceFlush = 0;
+u64  g_logLastFlushQpc = 0;
+constexpr u32 kLogFlushRun = 64;
+
+bool LogFlushEachLine()
+{
+    static const bool s_each = [] {
+        if (const char* e = std::getenv("XROS_LOG_FLUSH")) return atoi(e) != 0;
+        return false;
+    }();
+    return s_each;
+}
+}   // namespace
+
+void LogProfGet(u64& lines, u64& clkTotal, u64& clkWrite)
+{
+    lines    = g_logLines.load(std::memory_order_relaxed);
+    clkTotal = g_logClk.load(std::memory_order_relaxed);
+    clkWrite = g_logWriteClk.load(std::memory_order_relaxed);
+}
+
+void LogFlushNow()
+{
+    if (logstream.is_open()) logstream.flush();
+    g_logSinceFlush = 0;
+}
 static void AddOne(std::string& split, bool first_line)
 {
     static std::recursive_mutex logCS;
     std::scoped_lock lock(logCS);
+
+    const u64 clkEnter = CPU::GetCLK();
+    const bool isError = !split.empty() && split.front() == '!';   // before insert_time prefixes it
+    g_logLines.fetch_add(1, std::memory_order_relaxed);
 
     if (IsDebuggerPresent())
     { //Вывод в отладчик студии
@@ -82,9 +122,24 @@ static void AddOne(std::string& split, bool first_line)
         insert_time();
 
         //Вывод в лог-файл
+        const u64 clkWrite0 = CPU::GetCLK();
         logstream << split;
-        logstream.flush();
+        // The flush is what makes the log survive a hard kill (quick_exit in
+        // xrDebug::backend runs no destructors -- it calls LogFlushNow instead), and
+        // it costs a syscall per line: measured 40 ms of the render phases alone for
+        // 6859 lines, ~100 ms over a whole level load. So it is bounded in TIME
+        // instead of taken every line: errors flush immediately, everything else at
+        // most 2 ms behind. XROS_LOG_FLUSH=1 restores the line-by-line behaviour.
+        const u64 now = CPU::QPC();
+        if (LogFlushEachLine() || isError || ++g_logSinceFlush >= kLogFlushRun
+            || (now - g_logLastFlushQpc) * 500 > CPU::QPCFreq()) {
+            logstream.flush();
+            g_logSinceFlush   = 0;
+            g_logLastFlushQpc = now;
+        }
+        g_logWriteClk.fetch_add(CPU::GetCLK() - clkWrite0, std::memory_order_relaxed);
     }
+    g_logClk.fetch_add(CPU::GetCLK() - clkEnter, std::memory_order_relaxed);
 }
 
 void Log(const std::string& str)
